@@ -1,12 +1,22 @@
 # Example strategies
 
-`user_strategies/` is git-ignored in this repo — it is where your **private**
-strategy repo gets cloned at deploy time, so the alpha never lands in the public
-engine's history.
-
-To try the pipeline before you have one:
+`user_strategies/` is git-ignored **and untracked** in this repo — it is where
+your **private** strategy repo gets cloned, whole, so the alpha never lands in
+the public engine's history:
 
 ```bash
+git clone git@github.com:you/my-private-strategies.git user_strategies
+```
+
+Nothing is committed under that path, not even a `.gitkeep`, because `git clone`
+refuses a destination that already contains a file. That means the directory is
+absent from a fresh checkout and you create it yourself when you are not cloning
+into it.
+
+To try the pipeline before you have a private repo:
+
+```bash
+mkdir -p user_strategies
 cp examples/user_strategies/ema_atr_breakout.py user_strategies/
 uv run qte-backtest run --strategy QTE_EXAMPLE_EMA_ATR --symbol XAUUSD --timeframe M15
 ```

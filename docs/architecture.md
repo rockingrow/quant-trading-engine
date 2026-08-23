@@ -56,8 +56,21 @@ two rows, not two implementations.
 
 `user_strategies/` is a mounted volume cloned from a private repo, not an
 installed distribution. Requiring it to be pip-installable would drag the
-private repo into the public build. A module that fails to import is logged and
-skipped — one broken strategy file should not stop the other four from trading.
+private repo into the public build, and it would trade a fast edit-and-restart
+loop for a version bump and an image rebuild on every change to a strategy.
+
+Two consequences follow from "it is a whole repository":
+
+- **Nothing is committed under that path**, not even a `.gitkeep`. `git clone`
+  refuses a destination that already contains a file, so a tracked placeholder
+  would break the one command the design exists to support.
+- **Discovery filters repo furniture.** A bare `rglob("*.py")` would import the
+  private repo's own test suite and, if a virtualenv lives in there, walk
+  site-packages. Hidden directories and `EXCLUDED_DIRECTORIES` are skipped
+  before the importer sees them.
+
+A module that fails to import is logged and skipped — one broken strategy file
+should not stop the other four from trading.
 
 Duplicate strategy names are an error, not a warning to skim past: workers
 subscribe by strategy name, so two algorithms sharing one would execute against

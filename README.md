@@ -55,7 +55,10 @@ cd quant-trading-engine
 cp .env.example .env          # fill in QTE_TIINGO__API_KEY at minimum
 make install-dev              # uv sync
 
-# Try the pipeline with the example strategy
+# Try the pipeline with the example strategy. user_strategies/ does not exist
+# in a fresh clone — it is left out of git so `git clone <your repo>
+# user_strategies` has an empty destination to land in.
+mkdir -p user_strategies
 cp examples/user_strategies/ema_atr_breakout.py user_strategies/
 
 make infra                    # redis + postgres + nats
@@ -76,7 +79,7 @@ Requires Python 3.11+, [uv](https://docs.astral.sh/uv/), and Docker.
 | `backtest-engine/` | History downloader, parquet store, replay loop, fill simulator, metrics, `qte-backtest` CLI. |
 | `strategy-engine/` | The live runner: plugin loading, the NATS event loop, delivery to the broker, audit. |
 | `api-gateway/` | FastAPI control plane. |
-| `user_strategies/` | **Git-ignored.** Your private strategy repo, cloned in at deploy time. |
+| `user_strategies/` | **Git-ignored and untracked.** Your private strategy repo, cloned in whole. Absent from a fresh checkout by design. |
 | `deploy/` | Postgres init SQL (incl. pgvector) and the standalone NATS config. |
 | `examples/user_strategies/` | A worked example of the plugin contract. Not an edge. |
 
@@ -124,6 +127,14 @@ Rules the framework enforces so you do not have to:
   mints/reuses the trade-cycle id, sends, and audits.
 - `on_tick(price, ctx)` is optional. Override it only when an exit has to react
   faster than a bar close — the runner subscribes to ticks only if something does.
+
+Discovery walks `user_strategies/` recursively, so a subfolder per instrument is
+fine. Because the directory is a whole cloned repo rather than a tidy folder, it
+skips hidden directories (`.git`, `.venv`, …) and the usual repo furniture —
+`tests/`, `docs/`, `build/`, `node_modules/` and friends
+(`qte_shared.plugin_loader.EXCLUDED_DIRECTORIES`). Files starting with `_` are
+skipped too, so shared helpers live in `_helpers.py`. A file that fails to
+import is logged and skipped: one broken strategy does not stop the others.
 
 ---
 
@@ -208,7 +219,8 @@ Interactive docs at `/docs`.
 git clone https://github.com/rockingrow/quant-trading-engine
 cd quant-trading-engine && cp .env.example .env   # then edit it
 
-# 2. Private alpha, into the ignored directory
+# 2. Private alpha, into the ignored directory. It is untracked and absent
+#    from the checkout, so this clone lands in an empty destination.
 git clone git@github.com:you/my-private-strategies.git user_strategies
 
 # 3. Up

@@ -220,11 +220,11 @@ __marimo__/
 # ── QTE ───────────────────────────────────────────────────────────────
 # The private strategy repo is cloned in here at deploy time. It must never
 # reach this public repository's history.
-# Anchored to the repo root and written as `dir/*` rather than `dir/`, so the
-# .gitkeep negations below still apply (git never descends into an excluded
-# directory) and `examples/user_strategies/` is not swept up by the same rule.
-/user_strategies/*
-!/user_strategies/.gitkeep
+# Your private strategy repo gets cloned straight into this directory, so it is
+# ignored whole — and left UNTRACKED, with no .gitkeep, because `git clone <repo>
+# user_strategies` refuses a destination that already contains a file. Anchored
+# to the repo root so `examples/user_strategies/` is not swept up by the rule.
+/user_strategies/
 
 # Downloaded market history — regenerate with `make download`, never commit.
 /data/parquet/*

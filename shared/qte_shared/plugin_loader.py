@@ -24,6 +24,27 @@ from qte_shared.strategy_base import StrategyBase
 
 log = get_logger(__name__)
 
+#: Directory names never scanned for strategies. The loader points at a cloned
+#: repository, which brings its own tests, docs and possibly a virtualenv along
+#: with the code that matters. Hidden directories (``.git``, ``.venv``, …) are
+#: excluded separately, by the leading dot.
+EXCLUDED_DIRECTORIES = frozenset(
+    {
+        "__pycache__",
+        "build",
+        "dist",
+        "docs",
+        "env",
+        "examples",
+        "node_modules",
+        "scripts",
+        "site-packages",
+        "test",
+        "tests",
+        "venv",
+    }
+)
+
 
 @dataclass(slots=True)
 class LoadedStrategy:
@@ -88,11 +109,27 @@ class StrategyLoader:
         )
 
     def _candidate_files(self) -> list[Path]:
+        """Every ``.py`` worth importing, once the repo furniture is filtered out.
+
+        The directory is a whole cloned repository, not a tidy folder of
+        strategy files, so a bare ``rglob`` would import that repo's test suite
+        and — if a virtualenv lives in there — walk thousands of files in
+        site-packages before finding anything. Both are skipped here rather
+        than tolerated by the per-file error handler.
+        """
         return [
             path
             for path in self.directory.rglob("*.py")
-            if not path.name.startswith("_") and "__pycache__" not in path.parts
+            if not path.name.startswith("_") and not self._is_excluded(path)
         ]
+
+    def _is_excluded(self, path: Path) -> bool:
+        relative = path.relative_to(self.directory)
+        return any(
+            # Hidden directories cover .git, .venv, .pytest_cache, .ruff_cache…
+            part.startswith(".") or part in EXCLUDED_DIRECTORIES
+            for part in relative.parts[:-1]
+        )
 
     def _import_file(self, path: Path):
         """Import *path* under a namespaced module name.
