@@ -95,6 +95,10 @@ class StrategyContext:
 
 IntentResult = SignalIntent | Sequence[SignalIntent] | None
 
+#: Floor for the default history window. A strategy with a short warm-up still
+#: wants enough bars for a chart-length view of what it is trading.
+MIN_HISTORY_WINDOW = 400
+
 
 class StrategyBase(ABC):
     """Base class every plugin in ``__strategies__/`` must subclass.
@@ -114,6 +118,15 @@ class StrategyBase(ABC):
     #: Minimum closed candles before the first call — the runner buffers until
     #: it has this many, so indicators never see a half-warm window.
     warmup: int = 200
+    #: How many closed candles ``on_candle_closed`` receives, in **both** the
+    #: backtest and the live runner.
+    #:
+    #: ``None`` (the default) means ``max(warmup * 2, MIN_HISTORY_WINDOW)``: an
+    #: indicator needing N bars needs N *valid* bars, and its own warm-up eats
+    #: the oldest few. Set an integer to widen it. Set ``0`` for every bar
+    #: available — but read :meth:`history_window` first, because "available"
+    #: does not mean the same thing in a backtest as it does live.
+    max_history: int | None = None
 
     def __init__(self, params: dict[str, Any] | None = None) -> None:
         self.params: dict[str, Any] = dict(params or {})
@@ -152,6 +165,26 @@ class StrategyBase(ABC):
 
     # ── Convenience for subclasses ────────────────────────────────────
 
+    def history_window(self) -> int | None:
+        """Bars handed to :meth:`on_candle_closed`; ``None`` means unbounded.
+
+        Both drivers call this, which is the point. Before it existed the live
+        runner kept a bounded deque while the backtest passed the entire file,
+        so a strategy using a running sum or a session VWAP computed one thing
+        on the chart and another in production — the exact divergence
+        write-once-run-anywhere is supposed to rule out.
+
+        A word on ``max_history = 0``: it gives every bar the driver has, and a
+        backtest has the whole parquet file while a restarted runner has only
+        what Redis retained. Unbounded therefore means "the same code sees
+        different amounts of history in the two places", which is the thing
+        this method exists to prevent. The runner warns when a strategy asks
+        for more than Redis keeps.
+        """
+        if self.max_history == 0:
+            return None
+        return self.max_history or max(self.warmup * 2, MIN_HISTORY_WINDOW)
+
     def param(self, key: str, default: Any = None) -> Any:
         return self.params.get(key, default)
 
@@ -164,6 +197,7 @@ class StrategyBase(ABC):
             "symbols": list(self.symbols),
             "timeframe": self.timeframe,
             "warmup": self.warmup,
+            "history_window": self.history_window(),
             "params": self.params,
         }
 

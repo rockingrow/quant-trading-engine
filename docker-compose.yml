@@ -15,9 +15,6 @@
 name: qte
 
 x-app: &app
-  build:
-    context: .
-    dockerfile: Dockerfile
   env_file: [.env]
   restart: unless-stopped
   volumes:
@@ -74,10 +71,22 @@ services:
 
   data-ingestion:
     <<: *app
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # No pyarrow, no backtest engine — this container only reads the feed.
+      args: {QTE_PACKAGE: qte-ingestion}
     command: ["qte-ingestion"]
 
   strategy-runner:
     <<: *app
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # Ships qte-strategy-runner and qte-control. NOT the backtest engine:
+      # strategy-engine does not depend on it, so replaying history is done on
+      # the host with `make backtest`, not inside the live trading container.
+      args: {QTE_PACKAGE: qte-strategy-engine}
     command: ["qte-strategy-runner"]
 
 volumes:

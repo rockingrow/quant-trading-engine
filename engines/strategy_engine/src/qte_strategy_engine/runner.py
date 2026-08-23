@@ -62,10 +62,9 @@ class StrategySlot:
         self.symbol = symbol
         self.factory = factory
         self.timeframe = normalize_timeframe(strategy.timeframe)
-        # Keep a little more than the strategy asked for: an indicator that
-        # needs N bars needs N *valid* bars, and the oldest few are consumed by
-        # its own warm-up before it produces a number at all.
-        self.buffer: deque[Candle] = deque(maxlen=max(strategy.warmup * 2, 400))
+        # Exactly the window the backtest hands the same strategy — the bound
+        # lives on StrategyBase so the two drivers cannot drift apart.
+        self.buffer: deque[Candle] = deque(maxlen=strategy.history_window())
         self.started = False
 
     @property
@@ -142,6 +141,7 @@ class StrategyRunner:
                     inputs=strategy.params,
                 )
                 slot = StrategySlot(strategy, symbol, factory)
+                self._warn_if_history_exceeds_redis(slot)
                 self.slots.append(slot)
                 self._by_subject[(symbol, slot.timeframe)].append(slot)
                 log.info(
@@ -151,6 +151,36 @@ class StrategyRunner:
                     slot.timeframe,
                     strategy.warmup,
                 )
+
+    @staticmethod
+    def _warn_if_history_exceeds_redis(slot: StrategySlot) -> None:
+        """Say so when live can never give the strategy its backtest window.
+
+        The backtest reads the whole parquet file, so it can always satisfy the
+        window. A restarted runner refills from Redis, which keeps only
+        ``QTE_REDIS__CANDLE_HISTORY`` bars — ask for more than that and the two
+        drivers feed the same strategy different amounts of history, silently.
+        """
+        wanted = slot.strategy.history_window()
+        retained = settings.redis.candle_history
+        if wanted is None:
+            log.warning(
+                "Strategy %s sets max_history=0 (unbounded). Live it will see at most "
+                "%d candles — whatever Redis retained — while a backtest sees the whole "
+                "file. Set an explicit max_history to make the two agree.",
+                slot.strategy.name,
+                retained,
+            )
+        elif wanted > retained:
+            log.warning(
+                "Strategy %s wants %d candles but Redis retains %d. After a restart it "
+                "will run on a shorter window than it was backtested on; raise "
+                "QTE_REDIS__CANDLE_HISTORY to at least %d.",
+                slot.strategy.name,
+                wanted,
+                retained,
+                wanted,
+            )
 
     async def _restore_state(self) -> None:
         """Refill candle buffers and open-cycle ids from Redis."""

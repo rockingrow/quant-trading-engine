@@ -150,3 +150,34 @@ The difference matters because the counted version does not break loudly. Moving
 `engines/`: the engine keeps starting, silently reads no `.env`, and looks for
 strategies in a directory that does not exist. Identifying the root by its
 marker makes the layout free to change.
+
+## Why the strategy sees a bounded window
+
+`StrategyBase.history_window()` is read by *both* drivers, and that is the whole
+point of it existing. Before it did, the live runner kept a deque of
+`max(warmup * 2, 400)` candles while the backtest passed `frame.iloc[:i+1]` —
+the entire file. A strategy that read the whole frame therefore computed one
+thing on the chart and another in production, silently, and in the direction
+that flatters the backtest.
+
+It also made the replay quadratic: 105k bars (about three years of M15) took
+roughly twelve minutes, and doubling the history quadrupled the cost. Bounded,
+the same replay is linear — measured at exactly 2.00x per doubling — and lands
+around five minutes with two indicators.
+
+The rest of that cost is per-bar indicator recomputation, and it is the price of
+the guarantee: the backtest calls the same `ema()` on the same window the live
+runner will. Making it faster means incremental indicators that carry state
+between bars, which is a real design change rather than a tuning exercise.
+
+## Why each service builds its own image
+
+The workspace was split so that `uv sync --package` would have a boundary to cut
+along; the Dockerfile now actually cuts there. `QTE_PACKAGE` selects one member,
+and the difference is not cosmetic — the full workspace venv is 352 MB against
+~142 MB per service, mostly pyarrow, which only the backtest engine needs.
+
+The boundary only holds if the manifests stay honest, so
+`tests/test_packaging.py` asserts the dependency graph is a star: leaf engines
+may depend on `qte-shared` and nothing else in the workspace. A direct edge
+between two leaves is how a microservice boundary quietly stops being one.

@@ -130,6 +130,11 @@ class BacktestEngine:
                 f"{len(frame)} bars is not enough for a strategy needing {warmup} of warm-up"
             )
 
+        # The same bound the live runner keeps its deque at. Passing the whole
+        # file instead would be both quadratic and a lie: a strategy would see
+        # history in the backtest that it can never see in production.
+        window_size = self.strategy.history_window()
+
         context = StrategyContext(
             symbol=self.symbol,
             timeframe=self.timeframe,
@@ -151,7 +156,8 @@ class BacktestEngine:
 
             context.now = bar_time
             context.open_uxid = self.factory.open_cycle(self.symbol)
-            window = frame.iloc[: position + 1]
+            start = 0 if window_size is None else max(0, position + 1 - window_size)
+            window = frame.iloc[start : position + 1]
             for intent in _as_intents(self.strategy.on_candle_closed(window, context)):
                 self._apply(intent, bar_time, float(bar["close"]))
 

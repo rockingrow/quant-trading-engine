@@ -75,10 +75,10 @@ Requires Python 3.11+, [uv](https://docs.astral.sh/uv/), and Docker.
 
 | Path | What it is |
 | --- | --- |
-| `engines/shared/` | `qte_shared` — models, indicators, `StrategyBase`, NATS/Redis/Postgres adapters, the plugin loader, the signal factory. Every other engine depends on this and on nothing else in the repo. |
-| `engines/data-ingestion/` | Tiingo WebSocket → resampler → Redis + NATS. |
-| `engines/backtest-engine/` | History downloader, parquet store, replay loop, fill simulator, metrics, reports, `qte-backtest` CLI. |
-| `engines/strategy-engine/` | The live runner: plugin loading, the NATS event loop, delivery to the broker, audit, and the `qte-control` operator CLI. |
+| `engines/shared/src/qte_shared/` | — models, indicators, `StrategyBase`, NATS/Redis/Postgres adapters, the plugin loader, the signal factory. Every other engine depends on this and on nothing else in the repo. |
+| `engines/data_ingestion/src/qte_ingestion/` | Tiingo WebSocket → resampler → Redis + NATS. |
+| `engines/backtest_engine/src/qte_backtest/` | History downloader, parquet store, replay loop, fill simulator, metrics, reports, `qte-backtest` CLI. |
+| `engines/strategy_engine/src/qte_strategy_engine/` | The live runner: plugin loading, the NATS event loop, delivery to the broker, audit, and the `qte-control` operator CLI. |
 | `__strategies__/` | **Git-ignored and untracked.** Your private strategy repo, cloned in whole. Absent from a fresh checkout by design. |
 | `migrations/` | Alembic. One chain for the whole system; `env.py` imports every engine's models. |
 | `deploy/` | The standalone NATS config. |
@@ -133,6 +133,13 @@ Rules the framework enforces so you do not have to:
   mints/reuses the trade-cycle id, sends, and audits.
 - `on_tick(price, ctx)` is optional. Override it only when an exit has to react
   faster than a bar close — the runner subscribes to ticks only if something does.
+
+`df` holds `history_window()` bars — `max(warmup * 2, 400)` by default, or
+whatever `max_history` you set. **The live runner uses the same number**, so a
+strategy that reads the whole frame (a running sum, a session VWAP) computes the
+same thing in both places. Set `max_history = 0` for everything available, but
+note that "available" is the whole parquet file in a backtest and only what
+Redis retained after a restart — the runner warns when the two cannot match.
 
 Discovery walks `__strategies__/` recursively, so a subfolder per instrument is
 fine. Because the directory is a whole cloned repo rather than a tidy folder, it
@@ -322,6 +329,16 @@ make up
 make db-upgrade
 make logs
 ```
+
+Each service builds its **own image**: `QTE_PACKAGE` selects one workspace
+member, so the ingestion container does not carry pyarrow (152 MB, backtest
+only) or the backtest engine at all. A full-workspace venv is 352 MB; each
+service's is ~142 MB.
+
+The backtest CLI is deliberately in neither container — replaying history is
+done on the host with `make backtest`, not inside the live trading process.
+Alembic is in both, because any container that can reach the database should be
+able to migrate it.
 
 `docker-compose.yml` ships a `nats` service for standalone development. In
 production you normally point `QTE_BROKER__NATS_URL` at the **broker's** NATS,

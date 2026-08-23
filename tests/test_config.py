@@ -49,18 +49,21 @@ def test_the_defaults_hang_off_the_root_rather_than_the_working_directory():
 
 
 def test_the_shared_package_really_lives_under_engines():
-    assert (REPO_ROOT / "engines" / "shared" / "qte_shared" / "config.py").is_file()
+    assert (REPO_ROOT / "engines" / "shared" / "src" / "qte_shared" / "config.py").is_file()
     assert not (REPO_ROOT / "shared").exists()
 
 
 def test_every_workspace_member_is_an_engine():
     members = sorted(path.name for path in (REPO_ROOT / "engines").iterdir() if path.is_dir())
-    assert members == ["backtest-engine", "data-ingestion", "shared", "strategy-engine"]
+    assert members == ["backtest_engine", "data_ingestion", "shared", "strategy_engine"]
     for name in members:
         assert (REPO_ROOT / "engines" / name / "pyproject.toml").is_file()
+        # src-layout: the importable package is one level down, so the engine
+        # folder and the package name never sit adjacent looking near-identical.
+        assert (REPO_ROOT / "engines" / name / "src").is_dir()
 
 
 def test_no_stray_path_assumptions_survive_outside_the_root():
     # REPO_ROOT must be an ancestor of the package, never a sibling or below it.
-    package = Path(__file__).resolve().parents[1] / "engines" / "shared"
+    package = Path(__file__).resolve().parents[1] / "engines" / "shared" / "src"
     assert package.is_relative_to(REPO_ROOT)

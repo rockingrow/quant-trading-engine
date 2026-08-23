@@ -897,7 +897,7 @@ wheels = [
 [[package]]
 name = "qte-backtest"
 version = "0.1.0"
-source = { editable = "engines/backtest-engine" }
+source = { editable = "engines/backtest_engine" }
 dependencies = [
     { name = "httpx" },
     { name = "pyarrow" },
@@ -914,7 +914,7 @@ requires-dist = [
 [[package]]
 name = "qte-ingestion"
 version = "0.1.0"
-source = { editable = "engines/data-ingestion" }
+source = { editable = "engines/data_ingestion" }
 dependencies = [
     { name = "httpx" },
     { name = "qte-shared" },
@@ -963,7 +963,7 @@ requires-dist = [
 [[package]]
 name = "qte-strategy-engine"
 version = "0.1.0"
-source = { editable = "engines/strategy-engine" }
+source = { editable = "engines/strategy_engine" }
 dependencies = [
     { name = "httpx" },
     { name = "qte-shared" },
@@ -996,10 +996,10 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "qte-backtest", editable = "engines/backtest-engine" },
-    { name = "qte-ingestion", editable = "engines/data-ingestion" },
+    { name = "qte-backtest", editable = "engines/backtest_engine" },
+    { name = "qte-ingestion", editable = "engines/data_ingestion" },
     { name = "qte-shared", editable = "engines/shared" },
-    { name = "qte-strategy-engine", editable = "engines/strategy-engine" },
+    { name = "qte-strategy-engine", editable = "engines/strategy_engine" },
 ]
 
 [package.metadata.requires-dev]

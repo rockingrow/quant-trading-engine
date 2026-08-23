@@ -56,7 +56,7 @@ def test_ingestion_owns_no_tables_of_its_own():
 
     Inventing a table to justify a folder would be the wrong way round.
     """
-    assert not (REPO_ROOT / "engines" / "data-ingestion" / "qte_ingestion" / "db").exists()
+    assert not (REPO_ROOT / "engines" / "data_ingestion" / "src" / "qte_ingestion" / "db").exists()
 
 
 # ── Alembic wiring ────────────────────────────────────────────────────
@@ -171,3 +171,14 @@ def test_compose_pins_a_stock_postgres_image():
     compose = (REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     assert "pgvector/pgvector" not in compose
     assert "image: postgres:" in compose
+
+
+def test_both_service_images_can_run_migrations():
+    """Alembic must be reachable from any container that can reach the database.
+
+    It sits in qte-shared's dependencies rather than a dev group precisely so
+    `alembic upgrade` is available wherever the DSN is.
+    """
+    shared = (REPO_ROOT / "engines" / "shared" / "pyproject.toml").read_text(encoding="utf-8")
+    dependencies = shared[shared.index("dependencies = [") : shared.index("[build-system]")]
+    assert "alembic" in dependencies
