@@ -1,11 +1,11 @@
 # Example strategies
 
-`user_strategies/` is git-ignored **and untracked** in this repo — it is where
+`__strategies__/` is git-ignored **and untracked** in this repo — it is where
 your **private** strategy repo gets cloned, whole, so the alpha never lands in
 the public engine's history:
 
 ```bash
-git clone git@github.com:you/my-private-strategies.git user_strategies
+git clone git@github.com:you/my-private-strategies.git __strategies__
 ```
 
 Nothing is committed under that path, not even a `.gitkeep`, because `git clone`
@@ -16,8 +16,8 @@ into it.
 To try the pipeline before you have a private repo:
 
 ```bash
-mkdir -p user_strategies
-cp examples/user_strategies/ema_atr_breakout.py user_strategies/
+mkdir -p __strategies__
+cp examples/__strategies__/ema_atr_breakout.py __strategies__/
 uv run qte-backtest run --strategy QTE_EXAMPLE_EMA_ATR --symbol XAUUSD --timeframe M15
 ```
 

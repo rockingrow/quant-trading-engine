@@ -34,7 +34,7 @@ qte-strategy-engine = { workspace = true }
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-exclude = ["user_strategies"]
+exclude = ["__strategies__"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

@@ -2,7 +2,7 @@
 
 An event-driven framework for developing, backtesting and running quantitative
 trading strategies. The engine is public; **your alpha is not** — strategies
-live in `user_strategies/`, which is git-ignored here and cloned from your own
+live in `__strategies__/`, which is git-ignored here and cloned from your own
 private repository at deploy time.
 
 QTE ingests market data from Tiingo, keeps hot state in Redis, audits every
@@ -15,7 +15,7 @@ Tiingo WS ─▶ data-ingestion ─▶ Redis (hot state)
                     │
                     └─▶ NATS  QTE.candle.closed.<symbol>.<tf>
                                        │
-                            strategy-runner ──▶ user_strategies/*.py
+                            strategy-runner ──▶ __strategies__/*.py
                                        │
                     ┌──────────────────┴──────────────────┐
                     ▼                                     ▼
@@ -40,7 +40,7 @@ drive that same interface with the same indicator code, so the file that
 produced a backtest curve is the file that trades.
 
 **Plugin / blackbox strategies.** The engine never contains an edge. It loads
-whatever `StrategyBase` subclasses it finds in `user_strategies/` by file path
+whatever `StrategyBase` subclasses it finds in `__strategies__/` by file path
 — a mounted volume, not an installed package — so the public engine and your
 private algorithms are versioned and released independently.
 
@@ -55,11 +55,11 @@ cd quant-trading-engine
 cp .env.example .env          # fill in QTE_TIINGO__API_KEY at minimum
 make install-dev              # uv sync
 
-# Try the pipeline with the example strategy. user_strategies/ does not exist
+# Try the pipeline with the example strategy. __strategies__/ does not exist
 # in a fresh clone — it is left out of git so `git clone <your repo>
-# user_strategies` has an empty destination to land in.
-mkdir -p user_strategies
-cp examples/user_strategies/ema_atr_breakout.py user_strategies/
+# __strategies__` has an empty destination to land in.
+mkdir -p __strategies__
+cp examples/__strategies__/ema_atr_breakout.py __strategies__/
 
 make infra                    # redis + postgres + nats
 make download                 # Tiingo history → data/parquet/*.parquet
@@ -78,10 +78,10 @@ Requires Python 3.11+, [uv](https://docs.astral.sh/uv/), and Docker.
 | `engines/data-ingestion/` | Tiingo WebSocket → resampler → Redis + NATS. |
 | `engines/backtest-engine/` | History downloader, parquet store, replay loop, fill simulator, metrics, reports, `qte-backtest` CLI. |
 | `engines/strategy-engine/` | The live runner: plugin loading, the NATS event loop, delivery to the broker, audit, and the `qte-control` operator CLI. |
-| `user_strategies/` | **Git-ignored and untracked.** Your private strategy repo, cloned in whole. Absent from a fresh checkout by design. |
+| `__strategies__/` | **Git-ignored and untracked.** Your private strategy repo, cloned in whole. Absent from a fresh checkout by design. |
 | `deploy/` | Postgres init SQL (incl. pgvector) and the standalone NATS config. |
 | `data/reports/` | Backtest reports, JSON + Markdown. Git-ignored. |
-| `examples/user_strategies/` | A worked example of the plugin contract. Not an edge. |
+| `examples/__strategies__/` | A worked example of the plugin contract. Not an edge. |
 
 ---
 
@@ -132,7 +132,7 @@ Rules the framework enforces so you do not have to:
 - `on_tick(price, ctx)` is optional. Override it only when an exit has to react
   faster than a bar close — the runner subscribes to ticks only if something does.
 
-Discovery walks `user_strategies/` recursively, so a subfolder per instrument is
+Discovery walks `__strategies__/` recursively, so a subfolder per instrument is
 fine. Because the directory is a whole cloned repo rather than a tidy folder, it
 skips hidden directories (`.git`, `.venv`, …) and the usual repo furniture —
 `tests/`, `docs/`, `build/`, `node_modules/` and friends
@@ -253,7 +253,7 @@ Everything else the engine knows is a CLI command or a SQL query:
 
 | Want | Do |
 | --- | --- |
-| What strategies are loaded | `ls user_strategies/`, or run a backtest — the loader logs each one it finds |
+| What strategies are loaded | `ls __strategies__/`, or run a backtest — the loader logs each one it finds |
 | Signal audit trail | `SELECT * FROM signals ORDER BY created_at DESC LIMIT 20` |
 | One trade cycle end to end | `SELECT * FROM signals WHERE signal_uxid = '…' ORDER BY created_at` |
 | Backtest a strategy | `uv run qte-backtest run --strategy … --symbol … --report` |
@@ -268,7 +268,7 @@ cd quant-trading-engine && cp .env.example .env   # then edit it
 
 # 2. Private alpha, into the ignored directory. It is untracked and absent
 #    from the checkout, so this clone lands in an empty destination.
-git clone git@github.com:you/my-private-strategies.git user_strategies
+git clone git@github.com:you/my-private-strategies.git __strategies__
 
 # 3. Up
 make up && make logs

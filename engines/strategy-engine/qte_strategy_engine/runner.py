@@ -101,7 +101,7 @@ class StrategyRunner:
         if not self.slots:
             raise RuntimeError(
                 f"No strategies loaded from {settings.engine.strategies_dir}. Clone your "
-                "private strategy repo into user_strategies/ (see README, phase 6)."
+                "private strategy repo into __strategies__/ (see README, phase 6)."
             )
 
         await self._restore_state()

@@ -18,7 +18,7 @@ x-app: &app
   volumes:
     # The private strategy repo, mounted read-only: the engine loads it and
     # can never write to it.
-    - ./user_strategies:/app/user_strategies:ro
+    - ./__strategies__:/app/__strategies__:ro
     - ./data/parquet:/app/data/parquet
     - ./data/reports:/app/data/reports
   depends_on:

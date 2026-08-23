@@ -32,9 +32,9 @@ COPY engines/ engines/
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev
 
-# user_strategies/ is never baked in. It is a mounted volume, so the private
+# __strategies__/ is never baked in. It is a mounted volume, so the private
 # repo can be updated (or pulled) without rebuilding the public engine.
-RUN mkdir -p /app/user_strategies /app/data/parquet /app/data/reports \
+RUN mkdir -p /app/__strategies__ /app/data/parquet /app/data/reports \
     && useradd --create-home --uid 10001 qte \
     && chown -R qte:qte /app
 USER qte

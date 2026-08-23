@@ -1,4 +1,4 @@
-"""The repo root drives .env, user_strategies/ and data/ — it must not drift.
+"""The repo root drives .env, __strategies__/ and data/ — it must not drift.
 
 A hardcoded `parents[N]` does not fail when a package moves; it resolves one
 level off and the engine quietly looks for everything in the wrong place. This
@@ -43,7 +43,7 @@ def test_a_pyproject_without_the_workspace_table_is_not_the_root(tmp_path, monke
 
 
 def test_the_defaults_hang_off_the_root_rather_than_the_working_directory():
-    assert settings.engine.strategies_dir == REPO_ROOT / "user_strategies"
+    assert settings.engine.strategies_dir == REPO_ROOT / "__strategies__"
     assert settings.engine.parquet_dir == REPO_ROOT / "data" / "parquet"
     assert settings.engine.reports_dir == REPO_ROOT / "data" / "reports"
 

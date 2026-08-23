@@ -1,4 +1,4 @@
-"""The contract every plugin in ``user_strategies/`` implements.
+"""The contract every plugin in ``__strategies__/`` implements.
 
 Write-once, run-anywhere lives here: the backtest replay and the live runner
 both drive a strategy through *this* interface and nothing else, so the same
@@ -97,7 +97,7 @@ IntentResult = SignalIntent | Sequence[SignalIntent] | None
 
 
 class StrategyBase(ABC):
-    """Base class every plugin in ``user_strategies/`` must subclass.
+    """Base class every plugin in ``__strategies__/`` must subclass.
 
     Subclasses are discovered by :mod:`qte_strategy_engine.loader`, which
     instantiates them with ``params`` from configuration and calls the hooks

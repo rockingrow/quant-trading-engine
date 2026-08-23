@@ -116,3 +116,41 @@ def test_two_files_of_the_same_name_do_not_shadow_each_other(plugin_dir):
 
     found = sorted(entry.name for entry in StrategyLoader(plugin_dir).discover())
     assert found == ["ALPHA", "BETA", "MY_EDGE"]
+
+
+def test_a_dunder_directory_name_does_not_hide_its_own_contents(tmp_path):
+    """The default directory is `__strategies__`, and `_`-prefixed names are skipped.
+
+    Those two rules meet at the root: if the exclusion looked at the directory's
+    own name rather than the paths beneath it, the engine would load nothing and
+    say only "no strategies found".
+    """
+    root = tmp_path / "__strategies__"
+    (root / "gold").mkdir(parents=True)
+    (root / "gold" / "edge.py").write_text(STRATEGY_SOURCE)
+
+    assert [entry.name for entry in StrategyLoader(root).discover()] == ["MY_EDGE"]
+
+
+def test_underscore_files_inside_a_dunder_directory_are_still_skipped(tmp_path):
+    root = tmp_path / "__strategies__"
+    root.mkdir()
+    (root / "edge.py").write_text(STRATEGY_SOURCE)
+    (root / "_helpers.py").write_text(
+        STRATEGY_SOURCE.replace("MyEdge", "Helper").replace("MY_EDGE", "HELPER")
+    )
+
+    assert [entry.name for entry in StrategyLoader(root).discover()] == ["MY_EDGE"]
+
+
+def test_the_module_namespace_matches_the_directory_convention(tmp_path):
+    # Modules are registered under a `__strategies__.` prefix so a plugin named
+    # utils.py cannot shadow anything real in sys.modules.
+    import sys
+
+    root = tmp_path / "__strategies__"
+    (root / "gold").mkdir(parents=True)
+    (root / "gold" / "edge.py").write_text(STRATEGY_SOURCE)
+
+    StrategyLoader(root).discover()
+    assert "__strategies__.gold.edge" in sys.modules

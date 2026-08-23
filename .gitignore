@@ -222,9 +222,9 @@ __marimo__/
 # reach this public repository's history.
 # Your private strategy repo gets cloned straight into this directory, so it is
 # ignored whole — and left UNTRACKED, with no .gitkeep, because `git clone <repo>
-# user_strategies` refuses a destination that already contains a file. Anchored
-# to the repo root so `examples/user_strategies/` is not swept up by the rule.
-/user_strategies/
+# __strategies__` refuses a destination that already contains a file. Anchored
+# to the repo root so `examples/__strategies__/` is not swept up by the rule.
+/__strategies__/
 
 # Downloaded market history — regenerate with `make download`, never commit.
 /data/parquet/*

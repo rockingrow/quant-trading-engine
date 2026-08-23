@@ -20,7 +20,7 @@ def _find_repo_root() -> Path:
 
     Counting parent directories (``parents[3]``) works right up until a package
     moves — and then it does not fail, it silently resolves ``.env``,
-    ``user_strategies/`` and ``data/`` one level off and the engine looks for
+    ``__strategies__/`` and ``data/`` one level off and the engine looks for
     everything in the wrong place. So the root is *identified* rather than
     counted: it is the ancestor whose ``pyproject.toml`` declares the uv
     workspace.
@@ -128,7 +128,7 @@ class EngineSettings(BaseSettings):
     timeframes: list[str] = Field(default_factory=lambda: ["M1", "M15"])
     signal_timeframe: str = "M15"
     warmup_candles: int = 300
-    strategies_dir: Path = REPO_ROOT / "user_strategies"
+    strategies_dir: Path = REPO_ROOT / "__strategies__"
     parquet_dir: Path = REPO_ROOT / "data" / "parquet"
     reports_dir: Path = REPO_ROOT / "data" / "reports"
 

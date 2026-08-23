@@ -54,7 +54,7 @@ two rows, not two implementations.
 
 ## Why the plugin loader imports by path
 
-`user_strategies/` is a mounted volume cloned from a private repo, not an
+`__strategies__/` is a mounted volume cloned from a private repo, not an
 installed distribution. Requiring it to be pip-installable would drag the
 private repo into the public build, and it would trade a fast edit-and-restart
 loop for a version bump and an image rebuild on every change to a strategy.
@@ -104,7 +104,7 @@ strategy backtests profitably.
 
 ## Why the repo root is searched for, not counted
 
-`qte_shared.config` resolves `.env`, `user_strategies/` and `data/` relative to
+`qte_shared.config` resolves `.env`, `__strategies__/` and `data/` relative to
 the workspace root, and it finds that root by walking up until it hits the
 `pyproject.toml` that declares `[tool.uv.workspace]` — not by counting parent
 directories.

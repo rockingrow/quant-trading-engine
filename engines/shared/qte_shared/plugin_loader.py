@@ -1,4 +1,4 @@
-"""Dynamic discovery of the private strategies in ``user_strategies/``.
+"""Dynamic discovery of the private strategies in ``__strategies__/``.
 
 This is the plugin seam. The engine is public; the alpha is not. The loader
 imports whatever ``StrategyBase`` subclasses it finds in a directory that is
@@ -134,11 +134,11 @@ class StrategyLoader:
     def _import_file(self, path: Path):
         """Import *path* under a namespaced module name.
 
-        The ``user_strategies.`` prefix keeps a plugin called ``utils.py`` from
+        The ``__strategies__.`` prefix keeps a plugin called ``utils.py`` from
         shadowing anything real in ``sys.modules``.
         """
         relative = path.relative_to(self.directory).with_suffix("")
-        module_name = "user_strategies." + ".".join(relative.parts)
+        module_name = "__strategies__." + ".".join(relative.parts)
         spec = importlib.util.spec_from_file_location(module_name, path)
         if spec is None or spec.loader is None:
             raise ImportError(f"Cannot build an import spec for {path}")

@@ -1,6 +1,6 @@
 """A worked example of the plugin contract — not a strategy to trade.
 
-Copy this file into ``user_strategies/`` to see the whole pipeline move, then
+Copy this file into ``__strategies__/`` to see the whole pipeline move, then
 replace it with your own. The edge here is deliberately naive; what is worth
 copying is the *shape*:
 
