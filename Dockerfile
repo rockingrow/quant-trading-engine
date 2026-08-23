@@ -1,6 +1,7 @@
-# One image, three entry points. The services differ only in which console
-# script the container runs, so building them separately would mean three
-# copies of the same dependency tree in the registry for no benefit.
+# One image, two long-running entry points (plus the CLIs). The services differ
+# only in which console script the container runs, so building them separately
+# would mean two copies of the same dependency tree in the registry for no
+# benefit.
 
 FROM python:3.11-slim AS base
 
@@ -19,28 +20,24 @@ WORKDIR /app
 # does not touch a pyproject or the lockfile.
 COPY pyproject.toml uv.lock ./
 COPY shared/pyproject.toml shared/
-COPY data-ingestion/pyproject.toml data-ingestion/
-COPY backtest-engine/pyproject.toml backtest-engine/
-COPY strategy-engine/pyproject.toml strategy-engine/
-COPY api-gateway/pyproject.toml api-gateway/
+COPY engines/data-ingestion/pyproject.toml engines/data-ingestion/
+COPY engines/backtest-engine/pyproject.toml engines/backtest-engine/
+COPY engines/strategy-engine/pyproject.toml engines/strategy-engine/
 
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-install-workspace --no-dev
 
 COPY shared/ shared/
-COPY data-ingestion/ data-ingestion/
-COPY backtest-engine/ backtest-engine/
-COPY strategy-engine/ strategy-engine/
-COPY api-gateway/ api-gateway/
+COPY engines/ engines/
 
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev
 
 # user_strategies/ is never baked in. It is a mounted volume, so the private
 # repo can be updated (or pulled) without rebuilding the public engine.
-RUN mkdir -p /app/user_strategies /app/data/parquet \
+RUN mkdir -p /app/user_strategies /app/data/parquet /app/data/reports \
     && useradd --create-home --uid 10001 qte \
     && chown -R qte:qte /app
 USER qte
 
-CMD ["qte-api"]
+CMD ["qte-strategy-runner"]

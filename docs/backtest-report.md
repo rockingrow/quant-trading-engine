@@ -99,16 +99,21 @@ Adding a rule is a function in `diagnostics.py` returning `Finding | None`,
 registered in `_RULES`, plus a test that it fires on the fault and stays quiet
 on a healthy run.
 
-## Over HTTP
+## Getting at it
 
-The control plane serves the same artefacts, so an agent with network access
-does not need the filesystem:
+The files are the interface. `data/reports/` holds one JSON and one Markdown per
+run, named `<strategy>_<symbol>_<timeframe>_<timestamp>`, so runs accumulate side
+by side and comparing this one against the last is a diff rather than an
+archaeology exercise.
 
-| Endpoint | |
-| --- | --- |
-| `POST /backtest/run` | Runs and returns metrics, trades, findings and `trustworthy`. Writes the files unless `write_report: false`. |
-| `GET /backtest/reports` | Report files, newest first. |
-| `GET /backtest/reports/{name}` | One file whole. Names are resolved inside the reports directory and refused if they escape it. |
+```bash
+make reports                          # what has been written
+uv run qte-backtest run … --report    # write another
+```
+
+An agent reads `data/reports/*.json` directly. There is no HTTP service in front
+of it, and adding one would put a process to keep alive between an agent and a
+file it can already open.
 
 ## What it does not do
 

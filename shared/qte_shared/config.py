@@ -110,15 +110,6 @@ class EngineSettings(BaseSettings):
     reports_dir: Path = REPO_ROOT / "data" / "reports"
 
 
-class ApiSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="QTE_API__", extra="ignore")
-
-    host: str = "0.0.0.0"
-    port: int = 8000
-    api_key: str = ""
-    cors_origins: list[str] = Field(default_factory=list)
-
-
 class Settings(BaseSettings):
     """Root settings object — import :data:`settings`, not this class."""
 
@@ -138,7 +129,6 @@ class Settings(BaseSettings):
     postgres: PostgresSettings = Field(default_factory=PostgresSettings)
     tiingo: TiingoSettings = Field(default_factory=TiingoSettings)
     engine: EngineSettings = Field(default_factory=EngineSettings)
-    api: ApiSettings = Field(default_factory=ApiSettings)
 
     @property
     def broker_nats_url(self) -> str:

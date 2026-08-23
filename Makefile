@@ -59,16 +59,18 @@ ingestion: ## Run the ingestion service locally
 runner: ## Run the strategy runner locally
 	uv run qte-strategy-runner
 
-api: ## Run the control-plane API locally
-	uv run qte-api
+shadow-status: ## Show whether signals are reaching the broker
+	uv run qte-control shadow status
 
 shadow-on: ## Pause delivery to the broker on every running runner
-	curl -fsS -X POST localhost:8000/admin/shadow-mode -H 'Content-Type: application/json' \
-		$(if $(API_KEY),-H 'X-API-KEY: $(API_KEY)',) -d '{"enabled": true}' | jq .
+	uv run qte-control shadow on
 
-shadow-off: ## Resume delivery to the broker (GOES LIVE)
-	curl -fsS -X POST localhost:8000/admin/shadow-mode -H 'Content-Type: application/json' \
-		$(if $(API_KEY),-H 'X-API-KEY: $(API_KEY)',) -d '{"enabled": false}' | jq .
+shadow-off: ## Resume delivery to the broker (GOES LIVE — prompts to confirm)
+	uv run qte-control shadow off
+
+ping: ## Ask the running runners to identify themselves
+	uv run qte-control ping
 
 .PHONY: help install install-dev lock test lint format check infra up down logs nuke \
-	download history backtest reports ingestion runner api shadow-on shadow-off
+	download history backtest reports ingestion runner \
+	shadow-status shadow-on shadow-off ping

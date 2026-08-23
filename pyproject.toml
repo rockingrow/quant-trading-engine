@@ -9,7 +9,6 @@ dependencies = [
     "qte-ingestion",
     "qte-backtest",
     "qte-strategy-engine",
-    "qte-api",
 ]
 
 [dependency-groups]
@@ -24,14 +23,13 @@ dev = [
 package = false
 
 [tool.uv.workspace]
-members = ["shared", "data-ingestion", "backtest-engine", "strategy-engine", "api-gateway"]
+members = ["shared", "engines/*"]
 
 [tool.uv.sources]
 qte-shared = { workspace = true }
 qte-ingestion = { workspace = true }
 qte-backtest = { workspace = true }
 qte-strategy-engine = { workspace = true }
-qte-api = { workspace = true }
 
 [tool.ruff]
 line-length = 100

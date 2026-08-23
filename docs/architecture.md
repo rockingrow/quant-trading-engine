@@ -76,11 +76,20 @@ Duplicate strategy names are an error, not a warning to skim past: workers
 subscribe by strategy name, so two algorithms sharing one would execute against
 each other's positions.
 
-## Why the API comes up degraded
+## Why there is no control-plane service
 
-A control plane that refuses to start because NATS is down cannot tell anyone
-that NATS is down. `/health` reports per-dependency state and says `degraded`;
-the process stays up.
+There was one — a FastAPI gateway serving health, the audit trail, backtest
+triggers and the shadow-mode switch. It was removed because almost everything it
+served was already available more directly: listing strategies is `ls`, the
+audit trail is a SQL query, running a backtest is a CLI command, and a report is
+a file on disk that an agent can open. A web service in front of those is a
+process to keep alive, secure and monitor in exchange for a second way to reach
+the same data.
+
+The exception is shadow mode, which genuinely has to reach a *process that is
+already running* — flipping live/paper must not require a restart mid-position.
+That is one message on `QTE.control`, so `qte-control` publishes it straight to
+NATS and no service is needed to carry it.
 
 Relatedly, `NatsBus.connect` bounds the *initial* connect even though reconnects
 are unlimited: nats-py applies `max_reconnect_attempts` to both, so `-1` (what a

@@ -20,9 +20,9 @@ Tiingo WS ─▶ data-ingestion ─▶ Redis (hot state)
                     ┌──────────────────┴──────────────────┐
                     ▼                                     ▼
       NATS SIGNALS.<strategy>                   PostgreSQL (audit, JSONB)
-      (algo-trading-broker JetStream)                     ▲
-                    │                                     │
-                    ▼                              api-gateway (FastAPI)
+      (algo-trading-broker JetStream)
+                    │
+                    ▼
              MT5 / Binance workers
 ```
 
@@ -74,11 +74,10 @@ Requires Python 3.11+, [uv](https://docs.astral.sh/uv/), and Docker.
 
 | Path | What it is |
 | --- | --- |
-| `shared/` | `qte_shared` — models, indicators, `StrategyBase`, NATS/Redis/Postgres adapters, the plugin loader, the signal factory. Every other package depends on this and on nothing else in the repo. |
-| `data-ingestion/` | Tiingo WebSocket → resampler → Redis + NATS. |
-| `backtest-engine/` | History downloader, parquet store, replay loop, fill simulator, metrics, `qte-backtest` CLI. |
-| `strategy-engine/` | The live runner: plugin loading, the NATS event loop, delivery to the broker, audit. |
-| `api-gateway/` | FastAPI control plane. |
+| `shared/` | `qte_shared` — models, indicators, `StrategyBase`, NATS/Redis/Postgres adapters, the plugin loader, the signal factory. Every engine depends on this and on nothing else in the repo. |
+| `engines/data-ingestion/` | Tiingo WebSocket → resampler → Redis + NATS. |
+| `engines/backtest-engine/` | History downloader, parquet store, replay loop, fill simulator, metrics, reports, `qte-backtest` CLI. |
+| `engines/strategy-engine/` | The live runner: plugin loading, the NATS event loop, delivery to the broker, audit, and the `qte-control` operator CLI. |
 | `user_strategies/` | **Git-ignored and untracked.** Your private strategy repo, cloned in whole. Absent from a fresh checkout by design. |
 | `deploy/` | Postgres init SQL (incl. pgvector) and the standalone NATS config. |
 | `data/reports/` | Backtest reports, JSON + Markdown. Git-ignored. |
@@ -230,27 +229,35 @@ position it opened.
 
 ---
 
-## Control plane
+## Operating a running engine
 
-`api-gateway` (default `:8000`) is off the trading path — it reads the audit
-trail and flips switches. Set `QTE_API__API_KEY` before this port is reachable
-from anywhere but your laptop; mutating endpoints then require `X-API-KEY`.
+There is no web service. The one control that genuinely has to reach a *running*
+process is shadow mode — the live/paper switch, which must not require
+restarting a runner mid-position — and that travels on NATS like every other
+engine event:
 
-| Endpoint | |
+```bash
+uv run qte-control shadow status   # is it paper or live right now?
+uv run qte-control shadow on       # pause delivery to the broker
+uv run qte-control shadow off      # GO LIVE — prompts unless you pass --yes
+uv run qte-control ping            # which runners are up, and in what mode
+```
+
+The flag is written to Redis first and broadcast second, so a runner that starts
+*after* the broadcast still comes up in the mode you last chose. If NATS is
+unreachable the command says so explicitly rather than reporting success —
+"stored, but the process running right now did not hear it" is a different
+outcome from "applied".
+
+Everything else the engine knows is a CLI command or a SQL query:
+
+| Want | Do |
 | --- | --- |
-| `GET /health` | Liveness plus per-dependency state. Reports `degraded` instead of failing, so it can tell you *which* piece is down. |
-| `GET /strategies` | Plugins currently discoverable in `user_strategies/`. |
-| `GET /signals` | Newest-first audit trail; filter by `strategy`, `symbol`, `since`. |
-| `GET /signals/cycle/{uxid}` | One whole trade cycle, oldest first — the reconciliation view. |
-| `POST /backtest/run` | Replay a strategy and get the report back. |
-| `GET /backtest/runs`, `GET /backtest/history` | Past runs; parquet on disk. |
-| `GET /backtest/reports` | Report files, newest first. |
-| `GET /backtest/reports/{name}` | One report whole — how an agent fetches it without filesystem access. |
-| `POST /admin/shadow-mode` | Pause or resume delivery across every running runner. |
-
-Interactive docs at `/docs`.
-
----
+| What strategies are loaded | `ls user_strategies/`, or run a backtest — the loader logs each one it finds |
+| Signal audit trail | `SELECT * FROM signals ORDER BY created_at DESC LIMIT 20` |
+| One trade cycle end to end | `SELECT * FROM signals WHERE signal_uxid = '…' ORDER BY created_at` |
+| Backtest a strategy | `uv run qte-backtest run --strategy … --symbol … --report` |
+| Read a report | `data/reports/*.json` — the file an agent analyses |
 
 ## Deployment
 
@@ -278,11 +285,12 @@ publishing to a second cluster means nobody ever receives the signals.
 2. **Shadow mode** — `QTE_BROKER__SHADOW_MODE=true` (the default). Ingestion and
    strategies run, signals are built, logged and audited, and nothing reaches
    the broker.
-3. **Reconcile** — pull `GET /signals` and check the entries and exits against
-   the chart. `GET /signals/cycle/{uxid}` gives you one trade end to end.
-4. **Go live** — `make shadow-off` (or `POST /admin/shadow-mode {"enabled": false}`).
-   It takes effect on every running runner immediately, and the flag is stored
-   in Redis so a restart comes up in the mode you last chose.
+3. **Reconcile** — read the `signals` table and check the entries and exits
+   against the chart. Filtering by `signal_uxid` gives you one trade end to end,
+   which is the same grouping the broker renders into a single broadcast.
+4. **Go live** — `make shadow-off`. It takes effect on every running runner
+   immediately, and the flag is stored in Redis so a restart comes up in the
+   mode you last chose.
 
 `make shadow-on` puts it back. That is the kill switch; keep it to hand.
 

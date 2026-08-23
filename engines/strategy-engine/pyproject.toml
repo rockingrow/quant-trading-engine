@@ -10,6 +10,7 @@ dependencies = [
 
 [project.scripts]
 qte-strategy-runner = "qte_strategy_engine.main:run"
+qte-control = "qte_strategy_engine.control:main"
 
 [build-system]
 requires = ["hatchling"]
