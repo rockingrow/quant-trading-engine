@@ -23,7 +23,7 @@ dev = [
 package = false
 
 [tool.uv.workspace]
-members = ["shared", "engines/*"]
+members = ["engines/*"]
 
 [tool.uv.sources]
 qte-shared = { workspace = true }

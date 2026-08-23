@@ -19,7 +19,7 @@ WORKDIR /app
 # Manifests first: the dependency layer is then cached across every change that
 # does not touch a pyproject or the lockfile.
 COPY pyproject.toml uv.lock ./
-COPY shared/pyproject.toml shared/
+COPY engines/shared/pyproject.toml engines/shared/
 COPY engines/data-ingestion/pyproject.toml engines/data-ingestion/
 COPY engines/backtest-engine/pyproject.toml engines/backtest-engine/
 COPY engines/strategy-engine/pyproject.toml engines/strategy-engine/
@@ -27,7 +27,6 @@ COPY engines/strategy-engine/pyproject.toml engines/strategy-engine/
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-install-workspace --no-dev
 
-COPY shared/ shared/
 COPY engines/ engines/
 
 RUN --mount=type=cache,target=/root/.cache/uv \

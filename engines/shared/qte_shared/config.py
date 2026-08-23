@@ -14,7 +14,30 @@ from typing import Literal
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+
+def _find_repo_root() -> Path:
+    """Walk up from this file until the workspace root is found.
+
+    Counting parent directories (``parents[3]``) works right up until a package
+    moves — and then it does not fail, it silently resolves ``.env``,
+    ``user_strategies/`` and ``data/`` one level off and the engine looks for
+    everything in the wrong place. So the root is *identified* rather than
+    counted: it is the ancestor whose ``pyproject.toml`` declares the uv
+    workspace.
+
+    Falls back to the package's grandparent for an installed (non-editable)
+    copy, where there is no workspace above it and these defaults are expected
+    to be overridden by environment variables anyway.
+    """
+    here = Path(__file__).resolve()
+    for candidate in here.parents:
+        manifest = candidate / "pyproject.toml"
+        if manifest.is_file() and "[tool.uv.workspace]" in manifest.read_text(encoding="utf-8"):
+            return candidate
+    return here.parents[2]
+
+
+REPO_ROOT = _find_repo_root()
 
 
 class NatsSettings(BaseSettings):

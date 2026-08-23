@@ -101,3 +101,16 @@ Listed in the README. The one worth repeating: when a bar's range covers both
 the stop and the target, the simulator takes the **stop**. Without tick data
 there is no ordering, and assuming the favourable one is precisely how a losing
 strategy backtests profitably.
+
+## Why the repo root is searched for, not counted
+
+`qte_shared.config` resolves `.env`, `user_strategies/` and `data/` relative to
+the workspace root, and it finds that root by walking up until it hits the
+`pyproject.toml` that declares `[tool.uv.workspace]` — not by counting parent
+directories.
+
+The difference matters because the counted version does not break loudly. Moving
+`shared/` to `engines/shared/` adds one level, and `parents[2]` then points at
+`engines/`: the engine keeps starting, silently reads no `.env`, and looks for
+strategies in a directory that does not exist. Identifying the root by its
+marker makes the layout free to change.

@@ -74,7 +74,7 @@ Requires Python 3.11+, [uv](https://docs.astral.sh/uv/), and Docker.
 
 | Path | What it is |
 | --- | --- |
-| `shared/` | `qte_shared` — models, indicators, `StrategyBase`, NATS/Redis/Postgres adapters, the plugin loader, the signal factory. Every engine depends on this and on nothing else in the repo. |
+| `engines/shared/` | `qte_shared` — models, indicators, `StrategyBase`, NATS/Redis/Postgres adapters, the plugin loader, the signal factory. Every other engine depends on this and on nothing else in the repo. |
 | `engines/data-ingestion/` | Tiingo WebSocket → resampler → Redis + NATS. |
 | `engines/backtest-engine/` | History downloader, parquet store, replay loop, fill simulator, metrics, reports, `qte-backtest` CLI. |
 | `engines/strategy-engine/` | The live runner: plugin loading, the NATS event loop, delivery to the broker, audit, and the `qte-control` operator CLI. |
