@@ -53,11 +53,14 @@ The schema used to be a `.sql` file mounted into the Postgres image's
 directory. Changing the schema afterwards meant either editing a file that would
 never run again, or deleting the volume — and the volume is the audit trail.
 
-The revision chain is deliberately split in two: the core schema runs on any
-PostgreSQL, and pgvector plus the unmapped `signals.embedding` column is a
-second, optional step. That keeps a speculative capability — nothing writes
-`embedding` yet — from making a stock Postgres image insufficient to run the
-engine.
+There is one revision and it needs no extensions. An earlier draft carried
+pgvector and an unmapped `signals.embedding` column as a second, optional
+revision, on the theory that an agent might later want to ask which past trades
+resembled this one. Nothing wrote that column, and an unapplied revision sitting
+at the head of the chain is worse than no revision at all: `alembic upgrade head`
+is what everyone types, so a step that must be skipped fails the command people
+reach for by reflex. It was removed. When vector search is actually wanted it is
+a migration written then, against a schema that exists by then.
 
 ## Why Redis holds state that Postgres does not
 

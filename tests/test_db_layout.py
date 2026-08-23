@@ -135,3 +135,39 @@ def test_a_backtest_trade_is_timestamped_by_the_market_not_the_clock():
     columns = BacktestTrade.__table__.columns
     assert "opened_at" in columns and "closed_at" in columns
     assert "created_at" not in columns
+
+
+def test_backtest_trades_are_never_lazy_loaded_by_accident():
+    """A run leaves its repository detached, so a lazy `.trades` is always a bug.
+
+    The listing returns runs after the session has closed. Left on the default
+    strategy, `run.trades` would try to emit SQL — outside a session it fails
+    confusingly, inside one it fires a silent SELECT per run.
+    """
+    assert BacktestRun.trades.property.lazy == "raise_on_sql"
+
+
+def test_the_listing_can_be_asked_for_trades_explicitly():
+    import inspect
+
+    signature = inspect.signature(BacktestRepository.list_backtests)
+    parameter = signature.parameters["with_trades"]
+    assert parameter.default is False, "loading every trade must be opt-in"
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+
+
+def test_the_schema_needs_no_postgres_extensions():
+    """Stock postgres is enough — nothing in the migrations installs an extension."""
+    versions = sorted((MIGRATIONS / "versions").glob("*.py"))
+    assert versions, "no migrations found"
+    for path in versions:
+        source = path.read_text(encoding="utf-8").lower()
+        assert "create extension" not in source, (
+            f"{path.name} installs an extension; the stack runs on postgres:16-alpine"
+        )
+
+
+def test_compose_pins_a_stock_postgres_image():
+    compose = (REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "pgvector/pgvector" not in compose
+    assert "image: postgres:" in compose

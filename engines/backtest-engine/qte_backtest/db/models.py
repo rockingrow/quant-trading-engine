@@ -33,8 +33,15 @@ class BacktestRun(Base):
     params: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
     metrics: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
 
+    # lazy="raise_on_sql" bans the implicit lazy load. It does not change the
+    # error a *detached* run gives — SQLAlchemy raises DetachedInstanceError
+    # before the strategy is consulted, and that message already names the
+    # attribute. What it catches is the other case: a run still attached to a
+    # session, where an unguarded `.trades` would quietly emit one SELECT per
+    # run. Either way the fix is the same — ask for them up front with
+    # list_backtests(with_trades=True).
     trades: Mapped[list[BacktestTrade]] = relationship(
-        back_populates="run", cascade="all, delete-orphan"
+        back_populates="run", cascade="all, delete-orphan", lazy="raise_on_sql"
     )
 
 

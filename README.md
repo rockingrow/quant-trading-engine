@@ -6,7 +6,7 @@ live in `__strategies__/`, which is git-ignored here and cloned from your own
 private repository at deploy time.
 
 QTE ingests market data from Tiingo, keeps hot state in Redis, audits every
-signal into PostgreSQL (pgvector-ready), and publishes trade signals over NATS
+signal into PostgreSQL, and publishes trade signals over NATS
 to [`algo-trading-broker`](https://github.com/rockingrow/algo-trading-broker),
 which fans them out to MT5 / Binance workers.
 
@@ -299,16 +299,12 @@ the metadata, and propose dropping it. For the same reason, adding an engine
 that owns tables means adding its `models` import to `migrations/env.py`.
 `tests/test_db_layout.py` enforces both.
 
-The revision chain is two steps on purpose:
-
-1. **Core schema** — everything QTE writes, on any PostgreSQL.
-2. **pgvector** — the extension plus the unmapped `signals.embedding` column,
-   which exists so an agent can embed a signal's context and ask which past
-   trades looked like this one. Nothing in QTE writes it.
-
-Stop after the first revision to run on a stock `postgres` image without vector
-search. If pgvector is missing when the second runs, the migration says so and
-names the fix rather than failing with `could not open extension control file`.
+The schema needs **no PostgreSQL extensions** — `docker-compose.yml` pins
+`postgres:16-alpine`. If you later want vector search over the signal audit
+trail, that is a new migration (`make db-revision M="add signal embeddings"`)
+plus an image with pgvector; it is deliberately not carried as an unapplied
+revision in the meantime, because `alembic upgrade head` is the reflexive
+command and a revision that must not be applied is a trap.
 
 ## Deployment
 

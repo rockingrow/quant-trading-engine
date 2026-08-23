@@ -9,6 +9,7 @@ from typing import Any
 from qte_shared.db.session import Database, get_database
 from qte_shared.logging_setup import get_logger
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
 from qte_backtest.db.models import BacktestRun, BacktestTrade
 
@@ -52,7 +53,21 @@ class BacktestRepository:
             log.error("Backtest audit write failed: %s", exc)
             return None
 
-    async def list_backtests(self, limit: int = 50) -> Sequence[BacktestRun]:
+    async def list_backtests(
+        self, limit: int = 50, *, with_trades: bool = False
+    ) -> Sequence[BacktestRun]:
+        """Recent runs, newest first.
+
+        Trades are left unloaded unless asked for: a listing of 50 runs can
+        carry thousands of trade rows and most callers want only the headline
+        metrics. Since the session closes before this returns, an unloaded
+        ``run.trades`` can never be lazy-loaded afterwards — the relationship is
+        configured to say that plainly rather than fail from inside the ORM.
+        """
         statement = select(BacktestRun).order_by(BacktestRun.created_at.desc()).limit(limit)
+        if with_trades:
+            # selectinload, not joinedload: one extra query rather than a join
+            # that repeats every run row once per trade it owns.
+            statement = statement.options(selectinload(BacktestRun.trades))
         async with self._db.session() as session:
             return (await session.execute(statement)).scalars().all()

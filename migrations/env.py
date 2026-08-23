@@ -45,20 +45,6 @@ def _database_url() -> str:
     return settings.postgres.dsn
 
 
-def _include_object(obj, name, type_, reflected, compare_to) -> bool:
-    """Keep autogenerate from proposing changes to things we do not manage.
-
-    ``signals.embedding`` is a pgvector column created by migration and never
-    mapped on the ORM side, because nothing in QTE writes it — it exists so an
-    agent can embed a signal's context later. Unmapped means autogenerate sees
-    it as an extra column and offers to drop it, which would silently discard
-    embeddings on the next migration.
-    """
-    if type_ == "column" and reflected and name == "embedding":
-        return False
-    return True
-
-
 def run_migrations_offline() -> None:
     """Emit SQL to stdout without connecting — for review or a DBA handoff."""
     context.configure(
@@ -66,7 +52,6 @@ def run_migrations_offline() -> None:
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
-        include_object=_include_object,
         compare_type=True,
     )
     with context.begin_transaction():
@@ -77,7 +62,6 @@ def _run(connection: Connection) -> None:
     context.configure(
         connection=connection,
         target_metadata=target_metadata,
-        include_object=_include_object,
         compare_type=True,
     )
     with context.begin_transaction():

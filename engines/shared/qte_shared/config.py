@@ -93,7 +93,7 @@ class RedisSettings(BaseSettings):
 
 
 class PostgresSettings(BaseSettings):
-    """Audit trail. JSONB rows, pgvector-ready, never on the hot path."""
+    """Audit trail. Plain PostgreSQL, JSONB rows, never on the hot path."""
 
     model_config = SettingsConfigDict(env_prefix="QTE_POSTGRES__", extra="ignore")
 

@@ -1,9 +1,6 @@
 """Core audit schema: signals, backtest runs and trades, engine events.
 
-Everything QTE writes, on any PostgreSQL. The pgvector extension and the
-``signals.embedding`` column are deliberately NOT here — they are an additive
-capability in the next revision, so a deployment that does not want vector
-search can run the whole engine on a stock Postgres image.
+Everything QTE writes, on a stock PostgreSQL — no extensions required.
 
 Revision ID: 7d2d0fa9cd86
 Revises:
