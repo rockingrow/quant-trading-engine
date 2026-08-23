@@ -40,7 +40,7 @@ class FakeBus:
         self.published.append((subject, payload))
 
 
-class FakeAudit:
+class FakeEvents:
     def __init__(self):
         self.events = []
 
@@ -51,10 +51,10 @@ class FakeAudit:
 @pytest.fixture
 def wired(monkeypatch):
     """Swap Redis, NATS and the audit repo for recorders."""
-    redis, bus, audit = FakeRedis(), FakeBus(), FakeAudit()
+    redis, bus, audit = FakeRedis(), FakeBus(), FakeEvents()
     monkeypatch.setattr(control, "RedisState", lambda *a, **k: redis)
     monkeypatch.setattr(control, "NatsBus", lambda *a, **k: bus)
-    monkeypatch.setattr(control, "AuditRepository", lambda *a, **k: audit)
+    monkeypatch.setattr(control, "EventRepository", lambda *a, **k: audit)
     return redis, bus, audit
 
 
@@ -92,10 +92,10 @@ async def test_going_live_is_announced_plainly(wired, capsys):
 
 async def test_redis_is_written_even_when_nats_is_down(monkeypatch, capsys):
     # The flag surviving matters: the next runner to start reads it from Redis.
-    redis, bus, audit = FakeRedis(), FakeBus(fail=True), FakeAudit()
+    redis, bus, audit = FakeRedis(), FakeBus(fail=True), FakeEvents()
     monkeypatch.setattr(control, "RedisState", lambda *a, **k: redis)
     monkeypatch.setattr(control, "NatsBus", lambda *a, **k: bus)
-    monkeypatch.setattr(control, "AuditRepository", lambda *a, **k: audit)
+    monkeypatch.setattr(control, "EventRepository", lambda *a, **k: audit)
 
     await control._set_shadow_mode(True)
 
@@ -181,7 +181,7 @@ async def test_an_unreachable_redis_changes_nothing_rather_than_half_applying(mo
     bus = FakeBus()
     monkeypatch.setattr(control, "RedisState", lambda *a, **k: DeadRedis())
     monkeypatch.setattr(control, "NatsBus", lambda *a, **k: bus)
-    monkeypatch.setattr(control, "AuditRepository", lambda *a, **k: FakeAudit())
+    monkeypatch.setattr(control, "EventRepository", lambda *a, **k: FakeEvents())
 
     with pytest.raises(SystemExit) as exit_info:
         await control._set_shadow_mode(False)

@@ -26,6 +26,39 @@ bucket the clock has passed, regardless of feed activity. A bucket with no ticks
 produces no candle: forward-filling a flat synthetic bar would feed strategies a
 body that never traded, which corrupts any indicator with a range in it.
 
+## Why each engine owns its own tables
+
+`signals` is written only by the strategy runner; the backtest tables only by
+the replay. Each lives in that engine's own `db/` package with the repository
+that reads and writes it, so a change to how signals are audited touches one
+engine rather than a module three engines import.
+
+The exception is `engine_events`, which every engine writes and none owns; it
+stays in `qte_shared.db`. Ingestion therefore has no `db/` package — it writes
+only that shared table. Giving it an empty one, or inventing a table to fill it,
+would be arranging the code to match a diagram rather than the writes.
+
+What they do share is one `DeclarativeBase`. Alembic autogenerate diffs the
+database against `Base.metadata`, so a model registered on a *different* base
+would be invisible to it — and invisibility here does not fail loudly. The table
+would never be created, and the next autogenerate would find it in the database,
+fail to find it in the metadata, and propose `DROP TABLE`. The same trap applies
+to `migrations/env.py`: an engine whose models it does not import is an engine
+whose tables Alembic will offer to delete.
+
+## Why Alembic replaced the init script
+
+The schema used to be a `.sql` file mounted into the Postgres image's
+`docker-entrypoint-initdb.d`. That hook runs exactly once, on an empty data
+directory. Changing the schema afterwards meant either editing a file that would
+never run again, or deleting the volume — and the volume is the audit trail.
+
+The revision chain is deliberately split in two: the core schema runs on any
+PostgreSQL, and pgvector plus the unmapped `signals.embedding` column is a
+second, optional step. That keeps a speculative capability — nothing writes
+`embedding` yet — from making a stock Postgres image insufficient to run the
+engine.
+
 ## Why Redis holds state that Postgres does not
 
 Redis is the hot path's memory: the last tick, the warm-up window, the open

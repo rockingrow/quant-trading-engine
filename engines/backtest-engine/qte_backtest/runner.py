@@ -8,12 +8,12 @@ from pathlib import Path
 from typing import Any
 
 from qte_shared.config import settings
-from qte_shared.db import AuditRepository
 from qte_shared.logging_setup import get_logger
 from qte_shared.plugin_loader import StrategyLoader
 from qte_shared.signal_factory import BracketPolicy
 
 from qte_backtest.data_store import ParquetStore
+from qte_backtest.db import BacktestRepository
 from qte_backtest.execution import CostModel
 from qte_backtest.replay import BacktestEngine
 from qte_backtest.report import BacktestReport, build_report
@@ -103,7 +103,7 @@ async def run_backtest(
         )
 
     if request.persist and settings.postgres.enabled:
-        run_id = await AuditRepository().record_backtest(
+        run_id = await BacktestRepository().record_backtest(
             strategy=result.strategy,
             symbol=result.symbol,
             timeframe=result.timeframe,

@@ -40,6 +40,24 @@ logs: ## Tail every service
 nuke: ## Stop the stack and DELETE its volumes (audit trail included)
 	docker compose down -v
 
+db-upgrade: ## Apply every pending migration
+	uv run alembic upgrade head
+
+db-downgrade: ## Roll back one migration
+	uv run alembic downgrade -1
+
+db-revision: ## Autogenerate a migration from model changes: make db-revision M="add x"
+	uv run alembic revision --autogenerate -m "$(M)"
+
+db-current: ## Which revision the database is on
+	uv run alembic current --verbose
+
+db-history: ## The migration history
+	uv run alembic history --indicate-current
+
+db-check: ## Fail if the models have drifted from the migrations
+	uv run alembic check
+
 download: ## Fetch Tiingo history for QTE_ENGINE__SYMBOLS into parquet
 	uv run qte-backtest download
 
@@ -72,5 +90,6 @@ ping: ## Ask the running runners to identify themselves
 	uv run qte-control ping
 
 .PHONY: help install install-dev lock test lint format check infra up down logs nuke \
+	db-upgrade db-downgrade db-revision db-current db-history db-check \
 	download history backtest reports ingestion runner \
 	shadow-status shadow-on shadow-off ping

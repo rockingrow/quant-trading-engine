@@ -19,7 +19,7 @@ from datetime import UTC, datetime
 from qte_shared.bus import NatsBus, Subjects
 from qte_shared.cache import RedisState
 from qte_shared.config import settings
-from qte_shared.db import AuditRepository
+from qte_shared.db import EventRepository
 from qte_shared.logging_setup import get_logger
 from qte_shared.models import Candle, CandleClosedEvent, Tick, TickEvent
 from qte_shared.symbols import build_specs
@@ -43,7 +43,7 @@ class IngestionService:
         self.bus = NatsBus(name="qte-ingestion")
         self.state = RedisState()
         self.subjects = Subjects()
-        self.audit = AuditRepository()
+        self.events = EventRepository()
         self._resamplers: dict[str, Resampler] = {
             spec.symbol: Resampler(spec.symbol, self.timeframes) for spec in self.specs
         }
@@ -67,7 +67,7 @@ class IngestionService:
             raise RuntimeError("No market sockets started — check QTE_ENGINE__SYMBOLS")
 
         self._flush_task = asyncio.create_task(self._flush_loop(), name="candle-flush")
-        await self.audit.record_event(
+        await self.events.record_event(
             service=SERVICE_NAME,
             event="started",
             payload={
@@ -93,7 +93,7 @@ class IngestionService:
             self._flush_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._flush_task
-        await self.audit.record_event(service=SERVICE_NAME, event="stopped")
+        await self.events.record_event(service=SERVICE_NAME, event="stopped")
         await self.bus.close()
         await self.state.close()
         log.info("Ingestion stopped")

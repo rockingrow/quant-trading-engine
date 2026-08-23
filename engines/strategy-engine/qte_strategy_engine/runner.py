@@ -32,7 +32,7 @@ from nats.aio.msg import Msg
 from qte_shared.bus import NatsBus, Subjects
 from qte_shared.cache import RedisState
 from qte_shared.config import settings
-from qte_shared.db import AuditRepository
+from qte_shared.db import EventRepository
 from qte_shared.logging_setup import get_logger
 from qte_shared.models import Candle, CandleClosedEvent, SignalAction, TickEvent
 from qte_shared.plugin_loader import load_strategies
@@ -46,6 +46,7 @@ from qte_shared.strategy_base import (
 from qte_shared.timeframes import normalize_timeframe
 
 from qte_strategy_engine.broker_sink import BrokerSink
+from qte_strategy_engine.db import SignalRepository
 from qte_strategy_engine.settings import runner_settings
 
 log = get_logger(__name__)
@@ -83,7 +84,8 @@ class StrategyRunner:
         self.bus = NatsBus(name="qte-strategy-runner")
         self.state = RedisState()
         self.subjects = Subjects()
-        self.audit = AuditRepository()
+        self.events = EventRepository()
+        self.signals = SignalRepository()
         self.sink = sink or BrokerSink()
         self.slots: list[StrategySlot] = []
         self._by_subject: dict[tuple[str, str], list[StrategySlot]] = defaultdict(list)
@@ -107,7 +109,7 @@ class StrategyRunner:
         await self._restore_state()
         await self._subscribe()
 
-        await self.audit.record_event(
+        await self.events.record_event(
             service=SERVICE_NAME,
             event="started",
             payload={
@@ -243,7 +245,7 @@ class StrategyRunner:
             log.exception(
                 "Strategy %s raised on %s %s", slot.strategy.name, slot.symbol, candle.open_time
             )
-            await self.audit.record_event(
+            await self.events.record_event(
                 service=SERVICE_NAME,
                 event="strategy_error",
                 level="ERROR",
@@ -289,7 +291,7 @@ class StrategyRunner:
             enabled = bool(command.get("enabled", True))
             self.sink.set_shadow_mode(enabled)
             await self.state.set_flag("shadow_mode", enabled)
-            await self.audit.record_event(
+            await self.events.record_event(
                 service=SERVICE_NAME,
                 event="shadow_mode_changed",
                 level="WARNING",
@@ -334,7 +336,7 @@ class StrategyRunner:
         if result.status != "failed":
             await self._track_cycle(slot, signal.position.action, signal.signal_uxid)
 
-        await self.audit.record_signal(
+        await self.signals.record_signal(
             signal,
             transport=result.transport,
             delivery_status=result.status,
@@ -378,7 +380,7 @@ class StrategyRunner:
         for slot in self.slots:
             with contextlib.suppress(Exception):
                 slot.strategy.on_stop()
-        await self.audit.record_event(service=SERVICE_NAME, event="stopped")
+        await self.events.record_event(service=SERVICE_NAME, event="stopped")
         await self.sink.stop()
         await self.bus.close()
         await self.state.close()

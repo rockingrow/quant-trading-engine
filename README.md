@@ -62,6 +62,7 @@ mkdir -p __strategies__
 cp examples/__strategies__/ema_atr_breakout.py __strategies__/
 
 make infra                    # redis + postgres + nats
+make db-upgrade               # create the schema (Alembic owns it, not an init script)
 make download                 # Tiingo history → data/parquet/*.parquet
 make backtest STRATEGY=QTE_EXAMPLE_EMA_ATR SYMBOL=XAUUSD
 ```
@@ -79,7 +80,8 @@ Requires Python 3.11+, [uv](https://docs.astral.sh/uv/), and Docker.
 | `engines/backtest-engine/` | History downloader, parquet store, replay loop, fill simulator, metrics, reports, `qte-backtest` CLI. |
 | `engines/strategy-engine/` | The live runner: plugin loading, the NATS event loop, delivery to the broker, audit, and the `qte-control` operator CLI. |
 | `__strategies__/` | **Git-ignored and untracked.** Your private strategy repo, cloned in whole. Absent from a fresh checkout by design. |
-| `deploy/` | Postgres init SQL (incl. pgvector) and the standalone NATS config. |
+| `migrations/` | Alembic. One chain for the whole system; `env.py` imports every engine's models. |
+| `deploy/` | The standalone NATS config. |
 | `data/reports/` | Backtest reports, JSON + Markdown. Git-ignored. |
 | `examples/__strategies__/` | A worked example of the plugin contract. Not an edge. |
 
@@ -259,6 +261,55 @@ Everything else the engine knows is a CLI command or a SQL query:
 | Backtest a strategy | `uv run qte-backtest run --strategy … --symbol … --report` |
 | Read a report | `data/reports/*.json` — the file an agent analyses |
 
+## Database
+
+Alembic owns the schema. There is no init script — one would only ever run on an
+empty volume, which is exactly the case a migration tool exists to outgrow.
+
+```bash
+make db-upgrade                     # apply everything pending
+make db-current                     # where is this database?
+make db-revision M="add a column"   # autogenerate from model changes
+make db-check                       # fail if the models have drifted
+make db-downgrade                   # back out one revision
+```
+
+The DSN comes from `QTE_POSTGRES__DSN` through `migrations/env.py`; `alembic.ini`
+deliberately does not set `sqlalchemy.url`, because two places to configure it is
+one place for it to drift from what the engines actually connect to.
+
+**Each engine owns the tables it writes**, with its models and repositories in
+its own `db/` package:
+
+| Package | Tables | Repository |
+| --- | --- | --- |
+| `qte_strategy_engine.db` | `signals` | `SignalRepository` |
+| `qte_backtest.db` | `backtest_runs`, `backtest_trades` | `BacktestRepository` |
+| `qte_shared.db` | `engine_events` | `EventRepository` |
+
+`engine_events` sits in shared because every engine writes it and none owns it.
+Ingestion has no `db/` package at all — it writes only that shared table, and
+inventing a table to justify a folder would be the wrong way round.
+
+They all share one `DeclarativeBase` (`qte_shared.db.base`). That is not
+incidental: Alembic diffs the database against `Base.metadata`, so a model on a
+different base would be invisible to autogenerate — its table would never be
+created, and a later revision would see it in the database, fail to find it in
+the metadata, and propose dropping it. For the same reason, adding an engine
+that owns tables means adding its `models` import to `migrations/env.py`.
+`tests/test_db_layout.py` enforces both.
+
+The revision chain is two steps on purpose:
+
+1. **Core schema** — everything QTE writes, on any PostgreSQL.
+2. **pgvector** — the extension plus the unmapped `signals.embedding` column,
+   which exists so an agent can embed a signal's context and ask which past
+   trades looked like this one. Nothing in QTE writes it.
+
+Stop after the first revision to run on a stock `postgres` image without vector
+search. If pgvector is missing when the second runs, the migration says so and
+names the fix rather than failing with `could not open extension control file`.
+
 ## Deployment
 
 ```bash
@@ -270,8 +321,10 @@ cd quant-trading-engine && cp .env.example .env   # then edit it
 #    from the checkout, so this clone lands in an empty destination.
 git clone git@github.com:you/my-private-strategies.git __strategies__
 
-# 3. Up
-make up && make logs
+# 3. Up, then create the schema
+make up
+make db-upgrade
+make logs
 ```
 
 `docker-compose.yml` ships a `nats` service for standalone development. In

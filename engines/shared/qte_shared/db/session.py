@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from qte_shared.config import settings
-from qte_shared.db.models import Base
+from qte_shared.db.base import Base
 from qte_shared.logging_setup import get_logger
 
 log = get_logger(__name__)
@@ -65,15 +65,20 @@ class Database:
                 raise
 
     async def create_all(self) -> None:
-        """Create tables if missing.
+        """Create every registered table directly, bypassing Alembic.
 
-        Convenience for tests and a bare local run. In Docker the schema comes
-        from ``deploy/postgres/init/001_schema.sql``, which also installs
-        pgvector and the ``embedding`` column this metadata does not describe.
+        For tests and throwaway databases only. It leaves no version stamp, so
+        a database built this way looks like a fresh one to Alembic and the
+        first ``alembic upgrade`` will try to create the tables again. Use
+        ``make db-upgrade`` for anything you intend to keep.
+
+        Importing the engines' model modules is what registers their tables on
+        the shared metadata; without those imports this creates only the tables
+        shared itself declares.
         """
         async with self.engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
-        log.info("Audit schema ensured")
+        log.info("Schema created directly from metadata (no Alembic version stamped)")
 
     async def ping(self) -> bool:
         try:

@@ -27,7 +27,7 @@ import sys
 from qte_shared.bus import NatsBus, Subjects
 from qte_shared.cache import RedisState
 from qte_shared.config import settings
-from qte_shared.db import AuditRepository
+from qte_shared.db import EventRepository
 from qte_shared.logging_setup import configure_logging, get_logger
 
 log = get_logger(__name__)
@@ -86,7 +86,7 @@ async def _set_shadow_mode(enabled: bool) -> None:
     finally:
         await bus.close()
 
-    await AuditRepository().record_event(
+    await EventRepository().record_event(
         service="qte-control",
         event="shadow_mode_changed",
         level="WARNING",
