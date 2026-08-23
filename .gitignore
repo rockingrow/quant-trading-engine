@@ -231,6 +231,10 @@ __marimo__/
 !/data/parquet/.gitkeep
 *.parquet
 
+# Backtest reports. Regenerated per run and named with a timestamp, so they
+# accumulate fast; keep the ones that matter somewhere else.
+/data/reports/
+
 .env
 .env.*
 !.env.example

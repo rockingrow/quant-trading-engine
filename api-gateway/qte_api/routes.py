@@ -7,9 +7,10 @@ between a strategy and the broker.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
+from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from qte_backtest.data_store import ParquetStore
 from qte_backtest.runner import BacktestRequest, run_backtest
 from qte_shared.bus import Subjects
@@ -24,8 +25,10 @@ from qte_api.schemas import (
     BacktestRunRequest,
     BacktestRunResponse,
     BacktestRunSummary,
+    Finding,
     HealthResponse,
     HistoryEntry,
+    ReportFile,
     ShadowModeRequest,
     ShadowModeResponse,
     SignalRow,
@@ -222,7 +225,7 @@ async def trigger_backtest(request: BacktestRunRequest) -> BacktestRunResponse:
     move to M1 over a decade, that trade-off changes.
     """
     try:
-        result = await run_backtest(
+        report = await run_backtest(
             BacktestRequest(
                 strategy=request.strategy,
                 symbol=request.symbol,
@@ -237,6 +240,7 @@ async def trigger_backtest(request: BacktestRunRequest) -> BacktestRunResponse:
                 quantity=request.quantity,
                 starting_equity=request.starting_equity,
                 persist=request.persist,
+                report_dir=settings.engine.reports_dir if request.write_report else None,
             )
         )
     except LookupError as exc:
@@ -246,15 +250,78 @@ async def trigger_backtest(request: BacktestRunRequest) -> BacktestRunResponse:
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
+    result = report.result
+    payload = report.to_dict(include_signals=request.include_signals)
     return BacktestRunResponse(
         strategy=result.strategy,
         symbol=result.symbol,
         timeframe=result.timeframe,
-        metrics=result.metrics.to_dict(),
+        metrics=payload["metrics"],
         rejected_entries=result.rejected,
-        trades=[_serialise_trade(trade) for trade in result.trades_as_rows()],
+        # The report's own trade rows, not the audit-table shape: they carry
+        # R-multiples and excursion, which is what a reviewer reads.
+        trades=payload["trades"],
         report=result.report(),
+        trustworthy=report.is_trustworthy,
+        diagnostics=[Finding(**finding) for finding in payload["diagnostics"]["findings"]],
+        report_files=[path.name for path in _written_reports(report, request.write_report)],
+        signals=payload["signals"],
     )
+
+
+@router.get("/backtest/reports", response_model=list[ReportFile], tags=["backtest"])
+async def list_reports(limit: int = Query(default=50, ge=1, le=500)) -> list[ReportFile]:
+    """Report files on disk, newest first — the index an agent starts from."""
+    directory = Path(settings.engine.reports_dir)
+    if not directory.is_dir():
+        return []
+    files = sorted(
+        (path for path in directory.iterdir() if path.suffix in (".json", ".md")),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    return [
+        ReportFile(
+            name=path.name,
+            format=path.suffix.lstrip("."),
+            size_bytes=path.stat().st_size,
+            modified_at=datetime.fromtimestamp(path.stat().st_mtime, tz=UTC),
+        )
+        for path in files[:limit]
+    ]
+
+
+@router.get("/backtest/reports/{name}", tags=["backtest"])
+async def get_report(name: str) -> Response:
+    """Serve one report file whole, for an agent to read and analyse.
+
+    The name is resolved inside the reports directory and rejected if it lands
+    anywhere else — otherwise `../../.env` would be a readable report.
+    """
+    directory = Path(settings.engine.reports_dir).resolve()
+    candidate = (directory / name).resolve()
+    if not candidate.is_relative_to(directory) or candidate.suffix not in (".json", ".md"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Report names may not traverse outside the reports directory",
+        )
+    if not candidate.is_file():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such report")
+
+    media_type = "application/json" if candidate.suffix == ".json" else "text/markdown"
+    return Response(content=candidate.read_text(encoding="utf-8"), media_type=media_type)
+
+
+def _written_reports(report, requested: bool) -> list[Path]:
+    """Which files the run left behind, matched by the report's own stem."""
+    if not requested:
+        return []
+    directory = Path(settings.engine.reports_dir)
+    stem = (
+        f"{report.result.strategy}_{report.result.symbol}_{report.result.timeframe}"
+        f"_{report.generated_at:%Y%m%dT%H%M%SZ}"
+    )
+    return sorted(path for path in directory.glob(f"{stem}.*")) if directory.is_dir() else []
 
 
 # ── Helpers ───────────────────────────────────────────────────────────

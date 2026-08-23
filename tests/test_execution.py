@@ -107,3 +107,80 @@ def test_contract_size_scales_pnl():
     position = _long(simulator, quantity=1.0, tp1_percent=100.0)
     simulator.process_bar(position, _bar(2000, 2011, 1999, 2010), NOW)
     assert position.net_pnl == pytest.approx(1000.0)
+
+
+def test_excursion_records_the_worst_and_best_price_touched():
+    # MAE/MFE is what separates "entry was wrong" from "exit gave it back".
+    simulator = FillSimulator(CostModel())
+    position = _long(simulator, sl=1950.0, tp1=2100.0, tp2=2200.0)
+    simulator.process_bar(position, _bar(2000, 2030, 1980, 2010), NOW)
+    simulator.process_bar(position, _bar(2010, 2050, 1995, 2040), NOW)
+
+    assert position.mae == pytest.approx(20.0)  # low of 1980, 20 below entry
+    assert position.mfe == pytest.approx(50.0)  # high of 2050
+    assert position.bars_held == 2
+
+
+def test_excursion_includes_the_bar_that_closes_the_trade():
+    # Skipping it would understate MAE on exactly the trades it matters for.
+    simulator = FillSimulator(CostModel())
+    position = _long(simulator, sl=1990.0)
+    simulator.process_bar(position, _bar(2000, 2005, 1985, 1988), NOW)
+    assert not position.is_open
+    assert position.mae == pytest.approx(15.0)
+    assert position.bars_held == 1
+
+
+def test_a_shorts_excursion_is_mirrored():
+    simulator = FillSimulator(CostModel())
+    position = simulator.open_position(
+        symbol="XAUUSD",
+        action=SignalAction.SHORT,
+        bar_time=NOW,
+        price=2000.0,
+        quantity=1.0,
+        sl=2100.0,
+        tp1=1900.0,
+    )
+    simulator.process_bar(position, _bar(2000, 2030, 1960, 1970), NOW)
+    assert position.mae == pytest.approx(30.0)  # price rose against the short
+    assert position.mfe == pytest.approx(40.0)
+
+
+def test_r_multiple_is_measured_against_the_risk_taken_at_entry():
+    simulator = FillSimulator(CostModel())
+    position = _long(simulator, sl=1990.0, tp1=2010.0, tp1_percent=100.0)
+    simulator.process_bar(position, _bar(2000, 2011, 1999, 2010), NOW)
+    # Risked 10 to make 10.
+    assert position.initial_risk == pytest.approx(10.0)
+    assert position.r_multiple == pytest.approx(1.0)
+
+
+def test_moving_the_stop_to_breakeven_does_not_shrink_the_recorded_risk():
+    # initial_sl exists precisely so a trade's risk cannot appear to change
+    # after the fact and inflate every R-multiple that follows.
+    simulator = FillSimulator(CostModel())
+    position = _long(simulator, sl=1990.0, tp1=2010.0, tp1_percent=50.0, move_sl_to_be=True)
+    simulator.process_bar(position, _bar(2000, 2011, 1999, 2010), NOW)
+
+    assert position.sl == pytest.approx(2000.0)  # moved to breakeven
+    assert position.initial_sl == pytest.approx(1990.0)
+    assert position.initial_risk == pytest.approx(10.0)
+
+
+def test_a_trade_with_no_stop_has_no_r_multiple_rather_than_a_wrong_one():
+    simulator = FillSimulator(CostModel())
+    position = _long(simulator, sl=None, tp1=2010.0, tp1_percent=100.0)
+    simulator.process_bar(position, _bar(2000, 2011, 1999, 2010), NOW)
+    assert position.initial_risk is None
+    assert position.r_multiple is None
+    assert position.mae_r is None
+
+
+def test_r_multiple_is_unaffected_by_contract_size():
+    # It must compare across instruments, so scaling P&L must not scale R.
+    for contract_size in (1.0, 100.0):
+        simulator = FillSimulator(CostModel(contract_size=contract_size))
+        position = _long(simulator, sl=1990.0, tp1=2010.0, tp1_percent=100.0)
+        simulator.process_bar(position, _bar(2000, 2011, 1999, 2010), NOW)
+        assert position.r_multiple == pytest.approx(1.0)

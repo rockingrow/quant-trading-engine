@@ -47,7 +47,11 @@ history: ## List the parquet history on disk
 	uv run qte-backtest list
 
 backtest: ## Replay one strategy: make backtest STRATEGY=... SYMBOL=XAUUSD [TF=M15]
-	uv run qte-backtest run --strategy $(STRATEGY) --symbol $(SYMBOL) --timeframe $(or $(TF),M15)
+	uv run qte-backtest run --strategy $(STRATEGY) --symbol $(SYMBOL) \
+		--timeframe $(or $(TF),M15) --report
+
+reports: ## List the backtest reports written so far
+	@ls -lht data/reports 2>/dev/null | head -20 || echo "No reports yet — run make backtest"
 
 ingestion: ## Run the ingestion service locally
 	uv run qte-ingestion
@@ -67,4 +71,4 @@ shadow-off: ## Resume delivery to the broker (GOES LIVE)
 		$(if $(API_KEY),-H 'X-API-KEY: $(API_KEY)',) -d '{"enabled": false}' | jq .
 
 .PHONY: help install install-dev lock test lint format check infra up down logs nuke \
-	download history backtest ingestion runner api shadow-on shadow-off
+	download history backtest reports ingestion runner api shadow-on shadow-off

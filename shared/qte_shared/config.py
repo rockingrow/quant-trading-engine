@@ -107,6 +107,7 @@ class EngineSettings(BaseSettings):
     warmup_candles: int = 300
     strategies_dir: Path = REPO_ROOT / "user_strategies"
     parquet_dir: Path = REPO_ROOT / "data" / "parquet"
+    reports_dir: Path = REPO_ROOT / "data" / "reports"
 
 
 class ApiSettings(BaseSettings):

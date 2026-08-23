@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from datetime import UTC, date, datetime
+from pathlib import Path
 
 from qte_shared.config import settings
 from qte_shared.logging_setup import configure_logging, get_logger
@@ -57,6 +58,24 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--equity", type=float, default=10_000.0)
     run.add_argument("--persist", action="store_true", help="Write the run into Postgres")
     run.add_argument(
+        "--report",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="DIR",
+        help="Write the machine-readable report (default dir: QTE_ENGINE__REPORTS_DIR)",
+    )
+    run.add_argument(
+        "--report-format",
+        default="json,md",
+        help="Comma-separated: json, md (default: both)",
+    )
+    run.add_argument(
+        "--no-report-signals",
+        action="store_true",
+        help="Omit the emitted broker payloads from the JSON report",
+    )
+    run.add_argument(
         "--param",
         action="append",
         default=[],
@@ -84,7 +103,11 @@ async def _download(args: argparse.Namespace) -> None:
 
 
 async def _run(args: argparse.Namespace) -> None:
-    result = await run_backtest(
+    report_dir = None
+    if args.report is not None:
+        report_dir = Path(args.report) if args.report else settings.engine.reports_dir
+
+    report = await run_backtest(
         BacktestRequest(
             strategy=args.strategy,
             symbol=args.symbol,
@@ -99,10 +122,37 @@ async def _run(args: argparse.Namespace) -> None:
             quantity=args.quantity,
             starting_equity=args.equity,
             persist=args.persist,
+            report_dir=report_dir,
+            report_formats=tuple(
+                fmt.strip() for fmt in args.report_format.split(",") if fmt.strip()
+            ),
+            report_include_signals=not args.no_report_signals,
         )
     )
     print()
-    print(result.report())
+    print(report.result.report())
+    print()
+    _print_findings(report)
+
+
+def _print_findings(report) -> None:
+    """Surface the diagnostics on the terminal, not only in the file.
+
+    A report nobody opens is a report nobody acts on, and the critical findings
+    are exactly the ones that decide whether the numbers just printed mean
+    anything.
+    """
+    if not report.findings:
+        print("Diagnostics       no findings")
+        print()
+        return
+
+    counts = report.severity_counts()
+    summary = ", ".join(f"{count} {name}" for name, count in counts.items() if count)
+    print(f"Diagnostics       {summary}")
+    for finding in report.findings:
+        print(f"  [{finding.severity.upper():<8}] {finding.code}: {finding.title}")
+        print(f"             → {finding.suggestion}")
     print()
 
 

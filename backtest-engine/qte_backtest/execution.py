@@ -95,9 +95,31 @@ class SimulatedPosition:
     legs: list[ClosedLeg] = field(default_factory=list)
     tp1_filled: bool = False
 
+    #: The stop as it was at entry, kept separately because ``sl`` is mutated
+    #: when the position moves to breakeven. Every R-multiple in the report is
+    #: measured against this, so a trade's risk does not appear to shrink after
+    #: the fact.
+    initial_sl: float | None = None
+    #: Worst and best prices *touched* while the position was open — the raw
+    #: material for MAE/MFE. A winner that spent the trade a tick from its stop
+    #: is a different trade from one that never traded against you, and only
+    #: excursion tells them apart.
+    worst_price: float | None = None
+    best_price: float | None = None
+    bars_held: int = 0
+    #: Copied from the simulator's cost model so ``r_multiple`` can undo the
+    #: contract scaling applied to P&L without reaching back for it.
+    contract_size: float = 1.0
+
     def __post_init__(self) -> None:
         if not self.remaining:
             self.remaining = self.quantity
+        if self.initial_sl is None:
+            self.initial_sl = self.sl
+        if self.worst_price is None:
+            self.worst_price = self.entry_price
+        if self.best_price is None:
+            self.best_price = self.entry_price
 
     @property
     def is_open(self) -> bool:
@@ -130,6 +152,54 @@ class SimulatedPosition:
     @property
     def exit_reason(self) -> str | None:
         return self.legs[-1].reason.value if self.legs else None
+
+    @property
+    def initial_risk(self) -> float | None:
+        """Distance from entry to the stop as it stood at entry, in price units.
+
+        ``None`` when the trade had no stop, which is itself worth reporting —
+        every R-multiple below is undefined for such a trade.
+        """
+        if self.initial_sl is None:
+            return None
+        risk = abs(self.entry_price - self.initial_sl)
+        return risk if risk > 0 else None
+
+    @property
+    def mae(self) -> float:
+        """Maximum adverse excursion in price units, always >= 0."""
+        if self.worst_price is None:
+            return 0.0
+        return max(0.0, (self.entry_price - self.worst_price) * self.direction)
+
+    @property
+    def mfe(self) -> float:
+        """Maximum favourable excursion in price units, always >= 0."""
+        if self.best_price is None:
+            return 0.0
+        return max(0.0, (self.best_price - self.entry_price) * self.direction)
+
+    @property
+    def mae_r(self) -> float | None:
+        risk = self.initial_risk
+        return self.mae / risk if risk else None
+
+    @property
+    def mfe_r(self) -> float | None:
+        risk = self.initial_risk
+        return self.mfe / risk if risk else None
+
+    @property
+    def r_multiple(self) -> float | None:
+        """Realised P&L expressed in units of the risk taken at entry.
+
+        Net of costs and sized per unit, so it compares across instruments and
+        position sizes in a way raw currency P&L cannot.
+        """
+        risk = self.initial_risk
+        if not risk or not self.quantity:
+            return None
+        return self.net_pnl / (risk * self.quantity * self.contract_size)
 
 
 class FillSimulator:
@@ -170,6 +240,8 @@ class FillSimulator:
             move_sl_to_be=move_sl_to_be,
             signal_uxid=signal_uxid,
             entry_fees=self.costs.commission(quantity),
+            initial_sl=sl,
+            contract_size=self.costs.contract_size,
         )
 
     # ── Walking forward ───────────────────────────────────────────────
@@ -184,6 +256,21 @@ class FillSimulator:
 
         high, low = float(bar["high"]), float(bar["low"])
         open_price = float(bar["open"])
+
+        # Excursion is recorded before the exit checks, so the bar that stops a
+        # trade out still contributes its range. Skipping it would understate
+        # MAE on exactly the trades whose MAE matters most.
+        position.bars_held += 1
+        position.worst_price = (
+            min(position.worst_price, low)
+            if position.direction == 1
+            else max(position.worst_price, high)
+        )
+        position.best_price = (
+            max(position.best_price, high)
+            if position.direction == 1
+            else min(position.best_price, low)
+        )
 
         if self._touched(position.sl, position.direction, high, low, is_stop=True):
             reason = (

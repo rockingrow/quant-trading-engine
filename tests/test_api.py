@@ -37,9 +37,12 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     (strategies / "probe.py").write_text(STRATEGY_SOURCE)
     parquet = tmp_path / "parquet"
     parquet.mkdir()
+    reports = tmp_path / "reports"
+    reports.mkdir()
 
     monkeypatch.setattr(settings.engine, "strategies_dir", strategies)
     monkeypatch.setattr(settings.engine, "parquet_dir", parquet)
+    monkeypatch.setattr(settings.engine, "reports_dir", reports)
     monkeypatch.setattr(settings.postgres, "enabled", False)
     # No NATS in this test run; keep the deliberate startup retry short.
     monkeypatch.setattr(settings.nats, "connect_timeout", 0.3)
@@ -86,3 +89,45 @@ def test_backtest_run_404s_when_the_history_is_missing(client):
 def test_the_api_key_guard_is_enforced_when_one_is_configured(client, monkeypatch):
     monkeypatch.setattr(settings.api, "api_key", "s3cret")
     assert client.post("/admin/shadow-mode", json={"enabled": True}).status_code == 401
+
+
+def test_reports_listing_is_empty_before_anything_runs(client):
+    assert client.get("/backtest/reports").json() == []
+
+
+def test_a_written_report_can_be_listed_and_fetched_whole(client):
+    directory = settings.engine.reports_dir
+    (directory / "RUN_XAUUSD_M15_20260501T000000Z.json").write_text('{"schema_version": "1.0"}')
+    (directory / "RUN_XAUUSD_M15_20260501T000000Z.md").write_text("# Backtest")
+
+    listing = client.get("/backtest/reports").json()
+    assert {entry["format"] for entry in listing} == {"json", "md"}
+
+    fetched = client.get("/backtest/reports/RUN_XAUUSD_M15_20260501T000000Z.json")
+    assert fetched.status_code == 200
+    assert fetched.json() == {"schema_version": "1.0"}
+    assert fetched.headers["content-type"].startswith("application/json")
+
+
+def test_a_markdown_report_is_served_as_markdown(client):
+    (settings.engine.reports_dir / "a.md").write_text("# Backtest")
+    response = client.get("/backtest/reports/a.md")
+    assert response.headers["content-type"].startswith("text/markdown")
+    assert response.text == "# Backtest"
+
+
+@pytest.mark.parametrize("name", ["../../.env", "..%2f..%2f.env", "subdir/../../../etc/passwd"])
+def test_a_report_name_cannot_escape_the_reports_directory(client, name):
+    # Without the containment check, `../../.env` would be a readable report.
+    response = client.get(f"/backtest/reports/{name}")
+    assert response.status_code in (400, 404)
+    assert "QTE_BROKER__TOKEN" not in response.text
+
+
+def test_a_non_report_extension_is_refused(client):
+    (settings.engine.reports_dir / "secrets.txt").write_text("nope")
+    assert client.get("/backtest/reports/secrets.txt").status_code == 400
+
+
+def test_fetching_a_report_that_does_not_exist_404s(client):
+    assert client.get("/backtest/reports/nope.json").status_code == 404

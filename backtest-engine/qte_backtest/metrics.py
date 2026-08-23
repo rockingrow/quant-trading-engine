@@ -41,9 +41,42 @@ class BacktestMetrics:
     max_drawdown_pct: float | None = None
     sharpe: float | None = None
     max_consecutive_losses: int = 0
+    max_consecutive_wins: int = 0
     period_start: datetime | None = None
     period_end: datetime | None = None
     equity_curve: list[float] = field(default_factory=list)
+
+    # ── Risk-normalised view ──────────────────────────────────────────
+    # R-multiples are P&L divided by the risk taken at entry, so they compare
+    # across instruments and position sizes. An agent reading this report should
+    # reason in R and treat the currency figures as scale.
+    total_r: float | None = None
+    expectancy_r: float | None = None
+    average_win_r: float | None = None
+    average_loss_r: float | None = None
+    payoff_ratio: float | None = None
+    trades_without_stop: int = 0
+
+    # ── Excursion ─────────────────────────────────────────────────────
+    # What price did while the trade was open. The gap between MFE and realised
+    # P&L is where exit logic leaks money; MAE on winners is where the stop is
+    # tighter than the strategy needs.
+    average_mae_r: float | None = None
+    average_mfe_r: float | None = None
+    average_mae_r_winners: float | None = None
+    average_mfe_r_losers: float | None = None
+
+    # ── Shape of the trading ──────────────────────────────────────────
+    exit_reasons: dict[str, int] = field(default_factory=dict)
+    long_trades: int = 0
+    short_trades: int = 0
+    long_net_pnl: float = 0.0
+    short_net_pnl: float = 0.0
+    average_bars_held: float | None = None
+    max_bars_held: int = 0
+    bars_in_market: int = 0
+    exposure_pct: float | None = None
+    best_trade_share_pct: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -53,7 +86,9 @@ class BacktestMetrics:
 
 
 def compute_metrics(
-    positions: Sequence[SimulatedPosition], starting_equity: float = 0.0
+    positions: Sequence[SimulatedPosition],
+    starting_equity: float = 0.0,
+    total_bars: int = 0,
 ) -> BacktestMetrics:
     closed = [position for position in positions if position.legs]
     metrics = BacktestMetrics()
@@ -103,13 +138,96 @@ def compute_metrics(
         worst_streak = max(worst_streak, streak)
 
     metrics.equity_curve = [round(point, 6) for point in curve]
+    metrics.max_consecutive_wins = _longest_run(pnls, winning=True)
     metrics.max_drawdown = round(max_drawdown, 6)
     metrics.max_drawdown_pct = max_drawdown_pct
     metrics.max_consecutive_losses = worst_streak
     metrics.period_start = closed[0].opened_at
     metrics.period_end = closed[-1].closed_at or closed[-1].opened_at
     metrics.sharpe = _sharpe(pnls, metrics.period_start, metrics.period_end)
+    _add_risk_normalised(metrics, closed)
+    _add_excursion(metrics, closed)
+    _add_shape(metrics, closed, total_bars)
     return metrics
+
+
+def _add_risk_normalised(metrics: BacktestMetrics, closed: Sequence[SimulatedPosition]) -> None:
+    """R-multiple statistics, over the trades that actually had a stop."""
+    r_values = [position.r_multiple for position in closed]
+    metrics.trades_without_stop = sum(1 for value in r_values if value is None)
+    usable = [value for value in r_values if value is not None]
+    if not usable:
+        return
+
+    metrics.total_r = round(sum(usable), 4)
+    metrics.expectancy_r = round(sum(usable) / len(usable), 4)
+    wins = [value for value in usable if value > 0]
+    losses = [value for value in usable if value < 0]
+    if wins:
+        metrics.average_win_r = round(sum(wins) / len(wins), 4)
+    if losses:
+        metrics.average_loss_r = round(sum(losses) / len(losses), 4)
+    if wins and losses:
+        # How many times bigger the average win is than the average loss. Read
+        # it against win rate: 30% at 3:1 and 60% at 0.8:1 are both viable, and
+        # neither number means anything on its own.
+        metrics.payoff_ratio = round(metrics.average_win_r / abs(metrics.average_loss_r), 4)
+
+
+def _add_excursion(metrics: BacktestMetrics, closed: Sequence[SimulatedPosition]) -> None:
+    mae = [position.mae_r for position in closed if position.mae_r is not None]
+    mfe = [position.mfe_r for position in closed if position.mfe_r is not None]
+    if mae:
+        metrics.average_mae_r = round(sum(mae) / len(mae), 4)
+    if mfe:
+        metrics.average_mfe_r = round(sum(mfe) / len(mfe), 4)
+
+    winner_mae = [p.mae_r for p in closed if p.net_pnl > 0 and p.mae_r is not None]
+    loser_mfe = [p.mfe_r for p in closed if p.net_pnl < 0 and p.mfe_r is not None]
+    if winner_mae:
+        metrics.average_mae_r_winners = round(sum(winner_mae) / len(winner_mae), 4)
+    if loser_mfe:
+        metrics.average_mfe_r_losers = round(sum(loser_mfe) / len(loser_mfe), 4)
+
+
+def _add_shape(
+    metrics: BacktestMetrics, closed: Sequence[SimulatedPosition], total_bars: int
+) -> None:
+    reasons: dict[str, int] = {}
+    for position in closed:
+        for leg in position.legs:
+            reasons[leg.reason.value] = reasons.get(leg.reason.value, 0) + 1
+    metrics.exit_reasons = dict(sorted(reasons.items()))
+
+    longs = [position for position in closed if position.direction == 1]
+    shorts = [position for position in closed if position.direction == -1]
+    metrics.long_trades = len(longs)
+    metrics.short_trades = len(shorts)
+    metrics.long_net_pnl = round(sum(position.net_pnl for position in longs), 6)
+    metrics.short_net_pnl = round(sum(position.net_pnl for position in shorts), 6)
+
+    held = [position.bars_held for position in closed]
+    if held:
+        metrics.average_bars_held = round(sum(held) / len(held), 2)
+        metrics.max_bars_held = max(held)
+        metrics.bars_in_market = sum(held)
+        if total_bars > 0:
+            metrics.exposure_pct = round(100.0 * sum(held) / total_bars, 3)
+
+    # How much of the result rests on the single best trade. A strategy whose
+    # net P&L is one outlier has not been demonstrated, it has been sampled.
+    if metrics.net_pnl > 0 and metrics.largest_win > 0:
+        metrics.best_trade_share_pct = round(100.0 * metrics.largest_win / metrics.net_pnl, 2)
+
+
+def _longest_run(pnls: Sequence[float], *, winning: bool) -> int:
+    streak = 0
+    longest = 0
+    for value in pnls:
+        hit = value > 0 if winning else value < 0
+        streak = streak + 1 if hit else 0
+        longest = max(longest, streak)
+    return longest
 
 
 def _sharpe(pnls: Sequence[float], start: datetime | None, end: datetime | None) -> float | None:

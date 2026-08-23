@@ -26,6 +26,7 @@ from qte_shared.logging_setup import get_logger
 from qte_shared.models import BrokerSignal, SignalAction
 from qte_shared.signal_factory import BracketPolicy, SignalFactory
 from qte_shared.strategy_base import SignalIntent, StrategyBase, StrategyContext
+from qte_shared.timeframes import timeframe_seconds
 
 from qte_backtest.execution import CostModel, ExitReason, FillSimulator, SimulatedPosition
 from qte_backtest.metrics import BacktestMetrics, compute_metrics, format_report
@@ -43,6 +44,18 @@ class BacktestResult:
     signals: list[BrokerSignal] = field(default_factory=list)
     rejected: int = 0
     params: dict[str, Any] = field(default_factory=dict)
+
+    # Context the report and the diagnostics need. Captured here because the
+    # engine is the only place that still has the frame and the cost model in
+    # hand — reconstructing them later invites the two drifting apart.
+    costs: CostModel = field(default_factory=CostModel)
+    warmup: int = 0
+    bars: int = 0
+    data_start: datetime | None = None
+    data_end: datetime | None = None
+    data_gaps: int = 0
+    strategy_meta: dict[str, Any] = field(default_factory=dict)
+    starting_equity: float = 0.0
 
     def report(self) -> str:
         header = f"{self.strategy} — {self.symbol} {self.timeframe}"
@@ -158,11 +171,19 @@ class BacktestEngine:
             strategy=self.strategy.name,
             symbol=self.symbol,
             timeframe=self.timeframe,
-            metrics=compute_metrics(self.positions, self.starting_equity),
+            metrics=compute_metrics(self.positions, self.starting_equity, total_bars=len(frame)),
             positions=self.positions,
             signals=self.signals,
             rejected=self._rejected,
             params=dict(self.strategy.params),
+            costs=self.simulator.costs,
+            warmup=warmup,
+            bars=len(frame),
+            data_start=_as_datetime(frame.index[0]),
+            data_end=_as_datetime(frame.index[-1]),
+            data_gaps=count_gaps(frame, self.timeframe),
+            strategy_meta=self.strategy.describe(),
+            starting_equity=self.starting_equity,
         )
 
     # ── Intent handling ───────────────────────────────────────────────
@@ -225,6 +246,19 @@ def _as_intents(result: Any) -> Sequence[SignalIntent]:
     if isinstance(result, SignalIntent):
         return (result,)
     return tuple(result)
+
+
+def count_gaps(frame: pd.DataFrame, timeframe: str) -> int:
+    """How many times consecutive bars are further apart than one timeframe.
+
+    Weekends and session breaks land here too, which is why the diagnostic that
+    reads this is informational: the number is a prompt to check the calendar,
+    not a defect on its own.
+    """
+    if len(frame) < 2:
+        return 0
+    expected = pd.Timedelta(seconds=timeframe_seconds(timeframe))
+    return int((frame.index.to_series().diff().dropna() > expected).sum())
 
 
 def _as_datetime(value: Any) -> datetime:

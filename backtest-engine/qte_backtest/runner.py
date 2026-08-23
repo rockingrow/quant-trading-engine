@@ -15,7 +15,8 @@ from qte_shared.signal_factory import BracketPolicy
 
 from qte_backtest.data_store import ParquetStore
 from qte_backtest.execution import CostModel
-from qte_backtest.replay import BacktestEngine, BacktestResult
+from qte_backtest.replay import BacktestEngine
+from qte_backtest.report import BacktestReport, build_report
 
 log = get_logger(__name__)
 
@@ -35,6 +36,12 @@ class BacktestRequest:
     quantity: float = 1.0
     starting_equity: float = 10_000.0
     persist: bool = False
+    #: Where to write the machine-readable report. ``None`` skips writing it;
+    #: the report object is built either way, because the diagnostics are worth
+    #: having in the return value even when nothing lands on disk.
+    report_dir: Path | None = None
+    report_formats: tuple[str, ...] = ("json", "md")
+    report_include_signals: bool = True
 
 
 async def run_backtest(
@@ -42,8 +49,13 @@ async def run_backtest(
     *,
     strategies_dir: Path | None = None,
     parquet_dir: Path | None = None,
-) -> BacktestResult:
-    """Load the strategy and its history, replay, and optionally audit the run."""
+) -> BacktestReport:
+    """Load the strategy and its history, replay it, and diagnose the outcome.
+
+    Returns the :class:`~qte_backtest.report.BacktestReport` rather than the raw
+    result: the diagnostics are the part a caller acts on, and building them is
+    cheap enough that making it optional would only invite skipping it.
+    """
     loader = StrategyLoader(strategies_dir or settings.engine.strategies_dir)
     strategy = loader.load_one(request.strategy, request.params)
 
@@ -72,6 +84,23 @@ async def run_backtest(
         default_quantity=request.quantity,
     )
     result = engine.run(frame)
+    report = build_report(result)
+
+    critical = report.severity_counts()["critical"]
+    if critical:
+        log.warning(
+            "%s finished with %d critical finding(s) — treat its metrics as unproven: %s",
+            result.strategy,
+            critical,
+            ", ".join(f.code for f in report.findings if f.severity == "critical"),
+        )
+
+    if request.report_dir is not None:
+        report.write(
+            request.report_dir,
+            formats=request.report_formats,
+            include_signals=request.report_include_signals,
+        )
 
     if request.persist and settings.postgres.enabled:
         run_id = await AuditRepository().record_backtest(
@@ -81,9 +110,12 @@ async def run_backtest(
             period_start=result.metrics.period_start,
             period_end=result.metrics.period_end,
             params=result.params,
-            metrics=result.metrics.to_dict(),
+            metrics={
+                **result.metrics.to_dict(),
+                "diagnostics": [finding.to_dict() for finding in report.findings],
+            },
             trades=result.trades_as_rows(),
         )
         log.info("Backtest persisted run_id=%s", run_id)
 
-    return result
+    return report

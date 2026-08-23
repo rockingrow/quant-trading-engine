@@ -79,6 +79,7 @@ def test_the_allow_list_filters_discovery(plugin_dir):
 def test_a_missing_directory_is_empty_not_an_error(tmp_path):
     assert StrategyLoader(tmp_path / "nope").discover() == []
 
+
 def test_a_cloned_repos_furniture_is_not_imported(plugin_dir):
     """The directory is a whole repo, not a tidy folder of strategy files."""
     for noise in (".git", ".venv/lib/python3.11/site-packages/pandas", "tests", "docs"):

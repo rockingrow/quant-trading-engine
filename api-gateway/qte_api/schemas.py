@@ -59,6 +59,15 @@ class ShadowModeResponse(BaseModel):
     broadcast: bool = Field(description="Whether the change reached the runners over NATS.")
 
 
+class Finding(BaseModel):
+    code: str
+    severity: str
+    title: str
+    detail: str
+    suggestion: str
+    evidence: dict[str, Any]
+
+
 class BacktestRunRequest(BaseModel):
     strategy: str
     symbol: str
@@ -73,6 +82,17 @@ class BacktestRunRequest(BaseModel):
     contract_size: float = 1.0
     starting_equity: float = 10_000.0
     persist: bool = True
+    write_report: bool = Field(
+        default=True,
+        description="Also write the JSON + Markdown report under QTE_ENGINE__REPORTS_DIR.",
+    )
+    include_signals: bool = Field(
+        default=False,
+        description=(
+            "Include the emitted broker payloads in the response. Off by default because "
+            "the list grows with trade count; the written JSON report always has them."
+        ),
+    )
 
 
 class BacktestRunResponse(BaseModel):
@@ -82,7 +102,20 @@ class BacktestRunResponse(BaseModel):
     metrics: dict[str, Any]
     rejected_entries: int
     trades: list[dict[str, Any]]
-    report: str
+    report: str = Field(description="The human-readable text summary.")
+    trustworthy: bool = Field(
+        description="False when any critical finding fired — the metrics are unproven."
+    )
+    diagnostics: list[Finding]
+    report_files: list[str] = Field(default_factory=list)
+    signals: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class ReportFile(BaseModel):
+    name: str
+    format: str
+    size_bytes: int
+    modified_at: datetime
 
 
 class BacktestRunSummary(BaseModel):

@@ -81,6 +81,7 @@ Requires Python 3.11+, [uv](https://docs.astral.sh/uv/), and Docker.
 | `api-gateway/` | FastAPI control plane. |
 | `user_strategies/` | **Git-ignored and untracked.** Your private strategy repo, cloned in whole. Absent from a fresh checkout by design. |
 | `deploy/` | Postgres init SQL (incl. pgvector) and the standalone NATS config. |
+| `data/reports/` | Backtest reports, JSON + Markdown. Git-ignored. |
 | `examples/user_strategies/` | A worked example of the plugin contract. Not an edge. |
 
 ---
@@ -94,7 +95,7 @@ from qte_shared.strategy_base import SignalIntent, StrategyBase
 
 
 class MyEdge(StrategyBase):
-    name = "MT5_GOLD_M15_V1"   # ← the NATS subject workers subscribe to
+    name = "MT5_GOLD_M15_V1"  # ← the NATS subject workers subscribe to
     symbols = ("XAUUSD",)
     timeframe = "M15"
     warmup = 220
@@ -103,16 +104,20 @@ class MyEdge(StrategyBase):
         fast, slow = ema(df["close"], 21), ema(df["close"], 55)
         if not bool(crossover(fast, slow).iloc[-1]):
             return None
-        if context.open_uxid is not None:      # already in a trade
+        if context.open_uxid is not None:  # already in a trade
             return None
 
         close = float(df["close"].iloc[-1])
         risk = float(atr(df, 14).iloc[-1]) * 1.5
         return SignalIntent(
             action=SignalAction.LONG,
-            price=close, quantity=0.01,
-            sl=close - risk, tp1=close + risk * 1.5, tp2=close + risk * 3,
-            tp1_percent=50.0, move_sl_to_be=True,
+            price=close,
+            quantity=0.01,
+            sl=close - risk,
+            tp1=close + risk * 1.5,
+            tp2=close + risk * 3,
+            tp1_percent=50.0,
+            move_sl_to_be=True,
         )
 ```
 
@@ -163,6 +168,39 @@ not flatter one:
 `--persist` writes the run and every trade into Postgres (`backtest_runs`,
 `backtest_trades`).
 
+### The report
+
+`--report` writes a JSON artefact for an agent to analyse plus a Markdown
+companion for a human — same object, two renderings:
+
+```bash
+uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --report
+# → data/reports/MY_EDGE_XAUUSD_M15_20260823T150404Z.{json,md}
+```
+
+Beyond the headline metrics it carries what makes a result diagnosable: every
+statistic in **R-multiples** as well as currency, **MAE/MFE per trade** (how far
+price went against and for the position while it was open), each partial exit
+leg, the exact broker payloads the run would have published, and a
+`reading_guide` block spelling out the conventions an agent would otherwise
+guess at.
+
+The part worth having is `diagnostics` — a rule set that reads the finished run
+and says what is wrong with it. Each finding states the threshold it tripped,
+carries the numbers that tripped it, and proposes one concrete change:
+
+```
+Diagnostics       2 critical, 1 info
+  [CRITICAL] EXITS_NEVER_TRIGGER: 1/1 exits were forced by the end of the data
+             → Print entry, sl, tp1 and tp2 for the first trade and check the
+               distances against the instrument's typical bar range. A stop
+               should be a small multiple of ATR, not a multiple of price.
+```
+
+`report.is_trustworthy` is false whenever anything critical fired, so an agent
+knows to stop reading the metrics as meaningful. The rule table and the JSON
+schema are in [`docs/backtest-report.md`](docs/backtest-report.md).
+
 ---
 
 ## Sending signals to the broker
@@ -206,6 +244,8 @@ from anywhere but your laptop; mutating endpoints then require `X-API-KEY`.
 | `GET /signals/cycle/{uxid}` | One whole trade cycle, oldest first — the reconciliation view. |
 | `POST /backtest/run` | Replay a strategy and get the report back. |
 | `GET /backtest/runs`, `GET /backtest/history` | Past runs; parquet on disk. |
+| `GET /backtest/reports` | Report files, newest first. |
+| `GET /backtest/reports/{name}` | One report whole — how an agent fetches it without filesystem access. |
 | `POST /admin/shadow-mode` | Pause or resume delivery across every running runner. |
 
 Interactive docs at `/docs`.
