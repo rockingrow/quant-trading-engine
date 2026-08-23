@@ -1,0 +1,94 @@
+# QTE local/VPS stack.
+#
+# `nats` here is for standalone development. In production you normally point
+# QTE_BROKER__NATS_URL at the *broker's* NATS, because that is where the
+# JetStream `SIGNALS` stream its workers consume actually lives — publishing to
+# a second cluster would mean nobody ever receives the signals. Run this one
+# either way for QTE's own candle traffic, or set QTE_NATS__URL to the broker's
+# cluster and drop this service.
+
+name: qte
+
+x-app: &app
+  build:
+    context: .
+    dockerfile: Dockerfile
+  env_file: [.env]
+  restart: unless-stopped
+  volumes:
+    # The private strategy repo, mounted read-only: the engine loads it and
+    # can never write to it.
+    - ./user_strategies:/app/user_strategies:ro
+    - ./data/parquet:/app/data/parquet
+  depends_on:
+    redis-cache: {condition: service_healthy}
+    postgres-audit: {condition: service_healthy}
+    nats: {condition: service_started}
+
+services:
+  redis-cache:
+    image: redis:7-alpine
+    # AOF on: hot state (open cycles, the warm-up window) has to survive a
+    # restart, and losing the cycle id of an open position means the engine
+    # forgets which trade it is in.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redis-data:/data
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  postgres-audit:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-qte}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-qte}
+      POSTGRES_DB: ${POSTGRES_DB:-qte_audit}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # Runs only on an empty volume. Changing the schema later means a
+      # migration, not an edit to this file.
+      - ./deploy/postgres/init:/docker-entrypoint-initdb.d:ro
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-qte} -d ${POSTGRES_DB:-qte_audit}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  nats:
+    image: nats:2-alpine
+    command: ["-c", "/etc/nats/nats.conf"]
+    volumes:
+      - ./deploy/nats/nats.conf:/etc/nats/nats.conf:ro
+      - nats-data:/data
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+
+  data-ingestion:
+    <<: *app
+    command: ["qte-ingestion"]
+
+  strategy-runner:
+    <<: *app
+    command: ["qte-strategy-runner"]
+
+  api-gateway:
+    <<: *app
+    command: ["qte-api"]
+    ports: ["${QTE_API__PORT:-8000}:8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status == 200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+volumes:
+  redis-data:
+  postgres-data:
+  nats-data:

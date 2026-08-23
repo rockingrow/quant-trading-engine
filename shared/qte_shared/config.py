@@ -1,0 +1,157 @@
+"""Process configuration, read once from the environment / ``.env``.
+
+Every service imports :data:`settings`. Nested blocks use their own env
+prefixes (``QTE_NATS__URL``, ``QTE_BROKER__TOKEN``, …) so a section can be
+overridden wholesale in compose without touching the rest.
+"""
+
+from __future__ import annotations
+
+from functools import lru_cache
+from pathlib import Path
+from typing import Literal
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+class NatsSettings(BaseSettings):
+    """QTE's own internal event bus (candles, ticks, engine control)."""
+
+    model_config = SettingsConfigDict(env_prefix="QTE_NATS__", extra="ignore")
+
+    url: str = "nats://localhost:4222"
+    token: str = ""
+    subject_prefix: str = "QTE"
+    connect_timeout: float = 5.0
+    max_reconnect_attempts: int = -1
+    reconnect_time_wait: float = 2.0
+
+
+class BrokerSettings(BaseSettings):
+    """How signals reach ``algo-trading-broker``.
+
+    ``transport="nats"`` publishes the webhook envelope straight onto the
+    broker's JetStream ``SIGNALS.<strategy>`` subject — the same buffer its own
+    HTTP endpoint writes to, minus the HTTP hop. ``transport="http"`` POSTs to
+    ``/secret/webhook`` instead, which is the path that also verifies ``token``.
+
+    ``nats_url`` defaults to empty meaning "reuse the internal QTE NATS URL",
+    which is the right answer when QTE and the broker share one NATS cluster.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="QTE_BROKER__", extra="ignore")
+
+    transport: Literal["nats", "http"] = "nats"
+    nats_url: str = ""
+    nats_token: str = ""
+    http_url: str = "http://localhost:8080"
+    token: str = ""
+    stream: str = "SIGNALS"
+    subject_prefix: str = "SIGNALS"
+    publish_timeout: float = 5.0
+    # Shadow mode is the safety catch from phase 6: the runner does everything
+    # it would do live — build the signal, log it, audit it — but stops short of
+    # handing it to the broker.
+    shadow_mode: bool = True
+
+
+class RedisSettings(BaseSettings):
+    """Hot state: last tick, in-flight candles, per-strategy position state."""
+
+    model_config = SettingsConfigDict(env_prefix="QTE_REDIS__", extra="ignore")
+
+    url: str = "redis://localhost:6379/0"
+    key_prefix: str = "qte"
+    candle_history: int = 500
+    ttl_seconds: int = 0
+
+
+class PostgresSettings(BaseSettings):
+    """Audit trail. JSONB rows, pgvector-ready, never on the hot path."""
+
+    model_config = SettingsConfigDict(env_prefix="QTE_POSTGRES__", extra="ignore")
+
+    dsn: str = "postgresql+asyncpg://qte:qte@localhost:5432/qte_audit"
+    pool_size: int = 5
+    max_overflow: int = 5
+    echo: bool = False
+    enabled: bool = True
+
+
+class TiingoSettings(BaseSettings):
+    """Market data source — REST for history, WebSocket for live."""
+
+    model_config = SettingsConfigDict(env_prefix="QTE_TIINGO__", extra="ignore")
+
+    api_key: str = ""
+    rest_url: str = "https://api.tiingo.com"
+    fx_ws_url: str = "wss://api.tiingo.com/fx"
+    crypto_ws_url: str = "wss://api.tiingo.com/crypto"
+    # Tiingo's WS "thresholdLevel": 5 = top-of-book quotes only, 0 = every trade.
+    fx_threshold: int = 5
+    crypto_threshold: int = 2
+    request_timeout: float = 30.0
+
+
+class EngineSettings(BaseSettings):
+    """What the running engine trades and how much history it keeps warm."""
+
+    model_config = SettingsConfigDict(env_prefix="QTE_ENGINE__", extra="ignore")
+
+    symbols: list[str] = Field(default_factory=lambda: ["XAUUSD", "BTCUSDT"])
+    timeframes: list[str] = Field(default_factory=lambda: ["M1", "M15"])
+    signal_timeframe: str = "M15"
+    warmup_candles: int = 300
+    strategies_dir: Path = REPO_ROOT / "user_strategies"
+    parquet_dir: Path = REPO_ROOT / "data" / "parquet"
+
+
+class ApiSettings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="QTE_API__", extra="ignore")
+
+    host: str = "0.0.0.0"
+    port: int = 8000
+    api_key: str = ""
+    cors_origins: list[str] = Field(default_factory=list)
+
+
+class Settings(BaseSettings):
+    """Root settings object — import :data:`settings`, not this class."""
+
+    model_config = SettingsConfigDict(
+        env_file=(REPO_ROOT / ".env"),
+        env_file_encoding="utf-8",
+        env_prefix="QTE_",
+        extra="ignore",
+    )
+
+    env: Literal["dev", "staging", "prod"] = "dev"
+    log_level: str = "INFO"
+
+    nats: NatsSettings = Field(default_factory=NatsSettings)
+    broker: BrokerSettings = Field(default_factory=BrokerSettings)
+    redis: RedisSettings = Field(default_factory=RedisSettings)
+    postgres: PostgresSettings = Field(default_factory=PostgresSettings)
+    tiingo: TiingoSettings = Field(default_factory=TiingoSettings)
+    engine: EngineSettings = Field(default_factory=EngineSettings)
+    api: ApiSettings = Field(default_factory=ApiSettings)
+
+    @property
+    def broker_nats_url(self) -> str:
+        """Where to publish signals — the broker's own NATS, or ours if shared."""
+        return self.broker.nats_url or self.nats.url
+
+    @property
+    def broker_nats_token(self) -> str:
+        return self.broker.nats_token or self.nats.token
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    return Settings()
+
+
+settings = get_settings()

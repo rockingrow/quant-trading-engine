@@ -1,0 +1,57 @@
+[project]
+name = "quant-trading-engine"
+version = "0.1.0"
+description = "Event-driven quant trading engine: ingestion, backtest, live strategy runner, signal broker bridge."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "qte-shared",
+    "qte-ingestion",
+    "qte-backtest",
+    "qte-strategy-engine",
+    "qte-api",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+    "httpx>=0.27",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["shared", "data-ingestion", "backtest-engine", "strategy-engine", "api-gateway"]
+
+[tool.uv.sources]
+qte-shared = { workspace = true }
+qte-ingestion = { workspace = true }
+qte-backtest = { workspace = true }
+qte-strategy-engine = { workspace = true }
+qte-api = { workspace = true }
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = ["user_strategies"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = [
+    # FastAPI's Depends()/Query() defaults are the framework's own idiom.
+    "B008",
+    # StrategyBase.on_start/on_stop are optional hooks with a no-op default,
+    # not abstract methods a plugin must implement.
+    "B027",
+    # The enums mirror algo-trading-broker's `(str, Enum)` declarations. StrEnum
+    # would change what str() returns and drift the wire format from theirs.
+    "UP042",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]

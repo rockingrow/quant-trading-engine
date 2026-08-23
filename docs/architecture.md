@@ -1,0 +1,81 @@
+# Architecture notes
+
+Decisions that are easy to reverse by accident, and why they are the way they
+are.
+
+## Why two NATS namespaces
+
+`QTE.*` is ours — ticks and candle closes, on **core** NATS. At twenty ticks a
+second a dropped message is replaced by a fresher one immediately, so paying
+JetStream's persistence cost for market data buys nothing.
+
+`SIGNALS.<strategy>` is the **broker's**, on JetStream. Losing a signal loses a
+trade. Different guarantees, different transport, and the split is why the
+engine can be casual about one and careful about the other.
+
+In production both usually live on the same cluster (the broker's). QTE keeps
+two configurable URLs anyway, because "the market data bus" and "the order bus"
+are not the same concern and one day they may not be the same server.
+
+## Why a bar closes on the clock, not on the next tick
+
+A resampler that closes a bar when the *next* tick arrives publishes the M15
+candle two minutes late in a thin session — and every worker downstream expected
+it on the quarter hour. `Resampler.flush(now)` runs on a timer and closes any
+bucket the clock has passed, regardless of feed activity. A bucket with no ticks
+produces no candle: forward-filling a flat synthetic bar would feed strategies a
+body that never traded, which corrupts any indicator with a range in it.
+
+## Why Redis holds state that Postgres does not
+
+Redis is the hot path's memory: the last tick, the warm-up window, the open
+cycle id per (strategy, symbol). It runs with AOF on, so a restart loses at most
+the last write. The runner rebuilds its indicator window from Redis on boot
+instead of waiting hours for live candles, which is what makes a restart resume
+trading on the next close.
+
+Postgres is the audit trail — written *after* the signal has gone out, and its
+failures are logged rather than raised. A logging outage must not become a
+runner that stops trading.
+
+## Why the strategy returns intents instead of publishing
+
+Three things a strategy is not allowed to own, all in `SignalFactory`:
+
+1. **Cycle ids** — an entry mints one, every close reuses it. Getting this wrong
+   makes the broker render an exit as an unrelated trade.
+2. **The bracket** — SL/TP from the intent when set, from ATR/percentage
+   defaults when not, so "never send a naked entry" is enforced in one place.
+3. **Timeframe spelling** — QTE says `M15`, the broker's contract says `"15"`.
+
+Because both drivers go through the factory, a signal in a backtest report is
+byte-identical to the one a worker would have executed. Reconciliation compares
+two rows, not two implementations.
+
+## Why the plugin loader imports by path
+
+`user_strategies/` is a mounted volume cloned from a private repo, not an
+installed distribution. Requiring it to be pip-installable would drag the
+private repo into the public build. A module that fails to import is logged and
+skipped — one broken strategy file should not stop the other four from trading.
+
+Duplicate strategy names are an error, not a warning to skim past: workers
+subscribe by strategy name, so two algorithms sharing one would execute against
+each other's positions.
+
+## Why the API comes up degraded
+
+A control plane that refuses to start because NATS is down cannot tell anyone
+that NATS is down. `/health` reports per-dependency state and says `degraded`;
+the process stays up.
+
+Relatedly, `NatsBus.connect` bounds the *initial* connect even though reconnects
+are unlimited: nats-py applies `max_reconnect_attempts` to both, so `-1` (what a
+live feed wants) would make a first connect against a dead server hang forever.
+
+## Why the fill simulator is pessimistic
+
+Listed in the README. The one worth repeating: when a bar's range covers both
+the stop and the target, the simulator takes the **stop**. Without tick data
+there is no ordering, and assuming the favourable one is precisely how a losing
+strategy backtests profitably.
