@@ -137,3 +137,66 @@ def test_entry_with_zero_quantity_is_rejected():
     )
     with pytest.raises(ValueError, match="positive"):
         entry.validate_shape()
+
+
+# ── Bracket orientation ───────────────────────────────────────────────────
+#
+# `BracketPolicy` derives targets from `abs(price - sl)`, so it mirrors a
+# wrong-side stop rather than refusing it — and with the default first target
+# one R away, an inverted stop puts TP1 exactly on the stop. The broker's
+# schema takes any three numbers, so this is the last place to catch it.
+
+
+def _bracketed(action: SignalAction, **levels: float) -> BrokerSignal:
+    return BrokerSignal(
+        strategy="s",
+        symbol="XAUUSD",
+        timeframe="15",
+        position=PositionBlock(action=action, quantity=1.0, **levels),
+        token="t",
+    )
+
+
+def test_long_with_its_stop_above_the_entry_is_rejected():
+    signal = _bracketed(SignalAction.LONG, price=2400.0, sl=2450.0)
+    with pytest.raises(ValueError, match="not below the entry"):
+        signal.validate_shape()
+
+
+def test_short_with_its_stop_below_the_entry_is_rejected():
+    signal = _bracketed(SignalAction.SHORT, price=2400.0, sl=2350.0)
+    with pytest.raises(ValueError, match="not above the entry"):
+        signal.validate_shape()
+
+
+def test_long_with_a_target_below_the_entry_is_rejected():
+    signal = _bracketed(SignalAction.LONG, price=2400.0, sl=2390.0, tp1=2380.0)
+    with pytest.raises(ValueError, match=r"tp1 at 2380.0.*not above the entry"):
+        signal.validate_shape()
+
+
+def test_short_with_a_target_above_the_entry_is_rejected():
+    signal = _bracketed(SignalAction.SHORT, price=2400.0, sl=2410.0, tp2=2420.0)
+    with pytest.raises(ValueError, match=r"tp2 at 2420.0.*not below the entry"):
+        signal.validate_shape()
+
+
+def test_a_correctly_oriented_bracket_passes_both_ways():
+    _bracketed(SignalAction.LONG, price=2400.0, sl=2390.0, tp1=2410.0, tp2=2420.0).validate_shape()
+    _bracketed(SignalAction.SHORT, price=2400.0, sl=2410.0, tp1=2390.0, tp2=2380.0).validate_shape()
+
+
+def test_a_stop_at_the_entry_is_allowed():
+    """Degenerate, not wrong — a stop moved to breakeven lands exactly here."""
+    _bracketed(SignalAction.LONG, price=2400.0, sl=2400.0).validate_shape()
+
+
+def test_an_entry_carrying_no_bracket_at_all_still_passes():
+    """The bracket is optional on the wire; only its orientation is checked."""
+    _bracketed(SignalAction.LONG, price=2400.0).validate_shape()
+
+
+def test_a_close_is_not_bracket_checked():
+    """TP1 closes a long *above* its entry, but the close carries no entry to
+    compare against — only entries are oriented."""
+    _bracketed(SignalAction.TP1, price=2450.0, sl=2390.0).validate_shape()

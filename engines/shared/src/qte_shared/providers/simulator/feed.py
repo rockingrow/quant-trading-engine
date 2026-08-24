@@ -136,7 +136,20 @@ class SimulatorLiveFeed(LiveFeed):
                 log.warning("Simulator sent an unusable tick frame: %s", frame)
                 return
             self.ticks_received += 1
-            await self._on_tick(tick)
+            # The handler's failures are the handler's. Letting one reach the
+            # connect loop would tear down a healthy socket, lose every tick
+            # sent during the backoff, and log it as the simulator dropping the
+            # feed — sending whoever reads that log to the wrong service.
+            try:
+                await self._on_tick(tick)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception(
+                    "Tick handler failed symbol=%s ts=%s — the feed stays open",
+                    tick.symbol,
+                    tick.ts.isoformat(),
+                )
         elif kind == "error":
             log.error("Simulator refused a frame: %s", frame.get("message"))
         elif kind in ("welcome", "subscribed"):

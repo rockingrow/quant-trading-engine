@@ -150,13 +150,25 @@ class IngestionService:
                 await self.state.set_open_candle(open_candle)
 
     async def _flush_loop(self) -> None:
-        """Close bars on the clock so a quiet market still produces candles."""
+        """Close bars on the clock so a quiet market still produces candles.
+
+        One failed cycle costs one interval, never the loop. This task is the
+        only thing that closes a bar in a market too quiet to push the bucket
+        over with a tick, and nothing awaits it until :meth:`stop` — so an
+        exception escaping here would end wall-clock closing for the life of
+        the process, with the service still looking healthy.
+        """
         while not self._stopping.is_set():
             await asyncio.sleep(ingestion_settings.flush_interval)
-            now = datetime.now(UTC)
-            for resampler in self._resamplers.values():
-                for candle in resampler.flush(now):
-                    await self._emit_candle(candle)
+            try:
+                now = datetime.now(UTC)
+                for resampler in self._resamplers.values():
+                    for candle in resampler.flush(now):
+                        await self._emit_candle(candle)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Flush cycle failed — retrying at the next interval")
 
     async def _emit_candle(self, candle: Candle) -> None:
         await self.state.push_candle(candle)
