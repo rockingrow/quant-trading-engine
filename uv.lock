@@ -12,6 +12,7 @@ members = [
     "qte-backtest",
     "qte-ingestion",
     "qte-shared",
+    "qte-simulator",
     "qte-strategy-audit",
     "qte-strategy-engine",
     "quant-trading-engine",
@@ -445,11 +446,11 @@ name = "qte-ingestion"
 version = "0.1.0"
 source = { editable = "engines/data_ingestion" }
 dependencies = [
-    { name = "qte-shared", extra = ["tiingo"] },
+    { name = "qte-shared", extra = ["simulator", "tiingo"] },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "qte-shared", extras = ["tiingo"], editable = "engines/shared" }]
+requires-dist = [{ name = "qte-shared", extras = ["tiingo", "simulator"], editable = "engines/shared" }]
 
 [[package]]
 name = "qte-shared"
@@ -469,6 +470,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+simulator = [
+    { name = "websockets" },
+]
 tiingo = [
     { name = "httpx" },
     { name = "websockets" },
@@ -487,9 +491,21 @@ requires-dist = [
     { name = "pydantic-settings", specifier = ">=2.3" },
     { name = "redis", specifier = ">=5.0" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0" },
+    { name = "websockets", marker = "extra == 'simulator'", specifier = ">=12.0" },
     { name = "websockets", marker = "extra == 'tiingo'", specifier = ">=12.0" },
 ]
-provides-extras = ["tiingo"]
+provides-extras = ["tiingo", "simulator"]
+
+[[package]]
+name = "qte-simulator"
+version = "0.1.0"
+source = { editable = "engines/market_simulator" }
+dependencies = [
+    { name = "qte-shared", extra = ["simulator"] },
+]
+
+[package.metadata]
+requires-dist = [{ name = "qte-shared", extras = ["simulator"], editable = "engines/shared" }]
 
 [[package]]
 name = "qte-strategy-audit"
@@ -527,6 +543,7 @@ dependencies = [
     { name = "qte-backtest" },
     { name = "qte-ingestion" },
     { name = "qte-shared" },
+    { name = "qte-simulator" },
     { name = "qte-strategy-audit" },
     { name = "qte-strategy-engine" },
 ]
@@ -544,6 +561,7 @@ requires-dist = [
     { name = "qte-backtest", editable = "engines/backtest_engine" },
     { name = "qte-ingestion", editable = "engines/data_ingestion" },
     { name = "qte-shared", editable = "engines/shared" },
+    { name = "qte-simulator", editable = "engines/market_simulator" },
     { name = "qte-strategy-audit", editable = "engines/strategy_audit" },
     { name = "qte-strategy-engine", editable = "engines/strategy_engine" },
 ]

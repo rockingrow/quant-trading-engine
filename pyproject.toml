@@ -16,6 +16,7 @@ dependencies = [
     "qte-backtest",
     "qte-strategy-engine",
     "qte-strategy-audit",
+    "qte-simulator",
 ]
 
 [dependency-groups]
@@ -44,6 +45,7 @@ qte-ingestion = { workspace = true }
 qte-backtest = { workspace = true }
 qte-strategy-engine = { workspace = true }
 qte-strategy-audit = { workspace = true }
+qte-simulator = { workspace = true }
 
 [tool.ruff]
 line-length = 100

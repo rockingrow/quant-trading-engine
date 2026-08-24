@@ -17,7 +17,14 @@ ENGINES = REPO_ROOT / "engines"
 
 #: Every workspace member, so a new engine is covered by these checks the
 #: moment it exists rather than whenever someone remembers to list it.
-ALL_ENGINES = ("shared", "data_ingestion", "backtest_engine", "strategy_engine", "strategy_audit")
+ALL_ENGINES = (
+    "shared",
+    "data_ingestion",
+    "backtest_engine",
+    "strategy_engine",
+    "strategy_audit",
+    "market_simulator",
+)
 
 #: The leaves. `shared` is the hub every one of them depends on.
 LEAF_ENGINES = tuple(name for name in ALL_ENGINES if name != "shared")
@@ -86,6 +93,7 @@ def test_no_engine_depends_on_another_engine_except_through_shared():
         "qte-backtest": "backtest_engine",
         "qte-strategy-engine": "strategy_engine",
         "qte-strategy-audit": "strategy_audit",
+        "qte-simulator": "market_simulator",
     }
     for engine in LEAF_ENGINES:
         for dep in _dependencies(engine):
@@ -119,6 +127,20 @@ def test_compose_builds_a_different_image_per_service():
     compose = (REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     assert "QTE_PACKAGE: qte-ingestion" in compose
     assert "QTE_PACKAGE: qte-strategy-engine" in compose
+    assert "QTE_PACKAGE: qte-simulator" in compose
+
+
+def test_the_simulator_is_behind_a_compose_profile():
+    """`docker compose up` must not start a service that invents prices.
+
+    The dev-env guard would refuse it anywhere but QTE_ENV=dev — but a stack
+    that starts it *in* dev alongside the real feed gives two sources for one
+    symbol, and the resampler drops whichever arrives second as a late tick.
+    Starting it is a decision, so it takes a flag.
+    """
+    compose = (REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    simulator = compose.split("market-simulator:", 1)[1]
+    assert 'profiles: ["dev"]' in simulator.split("\n\n", 1)[0]
 
 
 def test_the_lockfile_points_at_the_renamed_engine_folders():

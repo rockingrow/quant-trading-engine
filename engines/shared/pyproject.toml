@@ -24,6 +24,12 @@ tiingo = [
     "httpx>=0.27",
     "websockets>=12.0",
 ]
+# The dev-only simulator's feed is a WebSocket client like any vendor's, so it
+# is an extra like any vendor's — an image that never talks to the simulator
+# does not install a socket stack for it.
+simulator = [
+    "websockets>=12.0",
+]
 
 [build-system]
 requires = ["hatchling"]

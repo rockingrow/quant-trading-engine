@@ -37,6 +37,9 @@ log = get_logger(__name__)
 #: until something actually asks for that vendor.
 _BUILTINS: dict[str, str] = {
     "tiingo": "qte_shared.providers.tiingo.provider:TiingoProvider",
+    # A fixture, not a vendor: it serves whatever `qte-simulator` is told to
+    # send, and refuses to be constructed outside QTE_ENV=dev.
+    "simulator": "qte_shared.providers.simulator.provider:SimulatorProvider",
 }
 
 #: name -> class, or "module:Class" for the not-yet-imported built-ins.

@@ -34,6 +34,7 @@ COPY engines/data_ingestion/pyproject.toml engines/data_ingestion/
 COPY engines/backtest_engine/pyproject.toml engines/backtest_engine/
 COPY engines/strategy_engine/pyproject.toml engines/strategy_engine/
 COPY engines/strategy_audit/pyproject.toml engines/strategy_audit/
+COPY engines/market_simulator/pyproject.toml engines/market_simulator/
 
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-install-workspace --no-dev --package ${QTE_PACKAGE}
