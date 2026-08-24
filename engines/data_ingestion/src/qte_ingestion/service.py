@@ -58,7 +58,7 @@ class IngestionService:
         self._flush_task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
 
-    # ── Lifecycle ──────────────────────────────────────────────────
+    # ── Lifecycle ─────────────────────────────────────────────────────
 
     async def start(self) -> None:
         await self.bus.connect()
@@ -131,7 +131,7 @@ class IngestionService:
                         candle.open_time,
                     )
 
-    # ── Tick path ──────────────────────────────────────────────────
+    # ── Tick path ─────────────────────────────────────────────────────
 
     async def _handle_tick(self, tick: Tick) -> None:
         await self.state.set_last_tick(tick)

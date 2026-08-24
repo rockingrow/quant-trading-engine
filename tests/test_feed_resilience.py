@@ -35,7 +35,7 @@ def _frame(price: float) -> str:
     return json.dumps(encode_tick(tick, seq=1))
 
 
-# ── The simulator feed ──────────────────────────────────────────────
+# ── The simulator feed ────────────────────────────────────────────────────
 
 
 async def test_a_raising_handler_does_not_stop_the_simulator_feed():
@@ -65,7 +65,7 @@ async def test_a_cancelled_handler_still_propagates():
         await feed._handle_raw(_frame(2400.0))
 
 
-# ── The vendor feed, which has the identical shape ───────────────────────
+# ── The vendor feed, which has the identical shape ────────────────────────
 
 
 async def test_a_raising_handler_does_not_stop_the_tiingo_feed():
@@ -88,7 +88,7 @@ async def test_a_raising_handler_does_not_stop_the_tiingo_feed():
     assert len(seen) == 3
 
 
-# ── The ingestion flush loop ───────────────────────────────────────
+# ── The ingestion flush loop ──────────────────────────────────────────────
 
 
 async def test_a_failed_publish_costs_one_cycle_not_the_flush_loop(monkeypatch):

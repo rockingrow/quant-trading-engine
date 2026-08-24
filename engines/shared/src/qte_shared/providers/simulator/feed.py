@@ -55,7 +55,7 @@ class SimulatorLiveFeed(LiveFeed):
         #: first thing worth knowing when a candle does not appear.
         self.ticks_received = 0
 
-    # ── Lifecycle ──────────────────────────────────────────────────
+    # ── Lifecycle ─────────────────────────────────────────────────────
 
     @property
     def symbols(self) -> tuple[str, ...]:
@@ -83,7 +83,7 @@ class SimulatorLiveFeed(LiveFeed):
                 pass
             self._task = None
 
-    # ── Connect loop ───────────────────────────────────────────────
+    # ── Connect loop ──────────────────────────────────────────────────
 
     async def _run(self) -> None:
         attempt = 0
