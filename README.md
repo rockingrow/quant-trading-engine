@@ -5,7 +5,8 @@ trading strategies. The engine is public; **your alpha is not** — strategies
 live in `__strategies__/`, which is git-ignored here and cloned from your own
 private repository at deploy time.
 
-QTE ingests market data from a pluggable provider (Tiingo ships with it),
+QTE ingests market data from a pluggable provider (Tiingo ships with it, and
+a dev-only simulator you drive by hand),
 keeps hot state in Redis, audits every
 signal into PostgreSQL, and publishes trade signals over NATS
 to [`algo-trading-broker`](https://github.com/rockingrow/algo-trading-broker),
@@ -79,6 +80,20 @@ make download                 # provider history → data/parquet/*.parquet
 make backtest STRATEGY=QTE_EXAMPLE_EMA_ATR SYMBOL=XAUUSD
 ```
 
+To rehearse the *live* path instead — with no vendor key and no market open —
+set `QTE_MARKET_DATA__PROVIDER=simulator` and drive the feed yourself:
+
+```bash
+make sim                      # terminal 1: the dev websocket feed
+make ingestion                # terminal 2
+make runner                   # terminal 3
+
+qte-simulator replay --symbol XAUUSD --generate 300 --seed 7 --verify
+# → 300/300 candles republished by ingestion
+```
+
+[`docs/simulator.md`](docs/simulator.md) is the step-by-step.
+
 Requires Python 3.13, [uv](https://docs.astral.sh/uv/), and Docker. The
 version is pinned rather than a floor: the runner imports the strategy
 plugins into its own process, and `pandas-ta` — which they use — needs
@@ -94,6 +109,7 @@ plugins into its own process, and `pandas-ta` — which they use — needs
 | `engines/data_ingestion/src/qte_ingestion/` | Provider live feed → resampler → Redis + NATS. |
 | `engines/backtest_engine/src/qte_backtest/` | History downloader, parquet store, replay loop, fill simulator, metrics, reports, `qte-backtest` CLI. |
 | `engines/strategy_engine/src/qte_strategy_engine/` | The live runner: plugin loading, the NATS event loop, delivery to the broker, audit, and the `qte-control` operator CLI. |
+| `engines/market_simulator/src/qte_simulator/` | **Dev only.** A WebSocket feed you drive by hand, so the whole pipeline can be rehearsed with no market open. Refuses to start unless `QTE_ENV=dev`. `qte-simulator`; see [`docs/simulator.md`](docs/simulator.md). |
 | `engines/strategy_audit/src/qte_strategy_audit/` | The deploy gate: validates every strategy in `__strategies__/` against the QTE signal contract and cross-checks the routing table. `qte-strategy-audit`. |
 | `__strategies__/` | **Git-ignored and untracked.** Your private strategy repo, cloned in whole — its own lockfile, its own tests, its own release cycle. Absent from a fresh checkout by design. |
 | `config/` | `strategies_mapping.example.toml` — the symbol → strategies table's schema. The real `strategies_mapping.toml` beside it is git-ignored. Also the standalone NATS config. |
@@ -517,6 +533,57 @@ schema are in [`docs/backtest-report.md`](docs/backtest-report.md).
 
 ---
 
+## Rehearsing the live path (dev only)
+
+The backtest replays history through a strategy. It does not exercise the
+socket, the resampler, Redis, NATS, the runner's warm-up, or the broker sink —
+which is most of what runs in production and all of what breaks at 3am.
+
+`qte-simulator` is a WebSocket server that speaks a market feed. `data-ingestion`
+connects to it exactly as it connects to a vendor, so the pipeline under test is
+the real one and only the prices are invented:
+
+```bash
+QTE_MARKET_DATA__PROVIDER=simulator   # the whole switch
+
+make sim                              # the feed
+qte-simulator tick   --symbol XAUUSD --bid 2400.0 --ask 2400.4
+qte-simulator bar    --symbol XAUUSD --open 2400 --high 2412.5 --low 2396.25 \
+                     --close 2408.75 --verify
+qte-simulator replay --symbol XAUUSD --generate 300 --seed 7 --verify --expect-signal
+qte-simulator walk   --symbol XAUUSD --rate 5
+```
+
+A bar is not published as a candle — it is expanded into the four ticks a bar is
+made of, and ingestion's own resampler rebuilds it. `--verify` then subscribes to
+`QTE.candle.closed.<symbol>.<tf>` and compares what came back, field by field,
+exiting non-zero on a mismatch:
+
+```
+Played 300 XAUUSD M15 bars as 1201 ticks → 1 feed client(s)
+
+Verify  300/300 candles republished by ingestion
+Signals 1 emitted on XAUUSD
+  QTE_EXAMPLE_EMA_ATR LONG price=2525.638811 qty=0.01 sl=2504.94991 [shadow]
+```
+
+**It refuses to run outside `QTE_ENV=dev`, and so does the provider that reads
+it.** Not a comment or a naming convention — `qte_shared.dev_only.require_dev_env`
+is called before the server binds a port and before the provider is constructed,
+with no override flag. A simulator looks exactly like a feed, so an engine wired
+to one in production would trade fabricated prices and log nothing unusual doing
+it; the refusal has to sit where the wiring happens.
+
+`docker-compose.yml` keeps it behind the `dev` profile (`make sim-up`), because
+starting it *alongside* a real feed gives one symbol two sources and the
+resampler drops whichever tick arrives second.
+
+The step-by-step — including how bars are placed on the clock, why that is not
+cosmetic, and what to check when a candle does not arrive — is
+[`docs/simulator.md`](docs/simulator.md).
+
+---
+
 ## Sending signals to the broker
 
 QTE emits exactly the payload `algo-trading-broker` validates — its
@@ -573,6 +640,7 @@ Everything else the engine knows is a CLI command or a SQL query:
 | One trade cycle end to end | `SELECT * FROM signals WHERE signal_uxid = '…' ORDER BY created_at` |
 | Backtest a strategy | `uv run qte-backtest run --strategy … --symbol … --report` |
 | Read a report | `data/reports/*.json` — the file an agent analyses |
+| Rehearse the live path | `make sim`, then `qte-simulator replay --symbol … --generate 300 --verify` (dev only) |
 
 ## Database
 
@@ -652,6 +720,9 @@ member, so the ingestion container does not carry pyarrow (152 MB, backtest
 only) or the backtest engine at all. A full-workspace venv is 352 MB; each
 service's is ~142 MB.
 
+The simulator is one of those images and sits behind the `dev` compose profile,
+so `docker compose up` never starts it. `make sim-up` does, in dev.
+
 The backtest CLI is deliberately in neither container — replaying history is
 done on the host with `make backtest`, not inside the live trading process.
 Alembic is in both, because any container that can reach the database should be
@@ -697,6 +768,12 @@ ingress. Fix the model, not the test.
 make strategy-test   # the mounted plugin repo's own suite, in its own venv
 ```
 
+`make check` covers the engine's logic. What it cannot cover is the wiring —
+the socket, the resampler, Redis, NATS, the runner's warm-up — because a unit
+test that stood those up would be standing up the system. `qte-simulator` is
+how that gets exercised instead, on demand, in dev:
+[`docs/simulator.md`](docs/simulator.md).
+
 That one is deliberately separate. The strategy repository has its own
 lockfile, its own Python and its own tests; running them from here would mean
 its results depended on this repo's environment, which is the coupling the
@@ -715,6 +792,14 @@ A strategy *repository* is free to decide otherwise — it owns its own
 dependencies, and the one in `__strategies__/` builds its indicators on
 `pandas_ta` where the library agrees with TradingView. That is exactly the point
 of the seam: neither side has to win the argument.
+
+---
+
+## Releases
+
+[`changelog.md`](changelog.md) — Keep a Changelog format, semantic versioning.
+Pre-1.0: the broker payload contract is pinned by tests, but the plugin and
+provider interfaces may still move.
 
 ---
 

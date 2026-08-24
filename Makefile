@@ -123,6 +123,42 @@ ingestion: ## Run the ingestion service locally
 runner: ## Run the strategy runner locally
 	uv run qte-strategy-runner
 
+# ── Dev market data simulator ───────────────────────────────────────────
+#
+# A WebSocket feed you drive by hand, so the whole pipeline can be rehearsed
+# without a market being open. Refuses to run unless QTE_ENV=dev. The full
+# walkthrough is docs/simulator.md.
+
+SIM_SYMBOL ?= XAUUSD
+SIM_TF     ?= M15
+SIM_BARS   ?= 300
+
+sim: ## Run the dev websocket market data simulator (QTE_ENV=dev only)
+	uv run qte-simulator serve
+
+sim-up: ## Same, in compose, on the dev profile
+	docker compose --profile dev up -d --build market-simulator
+
+sim-status: ## What the simulator is doing, and who is attached to it
+	uv run qte-simulator status
+
+sim-replay: ## Warm the engine: make sim-replay [SIM_SYMBOL=XAUUSD] [SIM_BARS=300]
+	uv run qte-simulator replay --symbol $(SIM_SYMBOL) --timeframe $(SIM_TF) \
+		--generate $(SIM_BARS) --seed 7
+
+sim-bar: ## Send one bar and check the candle comes back: make sim-bar O=.. H=.. L=.. C=..
+	uv run qte-simulator bar --symbol $(SIM_SYMBOL) --timeframe $(SIM_TF) \
+		--open $(O) --high $(H) --low $(L) --close $(C) --verify
+
+sim-walk: ## Stream a live-ish random walk until stopped
+	uv run qte-simulator walk --symbol $(SIM_SYMBOL) --rate 5
+
+sim-stop: ## Stop every background generator
+	uv run qte-simulator stop
+
+sim-watch: ## Tail closed candles and emitted signals on NATS
+	uv run qte-simulator watch --symbol $(SIM_SYMBOL) --timeframe $(SIM_TF)
+
 shadow-status: ## Show whether signals are reaching the broker
 	uv run qte-control shadow status
 
@@ -139,4 +175,5 @@ ping: ## Ask the running runners to identify themselves
 	strategy-deps strategy-requirements strategy-test strategies audit audit-strict routing \
 	db-upgrade db-downgrade db-revision db-current db-history db-check \
 	download history backtest reports ingestion runner csv-import \
+	sim sim-up sim-status sim-replay sim-bar sim-walk sim-stop sim-watch \
 	shadow-status shadow-on shadow-off ping

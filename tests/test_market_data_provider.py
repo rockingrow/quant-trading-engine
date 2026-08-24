@@ -277,5 +277,24 @@ def test_no_engine_outside_the_providers_package_imports_a_vendor():
     assert not offenders, f"vendor reached outside qte_shared/providers: {offenders}"
 
 
+def test_only_the_simulator_engine_knows_the_simulator_provider_exists():
+    """The one provider an engine may name, and only the engine that serves it.
+
+    `qte-simulator` is the other half of `qte_shared.providers.simulator` — it
+    is the server that provider dials — so it imports the shared wire protocol
+    on purpose. Every other engine must reach it the way it reaches any vendor:
+    through `create_provider`, by a name in configuration.
+    """
+    allowed = REPO_ROOT / "engines" / "market_simulator"
+    providers_dir = REPO_ROOT / "engines" / "shared" / "src" / "qte_shared" / "providers"
+    offenders: list[str] = []
+    for path in (REPO_ROOT / "engines").rglob("*.py"):
+        if providers_dir in path.parents or allowed in path.parents:
+            continue
+        if "qte_simulator" in path.read_text(encoding="utf-8"):
+            offenders.append(str(path.relative_to(REPO_ROOT)))
+    assert not offenders, f"the simulator reached outside its own engine: {offenders}"
+
+
 async def _noop(_tick) -> None:  # pragma: no cover - handler is never invoked here
     return None

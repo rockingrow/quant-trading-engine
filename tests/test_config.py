@@ -58,6 +58,7 @@ def test_every_workspace_member_is_an_engine():
     assert members == [
         "backtest_engine",
         "data_ingestion",
+        "market_simulator",
         "shared",
         "strategy_audit",
         "strategy_engine",

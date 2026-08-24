@@ -377,3 +377,86 @@ Three consequences are worth naming:
 `SymbolSpec` kept the part that is genuinely vendor-independent — which market a
 symbol trades on, since that decides which endpoint a provider reaches for — and
 lost `tiingo_ticker`, which is now `MarketDataProvider.ticker_for()`.
+
+## Why the simulator is a provider and not a test mode
+
+The provider seam above bought something that was not the point of building it:
+a fixture can be a *vendor*. `qte-simulator` is a WebSocket server; the thing
+ingestion connects to it with is an ordinary `MarketDataProvider` resolved out
+of the same registry as Tiingo. Pointing the pipeline at fabricated data is
+therefore `QTE_MARKET_DATA__PROVIDER=simulator` and nothing else — no branch in
+`IngestionService`, no `if testing` on the tick path, no second code path that
+can rot while nobody runs it.
+
+That is the whole argument for it. An end-to-end rehearsal is only worth
+running if the code it exercises is the code that trades, and every `if
+test_mode:` in a service is a place where those two diverge.
+
+**It sends ticks, never candles.** The server could publish
+`QTE.candle.closed` directly and skip ingestion entirely. Then the exercise
+would prove that the simulator can publish a candle, which nobody doubted. Bars
+are expanded into the four ticks a bar is made of and `qte_ingestion.resampler`
+rebuilds them, so the resampler — the component with the most arithmetic and
+the least visibility — is always in the path.
+
+**It serves `LIVE` and refuses `HISTORY`.** A backtest over invented bars would
+produce an equity curve, and an equity curve is read as evidence. The one thing
+worse than no backtest is a convincing fake of one.
+
+### Why the dev-env check is a function call
+
+`qte_shared.dev_only.require_dev_env` is called before the server binds a port
+and before the provider is constructed, and there is no override flag.
+
+A simulator is a component whose failure mode is silent and expensive: it looks
+exactly like a feed — same socket, same ticks, same candles — so an engine
+wired to one in production would trade synthetic prices and report nothing
+unusual while doing it. There is no log line that reads "these bars were
+invented". A comment or a naming convention does not survive a hurried
+deployment; a raised exception does. An escape hatch would be found and used by
+the first person in a hurry, and "we set `ALLOW_PROD=1` for a minute" is not a
+sentence anyone wants to read afterwards.
+
+### Why a replay anchors its bars in the future
+
+This is the least obvious thing in the simulator and the one most likely to be
+"fixed" by someone who has not hit it.
+
+A resampler closes a bar two ways: a tick lands in a later bucket, or the wall
+clock passes the bucket's end (`Resampler.flush`, on a timer). The second one
+exists so a quiet market still produces candles on schedule — see *Why a bar
+closes on the clock* above — and it is exactly what replaying historical
+timestamps runs into. Every bucket a replay fills is already over, so the flush
+timer can fire *between* two ticks of the same bar and publish half of it. Not
+rarely: three of every four inter-tick gaps are inside a bar, so a replay that
+runs for five seconds with a one-second flush interval corrupts roughly four
+bars.
+
+So the simulator keeps one forward series per symbol and every command
+continues it. `--anchor next`, the default, means *the first bucket nothing has
+been sent into yet*; the run marches forward from there, no bucket's end has
+passed, and the flush never touches them. Each bar is closed by the arrival of
+the next and the last by an explicit sealing tick. Deterministic at three
+hundred bars, which is what warming a strategy takes. `--anchor past` is kept
+because it exercises the other closing path — the flush — one bar at a time,
+where the exposure is the few hundred microseconds four ticks take to arrive.
+
+"The first bucket nothing has touched" rather than "the bucket after the last
+bar" on purpose: a loose `tick` is not a bar and does not move the bar cursor,
+but it does open a bucket in the resampler, and a bar placed in that bucket
+would inherit the tick's price as its open. The same reasoning makes an
+unstamped tick, and a `walk`, start from the later of the wall clock and the
+series — anything behind the bar the resampler holds open is dropped as late,
+loudly but dropped. The result is that the commands compose in any order, which
+they emphatically did not before.
+
+The price of all this is candle timestamps that run ahead of the clock, and a
+resampler left holding a bar in the future. Both are acceptable in a dev fixture
+and neither would be anywhere else, which is the same reason the guard above
+exists.
+
+Alternatives that were considered and are worse: throttling the replay (changes
+the exposure ratio, not the race); one tick per bar (loses the high and the
+low, so nothing with a range in it is being tested); and raising
+`QTE_INGESTION__FLUSH_INTERVAL` for the duration (a fixture that requires
+reconfiguring the service under test is a fixture testing something else).

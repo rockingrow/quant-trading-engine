@@ -226,6 +226,46 @@ class BrokerSignal(BaseModel):
                 )
             if self.position.quantity <= 0:
                 raise ValueError(f"quantity must be positive, got {self.position.quantity}")
+            self._validate_bracket()
+
+    def _validate_bracket(self) -> None:
+        """Refuse an entry whose stop or targets sit on the wrong side of it.
+
+        A long stopped above its own entry is stopped out on the fill, and
+        because the default first target is one R away, an inverted stop puts
+        TP1 *exactly on* the stop — an order no worker can resolve. Nothing
+        upstream catches it: ``BracketPolicy`` derives targets from
+        ``abs(price - sl)``, so it mirrors a wrong-side stop instead of
+        rejecting it, and the broker's schema is happy with any three numbers.
+
+        Cheap to hit — a sign error in an ATR stop, or a short's levels applied
+        to a long — and expensive to discover at the fill.
+        """
+        position = self.position
+        price = position.price
+        if price is None:
+            return
+
+        # A long loses below its entry and profits above it; a short is the
+        # mirror, so one sign flips every comparison. Equality is left alone —
+        # a level exactly at entry is degenerate but not wrong, and a stop
+        # moved to breakeven is a real thing.
+        long = position.action is SignalAction.LONG
+        side = "LONG" if long else "SHORT"
+        loss_side, profit_side = ("below", "above") if long else ("above", "below")
+        direction = 1.0 if long else -1.0
+
+        if position.sl is not None and (position.sl - price) * direction > 0:
+            raise ValueError(
+                f"{side} {self.symbol} entered at {price} has its stop at {position.sl}, "
+                f"which is not {loss_side} the entry — it would be stopped out on the fill"
+            )
+        for name, level in (("tp1", position.tp1), ("tp2", position.tp2)):
+            if level is not None and (level - price) * direction < 0:
+                raise ValueError(
+                    f"{side} {self.symbol} entered at {price} has {name} at {level}, "
+                    f"which is not {profit_side} the entry — that target is a loss"
+                )
 
     def to_envelope(self) -> dict[str, Any]:
         """Wrap into the JetStream envelope the broker's ``SignalWorker`` consumes."""

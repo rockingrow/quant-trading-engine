@@ -79,6 +79,12 @@ class Resampler:
         self.symbol = symbol
         self.timeframes = [normalize_timeframe(tf) for tf in timeframes]
         self._builders: dict[str, _BarBuilder] = {}
+        #: Open time of the last bucket published as closed, per timeframe.
+        #: The open builder cannot carry this: :meth:`flush` deletes it, and
+        #: without a mark that outlives it the next late tick for the same
+        #: bucket would open a *second* builder there and publish the bucket
+        #: again — the exact repaint the late-tick branch below exists to stop.
+        self._last_closed: dict[str, datetime] = {}
 
     # ── Feeding ───────────────────────────────────────────────────────
 
@@ -92,26 +98,41 @@ class Resampler:
         closed: list[Candle] = []
         for timeframe in self.timeframes:
             bucket = floor_to_bucket(tick.ts, timeframe)
+            last_closed = self._last_closed.get(timeframe)
+            if last_closed is not None and bucket <= last_closed:
+                # This bucket has already gone out as a closed candle. Whether
+                # it was closed by a later tick or by the flush timer, the bar
+                # is spent: strategies have acted on it.
+                self._log_late(timeframe, bucket, last_closed, reason="already closed")
+                continue
+
             builder = self._builders.get(timeframe)
             if builder is None:
                 self._builders[timeframe] = _BarBuilder(self.symbol, timeframe, bucket, price)
             elif bucket > builder.open_time:
                 closed.append(builder.snapshot(is_closed=True))
+                self._last_closed[timeframe] = builder.open_time
                 self._builders[timeframe] = _BarBuilder(self.symbol, timeframe, bucket, price)
             elif bucket < builder.open_time:
-                # Out-of-order tick from a reconnect replay: it belongs to a bar
-                # already published, and reopening that bar would repaint a
-                # candle strategies have acted on. Drop it and say so.
-                log.warning(
-                    "Dropping late tick symbol=%s tf=%s tick_bucket=%s open_bucket=%s",
-                    self.symbol,
-                    timeframe,
-                    bucket,
-                    builder.open_time,
-                )
+                # Out-of-order tick from a reconnect replay. Its bucket was
+                # never opened — the feed skipped it — but opening it now would
+                # publish a candle behind one already sent.
+                self._log_late(timeframe, bucket, builder.open_time, reason="behind the open bar")
                 continue
             self._builders[timeframe].update(price, tick.volume)
         return closed
+
+    def _log_late(
+        self, timeframe: str, bucket: datetime, boundary: datetime, *, reason: str
+    ) -> None:
+        log.warning(
+            "Dropping late tick symbol=%s tf=%s tick_bucket=%s boundary=%s (%s)",
+            self.symbol,
+            timeframe,
+            bucket,
+            boundary,
+            reason,
+        )
 
     def flush(self, now: datetime) -> list[Candle]:
         """Close every bar whose bucket has ended by *now*.
@@ -124,6 +145,7 @@ class Resampler:
             bucket_end = builder.open_time + timedelta(seconds=timeframe_seconds(timeframe))
             if now >= bucket_end:
                 closed.append(builder.snapshot(is_closed=True))
+                self._last_closed[timeframe] = builder.open_time
                 del self._builders[timeframe]
         return closed
 
@@ -141,6 +163,12 @@ class Resampler:
         """Resume a partially-built bar recovered from Redis after a restart."""
         timeframe = normalize_timeframe(candle.timeframe)
         if timeframe not in self.timeframes:
+            return
+        last_closed = self._last_closed.get(timeframe)
+        if last_closed is not None and candle.open_time <= last_closed:
+            # Redis held a bar this process has since closed. Restoring it would
+            # republish a bucket that has already gone out.
+            self._log_late(timeframe, candle.open_time, last_closed, reason="already closed")
             return
         builder = _BarBuilder(self.symbol, timeframe, candle.open_time, candle.open)
         builder.high = candle.high
