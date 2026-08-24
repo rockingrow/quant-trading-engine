@@ -16,7 +16,6 @@ common convention — it is slightly optimistic on a gap, and the gap handling i
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -25,7 +24,7 @@ import pandas as pd
 from qte_shared.logging_setup import get_logger
 from qte_shared.models import BrokerSignal, SignalAction
 from qte_shared.signal_factory import BracketPolicy, SignalFactory
-from qte_shared.strategy_base import SignalIntent, StrategyBase, StrategyContext
+from qte_shared.strategy_base import SignalIntent, StrategyContext, StrategyLike, as_intents
 from qte_shared.timeframes import timeframe_seconds
 
 from qte_backtest.execution import CostModel, ExitReason, FillSimulator, SimulatedPosition
@@ -94,7 +93,7 @@ class BacktestEngine:
 
     def __init__(
         self,
-        strategy: StrategyBase,
+        strategy: StrategyLike,
         *,
         symbol: str,
         timeframe: str | None = None,
@@ -158,7 +157,7 @@ class BacktestEngine:
             context.open_uxid = self.factory.open_cycle(self.symbol)
             start = 0 if window_size is None else max(0, position + 1 - window_size)
             window = frame.iloc[start : position + 1]
-            for intent in _as_intents(self.strategy.on_candle_closed(window, context)):
+            for intent in as_intents(self.strategy.on_candle_closed(window, context)):
                 self._apply(intent, bar_time, float(bar["close"]))
 
         # A position still open at the last bar is marked out at the final close
@@ -244,14 +243,6 @@ _EXIT_REASONS = {
     SignalAction.R_SL: ExitReason.R_SL,
     SignalAction.FLAT: ExitReason.FLAT,
 }
-
-
-def _as_intents(result: Any) -> Sequence[SignalIntent]:
-    if result is None:
-        return ()
-    if isinstance(result, SignalIntent):
-        return (result,)
-    return tuple(result)
 
 
 def count_gaps(frame: pd.DataFrame, timeframe: str) -> int:

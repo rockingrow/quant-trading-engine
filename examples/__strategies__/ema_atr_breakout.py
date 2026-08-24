@@ -4,12 +4,22 @@ Copy this file into ``__strategies__/`` to see the whole pipeline move, then
 replace it with your own. The edge here is deliberately naive; what is worth
 copying is the *shape*:
 
+* it subclasses :class:`~qte_shared.strategy_base.SignalStrategy`, so it has one
+  method per broker action — ``long``, ``short``, ``tp1``, ``tp2``, ``sl`` and
+  the optional ``r_sl`` / ``flat`` — and a reader can tell what it can emit
+  without reading a single body;
 * indicators come from ``qte_shared.indicators``, so the backtest and the live
   runner compute identical values;
 * the decision reads only ``df``, which never contains a future bar;
 * the stop is derived from ATR and the targets from the resulting risk, so the
   bracket is real rather than a round number;
 * it returns :class:`SignalIntent` objects and publishes nothing itself.
+
+Note what ``tp1``, ``tp2`` and ``sl`` do here: nothing, on purpose. The bracket
+travels with the entry and the broker's worker manages the exits, so this
+strategy has no per-bar opinion about them. Saying that in three lines is the
+point of the interface — the alternative is a reader inferring it from an
+absence and never being sure they inferred right.
 """
 
 from __future__ import annotations
@@ -17,11 +27,11 @@ from __future__ import annotations
 import pandas as pd
 
 from qte_shared.indicators import atr, crossover, crossunder, ema
-from qte_shared.strategy_base import IntentResult, SignalIntent, StrategyBase, StrategyContext
 from qte_shared.models import SignalAction
+from qte_shared.strategy_base import IntentResult, SignalIntent, SignalStrategy, StrategyContext
 
 
-class EmaAtrBreakout(StrategyBase):
+class EmaAtrBreakout(SignalStrategy):
     """Trades an EMA cross, stopped at a multiple of ATR."""
 
     name = "QTE_EXAMPLE_EMA_ATR"
@@ -29,7 +39,38 @@ class EmaAtrBreakout(StrategyBase):
     timeframe = "M15"
     warmup = 220
 
-    def on_candle_closed(self, df: pd.DataFrame, context: StrategyContext) -> IntentResult:
+    # ── Entries ───────────────────────────────────────────────────────
+
+    def long(self, df: pd.DataFrame, context: StrategyContext) -> IntentResult:
+        return self._entry(df, context, direction=1)
+
+    def short(self, df: pd.DataFrame, context: StrategyContext) -> IntentResult:
+        return self._entry(df, context, direction=-1)
+
+    # ── Exits ─────────────────────────────────────────────────────────
+
+    def tp1(self, df: pd.DataFrame, context: StrategyContext) -> IntentResult:
+        """Handled by the bracket the entry carried; nothing to decide per bar."""
+        return None
+
+    def tp2(self, df: pd.DataFrame, context: StrategyContext) -> IntentResult:
+        """Likewise — ``tp2`` travels with the entry."""
+        return None
+
+    def sl(self, df: pd.DataFrame, context: StrategyContext) -> IntentResult:
+        """The worker holds the stop. This strategy never moves it mid-trade."""
+        return None
+
+    # ── The edge ──────────────────────────────────────────────────────
+
+    def _entry(
+        self, df: pd.DataFrame, context: StrategyContext, *, direction: int
+    ) -> IntentResult:
+        """One body for both directions — the rules are symmetrical.
+
+        Splitting it into two would mean two places to change when the filter
+        changes, and a long/short asymmetry nobody meant to introduce.
+        """
         fast_length = self.param("fast", 21)
         slow_length = self.param("slow", 55)
         trend_length = self.param("trend", 200)
@@ -54,24 +95,20 @@ class EmaAtrBreakout(StrategyBase):
         if atr_value <= 0:
             return None
 
-        # Already in a trade: the bracket on the worker manages the exit, so
-        # there is nothing to decide until it closes.
-        if context.open_uxid is not None:
+        if direction > 0:
+            crossed = bool(crossover(fast, slow).iloc[-1]) and close > float(trend.iloc[-1])
+        else:
+            crossed = bool(crossunder(fast, slow).iloc[-1]) and close < float(trend.iloc[-1])
+        if not crossed:
             return None
 
-        long_signal = bool(crossover(fast, slow).iloc[-1]) and close > float(trend.iloc[-1])
-        short_signal = bool(crossunder(fast, slow).iloc[-1]) and close < float(trend.iloc[-1])
-        if not (long_signal or short_signal):
-            return None
-
-        direction = 1 if long_signal else -1
         risk = atr_value * atr_multiple
         stop = close - direction * risk
         take_profit_1 = close + direction * risk * min_rr
         take_profit_2 = close + direction * risk * min_rr * 2
 
         return SignalIntent(
-            action=SignalAction.LONG if long_signal else SignalAction.SHORT,
+            action=SignalAction.LONG if direction > 0 else SignalAction.SHORT,
             symbol=context.symbol,
             price=close,
             quantity=self.param("quantity", 0.01),

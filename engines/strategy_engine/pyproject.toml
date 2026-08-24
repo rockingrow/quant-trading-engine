@@ -2,9 +2,12 @@
 name = "qte-strategy-engine"
 version = "0.1.0"
 description = "QTE strategy runner: dynamic plugin loading, NATS event loop, broker signal emission, audit."
-requires-python = ">=3.11"
+requires-python = ">=3.13,<3.14"
 dependencies = [
     "qte-shared",
+    # The pre-flight audit runs in the runner's own process, so the runner
+    # image carries the auditor. See qte_strategy_engine.preflight.
+    "qte-strategy-audit",
     "httpx>=0.27",
 ]
 

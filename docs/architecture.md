@@ -112,6 +112,167 @@ Duplicate strategy names are an error, not a warning to skim past: workers
 subscribe by strategy name, so two algorithms sharing one would execute against
 each other's positions.
 
+## Why the strategy contract is structural, not nominal
+
+The loader does not ask `issubclass(cls, StrategyBase)`. It asks whether a class
+*behaves* like a strategy — a concrete `on_candle_closed`, a `name`, a
+`history_window()` — and converts the intents it returns into this repo's
+pydantic models at the boundary (`coerce_intent`). The audit recognises the
+seven signal methods the same way, so a repo that restates the interface is
+held to it without ever importing it.
+
+The nominal check would have forced every strategy repository to
+`import qte_shared`, and that one import decides a great deal:
+
+- It could not run its own test suite, lint pass or release without this repo
+  checked out beside it, and its results would depend on whichever revision of
+  the engine happened to be on disk.
+- It could not pin its own dependencies. A strategy that wants a particular
+  `pandas-ta` would be arguing with the engine's lockfile through a package it
+  does not own.
+- The engine's refactors would become the strategy repo's problem. Renaming a
+  module here would break a repository whose only real dependency on us is the
+  shape of a dataclass.
+
+What is actually shared is small and stable: seven action names the broker
+validates, eighteen intent fields, and the four hooks a driver calls. Both sides
+state it independently and `tests/test_plugin_contract.py` pins ours —
+including a fixture plugin written without a single `qte_shared` import, driven
+end to end into a `BrokerSignal`.
+
+The cost is a second copy that can drift. The mitigation is that drift fails
+loudly rather than silently: an unknown action raises where the intent is
+converted, in our process with our stack trace, rather than arriving as a 422
+from the broker after the trade decision has already been made.
+
+## Why a plugin repo declares a manifest
+
+Discovery prefers a manifest at the repo root — `strategies.py` or
+`manifest.py`, whichever the repo chose — exposing `load_all() -> {alias:
+class}` over scanning the tree. Declaring both is an error: which alias table
+is deployed would otherwise depend on the loader's lookup order.
+
+Scanning asks the engine to guess. It imports whatever is lying around, which
+for a strategy repository means a half-finished experiment can start trading
+because someone forgot it subclasses a base class — and it makes every file
+path a de-facto public API, so moving `gold/m5.py` is a deployment change.
+
+The manifest inverts that. The repo names what it publishes, under the alias the
+broker's workers subscribe to, and keeps the freedom to reorganise everything
+behind it. It also gives the plugin somewhere to bootstrap its own `sys.path`,
+which is what lets a `src/`-layout repository be loaded from a mounted volume
+with no install step.
+
+The scan is still there for the one-file case, and the two mix: a loose
+`ema_atr_breakout.py` is found beside a cloned repo that brought its own
+manifest. What a manifest claims, the scan leaves alone — importing those
+modules a second time would register every class twice.
+
+## Why the strategy interface is seven methods, not one
+
+A strategy could say everything it has to say through `on_candle_closed`, and
+for a while it did. The problem is not that the single hook cannot express a
+strategy; it is that it does not *declare* one. Reading a class told you nothing
+about what it could emit without reading three hundred lines of branching, and
+the two questions an operator actually asks — "does this ever take a partial?",
+"does it trail its stop, or does the worker?" — had no answer short of reading
+the body and hoping.
+
+So `SignalStrategy` names one method per broker action: `long`, `short`, `tp1`,
+`tp2` and `sl` required, `r_sl` and `flat` optional. The required five are the
+two that open a position and the three that close one; a strategy with no stated
+stop is not a strategy. The optional two are refinements — `r_sl` is a stop
+moved to break-even or trailed, `flat` a close that is neither a target nor a
+stop — and most strategies hand both to the broker-side bracket, which is a
+legitimate answer and worth stating rather than leaving as an absence.
+
+`on_candle_closed` did not go away; it is still what the drivers call, and
+`SignalStrategy` implements it by asking the seven in a fixed order — exits
+while a position is open (`sl`, `r_sl`, `tp1`, `tp2`, `flat`), entries while
+flat (`long`, `short`, first answer wins). The stop is asked before any target
+because a bar that both stopped out and reached a target stopped out. A method
+returning someone else's action raises: a `tp1()` emitting a `SHORT` would
+otherwise reach the broker as a perfectly valid payload.
+
+Two contracts, then, and they are enforced in different places on purpose:
+
+| | `StrategyBase` | `SignalStrategy` |
+| --- | --- | --- |
+| What it is | what the engine drives | what a strategy presents |
+| Enforced by | the loader, at boot | `qte-strategy-audit`, at deploy |
+| On failure | skip it, keep trading the rest | non-zero exit, before anything trades |
+
+`StrategyBase` stays minimal because every private strategy repo has to be able
+to restate it (see above) — anything added there is something they must all
+copy. The requirements live in the signal interface instead, and they are
+checked by a tool you run rather than by the process trying to trade, so a
+half-migrated repo still backtests.
+
+## Why the audit is a separate service
+
+The loader logs and skips what it cannot drive, deliberately: one broken file
+must not stop the other four from trading. That is the right behaviour for a
+process holding open positions and the wrong one for a deploy, because "skipped"
+and "there were none" are the same line in a log until the P&L does not arrive.
+
+`qte-strategy-audit` runs the same discovery and keeps what the loader discards.
+It reuses `StrategyLoader.collect()` rather than growing a second walker — a
+second one would drift, and an audit that disagrees with the loader about what
+is deployed is worse than no audit. Judgement is what it adds: signature arity,
+instantiability, the signal surface, duplicate names, and the routing table
+cross-checked in both directions.
+
+It is its own workspace member because it has no business in the runner's image.
+The runner imports strategies to trade them; the auditor imports them to refuse
+them, and mixing the two would put `inspect.signature` calls and a findings
+model in the process that is supposed to be reacting to a candle close.
+
+## Why symbol → strategy pairing lives in a file
+
+A strategy declaring `symbols = ("XAUUSD",)` is fine for one strategy and wrong
+for a book. The answer to "what is trading gold right now" would live scattered
+across a private repo's class attributes, and changing it would mean editing and
+redeploying that repo — a code change to express an operational decision.
+
+`config/strategies_mapping.toml` moves the pairing out of the code. It is a
+matrix — symbol × strategy × parameters — which is why it is a file rather
+than environment variables: flattening a matrix into `QTE_ROUTING__XAUUSD_0`
+is how it stops being reviewable. TOML rather than YAML because `tomllib` is
+in the standard library and this is parsed inside the trading process.
+
+The real file is git-ignored and `config/strategies_mapping.example.toml` is
+not. What you
+trade and at what risk is position information; this repo is public. The
+template keeps the schema reviewable in history while the book stays out of it,
+which is the same split `__strategies__/` makes for the code.
+
+Three details earn their complexity:
+
+- **Per-pair parameters, not per-strategy.** One strategy running tighter on
+  gold than on bitcoin is the ordinary case, and the runner builds one instance
+  per pair so a strategy carrying state between bars never has gold's last bar
+  deciding bitcoin's next one.
+- **An absent file is not an empty one.** No file means fall back to what each
+  strategy declares — the behaviour from before the table existed. A file that
+  routes nothing means trade nothing. Those differ by a deploy, so the table's
+  truthiness is "was a file read", not "does it list anything".
+- **A name nobody publishes is an error at boot**, not a shrug. The symptom
+  otherwise is a symbol that quietly trades nothing, which in a log is
+  indistinguishable from a strategy that found no setups.
+
+## Why the engine pins Python 3.13
+
+Nothing in this repo needs it. The runner imports the plugins in
+`__strategies__/` into its own process, so the engine's interpreter and its
+plugins' have to be the same one — and `pandas-ta`, which they use, requires
+≥ 3.12 and hard-pins a `numba` with no 3.14 wheel. The same reasoning puts a
+`numpy<2.3` entry in `[tool.uv] constraint-dependencies`: one process means one
+resolution, and the constraint belongs where the reason for it is, not as a
+bogus upper bound on `qte-shared`'s own numpy dependency.
+
+This is the real cost of the plugin seam: code is decoupled, the interpreter is
+not. Nothing makes that go away, so it is written down instead.
+
 ## Why there is no control-plane service
 
 There was one — a FastAPI gateway serving health, the audit trail, backtest
@@ -181,3 +342,38 @@ The boundary only holds if the manifests stay honest, so
 `tests/test_packaging.py` asserts the dependency graph is a star: leaf engines
 may depend on `qte-shared` and nothing else in the workspace. A direct edge
 between two leaves is how a microservice boundary quietly stops being one.
+
+## Why the market data vendor sits behind an interface
+
+Tiingo used to be spelled out in three places: a WebSocket client inside
+`data_ingestion`, a REST downloader inside `backtest_engine`, a `tiingo_ticker`
+property on `SymbolSpec` in shared, and a settings block on root `Settings`.
+Nothing was wrong with any one of them; together they meant a second data
+source — a broker feed, a recorded fixture, an exchange API for the crypto leg —
+was a change to every engine plus the core config.
+
+So the vendor moved behind `qte_shared/interfaces/market_data.py`, which
+declares the two things QTE actually consumes: a `HistorySource` returning the
+canonical OHLCV frame, and a `LiveFeed` pushing `Tick`s into a handler. A
+vendor is one `MarketDataProvider` — a factory that owns its credentials,
+endpoints and ticker spelling and hands back those two objects.
+
+Three consequences are worth naming:
+
+* **The engines never import a vendor.** They call `create_provider()`, which
+  resolves `QTE_MARKET_DATA__PROVIDER` through a registry. Adding a vendor is a
+  file under `qte_shared/providers/` and a `register_provider` call; swapping one
+  is an environment variable.
+* **The vendor's configuration lives with the vendor.** Root `Settings` carries
+  the *choice* (`market_data.provider`) and no vendor block, so a second vendor
+  never edits the core config. `QTE_TIINGO__*` is unchanged and now read by
+  `qte_shared.providers.tiingo`.
+* **Images stay split.** Built-ins are registered as import-path strings and
+  imported only when created, and the vendor's client libraries are an extra on
+  `qte-shared` (`qte-shared[tiingo]`) rather than a hard dependency. The
+  strategy runner installs neither `httpx` nor `websockets` for a socket it
+  never opens.
+
+`SymbolSpec` kept the part that is genuinely vendor-independent — which market a
+symbol trades on, since that decides which endpoint a provider reaches for — and
+lost `tiingo_ticker`, which is now `MarketDataProvider.ticker_for()`.

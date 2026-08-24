@@ -1,9 +1,11 @@
-"""Which feed a symbol belongs to, and how Tiingo spells it.
+"""Which market a symbol trades on.
 
 QTE speaks broker symbols (``XAUUSD``, ``BTCUSDT``) because that is what ends
-up in the signal a worker executes. Tiingo speaks lowercase tickers on two
-different sockets. The translation is one-way and lives here so no other module
-has to guess.
+up in the signal a worker executes. Every vendor spells them differently, and
+that translation belongs to the vendor: see
+:meth:`~qte_shared.interfaces.market_data.MarketDataProvider.ticker_for`. What
+stays here is the vendor-independent part — which market a symbol belongs to,
+because that decides *which* feed or endpoint the provider reaches for.
 """
 
 from __future__ import annotations
@@ -21,14 +23,10 @@ _CRYPTO_BASES = ("BTC", "ETH", "SOL", "XRP", "BNB", "ADA", "DOGE", "AVAX", "LTC"
 
 @dataclass(frozen=True, slots=True)
 class SymbolSpec:
-    """A symbol as QTE names it, as Tiingo names it, and where to find it."""
+    """A symbol as QTE names it, and the market it trades on."""
 
     symbol: str
     market: Market
-
-    @property
-    def tiingo_ticker(self) -> str:
-        return self.symbol.lower()
 
 
 def infer_market(symbol: str) -> Market:

@@ -1,12 +1,12 @@
 [project]
 name = "qte-ingestion"
 version = "0.1.0"
-description = "QTE data ingestion: Tiingo WebSocket -> resampler -> Redis state + NATS events."
-requires-python = ">=3.11"
+description = "QTE data ingestion: provider live feed -> resampler -> Redis state + NATS events."
+requires-python = ">=3.13,<3.14"
 dependencies = [
-    "qte-shared",
-    "websockets>=12.0",
-    "httpx>=0.27",
+    # The extra names the market data vendor this image ships with; swapping
+    # providers is one word here plus QTE_MARKET_DATA__PROVIDER.
+    "qte-shared[tiingo]",
 ]
 
 [project.scripts]

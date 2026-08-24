@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import sys
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -11,7 +12,7 @@ from qte_shared.config import settings
 from qte_shared.logging_setup import configure_logging, get_logger
 
 from qte_backtest.data_store import ParquetStore
-from qte_backtest.downloader import DownloadRequest, TiingoDownloader
+from qte_backtest.downloader import DownloadRequest, HistoryDownloader
 from qte_backtest.runner import BacktestRequest, run_backtest
 
 log = get_logger(__name__)
@@ -21,7 +22,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="qte-backtest", description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    download = subparsers.add_parser("download", help="Fetch Tiingo history into parquet")
+    download = subparsers.add_parser("download", help="Fetch provider history into parquet")
     download.add_argument(
         "--symbol",
         action="append",
@@ -88,7 +89,7 @@ def build_parser() -> argparse.ArgumentParser:
 async def _download(args: argparse.Namespace) -> None:
     symbols = args.symbol or settings.engine.symbols
     timeframes = args.timeframe or settings.engine.timeframes
-    downloader = TiingoDownloader()
+    downloader = HistoryDownloader()
     for symbol in symbols:
         for timeframe in timeframes:
             await downloader.download(
@@ -203,7 +204,22 @@ def _as_datetime(raw: str) -> datetime:
     return datetime.strptime(raw, "%Y-%m-%d").replace(tzinfo=UTC)
 
 
+def _widen_console() -> None:
+    """Let the report's box drawing survive a legacy console code page.
+
+    Windows terminals still default to cp1252, which has no ``─`` and no ``→``.
+    The replay itself is fine; it is the final ``print`` that raises, so a run
+    that took ten minutes dies at the last line with its numbers already
+    computed and nowhere to go. Replacement characters are a far better outcome
+    than that, and on a UTF-8 console nothing changes.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
 def main() -> None:
+    _widen_console()
     configure_logging()
     args = build_parser().parse_args()
     if args.command == "download":

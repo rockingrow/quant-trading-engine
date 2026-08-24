@@ -24,7 +24,6 @@ import asyncio
 import contextlib
 import json
 from collections import defaultdict, deque
-from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 
@@ -36,17 +35,21 @@ from qte_shared.db import EventRepository
 from qte_shared.logging_setup import get_logger
 from qte_shared.models import Candle, CandleClosedEvent, SignalAction, TickEvent
 from qte_shared.plugin_loader import load_strategies
+from qte_shared.routing import SymbolRouting
 from qte_shared.signal_factory import BracketPolicy, SignalFactory
 from qte_shared.strategy_base import (
     SignalIntent,
-    StrategyBase,
     StrategyContext,
+    StrategyLike,
+    as_intents,
     candles_to_frame,
+    overrides_on_tick,
 )
 from qte_shared.timeframes import normalize_timeframe
 
 from qte_strategy_engine.broker_sink import BrokerSink
 from qte_strategy_engine.db import SignalRepository
+from qte_strategy_engine.preflight import run_preflight_audit
 from qte_strategy_engine.settings import runner_settings
 
 log = get_logger(__name__)
@@ -57,13 +60,13 @@ SERVICE_NAME = "strategy-runner"
 class StrategySlot:
     """One strategy bound to one symbol, with its own candle buffer and cycle."""
 
-    def __init__(self, strategy: StrategyBase, symbol: str, factory: SignalFactory) -> None:
+    def __init__(self, strategy: StrategyLike, symbol: str, factory: SignalFactory) -> None:
         self.strategy = strategy
         self.symbol = symbol
         self.factory = factory
         self.timeframe = normalize_timeframe(strategy.timeframe)
         # Exactly the window the backtest hands the same strategy — the bound
-        # lives on StrategyBase so the two drivers cannot drift apart.
+        # lives on the strategy contract so the two drivers cannot drift apart.
         self.buffer: deque[Candle] = deque(maxlen=strategy.history_window())
         self.started = False
 
@@ -94,6 +97,12 @@ class StrategyRunner:
     # ── Startup ───────────────────────────────────────────────────────
 
     async def start(self) -> None:
+        # First, before anything is connected. The pre-flight audit may refuse
+        # to trade this book, and a refusal should cost nothing to unwind —
+        # there is no sense opening NATS, Redis and the broker for strategies
+        # we are about to reject. Off by configuration is the same call.
+        run_preflight_audit()
+
         await self.bus.connect()
         await self.state.connect()
         await self.sink.start()
@@ -125,15 +134,39 @@ class StrategyRunner:
         )
 
     def _build_slots(self) -> None:
-        """Instantiate one slot per (strategy, symbol) pair we are to trade."""
+        """Instantiate one slot per (strategy, symbol) pair we are to trade.
+
+        The routing table decides the pairs when there is one. Without it each
+        strategy keeps the symbols it declares on itself, which is what
+        happened before the table existed — see :mod:`qte_shared.routing`.
+        """
+        routing = SymbolRouting.load(settings.engine.routing_file)
         discovered = load_strategies(
             settings.engine.strategies_dir, runner_settings.enabled_strategies or None
         )
+        if routing:
+            self._warn_on_unrouted(routing, [entry.name for entry in discovered])
+
         for entry in discovered:
-            params = runner_settings.strategy_params.get(entry.name, {})
-            strategy = entry.instantiate(params)
-            symbols = [s.upper() for s in (strategy.symbols or settings.engine.symbols)]
+            defaults = runner_settings.strategy_params.get(entry.name, {})
+            if routing:
+                symbols = routing.symbols_for(entry.name)
+                if not symbols:
+                    log.info(
+                        "Strategy %s is loaded but routed to no symbol in %s — not running it",
+                        entry.name,
+                        routing.source,
+                    )
+                    continue
+            else:
+                declared = entry.cls.symbols or settings.engine.symbols
+                symbols = [symbol.upper() for symbol in declared]
+
             for symbol in symbols:
+                # One instance per pair: a strategy carries per-symbol state
+                # between bars, and sharing it across symbols would let gold's
+                # last bar decide what happens on bitcoin's next one.
+                strategy = entry.instantiate({**defaults, **routing.params_for(symbol, entry.name)})
                 factory = SignalFactory(
                     strategy.name,
                     timeframe=strategy.timeframe,
@@ -151,6 +184,25 @@ class StrategyRunner:
                     slot.timeframe,
                     strategy.warmup,
                 )
+
+    @staticmethod
+    def _warn_on_unrouted(routing: SymbolRouting, loaded: list[str]) -> None:
+        """Say so when the table names a strategy the loader never found.
+
+        Almost always a typo or a stale name after a rename, and the symptom
+        without this line is a symbol that quietly trades nothing — which reads
+        exactly like a strategy that found no setups.
+        """
+        unknown = [name for name in routing.strategies if name not in set(loaded)]
+        if unknown:
+            log.error(
+                "Routing table %s names %s, which %s did not publish. Those symbols will "
+                "trade nothing. Available: %s",
+                routing.source,
+                ", ".join(sorted(unknown)),
+                settings.engine.strategies_dir,
+                ", ".join(sorted(loaded)) or "none",
+            )
 
     @staticmethod
     def _warn_if_history_exceeds_redis(slot: StrategySlot) -> None:
@@ -217,7 +269,7 @@ class StrategyRunner:
         await self.bus.subscribe(self.subjects.engine_control(), self._on_control_message)
 
         wants_ticks = runner_settings.subscribe_ticks or any(
-            type(slot.strategy).on_tick is not StrategyBase.on_tick for slot in self.slots
+            overrides_on_tick(slot.strategy) for slot in self.slots
         )
         if wants_ticks:
             await self.bus.subscribe(self.subjects.tick_wildcard(), self._on_tick_message)
@@ -283,7 +335,7 @@ class StrategyRunner:
             )
             return
 
-        for intent in _as_intents(result):
+        for intent in as_intents(result):
             await self._emit(slot, intent, candle.close, context.now)
 
     async def _on_tick_message(self, msg: Msg) -> None:
@@ -305,7 +357,7 @@ class StrategyRunner:
             except Exception:
                 log.exception("Strategy %s raised on tick for %s", slot.strategy.name, slot.symbol)
                 continue
-            for intent in _as_intents(result):
+            for intent in as_intents(result):
                 await self._emit(slot, intent, price, event.tick.ts)
 
     async def _on_control_message(self, msg: Msg) -> None:
@@ -415,14 +467,6 @@ class StrategyRunner:
         await self.bus.close()
         await self.state.close()
         log.info("Runner stopped")
-
-
-def _as_intents(result: Any) -> Sequence[SignalIntent]:
-    if result is None:
-        return ()
-    if isinstance(result, SignalIntent):
-        return (result,)
-    return tuple(result)
 
 
 def _encode(payload: dict[str, Any]) -> bytes:

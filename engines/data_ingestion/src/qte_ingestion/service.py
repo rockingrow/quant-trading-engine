@@ -1,8 +1,13 @@
-"""Wires the Tiingo sockets to the resamplers, Redis and NATS.
+"""Wires the market data feeds to the resamplers, Redis and NATS.
 
 The flow is one-way and never blocks on a consumer:
 
-    Tiingo WS → Resampler → Redis (state) + NATS (event)
+    Live feed → Resampler → Redis (state) + NATS (event)
+
+Which vendor sits at the left-hand end is configuration
+(``QTE_MARKET_DATA__PROVIDER``): this service asks
+:func:`~qte_shared.providers.create_provider` for feeds and only ever sees
+:class:`~qte_shared.interfaces.market_data.LiveFeed` objects emitting ticks.
 
 Redis is written first and NATS second on purpose. The runner rebuilds its
 warm-up window from Redis when it starts, so a candle that reached the bus but
@@ -20,14 +25,15 @@ from qte_shared.bus import NatsBus, Subjects
 from qte_shared.cache import RedisState
 from qte_shared.config import settings
 from qte_shared.db import EventRepository
+from qte_shared.interfaces.market_data import Capability, LiveFeed
 from qte_shared.logging_setup import get_logger
 from qte_shared.models import Candle, CandleClosedEvent, Tick, TickEvent
+from qte_shared.providers import create_provider
 from qte_shared.symbols import build_specs
 from qte_shared.timeframes import normalize_timeframe
 
 from qte_ingestion.resampler import Resampler
 from qte_ingestion.settings import ingestion_settings
-from qte_ingestion.tiingo_ws import TiingoWebSocketClient
 
 log = get_logger(__name__)
 
@@ -35,7 +41,7 @@ SERVICE_NAME = "data-ingestion"
 
 
 class IngestionService:
-    """Owns the sockets, the resamplers and the publish loop."""
+    """Owns the live feeds, the resamplers and the publish loop."""
 
     def __init__(self) -> None:
         self.specs = build_specs(settings.engine.symbols, ingestion_settings.market_overrides)
@@ -44,10 +50,11 @@ class IngestionService:
         self.state = RedisState()
         self.subjects = Subjects()
         self.events = EventRepository()
+        self.provider = create_provider(capability=Capability.LIVE)
         self._resamplers: dict[str, Resampler] = {
             spec.symbol: Resampler(spec.symbol, self.timeframes) for spec in self.specs
         }
-        self._clients: list[TiingoWebSocketClient] = []
+        self._feeds: list[LiveFeed] = []
         self._flush_task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
 
@@ -58,25 +65,28 @@ class IngestionService:
         await self.state.connect()
         await self._restore_open_candles()
 
-        for market in ("fx", "crypto"):
-            client = TiingoWebSocketClient(market, self.specs, self._handle_tick)  # type: ignore[arg-type]
-            if client.start() is not None:
-                self._clients.append(client)
+        for feed in self.provider.live_feeds(self.specs, self._handle_tick):
+            if feed.start() is not None:
+                self._feeds.append(feed)
 
-        if not self._clients:
-            raise RuntimeError("No market sockets started — check QTE_ENGINE__SYMBOLS")
+        if not self._feeds:
+            raise RuntimeError(
+                f"Provider {self.provider.name!r} started no feeds — check QTE_ENGINE__SYMBOLS"
+            )
 
         self._flush_task = asyncio.create_task(self._flush_loop(), name="candle-flush")
         await self.events.record_event(
             service=SERVICE_NAME,
             event="started",
             payload={
+                "provider": self.provider.name,
                 "symbols": [spec.symbol for spec in self.specs],
                 "timeframes": self.timeframes,
             },
         )
         log.info(
-            "Ingestion started symbols=%s timeframes=%s",
+            "Ingestion started provider=%s symbols=%s timeframes=%s",
+            self.provider.name,
             [spec.symbol for spec in self.specs],
             self.timeframes,
         )
@@ -87,8 +97,8 @@ class IngestionService:
 
     async def stop(self) -> None:
         self._stopping.set()
-        for client in self._clients:
-            await client.stop()
+        for feed in self._feeds:
+            await feed.stop()
         if self._flush_task is not None:
             self._flush_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

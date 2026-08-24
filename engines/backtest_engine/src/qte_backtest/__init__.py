@@ -1,1 +1,1 @@
-"""QTE backtest engine — Tiingo history to parquet, replay, fill simulation."""
+"""QTE backtest engine: provider history to parquet, replay, fill simulation."""

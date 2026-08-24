@@ -154,3 +154,208 @@ def test_the_module_namespace_matches_the_directory_convention(tmp_path):
 
     StrategyLoader(root).discover()
     assert "__strategies__.gold.edge" in sys.modules
+
+
+# ── Manifests: a plugin repo that declares what it publishes ─────────────
+
+#: A plugin repository that never imports qte_shared. It restates the contract
+#: on its own side — its own base class, its own intent type, its own action
+#: enum — which is exactly what a repo with its own lockfile and CI has to do.
+STANDALONE_REPO = {
+    "src/edges/contract.py": """
+        from abc import ABC, abstractmethod
+        from dataclasses import dataclass, field
+        from enum import Enum
+
+
+        class Action(str, Enum):
+            LONG = "LONG"
+            FLAT = "FLAT"
+
+
+        @dataclass
+        class Intent:
+            action: Action
+            symbol: str | None = None
+            price: float | None = None
+            quantity: float | None = None
+            sl: float | None = None
+            reason: str = ""
+            indicators: dict = field(default_factory=dict)
+
+
+        class Base(ABC):
+            name = ""
+            symbols = ()
+            timeframe = "M15"
+            warmup = 10
+            max_history = None
+
+            def __init__(self, params=None):
+                self.params = dict(params or {})
+
+            def on_start(self, context): pass
+            def on_stop(self): pass
+
+            @abstractmethod
+            def on_candle_closed(self, df, context): ...
+
+            def on_tick(self, price, context): return None
+            def history_window(self): return self.max_history or 400
+            def describe(self): return {"name": self.name, "params": self.params}
+    """,
+    "src/edges/gold.py": """
+        from edges.contract import Action, Base, Intent
+
+
+        class GoldEdge(Base):
+            name = "GOLD_EDGE_V1"
+            symbols = ("XAUUSD",)
+
+            def on_candle_closed(self, df, context):
+                return Intent(action=Action.LONG, price=2000.0, quantity=1.0, sl=1990.0)
+    """,
+    "strategies.py": """
+        import sys
+        from pathlib import Path
+
+        sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+
+        from edges.gold import GoldEdge
+
+        ALIASES = {"GOLD_EDGE_V1": GoldEdge}
+
+
+        def load_all():
+            return dict(ALIASES)
+    """,
+}
+
+
+def write_repo(root: Path, files: dict[str, str]) -> Path:
+    for relative, source in files.items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(textwrap.dedent(source).lstrip(), encoding="utf-8")
+    return root
+
+
+@pytest.fixture
+def manifest_repo(tmp_path: Path) -> Path:
+    """A cloned plugin repo one level below the strategies directory."""
+    write_repo(tmp_path / "my-strategies", STANDALONE_REPO)
+    return tmp_path
+
+
+def test_a_repo_that_never_imports_the_engine_is_still_loaded(manifest_repo):
+    """The whole point of the manifest: no qte_shared on the plugin's side.
+
+    A strategy repository has its own lockfile, its own CI and its own release
+    cycle. Requiring it to subclass our base would mean it could not run its
+    own test suite without this repo checked out beside it.
+    """
+    found = StrategyLoader(manifest_repo).discover()
+
+    assert [entry.name for entry in found] == ["GOLD_EDGE_V1"]
+    assert found[0].source.name == "strategies.py"
+    strategy = found[0].instantiate({"risk": 3})
+    assert strategy.describe()["params"] == {"risk": 3}
+
+
+def test_the_alias_comes_from_the_manifest_not_the_class(manifest_repo):
+    """The repo decides what a strategy is published as; we do not guess it."""
+    (manifest_repo / "my-strategies" / "strategies.py").write_text(
+        (manifest_repo / "my-strategies" / "strategies.py")
+        .read_text(encoding="utf-8")
+        .replace('"GOLD_EDGE_V1": GoldEdge', '"RENAMED_ON_THE_WIRE": GoldEdge'),
+        encoding="utf-8",
+    )
+    found = StrategyLoader(manifest_repo).discover()
+    assert [entry.name for entry in found] == ["RENAMED_ON_THE_WIRE"]
+
+
+def test_a_manifest_repo_is_not_also_scanned(manifest_repo):
+    """Scanning it too would register every class twice and import files the
+    manifest deliberately left out."""
+    found = StrategyLoader(manifest_repo).discover()
+    assert len(found) == 1
+
+
+def test_a_manifest_at_the_root_of_the_directory_works_too(tmp_path):
+    """`__strategies__/` may *be* the checkout rather than contain it."""
+    write_repo(tmp_path, STANDALONE_REPO)
+    assert [entry.name for entry in StrategyLoader(tmp_path).discover()] == ["GOLD_EDGE_V1"]
+
+
+def test_loose_files_still_work_beside_a_manifest_repo(manifest_repo):
+    """Copying one example file in has to keep working — no ceremony required."""
+    (manifest_repo / "my_edge.py").write_text(STRATEGY_SOURCE)
+
+    found = sorted(entry.name for entry in StrategyLoader(manifest_repo).discover())
+    assert found == ["GOLD_EDGE_V1", "MY_EDGE"]
+
+
+def test_a_manifest_without_the_hook_is_reported_and_skipped(manifest_repo, caplog):
+    (manifest_repo / "my-strategies" / "strategies.py").write_text(
+        "ALIASES = {}\n", encoding="utf-8"
+    )
+    with caplog.at_level("ERROR"):
+        assert StrategyLoader(manifest_repo).discover() == []
+    assert "load_all" in caplog.text
+
+
+def test_a_manifest_that_raises_does_not_take_the_runner_down(manifest_repo, caplog):
+    (manifest_repo / "my-strategies" / "strategies.py").write_text(
+        "def load_all():\n    raise RuntimeError('boom')\n", encoding="utf-8"
+    )
+    (manifest_repo / "my_edge.py").write_text(STRATEGY_SOURCE)
+
+    with caplog.at_level("ERROR"):
+        found = StrategyLoader(manifest_repo).discover()
+
+    assert [entry.name for entry in found] == ["MY_EDGE"], "the other strategy still loads"
+    assert "boom" in caplog.text
+
+
+def test_a_manifest_publishing_a_non_strategy_is_refused(manifest_repo, caplog):
+    (manifest_repo / "my-strategies" / "strategies.py").write_text(
+        "def load_all():\n    return {'NOT_A_STRATEGY': dict}\n", encoding="utf-8"
+    )
+    with caplog.at_level("ERROR"):
+        assert StrategyLoader(manifest_repo).discover() == []
+    assert "NOT_A_STRATEGY" in caplog.text
+
+
+def test_a_manifest_repos_own_base_class_is_not_registered(manifest_repo):
+    """It declares on_candle_closed abstract exactly as ours does, so it never
+    looks concrete — and it is not in the manifest anyway."""
+    found = StrategyLoader(manifest_repo).discover()
+    assert [entry.cls.__name__ for entry in found] == ["GoldEdge"]
+
+
+def test_the_manifest_may_be_called_manifest_py(manifest_repo):
+    """``strategies.py`` and ``manifest.py`` are the same doorway.
+
+    The file answers to two readings — what it contains, and what it is — and a
+    plugin repo that picked the other name should not silently fall through to
+    the directory scan, which would bypass its alias table and import every
+    module in the tree.
+    """
+    repo = manifest_repo / "my-strategies"
+    (repo / "strategies.py").rename(repo / "manifest.py")
+
+    found = StrategyLoader(manifest_repo).discover()
+
+    assert [entry.name for entry in found] == ["GOLD_EDGE_V1"]
+    assert found[0].source.name == "manifest.py"
+
+
+def test_a_repo_declaring_two_manifests_is_refused(manifest_repo):
+    """Which alias table is deployed must not depend on the lookup order."""
+    repo = manifest_repo / "my-strategies"
+    (repo / "manifest.py").write_text(
+        (repo / "strategies.py").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+
+    with pytest.raises(RuntimeError, match="more than one strategy manifest"):
+        StrategyLoader(manifest_repo).discover()

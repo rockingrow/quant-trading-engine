@@ -1,0 +1,39 @@
+# All text files use LF in both the repo and working tree (including on Windows)
+* text=auto eol=lf
+
+# Text file types in the repo
+*.py     text eol=lf
+*.pine   text eol=lf
+*.md     text eol=lf
+*.toml   text eol=lf
+*.cfg    text eol=lf
+*.ini    text eol=lf
+*.json   text eol=lf
+*.yml    text eol=lf
+*.yaml   text eol=lf
+*.sh     text eol=lf
+*.lock   text eol=lf
+Makefile text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+
+# Windows-only scripts require CRLF
+*.bat    text eol=crlf
+*.cmd    text eol=crlf
+
+# Binary files: leave line endings untouched
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.gif    binary
+*.ico    binary
+*.pdf    binary
+*.zip    binary
+*.gz     binary
+*.xlsx   binary
+*.parquet binary
+*.pkl    binary
+*.npy    binary
+*.so     binary
+*.dll    binary
+*.pyd    binary

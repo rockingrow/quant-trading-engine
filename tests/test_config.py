@@ -55,7 +55,13 @@ def test_the_shared_package_really_lives_under_engines():
 
 def test_every_workspace_member_is_an_engine():
     members = sorted(path.name for path in (REPO_ROOT / "engines").iterdir() if path.is_dir())
-    assert members == ["backtest_engine", "data_ingestion", "shared", "strategy_engine"]
+    assert members == [
+        "backtest_engine",
+        "data_ingestion",
+        "shared",
+        "strategy_audit",
+        "strategy_engine",
+    ]
     for name in members:
         assert (REPO_ROOT / "engines" / name / "pyproject.toml").is_file()
         # src-layout: the importable package is one level down, so the engine

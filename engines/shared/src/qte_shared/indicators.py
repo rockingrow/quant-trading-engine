@@ -5,13 +5,19 @@ Nothing here knows what a position is. Every function takes a
 aligned to the same index, so a strategy can compose them freely and a backtest
 gets bit-identical values to the live runner.
 
-**On ``pandas_ta``**: it is deliberately *not* a hard dependency. The published
-build pins old NumPy/pandas internals (it still reaches for ``numpy.NaN``) and
-breaks on the versions QTE runs, and it has no WaveTrend — the one indicator
-the broker's payload schema actually names. So the implementations below are
-first-party and self-contained. :func:`pandas_ta_frame` is the escape hatch: if
-you install ``pandas-ta`` yourself it exposes the whole library on a frame,
-otherwise it raises a message telling you so.
+**On ``pandas_ta``**: it is deliberately *not* a dependency of the engine. It
+drags in ``numba`` — pinned, and the binding constraint on which Python the
+whole system may run — for four functions the engine itself uses, and it has no
+WaveTrend, the one indicator the broker's payload schema actually names. So the
+implementations below are first-party and self-contained, with TradingView's SMA
+seeding for :func:`ema`/:func:`rma` so a strategy ported off a Pine chart
+crosses at the same bars.
+
+A strategy *repository* may decide otherwise — it owns its own dependencies,
+and the one this engine loads today builds its indicators on ``pandas_ta``
+wherever the library agrees with TradingView. :func:`pandas_ta_frame` is the
+escape hatch on this side: if ``pandas-ta`` is installed it exposes the whole
+library on a frame, otherwise it raises a message telling you so.
 """
 
 from __future__ import annotations
@@ -225,8 +231,9 @@ def pandas_ta_frame(df: pd.DataFrame):
     """Return ``df.ta`` when ``pandas-ta`` is installed, else explain why not.
 
     QTE does not depend on it (see the module docstring), but a strategy that
-    wants its 130-odd extra indicators can ``uv add pandas-ta`` and reach them
-    through here without importing it at module scope everywhere.
+    wants its 270-odd extra indicators can ``uv add pandas-ta`` and reach them
+    through here without importing it at module scope everywhere. It is already
+    installed if you ran ``make strategy-deps`` for a plugin repo that uses it.
     """
     try:
         import pandas_ta  # noqa: F401
@@ -234,6 +241,7 @@ def pandas_ta_frame(df: pd.DataFrame):
         raise ImportError(
             "pandas-ta is not installed. QTE ships its own indicators; install "
             "pandas-ta only if you need something this module does not cover "
-            "(`uv add pandas-ta`), and pin a NumPy/pandas pair it supports."
+            "(`uv add pandas-ta`), and note that it pins numba, which decides "
+            "which Python versions the whole engine can run on."
         ) from exc
     return df.ta

@@ -3,12 +3,19 @@ name = "quant-trading-engine"
 version = "0.1.0"
 description = "Event-driven quant trading engine: ingestion, backtest, live strategy runner, signal broker bridge."
 readme = "README.md"
-requires-python = ">=3.11"
+# Pinned to 3.13, and the reason is not this repo's own dependencies — they are
+# happy on anything from 3.11 up. The strategy runner imports the plugins in
+# __strategies__/ into its own process, and those depend on pandas-ta, which
+# requires >=3.12 and hard-pins numba==0.61.2 (no wheel for 3.14). 3.13 is the
+# only interpreter the engine and its plugins both run on. Widen this only
+# after checking what the mounted strategy repo needs.
+requires-python = ">=3.13,<3.14"
 dependencies = [
     "qte-shared",
     "qte-ingestion",
     "qte-backtest",
     "qte-strategy-engine",
+    "qte-strategy-audit",
 ]
 
 [dependency-groups]
@@ -21,6 +28,12 @@ dev = [
 
 [tool.uv]
 package = false
+# The runner imports the plugins in __strategies__/ into its own process, so
+# one environment has to satisfy both resolutions. numba — which pandas-ta
+# pins — refuses NumPy above 2.2, and nothing here needs a newer one, so the
+# constraint lives here rather than as a bogus upper bound on qte-shared's own
+# numpy dependency. Drop it if the strategy repo ever stops needing numba.
+constraint-dependencies = ["numpy<2.3"]
 
 [tool.uv.workspace]
 members = ["engines/*"]
@@ -30,10 +43,11 @@ qte-shared = { workspace = true }
 qte-ingestion = { workspace = true }
 qte-backtest = { workspace = true }
 qte-strategy-engine = { workspace = true }
+qte-strategy-audit = { workspace = true }
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py313"
 exclude = ["__strategies__"]
 
 [tool.ruff.lint]

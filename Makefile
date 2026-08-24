@@ -25,10 +25,53 @@ format: ## Ruff format + import sort
 
 check: lint test ## Lint and test — what CI runs
 
+# ── Strategy plugins ────────────────────────────────────────────────────
+#
+# __strategies__/ is a separate repository with its own lockfile. Its code is a
+# mounted volume and needs no installing, but its *dependencies* do: the runner
+# imports the strategies into its own process. STRATEGY_REPO points at the
+# checkout; override it if yours is cloned somewhere else.
+
+STRATEGY_REPO ?= __strategies__/quant-trading-strategies
+
+strategy-deps: ## Install the mounted strategy repo's deps into this venv
+	uv export --project $(STRATEGY_REPO) --no-dev --no-emit-project \
+		--format requirements-txt | uv pip install -r -
+
+strategy-requirements: ## Freeze those deps into deploy/ for the image build
+	@if [ -f $(STRATEGY_REPO)/pyproject.toml ]; then \
+		uv export --project $(STRATEGY_REPO) --no-dev --no-emit-project \
+			--format requirements-txt -o deploy/strategy-requirements.txt; \
+	else \
+		echo "No strategy repo at $(STRATEGY_REPO) - nothing to freeze"; \
+	fi
+
+strategy-test: ## Run the strategy repo's own suite (separate from ours)
+	$(MAKE) -C $(STRATEGY_REPO) check
+
+audit: ## Validate __strategies__/ against the QTE signal contract + routing table
+	uv run qte-strategy-audit
+
+audit-strict: ## Same, but warnings fail too — what CI should run
+	uv run qte-strategy-audit --strict
+
+routing: ## Copy the strategies-mapping template into place (never overwrites)
+	@if [ -f config/strategies_mapping.toml ]; then \
+		echo "config/strategies_mapping.toml exists - leaving it alone"; \
+	else \
+		cp config/strategies_mapping.example.toml config/strategies_mapping.toml; \
+		echo "Wrote config/strategies_mapping.toml (git-ignored) - pair your symbols with strategies in it"; \
+	fi
+
+strategies: ## List what the mounted strategy repo publishes
+	uv run python -c "from qte_shared.config import settings; \
+		from qte_shared.plugin_loader import load_strategies; \
+		[print(e.name, 'from', e.source) for e in load_strategies(settings.engine.strategies_dir)]"
+
 infra: ## Start redis, postgres and nats only
 	docker compose up -d redis-cache postgres-audit nats
 
-up: ## Start the whole stack
+up: strategy-requirements ## Start the whole stack
 	docker compose up -d --build
 
 down: ## Stop the stack (volumes survive)
@@ -58,7 +101,10 @@ db-history: ## The migration history
 db-check: ## Fail if the models have drifted from the migrations
 	uv run alembic check
 
-download: ## Fetch Tiingo history for QTE_ENGINE__SYMBOLS into parquet
+csv-import: ## Convert an MT5 CSV export to parquet: make csv-import CSV=data/csv/x.csv [TZ=EET] [ARGS=--overwrite]
+	uv run python scripts/mt5_csv_to_parquet.py $(CSV) --tz $(or $(TZ),UTC) $(ARGS)
+
+download: ## Fetch provider history for QTE_ENGINE__SYMBOLS into parquet
 	uv run qte-backtest download
 
 history: ## List the parquet history on disk
@@ -90,6 +136,7 @@ ping: ## Ask the running runners to identify themselves
 	uv run qte-control ping
 
 .PHONY: help install install-dev lock test lint format check infra up down logs nuke \
+	strategy-deps strategy-requirements strategy-test strategies audit audit-strict routing \
 	db-upgrade db-downgrade db-revision db-current db-history db-check \
-	download history backtest reports ingestion runner \
+	download history backtest reports ingestion runner csv-import \
 	shadow-status shadow-on shadow-off ping

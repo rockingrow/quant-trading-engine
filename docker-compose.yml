@@ -21,6 +21,10 @@ x-app: &app
     # The private strategy repo, mounted read-only: the engine loads it and
     # can never write to it.
     - ./__strategies__:/app/__strategies__:ro
+    # Which strategies trade which symbols. Read-only and mounted rather than
+    # baked in: it is git-ignored, so it is never in the image, and changing
+    # the book is a restart rather than a rebuild.
+    - ./config:/app/config:ro
     - ./data/parquet:/app/data/parquet
     - ./data/reports:/app/data/reports
   depends_on:
@@ -37,7 +41,7 @@ services:
     command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
     volumes:
       - redis-data:/data
-    ports: ["6379:6379"]
+    ports: ["${QTE_REDIS_PORT:-6379}:6379"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -52,7 +56,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-qte_audit}
     volumes:
       - postgres-data:/var/lib/postgresql/data
-    ports: ["5432:5432"]
+    ports: ["${QTE_POSTGRES_PORT:-5432}:5432"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-qte} -d ${POSTGRES_DB:-qte_audit}"]
       interval: 5s
@@ -63,11 +67,11 @@ services:
     image: nats:2-alpine
     command: ["-c", "/etc/nats/nats.conf"]
     volumes:
-      - ./deploy/nats/nats.conf:/etc/nats/nats.conf:ro
+      - ./config/nats.conf:/etc/nats/nats.conf:ro
       - nats-data:/data
     ports:
-      - "4222:4222"
-      - "8222:8222"
+      - "${QTE_NATS_PORT:-4222}:4222"
+      - "${QTE_NATS_MONITOR_PORT:-8222}:8222"
 
   data-ingestion:
     <<: *app
@@ -88,6 +92,34 @@ services:
       # the host with `make backtest`, not inside the live trading container.
       args: {QTE_PACKAGE: qte-strategy-engine}
     command: ["qte-strategy-runner"]
+
+  # One-shot: validate what __strategies__/ publishes before trusting it.
+  #
+  #     docker compose run --rm strategy-audit
+  #
+  # No service depends_on this one, deliberately. `depends_on` would gate on a
+  # container that has already exited successfully, so it answers the question
+  # once — when the stack first came up — and never again however often the
+  # runner restarts or the read-only mount changes underneath it. The runner
+  # audits its own book on every start instead: QTE_RUNNER__AUDIT_ON_START.
+  # And data-ingestion never imports a strategy, so a strategy defect is not
+  # its business; stopping the feed over one would only cost the candles
+  # needed to debug it.
+  #
+  # Behind a profile so `docker compose up` does not start it — it exits, and a
+  # container that exits non-zero on purpose has no business in `up`. Same
+  # image as the runner would be, minus the reason to restart.
+  strategy-audit:
+    profiles: ["tools"]
+    env_file: [.env]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args: {QTE_PACKAGE: qte-strategy-audit}
+    volumes:
+      - ./__strategies__:/app/__strategies__:ro
+      - ./config:/app/config:ro
+    command: ["qte-strategy-audit", "--strict"]
 
 volumes:
   redis-data:

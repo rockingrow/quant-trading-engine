@@ -1,1 +1,1 @@
-"""QTE data ingestion — Tiingo WebSocket to Redis state and NATS events."""
+"""QTE data ingestion: live market data to Redis state and NATS events."""

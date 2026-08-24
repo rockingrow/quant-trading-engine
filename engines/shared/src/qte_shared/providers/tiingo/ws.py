@@ -1,9 +1,10 @@
-"""Tiingo WebSocket client — one socket per market, reconnecting forever.
+"""Tiingo WebSocket feed -- one socket per market, reconnecting forever.
 
 Tiingo runs FX and crypto on separate endpoints with the same envelope, so one
 class serves both and the market only changes the URL, the threshold and how a
-data row is read. Every parsed quote/trade becomes a :class:`~qte_shared.models.Tick`
-handed to a callback; nothing here knows about candles, Redis or NATS.
+data row is read. Every parsed quote/trade becomes a
+:class:`~qte_shared.models.Tick` handed to the callback; nothing here knows
+about candles, Redis or NATS.
 
 Reconnect policy is deliberately unbounded with capped backoff: a feed that
 gives up at 3am leaves the engine silently blind, which is worse than a socket
@@ -15,66 +16,70 @@ from __future__ import annotations
 import asyncio
 import json
 import random
-from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 
 import websockets
-from qte_shared.config import settings
+
+from qte_shared.interfaces.market_data import (
+    LiveFeed,
+    ProviderNotConfigured,
+    TickHandler,
+)
 from qte_shared.logging_setup import get_logger
 from qte_shared.models import Tick
-from qte_shared.symbols import Market, SymbolSpec
+from qte_shared.providers.tiingo.settings import TiingoSettings
+from qte_shared.symbols import Market
 
 log = get_logger(__name__)
-
-TickHandler = Callable[[Tick], Awaitable[None]]
 
 _MAX_BACKOFF_SECONDS = 60.0
 
 
-class TiingoWebSocketClient:
+class TiingoLiveFeed(LiveFeed):
     """Subscribes to one market's tickers and emits ticks until stopped."""
 
     def __init__(
         self,
         market: Market,
-        specs: list[SymbolSpec],
+        tickers: dict[str, str],
         on_tick: TickHandler,
-        api_key: str | None = None,
+        config: TiingoSettings,
     ) -> None:
+        """*tickers* maps the Tiingo ticker back to the QTE symbol it stands for."""
         self.market = market
-        self.specs = [spec for spec in specs if spec.market == market]
+        self.name = f"tiingo-{market}"
+        self._by_ticker = dict(tickers)
         self._on_tick = on_tick
-        self._api_key = api_key if api_key is not None else settings.tiingo.api_key
-        self._by_ticker = {spec.tiingo_ticker: spec.symbol for spec in self.specs}
+        self._config = config
         self._running = False
         self._task: asyncio.Task[None] | None = None
 
-    # ── Lifecycle ─────────────────────────────────────────────────────
+    # -- Lifecycle ---------------------------------------------------------
+
+    @property
+    def symbols(self) -> tuple[str, ...]:
+        return tuple(sorted(self._by_ticker.values()))
 
     @property
     def url(self) -> str:
-        return settings.tiingo.fx_ws_url if self.market == "fx" else settings.tiingo.crypto_ws_url
+        return self._config.fx_ws_url if self.market == "fx" else self._config.crypto_ws_url
 
     @property
     def threshold(self) -> int:
-        return (
-            settings.tiingo.fx_threshold
-            if self.market == "fx"
-            else settings.tiingo.crypto_threshold
-        )
+        return self._config.fx_threshold if self.market == "fx" else self._config.crypto_threshold
 
     def start(self) -> asyncio.Task[None] | None:
         """Spawn the connect loop. No-op when this market has no symbols."""
-        if not self.specs:
-            log.info("No %s symbols configured — skipping that socket", self.market)
+        if not self._by_ticker:
+            log.info("No %s symbols configured -- skipping that socket", self.market)
             return None
-        if not self._api_key:
-            raise RuntimeError(
+        if not self._config.api_key:
+            raise ProviderNotConfigured(
                 "QTE_TIINGO__API_KEY is not set; the Tiingo WebSocket cannot authenticate"
             )
         self._running = True
-        self._task = asyncio.create_task(self._run(), name=f"tiingo-{self.market}")
+        self._task = asyncio.create_task(self._run(), name=self.name)
         return self._task
 
     async def stop(self) -> None:
@@ -87,7 +92,7 @@ class TiingoWebSocketClient:
                 pass
             self._task = None
 
-    # ── Connect loop ──────────────────────────────────────────────────
+    # -- Connect loop ------------------------------------------------------
 
     async def _run(self) -> None:
         attempt = 0
@@ -113,7 +118,7 @@ class TiingoWebSocketClient:
                 attempt += 1
                 delay = _backoff(attempt)
                 log.warning(
-                    "Tiingo %s socket dropped (attempt %d): %s — retrying in %.1fs",
+                    "Tiingo %s socket dropped (attempt %d): %s -- retrying in %.1fs",
                     self.market,
                     attempt,
                     exc,
@@ -126,7 +131,7 @@ class TiingoWebSocketClient:
             json.dumps(
                 {
                     "eventName": "subscribe",
-                    "authorization": self._api_key,
+                    "authorization": self._config.api_key,
                     "eventData": {
                         "thresholdLevel": self.threshold,
                         "tickers": sorted(self._by_ticker),
@@ -135,7 +140,7 @@ class TiingoWebSocketClient:
             )
         )
 
-    # ── Message handling ──────────────────────────────────────────────
+    # -- Message handling --------------------------------------------------
 
     async def _handle_raw(self, raw: str | bytes) -> None:
         try:
@@ -200,7 +205,7 @@ class TiingoWebSocketClient:
 
 
 def _backoff(attempt: int) -> float:
-    """Exponential backoff with jitter, capped — never a tight reconnect loop."""
+    """Exponential backoff with jitter, capped -- never a tight reconnect loop."""
     base = min(_MAX_BACKOFF_SECONDS, 2.0 ** min(attempt, 6))
     return base * (0.5 + random.random() / 2)
 

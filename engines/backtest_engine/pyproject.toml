@@ -1,11 +1,11 @@
 [project]
 name = "qte-backtest"
 version = "0.1.0"
-description = "QTE backtest engine: Tiingo history downloader, parquet replay, fill simulation, reporting."
-requires-python = ">=3.11"
+description = "QTE backtest engine: provider history downloader, parquet replay, fill simulation, reporting."
+requires-python = ">=3.13,<3.14"
 dependencies = [
-    "qte-shared",
-    "httpx>=0.27",
+    # See data_ingestion: the extra pulls in the configured vendor's client.
+    "qte-shared[tiingo]",
     "pyarrow>=16.0",
 ]
 

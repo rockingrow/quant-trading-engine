@@ -104,19 +104,18 @@ class PostgresSettings(BaseSettings):
     enabled: bool = True
 
 
-class TiingoSettings(BaseSettings):
-    """Market data source — REST for history, WebSocket for live."""
+class MarketDataSettings(BaseSettings):
+    """Which market data vendor the process uses.
 
-    model_config = SettingsConfigDict(env_prefix="QTE_TIINGO__", extra="ignore")
+    Only the *choice* lives here. A vendor's own endpoints and credentials sit
+    with its provider (``QTE_TIINGO__*`` with
+    :mod:`qte_shared.providers.tiingo`), so adding a second vendor never edits
+    this file — see :mod:`qte_shared.interfaces.market_data`.
+    """
 
-    api_key: str = ""
-    rest_url: str = "https://api.tiingo.com"
-    fx_ws_url: str = "wss://api.tiingo.com/fx"
-    crypto_ws_url: str = "wss://api.tiingo.com/crypto"
-    # Tiingo's WS "thresholdLevel": 5 = top-of-book quotes only, 0 = every trade.
-    fx_threshold: int = 5
-    crypto_threshold: int = 2
-    request_timeout: float = 30.0
+    model_config = SettingsConfigDict(env_prefix="QTE_MARKET_DATA__", extra="ignore")
+
+    provider: str = "tiingo"
 
 
 class EngineSettings(BaseSettings):
@@ -129,6 +128,10 @@ class EngineSettings(BaseSettings):
     signal_timeframe: str = "M15"
     warmup_candles: int = 300
     strategies_dir: Path = REPO_ROOT / "__strategies__"
+    #: Symbol → strategies table. Git-ignored, with a tracked template beside
+    #: it; see :mod:`qte_shared.routing`. Absent means every strategy keeps the
+    #: symbols it declares on itself.
+    routing_file: Path = REPO_ROOT / "config" / "strategies_mapping.toml"
     parquet_dir: Path = REPO_ROOT / "data" / "parquet"
     reports_dir: Path = REPO_ROOT / "data" / "reports"
 
@@ -150,7 +153,7 @@ class Settings(BaseSettings):
     broker: BrokerSettings = Field(default_factory=BrokerSettings)
     redis: RedisSettings = Field(default_factory=RedisSettings)
     postgres: PostgresSettings = Field(default_factory=PostgresSettings)
-    tiingo: TiingoSettings = Field(default_factory=TiingoSettings)
+    market_data: MarketDataSettings = Field(default_factory=MarketDataSettings)
     engine: EngineSettings = Field(default_factory=EngineSettings)
 
     @property

@@ -8,7 +8,7 @@
 # The workspace layout is what makes this possible: each engine declares only
 # what it needs, so `uv sync --package` has a real boundary to cut along.
 
-FROM python:3.11-slim AS base
+FROM python:3.13-slim AS base
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -33,6 +33,7 @@ COPY engines/shared/pyproject.toml engines/shared/
 COPY engines/data_ingestion/pyproject.toml engines/data_ingestion/
 COPY engines/backtest_engine/pyproject.toml engines/backtest_engine/
 COPY engines/strategy_engine/pyproject.toml engines/strategy_engine/
+COPY engines/strategy_audit/pyproject.toml engines/strategy_audit/
 
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-install-workspace --no-dev --package ${QTE_PACKAGE}
@@ -44,9 +45,25 @@ COPY alembic.ini ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --package ${QTE_PACKAGE}
 
+# Strategies bring their own dependencies (pandas-ta and whatever else the
+# private repo needs), and they are imported into *this* process — so they have
+# to be installed here even though the code itself is a mounted volume.
+# __strategies__/ is not in the build context (see .dockerignore), so the
+# operator freezes them out of the plugin repo's own lockfile first:
+#
+#     make strategy-requirements   # writes deploy/strategy-requirements.txt
+#
+# Absent that file the image still builds; the runner then fails on the first
+# import of a strategy that needs something it does not have.
+COPY deploy/ deploy/
+RUN --mount=type=cache,target=/root/.cache/uv \
+    if [ -f deploy/strategy-requirements.txt ]; then \
+        uv pip install --python /opt/venv/bin/python -r deploy/strategy-requirements.txt; \
+    fi
+
 # __strategies__/ is never baked in. It is a mounted volume, so the private
 # repo can be updated (or pulled) without rebuilding the public engine.
-RUN mkdir -p /app/__strategies__ /app/data/parquet /app/data/reports \
+RUN mkdir -p /app/__strategies__ /app/config /app/data/parquet /app/data/reports \
     && useradd --create-home --uid 10001 qte \
     && chown -R qte:qte /app
 USER qte
