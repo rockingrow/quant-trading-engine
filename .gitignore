@@ -216,3 +216,39 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ── QTE ───────────────────────────────────────────────────────────────
+# The private strategy repo is cloned in here at deploy time. It must never
+# reach this public repository's history.
+# Your private strategy repo gets cloned straight into this directory, so it is
+# ignored whole — and left UNTRACKED, with no .gitkeep, because `git clone <repo>
+# __strategies__` refuses a destination that already contains a file. Anchored
+# to the repo root so `examples/__strategies__/` is not swept up by the rule.
+/__strategies__/
+
+# Frozen out of the strategy repo's lockfile by `make strategy-requirements` so
+# the image build can install what the plugins need. Regenerated per deploy and
+# describing a repo this one does not track, so it stays out of history.
+/deploy/strategy-requirements.txt
+
+# Which strategies trade which symbols, and at what risk. That is position
+# information and this repo is public, so the table itself stays out while the
+# template beside it — schema, dummy values — stays in and reviewable.
+/config/strategies_mapping.toml
+/config/strategies_mapping.*.toml
+!/config/strategies_mapping.example.toml
+
+# Downloaded market history — regenerate with `make download`, never commit.
+/data/parquet/*
+!/data/parquet/.gitkeep
+*.parquet
+*.csv
+
+# Backtest reports. Regenerated per run and named with a timestamp, so they
+# accumulate fast; keep the ones that matter somewhere else.
+/data/reports/*
+!/data/reports/.gitkeep
+
+.env
+.env.*
+!.env.example
