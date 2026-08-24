@@ -10,18 +10,23 @@ Findings are ordered by what they cost. Each says whether it was reproduced by
 running it or established by reading the code; the repro snippets are inline so
 that fixing one starts from a failing case rather than from prose.
 
-| # | Severity | What | Where |
-|---|----------|------|-------|
-| 1 | High | A flushed bar can be re-opened and republished with wrong OHLC | `resampler.py` |
-| 2 | Medium | A bug in the tick handler is reported as a dropped feed | `simulator/feed.py`, `tiingo/ws.py` |
-| 3 | Medium | The flush loop has no exception guard | `ingestion/service.py` |
-| 4 | Medium | An inverted bracket reaches the wire with SL and TP1 at the same price | `signal_factory.py` |
-| 5 | Medium | A second entry orphans the first trade cycle, silently | `signal_factory.py` |
-| 6 | Low | A background generator that dies looks like one that finished | `control.py`, `hub.py` |
-| 7 | Low | `/control` throws a traceback on disconnect; `/stream` does not | `server.py` |
-| 8 | Low | `stop_generators` swallows its own caller's cancellation | `hub.py` |
-| 9 | Low | A feed client is attached before it is welcomed | `server.py` |
-| 10 | Low | Falsy-zero defaults turn explicit zeros into fallbacks | `cli.py`, `sources.py` |
+**Findings 1–4 are fixed** — see the "Fixed" note at the end of each. The fixes
+landed with 17 regression tests; 10 of them fail against the code as it stood
+when this audit was written, which is what makes them regression tests rather
+than decoration. Findings 5–10 are still open.
+
+| # | Severity | What | Where | Status |
+|---|----------|------|-------|--------|
+| 1 | High | A flushed bar can be re-opened and republished with wrong OHLC | `resampler.py` | **Fixed** |
+| 2 | Medium | A bug in the tick handler is reported as a dropped feed | `simulator/feed.py`, `tiingo/ws.py` | **Fixed** |
+| 3 | Medium | The flush loop has no exception guard | `ingestion/service.py` | **Fixed** |
+| 4 | Medium | An inverted bracket reaches the wire with SL and TP1 at the same price | `signal_factory.py` | **Fixed** |
+| 5 | Medium | A second entry orphans the first trade cycle, silently | `signal_factory.py` | Open |
+| 6 | Low | A background generator that dies looks like one that finished | `control.py`, `hub.py` | Open |
+| 7 | Low | `/control` throws a traceback on disconnect; `/stream` does not | `server.py` | Open |
+| 8 | Low | `stop_generators` swallows its own caller's cancellation | `hub.py` | Open |
+| 9 | Low | A feed client is attached before it is welcomed | `server.py` | Open |
+| 10 | Low | Falsy-zero defaults turn explicit zeros into fallbacks | `cli.py`, `sources.py` | Open |
 
 Findings 1–3 reach past the simulator into the live trading path. That is the
 fixture doing its job — it is faithful enough to expose real defects — and also
@@ -49,10 +54,10 @@ the guard just does not survive a flush.
 r = Resampler("XAUUSD", ["M15"])
 base = datetime(2026, 8, 24, 9, 0, tzinfo=UTC)
 
-r.add_tick(Tick(symbol="XAUUSD", ts=base,                          last=2400.0, volume=1))
+r.add_tick(Tick(symbol="XAUUSD", ts=base, last=2400.0, volume=1))
 r.add_tick(Tick(symbol="XAUUSD", ts=base + timedelta(seconds=200), last=2410.0, volume=1))
 
-first = r.flush(base + timedelta(minutes=15))     # the wall-clock flush fires mid-bar
+first = r.flush(base + timedelta(minutes=15))  # the wall-clock flush fires mid-bar
 
 r.add_tick(Tick(symbol="XAUUSD", ts=base + timedelta(seconds=400), last=2395.0, volume=1))
 r.add_tick(Tick(symbol="XAUUSD", ts=base + timedelta(seconds=899), last=2408.0, volume=1))
@@ -86,6 +91,14 @@ whose bucket is at or below it, reusing the existing "Dropping late tick"
 warning. That makes the guard independent of whether a builder happens to be
 alive, and it also covers `restore()` resurrecting a bucket that was published
 just before the process died.
+
+**Fixed.** `Resampler` now carries `_last_closed`, an open-time watermark per
+timeframe, set by both `flush()` and the bucket-advance branch of `add_tick`.
+Any tick whose bucket is at or below it is dropped with the existing late-tick
+warning, so the guard no longer depends on a builder being alive. `restore()`
+checks the same watermark, so a bar recovered from Redis cannot republish a
+bucket this process has already closed. Regression tests in
+`tests/test_resampler.py`.
 
 ---
 
@@ -123,6 +136,12 @@ consumer failure with `log.exception`, and continue the receive loop — the sha
 `NatsBus.subscribe` already uses for its `guarded` wrapper, re-raising
 `CancelledError`. One bad tick should not cost a connection.
 
+**Fixed.** The handler call in `_handle_raw` now has its own `try` in both
+feeds: `CancelledError` propagates so shutdown still unwinds, anything else is
+logged with `log.exception` and the receive loop continues. A consumer bug now
+costs one tick instead of the connection, and the log names the consumer.
+Regression tests in `tests/test_feed_resilience.py`.
+
 ---
 
 ## 3. The flush loop has no exception guard
@@ -145,6 +164,12 @@ out of session that can be a long time, and the service goes on looking healthy
 **Fix.** Put a `try/except Exception: log.exception(...)` inside the `while`, so
 one failed publish costs one flush interval rather than the loop. Re-raise
 `CancelledError` so `stop()` still unwinds cleanly.
+
+**Fixed.** The cycle body is wrapped in `try / except CancelledError: raise /
+except Exception: log.exception(...)`, so a failed publish costs one flush
+interval rather than every future one. Regression test in
+`tests/test_feed_resilience.py` asserts the loop is still alive after a failure
+and still closing bars afterwards.
 
 ---
 
@@ -176,6 +201,13 @@ for LONG and `sl > price` for SHORT, and require each TP on the profit side.
 Raising there keeps it off the wire entirely, which is that method's stated
 contract. The factory is shared, so the backtest starts refusing the same signal
 — which is the point: better a red backtest than a matching pair of bad fills.
+
+**Fixed.** `validate_shape` now calls `_validate_bracket` for entries, which
+refuses a stop on the losing side of the entry and any target on the losing
+side. Equality is deliberately allowed — a stop moved to breakeven sits exactly
+at entry. Closes are not checked: a TP1 is above a long's entry by definition
+and carries no entry of its own to orient against. Regression tests in
+`tests/test_broker_contract.py`.
 
 ---
 
@@ -354,6 +386,7 @@ Worth stating plainly, because it shapes how much of the above is urgent.
   0.68 MiB at real-file float precision, against a ceiling near 7,400 bars. Thin
   headroom rather than a defect; worth a comment if `MAX_BARS` ever rises.
 
-Findings 1 and 3 are the two to fix before this branch runs anywhere that
-matters. Both are small, self-contained changes in `data_ingestion`, and both
-are testable without a live feed.
+Findings 1 and 3 were the two to fix before this branch ran anywhere that
+mattered; both are done, along with 2 and 4. Finding 5 is the remaining Medium
+and is a few lines — the question it needs answered is a policy one (warn,
+refuse, or auto-flatten the old cycle), not a technical one.
