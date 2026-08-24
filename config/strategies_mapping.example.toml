@@ -1,0 +1,57 @@
+# Which strategies trade which symbols.
+#
+#   cp config/strategies_mapping.example.toml config/strategies_mapping.toml
+#
+# This template is tracked; `config/strategies_mapping.toml` is git-ignored,
+# because what you actually trade — and at what risk — is position
+# information and this repo is public. Keep the two in step: a key added here
+# is a key the operator can use, and a key only in the real file is one
+# nobody can review.
+#
+# The runner reads `config/strategies_mapping.toml` on boot. Override the path with
+# QTE_ENGINE__ROUTING_FILE to mount it as a secret instead. With no file at
+# all, nothing breaks: each strategy falls back to its own `symbols` attribute,
+# or to QTE_ENGINE__SYMBOLS when it declares none.
+#
+# Validate a table before deploying it:
+#
+#   make audit          # checks routing against what __strategies__/ publishes
+#
+# Names on the right-hand side are *strategy names* — the `name` attribute, or
+# the manifest alias — not class names. `make strategies` lists what is loaded.
+
+
+# Applied to any symbol whose entry lists no strategies of its own. Leave it
+# empty to require every symbol to say what it wants.
+[defaults]
+strategies = []
+
+
+# ── One table per symbol ────────────────────────────────────────────────
+
+[symbols.XAUUSD]
+strategies = ["EXAMPLE_GOLD_M15_V1", "EXAMPLE_GOLD_M5_SCALP"]
+
+# Per-pair parameter overrides, keyed by strategy name. They win over
+# QTE_RUNNER__STRATEGY_PARAMS, which is the per-strategy default — so one
+# strategy can run tighter on gold than it does on everything else.
+[symbols.XAUUSD.params.EXAMPLE_GOLD_M15_V1]
+risk_percent = 1.0
+atr_sl_mult = 1.5
+
+[symbols.XAUUSD.params.EXAMPLE_GOLD_M5_SCALP]
+risk_percent = 0.5
+
+
+[symbols.BTCUSDT]
+strategies = ["EXAMPLE_CRYPTO_M15_V1"]
+
+[symbols.BTCUSDT.params.EXAMPLE_CRYPTO_M15_V1]
+risk_percent = 0.75
+
+
+# `enabled = false` parks a symbol without deleting its configuration, so
+# turning it back on is a one-word edit and the diff says what happened.
+[symbols.EURUSD]
+enabled = false
+strategies = ["EXAMPLE_FX_M15_V1"]

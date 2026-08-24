@@ -1,0 +1,157 @@
+# QTE local/VPS stack.
+#
+# The schema is NOT created by this file. Run `make db-upgrade` after the first
+# `up` — Alembic owns the schema, and an init-hook script would only ever run on
+# an empty volume, which is precisely the case a migration tool exists to
+# outgrow.
+#
+# `nats` here is for standalone development. In production you normally point
+# QTE_BROKER__NATS_URL at the *broker's* NATS, because that is where the
+# JetStream `SIGNALS` stream its workers consume actually lives — publishing to
+# a second cluster would mean nobody ever receives the signals. Run this one
+# either way for QTE's own candle traffic, or set QTE_NATS__URL to the broker's
+# cluster and drop this service.
+
+name: qte
+
+x-app: &app
+  env_file: [.env]
+  restart: unless-stopped
+  volumes:
+    # The private strategy repo, mounted read-only: the engine loads it and
+    # can never write to it.
+    - ./__strategies__:/app/__strategies__:ro
+    # Which strategies trade which symbols. Read-only and mounted rather than
+    # baked in: it is git-ignored, so it is never in the image, and changing
+    # the book is a restart rather than a rebuild.
+    - ./config:/app/config:ro
+    - ./data/parquet:/app/data/parquet
+    - ./data/reports:/app/data/reports
+  depends_on:
+    redis-cache: {condition: service_healthy}
+    postgres-audit: {condition: service_healthy}
+    nats: {condition: service_started}
+
+services:
+  redis-cache:
+    image: redis:7-alpine
+    # AOF on: hot state (open cycles, the warm-up window) has to survive a
+    # restart, and losing the cycle id of an open position means the engine
+    # forgets which trade it is in.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redis-data:/data
+    ports: ["${QTE_REDIS_PORT:-6379}:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  postgres-audit:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-qte}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-qte}
+      POSTGRES_DB: ${POSTGRES_DB:-qte_audit}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports: ["${QTE_POSTGRES_PORT:-5432}:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-qte} -d ${POSTGRES_DB:-qte_audit}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  nats:
+    image: nats:2-alpine
+    command: ["-c", "/etc/nats/nats.conf"]
+    volumes:
+      - ./config/nats.conf:/etc/nats/nats.conf:ro
+      - nats-data:/data
+    ports:
+      - "${QTE_NATS_PORT:-4222}:4222"
+      - "${QTE_NATS_MONITOR_PORT:-8222}:8222"
+
+  data-ingestion:
+    <<: *app
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # No pyarrow, no backtest engine — this container only reads the feed.
+      args: {QTE_PACKAGE: qte-ingestion}
+    command: ["qte-ingestion"]
+
+  strategy-runner:
+    <<: *app
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # Ships qte-strategy-runner and qte-control. NOT the backtest engine:
+      # strategy-engine does not depend on it, so replaying history is done on
+      # the host with `make backtest`, not inside the live trading container.
+      args: {QTE_PACKAGE: qte-strategy-engine}
+    command: ["qte-strategy-runner"]
+
+  # The dev-only market data simulator. `docker compose --profile dev up -d`.
+  #
+  # Behind a profile, and not because the guard is weak — QTE_ENV=dev is
+  # enforced in the process (`qte_shared.dev_only`). It is behind a profile
+  # because starting it *in* dev alongside a real feed gives one symbol two
+  # sources, and the resampler drops whichever tick arrives second as late.
+  # Which feed is live has to be a decision, so it takes a flag.
+  #
+  # It depends on nothing: no Redis, no Postgres, no NATS. It owns a socket and
+  # the ticks it is told to send, and everything downstream of that is the real
+  # pipeline — which is what makes the rehearsal worth running.
+  market-simulator:
+    profiles: ["dev"]
+    env_file: [.env]
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args: {QTE_PACKAGE: qte-simulator}
+    command: ["qte-simulator", "serve"]
+    # Published so the CLI on the host can drive it:
+    #   qte-simulator replay --symbol XAUUSD --generate 300
+    #
+    # Both sides are variables, unlike the other services: those images always
+    # listen on their standard port, while this one binds whatever
+    # QTE_SIMULATOR__PORT says. Hard-coding the container side would leave the
+    # mapping pointing at a port nothing is listening on the moment someone
+    # changed it. QTE_SIMULATOR__URL has to follow it too.
+    ports: ["${QTE_SIMULATOR_PORT:-8901}:${QTE_SIMULATOR__PORT:-8901}"]
+
+  # One-shot: validate what __strategies__/ publishes before trusting it.
+  #
+  #     docker compose run --rm strategy-audit
+  #
+  # No service depends_on this one, deliberately. `depends_on` would gate on a
+  # container that has already exited successfully, so it answers the question
+  # once — when the stack first came up — and never again however often the
+  # runner restarts or the read-only mount changes underneath it. The runner
+  # audits its own book on every start instead: QTE_RUNNER__AUDIT_ON_START.
+  # And data-ingestion never imports a strategy, so a strategy defect is not
+  # its business; stopping the feed over one would only cost the candles
+  # needed to debug it.
+  #
+  # Behind a profile so `docker compose up` does not start it — it exits, and a
+  # container that exits non-zero on purpose has no business in `up`. Same
+  # image as the runner would be, minus the reason to restart.
+  strategy-audit:
+    profiles: ["tools"]
+    env_file: [.env]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args: {QTE_PACKAGE: qte-strategy-audit}
+    volumes:
+      - ./__strategies__:/app/__strategies__:ro
+      - ./config:/app/config:ro
+    command: ["qte-strategy-audit", "--strict"]
+
+volumes:
+  redis-data:
+  postgres-data:
+  nats-data:

@@ -1,0 +1,11 @@
+.git
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+data/parquet/*.parquet
+__strategies__
+.env
+docs
+examples
