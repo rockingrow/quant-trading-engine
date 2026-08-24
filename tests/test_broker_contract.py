@@ -139,7 +139,7 @@ def test_entry_with_zero_quantity_is_rejected():
         entry.validate_shape()
 
 
-# ── Bracket orientation ────────────────────────────────────────────────────────
+# ── Bracket orientation ───────────────────────────────────────────────────
 #
 # `BracketPolicy` derives targets from `abs(price - sl)`, so it mirrors a
 # wrong-side stop rather than refusing it — and with the default first target

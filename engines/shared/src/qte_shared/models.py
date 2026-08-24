@@ -21,7 +21,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-# ── Correlation ids ─────────────────────────────────────────────────────────────
+# ── Correlation ids ───────────────────────────────────────────────────────
 
 #: The broker accepts exactly 16 uppercase alphanumeric characters and 422s on
 #: anything else, so QTE mints ids in that shape rather than discovering the
@@ -47,7 +47,7 @@ def utcnow() -> datetime:
     return datetime.now(UTC)
 
 
-# ── Market data ───────────────────────────────────────────────────────────────
+# ── Market data ───────────────────────────────────────────────────────────
 
 
 class Tick(BaseModel):
