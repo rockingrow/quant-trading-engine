@@ -224,7 +224,8 @@ __marimo__/
 # ignored whole — and left UNTRACKED, with no .gitkeep, because `git clone <repo>
 # __strategies__` refuses a destination that already contains a file. Anchored
 # to the repo root so `examples/__strategies__/` is not swept up by the rule.
-/__strategies__/
+/__strategies__/*
+!/__strategies__/.gitkeep
 
 # Frozen out of the strategy repo's lockfile by `make strategy-requirements` so
 # the image build can install what the plugins need. Regenerated per deploy and
