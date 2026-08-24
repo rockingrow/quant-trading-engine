@@ -160,8 +160,23 @@ class TiingoLiveFeed(LiveFeed):
             return
 
         tick = self._parse(message.get("data") or [])
-        if tick is not None:
+        if tick is None:
+            return
+        # A consumer that raises must not cost us the socket. Without this the
+        # exception reaches the reconnect handler in `_run`, which drops a
+        # healthy connection, loses every tick that arrives during the backoff,
+        # and reports a Redis or NATS failure as "Tiingo socket dropped".
+        try:
             await self._on_tick(tick)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception(
+                "Tick handler failed market=%s symbol=%s ts=%s — the socket stays open",
+                self.market,
+                tick.symbol,
+                tick.ts.isoformat(),
+            )
 
     def _parse(self, data: list[Any]) -> Tick | None:
         """Turn one Tiingo data row into a tick, or ``None`` if it isn't one.
