@@ -207,7 +207,7 @@ half-written.
 | --- | --- |
 | `engines/shared/src/qte_shared/` | — models, indicators, `StrategyBase`, NATS/Redis/Postgres adapters, the plugin loader, the signal factory, `interfaces/` (the contracts engines program against) and `providers/` (the market data vendors behind them). Every other engine depends on this and on nothing else in the repo. |
 | `engines/data_ingestion/src/qte_ingestion/` | Provider live feed → resampler → Redis + NATS. |
-| `engines/backtest_engine/src/qte_backtest/` | History downloader, parquet store, replay loop, fill simulator, metrics, reports, `qte-backtest` CLI. |
+| `engines/backtest_engine/src/qte_backtest/` | History downloader, parquet store, replay loop, fill simulator, metrics, reports, the HTML dashboard, `qte-backtest` CLI. |
 | `engines/strategy_engine/src/qte_strategy_engine/` | The live runner: plugin loading, the NATS event loop, delivery to the broker, audit, and the `qte-control` operator CLI. |
 | `engines/market_simulator/src/qte_simulator/` | **Dev only.** A WebSocket feed you drive by hand, so the whole pipeline can be rehearsed with no market open. Refuses to start unless `QTE_ENV=dev`. `qte-simulator`; see [`docs/simulator.md`](docs/simulator.md). |
 | `engines/strategy_audit/src/qte_strategy_audit/` | The deploy gate: validates every strategy in `__strategies__/` against the QTE signal contract and cross-checks the routing table. `qte-strategy-audit`. |
@@ -637,6 +637,30 @@ Diagnostics       2 critical, 1 info
 knows to stop reading the metrics as meaningful. The rule table and the JSON
 schema are in [`docs/backtest-report.md`](docs/backtest-report.md).
 
+### Seeing it
+
+`qte-backtest chart` renders a report into one self-contained HTML page, laid
+out like a strategy tester — the layout every discretionary trader already
+reads:
+
+```bash
+uv run qte-backtest chart data/reports/MY_EDGE_XAUUSD_M15_20260823T150404Z.json
+make chart REPORT=data/reports/MY_EDGE_XAUUSD_M15_20260823T150404Z.json
+uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --report --chart
+```
+
+The equity curve against buy-and-hold, the price window with every trade marked
+on it, P&L by period, the returns distribution, streaks, run-ups and drawdowns,
+MAE/MFE against realised R, the diagnostics and the full sortable trade list.
+
+Three things it will not do. It fetches **nothing** when it opens — stylesheet,
+script and data are inlined, so a report opens on a machine with no network. It
+takes the **JSON and nothing else**, so a run from three months ago still draws
+without its history, its strategy or this engine. And it **invents nothing**:
+statistics that need data the replay never had — intrabar equity, margin,
+liquidation — are absent rather than approximated, which is why there is no
+margin panel.
+
 ---
 
 ## Rehearsing the live path (dev only)
@@ -746,6 +770,7 @@ Everything else the engine knows is a CLI command or a SQL query:
 | One trade cycle end to end | `SELECT * FROM signals WHERE signal_uxid = '…' ORDER BY created_at` |
 | Backtest a strategy | `uv run qte-backtest run --strategy … --symbol … --report` |
 | Read a report | `data/reports/*.json` — the file an agent analyses |
+| Look at a report | `uv run qte-backtest chart data/reports/….json`, then open the HTML |
 | Rehearse the live path | `make sim`, then `qte-simulator replay --symbol … --generate 300 --verify` (dev only) |
 
 ## Database

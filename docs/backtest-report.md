@@ -1,13 +1,17 @@
 # The backtest report
 
-`qte_backtest.report` writes two files per run: a JSON artefact meant for an AI
-agent or a script, and a Markdown companion rendering the same object for a
-human. They are not a summary and a detail view of different numbers — the
-Markdown is the JSON, laid out for reading.
+`qte_backtest.report` writes a JSON artefact meant for an AI agent or a script,
+a Markdown companion rendering the same object for a human, and — on request —
+an HTML dashboard rendering it again as charts. They are not a summary and a
+detail view of different numbers: the Markdown is the JSON laid out for reading,
+and the HTML is the JSON drawn.
 
 ```bash
 uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --report
 # → data/reports/MY_EDGE_XAUUSD_M15_20260823T150404Z.{json,md}
+
+uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --report --chart
+# → …{json,md,html}
 ```
 
 ## What the JSON contains
@@ -17,6 +21,7 @@ uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --report
 | `reading_guide` | The conventions an agent would otherwise have to guess — what R means, what the fill model assumes, why there is only ever one position. |
 | `run` | Strategy, class, module, params, warm-up, starting equity. |
 | `data` | Bar count, first and last bar, bars left after warm-up, gap count. |
+| `market` | A downsampled OHLC window of the replayed history, plus the buy-and-hold basis — the one thing the trades cannot re-derive. |
 | `costs` | Spread, slippage, commission, contract size, derived round-trip cost. |
 | `metrics` | Currency **and** R-multiple statistics, excursion averages, exit-reason counts, direction split, exposure, streaks, equity curve. |
 | `diagnostics` | Findings, most severe first, each with its threshold, its evidence and one concrete change. |
@@ -31,6 +36,11 @@ Two design choices to know about:
   Pass `--no-report-signals` if the emitted payloads are not wanted.
 - **`schema_version` is the first key.** A consumer that learned this shape can
   detect that it changed.
+- **`market` is for drawing, never for computing.** Each row aggregates
+  `bucket_bars` consecutive bars — first open, highest high, lowest low, last
+  close — so a chart of a multi-year run stays a few hundred rows. Every metric
+  in the report comes from the full series; anything computed off these rows
+  would be a coarser answer wearing the same name.
 
 ## Reading it
 
@@ -99,6 +109,52 @@ Adding a rule is a function in `diagnostics.py` returning `Finding | None`,
 registered in `_RULES`, plus a test that it fires on the fault and stays quiet
 on a healthy run.
 
+## Drawing it
+
+`qte-backtest chart` turns a report into a single self-contained HTML page laid
+out like a strategy tester — the layout every discretionary trader already
+reads, so the numbers land without a legend.
+
+```bash
+uv run qte-backtest chart data/reports/MY_EDGE_XAUUSD_M15_20260823T150404Z.json
+# → …20260823T150404Z.html
+
+make chart REPORT=data/reports/MY_EDGE_XAUUSD_M15_20260823T150404Z.json
+```
+
+It takes the **JSON and nothing else**, which is the property worth protecting:
+a report kept from a run three months ago still draws, on a machine with no
+parquet history, no strategy installed and no engine. Rendering is a separate
+command rather than a flag you had to have remembered — the replay is the
+expensive part, and the file is the artefact.
+
+| Panel | Shows |
+| --- | --- |
+| Key stats | Total P&L, max drawdown, profitable trades, profit factor. |
+| Performance | Cumulative P&L against buy-and-hold, with per-trade excursion and the underwater band as toggles. |
+| Price and trades | The `market` window as candles, every entry marked and joined to its exit. |
+| Performance analysis | Breakdown (gross profit/loss, P&L grouped by exit, direction or month), Periodical (CAGR, Sharpe, Sortino, P&L by day/week/month/year), Benchmarking (return against buy-and-hold, weekly, with correlation), Growth and decline (alternating run-ups and drawdowns, their durations). |
+| Trades analysis | Distribution (returns histogram, winners/losers split), Streaks, and the full metric table split All / Long / Short. |
+| Risk and excursion | MAE and MFE against realised R, and the R sequence trade by trade. |
+| Diagnostics | Every finding, its evidence and its one concrete change. |
+| List of trades | The whole trade list, sortable and filterable. |
+
+Three rules the page keeps:
+
+- **Nothing is fetched when it opens.** The stylesheet, the script and the data
+  are inlined; there is no CDN and no build step. A report is something you
+  email, or open on a machine with no network.
+- **Nothing is invented.** A statistic that needs data the replay never had —
+  intrabar equity, margin, liquidation — is absent rather than approximated. A
+  tester's margin panel has no honest equivalent here, so there is no margin
+  panel.
+- **Every aggregate is re-derivable.** The trade list is the source and the
+  panels are views over it, so a reader who distrusts a number can recompute it
+  from the same file.
+
+The derivations live in `qte_backtest.visualize.view` and are tested without a
+browser; `render.py` only inlines them into the page.
+
 ## Getting at it
 
 The files are the interface. `data/reports/` holds one JSON and one Markdown per
@@ -109,11 +165,13 @@ archaeology exercise.
 ```bash
 make reports                          # what has been written
 uv run qte-backtest run … --report    # write another
+make chart REPORT=data/reports/….json # draw one
 ```
 
 An agent reads `data/reports/*.json` directly. There is no HTTP service in front
 of it, and adding one would put a process to keep alive between an agent and a
-file it can already open.
+file it can already open. The dashboard is a file for the same reason — opening
+it needs a browser, not a server.
 
 ## What it does not do
 

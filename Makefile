@@ -114,6 +114,9 @@ backtest: ## Replay one strategy: make backtest STRATEGY=... SYMBOL=XAUUSD [TF=M
 	uv run qte-backtest run --strategy $(STRATEGY) --symbol $(SYMBOL) \
 		--timeframe $(or $(TF),M15) --report
 
+chart: ## Draw a report as an interactive HTML dashboard: make chart REPORT=data/reports/x.json
+	uv run qte-backtest chart $(REPORT)
+
 reports: ## List the backtest reports written so far
 	@ls -lht data/reports 2>/dev/null | head -20 || echo "No reports yet — run make backtest"
 
@@ -174,6 +177,6 @@ ping: ## Ask the running runners to identify themselves
 .PHONY: help install install-dev lock test lint format check infra up down logs nuke \
 	strategy-deps strategy-requirements strategy-test strategies audit audit-strict routing \
 	db-upgrade db-downgrade db-revision db-current db-history db-check \
-	download history backtest reports ingestion runner csv-import \
+	download history backtest chart reports ingestion runner csv-import \
 	sim sim-up sim-status sim-replay sim-bar sim-walk sim-stop sim-watch \
 	shadow-status shadow-on shadow-off ping
