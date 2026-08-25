@@ -1,9 +1,10 @@
-"""``qte-backtest`` CLI — download history, list it, replay a strategy."""
+"""``qte-backtest`` CLI — download history, list it, replay a strategy, draw one."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -14,6 +15,7 @@ from qte_shared.logging_setup import configure_logging, get_logger
 from qte_backtest.data_store import ParquetStore
 from qte_backtest.downloader import DownloadRequest, HistoryDownloader
 from qte_backtest.runner import BacktestRequest, run_backtest
+from qte_backtest.visualize import render_html
 
 log = get_logger(__name__)
 
@@ -69,12 +71,17 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--report-format",
         default="json,md",
-        help="Comma-separated: json, md (default: both)",
+        help="Comma-separated: json, md, html (default: json,md)",
     )
     run.add_argument(
         "--no-report-signals",
         action="store_true",
         help="Omit the emitted broker payloads from the JSON report",
+    )
+    run.add_argument(
+        "--chart",
+        action="store_true",
+        help="Also write the interactive HTML dashboard (same as adding html to --report-format)",
     )
     run.add_argument(
         "--param",
@@ -83,6 +90,18 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="KEY=VALUE",
         help="Repeatable strategy parameter override",
     )
+    chart = subparsers.add_parser(
+        "chart", help="Render a report JSON into an interactive HTML dashboard"
+    )
+    chart.add_argument("report", type=Path, help="A *.json report written by `run --report`")
+    chart.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        metavar="FILE",
+        help="Where to write the page (default: the report's name with .html)",
+    )
+    chart.add_argument("--title", default=None, help="Override the page heading")
     return parser
 
 
@@ -124,9 +143,7 @@ async def _run(args: argparse.Namespace) -> None:
             starting_equity=args.equity,
             persist=args.persist,
             report_dir=report_dir,
-            report_formats=tuple(
-                fmt.strip() for fmt in args.report_format.split(",") if fmt.strip()
-            ),
+            report_formats=_report_formats(args),
             report_include_signals=not args.no_report_signals,
         )
     )
@@ -134,6 +151,34 @@ async def _run(args: argparse.Namespace) -> None:
     print(report.result.report())
     print()
     _print_findings(report)
+
+
+def _report_formats(args: argparse.Namespace) -> tuple[str, ...]:
+    formats = [fmt.strip() for fmt in args.report_format.split(",") if fmt.strip()]
+    if args.chart and "html" not in formats:
+        formats.append("html")
+    return tuple(formats)
+
+
+def _chart(args: argparse.Namespace) -> None:
+    """Draw a report that already exists, without re-running anything.
+
+    The replay is the expensive part and the JSON is the artefact, so rendering
+    is a separate command rather than a flag you have to have remembered: a run
+    from last month can be drawn today, and a report someone sent you can be
+    drawn without its parquet history, its strategy, or this engine's config.
+    """
+    report = json.loads(args.report.read_text(encoding="utf-8"))
+    if "trades" not in report or "metrics" not in report:
+        raise SystemExit(
+            f"{args.report} does not look like a qte-backtest report "
+            "(no 'trades'/'metrics' block). Pass the JSON written by `run --report`."
+        )
+    destination = args.out or args.report.with_suffix(".html")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(render_html(report, title=args.title), encoding="utf-8")
+    size = destination.stat().st_size / 1024
+    print(f"Wrote {destination} ({size:,.0f} KB) — open it in a browser")
 
 
 def _print_findings(report) -> None:
@@ -226,6 +271,8 @@ def main() -> None:
         asyncio.run(_download(args))
     elif args.command == "run":
         asyncio.run(_run(args))
+    elif args.command == "chart":
+        _chart(args)
     else:
         _list()
 

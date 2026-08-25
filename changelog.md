@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Backtest dashboard** (`qte-backtest chart`) — A report rendered as one
+  self-contained HTML page, laid out like a strategy tester: cumulative P&L
+  against buy-and-hold with the per-trade excursion and underwater band as
+  overlays, the price window with every trade marked on it, P&L by
+  day/week/month/year, benchmarking with weekly correlation, alternating
+  run-ups and drawdowns, the returns distribution and streaks, MAE/MFE against
+  realised R, the diagnostics, and the full sortable trade list. The layout is
+  borrowed deliberately — it is the one every discretionary trader already
+  reads, so the numbers land without a legend.
+
+  It takes the report JSON and nothing else, so a run from three months ago
+  still draws on a machine with no parquet history, no strategy installed and
+  no engine; and it fetches nothing when it opens, because a report is
+  something you email or open offline. Statistics the replay never had the data
+  for — intrabar equity, margin, liquidation — are absent rather than
+  approximated: a drawdown that ignores open positions is a smaller number and
+  would read as an improvement. `--report-format json,md,html` (or `--chart`)
+  writes it straight out of a run.
+
+### Changed
+
+- **Report schema 1.1** — adds a `market` block: a downsampled OHLC window of
+  the replayed history (each row aggregating `bucket_bars` bars — first open,
+  highest high, lowest low, last close) plus the buy-and-hold basis, anchored
+  at the first bar *after* warm-up so the benchmark is not credited with a
+  stretch the strategy was never allowed to trade. It is the one thing the
+  trade list cannot re-derive, and it is for drawing only — every metric in the
+  report still comes from the full series. `run.default_quantity` is recorded
+  alongside it so the benchmark is sized the way the strategy was. Additive:
+  a consumer of 1.0 reads a 1.1 report unchanged.
+
 ## [0.1.0] - 2026-08-24
 
 First release of **Quant Trading Engine** — an event-driven framework for

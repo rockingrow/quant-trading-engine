@@ -33,6 +33,39 @@ from qte_backtest.metrics import BacktestMetrics, compute_metrics, format_report
 log = get_logger(__name__)
 
 
+#: How many OHLC rows the report carries for drawing. Enough that a chart of a
+#: multi-year run still looks like a chart, small enough that the block stays a
+#: rounding error next to the trade list.
+MARKET_ROWS = 480
+
+
+@dataclass(slots=True)
+class MarketWindow:
+    """A downsampled OHLC view of the replayed history — for drawing only.
+
+    Every number in the report is computed from the full series; these rows
+    exist so a chart can show *where* the trades happened without the report
+    carrying a copy of the parquet file. Each row aggregates ``bucket_bars``
+    consecutive bars honestly (first open, highest high, lowest low, last
+    close), so the shape is the market's, only coarser.
+
+    ``benchmark_close`` is the close of the first bar the strategy could act on
+    — the bar after warm-up — which is what a buy-and-hold comparison has to be
+    anchored to. Anchoring it at the first bar of the file would credit or
+    charge the benchmark for a stretch the strategy was never allowed to trade.
+    """
+
+    bucket_bars: int
+    rows: list[list[Any]]
+    benchmark_close: float
+    last_close: float
+    benchmark_from: datetime | None = None
+
+    #: Column order of :attr:`rows`, carried into the JSON so a consumer reads
+    #: the arrays rather than guessing at them.
+    columns: tuple[str, ...] = ("t", "o", "h", "l", "c")
+
+
 @dataclass(slots=True)
 class BacktestResult:
     strategy: str
@@ -55,6 +88,11 @@ class BacktestResult:
     data_gaps: int = 0
     strategy_meta: dict[str, Any] = field(default_factory=dict)
     starting_equity: float = 0.0
+    #: The default size an entry without an explicit quantity was filled at.
+    #: Recorded so the buy-and-hold benchmark can be sized the same way, rather
+    #: than comparing one unit of the market against whatever the strategy did.
+    quantity: float = 1.0
+    market: MarketWindow | None = None
 
     def report(self) -> str:
         header = f"{self.strategy} — {self.symbol} {self.timeframe}"
@@ -189,6 +227,8 @@ class BacktestEngine:
             data_gaps=count_gaps(frame, self.timeframe),
             strategy_meta=self.strategy.describe(),
             starting_equity=self.starting_equity,
+            quantity=self.default_quantity,
+            market=sample_market(frame, warmup),
         )
 
     # ── Intent handling ───────────────────────────────────────────────
@@ -243,6 +283,37 @@ _EXIT_REASONS = {
     SignalAction.R_SL: ExitReason.R_SL,
     SignalAction.FLAT: ExitReason.FLAT,
 }
+
+
+def sample_market(frame: pd.DataFrame, warmup: int, rows: int = MARKET_ROWS) -> MarketWindow:
+    """Aggregate *frame* down to at most *rows* OHLC buckets.
+
+    Aggregation, not sampling: taking every Nth bar would drop the highs and
+    lows that a chart is mostly there to show, and a candle drawn from one
+    surviving bar is a claim about a range that was never traded.
+    """
+    bucket = max(1, -(-len(frame) // max(rows, 1)))
+    ohlc: list[list[Any]] = []
+    for start in range(0, len(frame), bucket):
+        chunk = frame.iloc[start : start + bucket]
+        ohlc.append(
+            [
+                _as_datetime(chunk.index[0]).isoformat(),
+                round(float(chunk["open"].iloc[0]), 8),
+                round(float(chunk["high"].max()), 8),
+                round(float(chunk["low"].min()), 8),
+                round(float(chunk["close"].iloc[-1]), 8),
+            ]
+        )
+
+    anchor = min(warmup, len(frame) - 1)
+    return MarketWindow(
+        bucket_bars=bucket,
+        rows=ohlc,
+        benchmark_close=round(float(frame["close"].iloc[anchor]), 8),
+        last_close=round(float(frame["close"].iloc[-1]), 8),
+        benchmark_from=_as_datetime(frame.index[anchor]),
+    )
 
 
 def count_gaps(frame: pd.DataFrame, timeframe: str) -> int:
