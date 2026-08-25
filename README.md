@@ -12,22 +12,167 @@ signal into PostgreSQL, and publishes trade signals over NATS
 to [`algo-trading-broker`](https://github.com/rockingrow/algo-trading-broker),
 which fans them out to MT5 / Binance workers.
 
+## ⚡ Quick Start
+
+### 1. Prerequisites
+
+- Python 3.13 — pinned, not a floor: the runner imports your strategy plugins
+  into its own process, and `pandas-ta` (which they use) needs ≥ 3.12 and pins a
+  `numba` with no 3.14 wheel. See `pyproject.toml`.
+- [uv](https://docs.astral.sh/uv/)
+- Docker & Docker Compose
+
+### 2. Installation
+
+```bash
+git clone https://github.com/rockingrow/quant-trading-engine
+cd quant-trading-engine
+
+cp .env.example .env          # fill in QTE_TIINGO__API_KEY at minimum
+make install-dev              # uv sync
 ```
-provider ─▶ data-ingestion ─▶ Redis (hot state)
-                    │
-                    └─▶ NATS  QTE.candle.closed.<symbol>.<tf>
-                                       │
-                            strategy-runner ──▶ __strategies__/*.py
-                                       │       (paired by config/strategies_mapping.toml)
-                                       │
-                    ┌──────────────────┴──────────────────┐
-                    ▼                                     ▼
-      NATS SIGNALS.<strategy>                   PostgreSQL (audit, JSONB)
-      (algo-trading-broker JetStream)
-                    │
-                    ▼
-             MT5 / Binance workers
+
+### 3. Drop In a Strategy
+
+`__strategies__/` is git-ignored: it is where your **private** strategy repo is
+cloned, whole, so the alpha never lands in this public history. Clone it into a
+subdirectory — `git clone <your private repo> __strategies__/my-strategies` —
+and point `STRATEGY_REPO` at it.
+
+The one thing committed under that path is
+[`__strategies__/_boilerplate/`](__strategies__/_boilerplate/): a template of
+exactly what a strategy repo looks like from the engine's side — `manifest.py`,
+a strategy class with one method per broker action, its own `pyproject.toml`
+and tests. Copy it, or read it and delete it. To see the pipeline move before
+you have written anything, use the worked example instead:
+
+```bash
+cp examples/__strategies__/ema_atr_breakout.py __strategies__/
+
+make routing                  # config/strategies_mapping.toml from the template (git-ignored)
+make audit                    # check what __strategies__/ publishes before running it
 ```
+
+### 4. Start Infrastructure
+
+```bash
+make infra                    # redis + postgres + nats
+```
+
+### 5. Run Database Migrations
+
+```bash
+make db-upgrade               # Alembic owns the schema — there is no init script
+```
+
+### 6. Backtest
+
+```bash
+make download                 # provider history → data/parquet/*.parquet
+make backtest STRATEGY=QTE_EXAMPLE_EMA_ATR SYMBOL=XAUUSD
+```
+
+The report lands in `data/reports/` as JSON + Markdown.
+
+### 7. (Optional) Rehearse the Live Path
+
+To drive the *live* path with no vendor key and no market open, set
+`QTE_MARKET_DATA__PROVIDER=simulator` and feed it by hand:
+
+```bash
+make sim                      # terminal 1: the dev websocket feed
+make ingestion                # terminal 2
+make runner                   # terminal 3
+
+qte-simulator replay --symbol XAUUSD --generate 300 --seed 7 --verify
+# → 300/300 candles republished by ingestion
+```
+
+[`docs/simulator.md`](docs/simulator.md) is the step-by-step. The simulator
+refuses to start unless `QTE_ENV=dev`.
+
+Signals only reach [`algo-trading-broker`](https://github.com/rockingrow/algo-trading-broker)
+once you point `QTE_BROKER__*` at it and turn shadow mode off — see
+[Sending signals to the broker](#sending-signals-to-the-broker) and
+[Going live (phase 6)](#going-live-phase-6).
+
+---
+
+## 🏗️ System Architecture
+
+```mermaid
+flowchart TD
+    subgraph providers["📈 Market data"]
+        TIINGO["Tiingo<br/>live + history"]
+        SIM["qte-simulator<br/>dev only, QTE_ENV=dev"]
+    end
+
+    subgraph qte["⚙️ Quant Trading Engine (public)"]
+        ING["data-ingestion<br/>feed → resampler"]
+        RUN["strategy-runner<br/>plugin loader + event loop"]
+        PLUG["__strategies__/*.py<br/>private alpha, git-ignored"]
+        AUDIT["qte-strategy-audit<br/>deploy gate"]
+        BT["qte-backtest<br/>replay + fills + report"]
+        CTL["qte-control<br/>shadow on/off, ping"]
+        MAP["config/strategies_mapping.toml<br/>symbol → strategies"]
+    end
+
+    subgraph infra["🧱 Infrastructure"]
+        REDIS[("Redis<br/>hot state, signal_uxid, shadow flag")]
+        NATS{{"NATS / JetStream"}}
+        PG[("PostgreSQL<br/>signal audit, JSONB")]
+        PARQUET[("data/parquet<br/>history")]
+    end
+
+    subgraph broker["🤝 algo-trading-broker (separate repo)"]
+        WH["POST /secret/webhook<br/>validates token"]
+        SW["SignalWorker<br/>durable consumer"]
+        MT5["MT5 workers"]
+        BIN["Binance workers"]
+    end
+
+    TIINGO -->|websocket| ING
+    SIM -.->|websocket, dev| ING
+    TIINGO -->|"qte-backtest download"| PARQUET
+
+    ING --> REDIS
+    ING -->|"QTE.candle.closed.&lt;symbol&gt;.&lt;tf&gt;"| NATS
+    NATS --> RUN
+    RUN <-->|"import by path"| PLUG
+    MAP -->|"pairs symbols with strategies"| RUN
+    AUDIT -->|"gate before deploy"| PLUG
+    PARQUET --> BT
+    BT <-->|"same SignalStrategy interface"| PLUG
+
+    RUN -->|"SignalIntent → WebhookPayload"| PG
+    RUN <-->|"trade-cycle signal_uxid"| REDIS
+    RUN -->|"QTE.signal.emitted (mirror)"| NATS
+    CTL -->|"shadow flag"| REDIS
+    CTL -->|"broadcast"| NATS
+
+    RUN ==>|"QTE_BROKER__TRANSPORT=nats (default)<br/>JetStream SIGNALS.&lt;strategy&gt;, Nats-Msg-Id dedupe"| SW
+    RUN -.->|"QTE_BROKER__TRANSPORT=http<br/>token-checked"| WH
+    WH -->|"same stream"| SW
+    SW --> MT5
+    SW --> BIN
+
+    classDef ext fill:#fff4e6,stroke:#e8890c,color:#7a4a00
+    classDef store fill:#eef4ff,stroke:#4a76d8,color:#1c356e
+    classDef alpha fill:#f6ecff,stroke:#8b4ad8,color:#3e1a6b
+    class WH,SW,MT5,BIN ext
+    class REDIS,NATS,PG,PARQUET store
+    class PLUG alpha
+```
+
+**The seam with `algo-trading-broker`.** QTE stops at the payload; the broker
+owns execution. The runner emits exactly the `WebhookPayload` the broker
+validates and — on the default `nats` transport — publishes it straight onto the
+JetStream subject `SIGNALS.<strategy>` that the broker's own webhook endpoint
+writes to, so its `SignalWorker` consumes QTE signals through the same durable,
+de-duplicated path as anything else it receives. The `http` transport posts to
+`/secret/webhook` instead, and is the path that verifies `QTE_BROKER__TOKEN`.
+Either way, the two repos share one contract and nothing else: no shared
+database, no shared process, no import in either direction.
 
 ---
 
@@ -56,51 +201,6 @@ half-written.
 
 ---
 
-## Quick start
-
-```bash
-git clone https://github.com/rockingrow/quant-trading-engine
-cd quant-trading-engine
-
-cp .env.example .env          # fill in QTE_TIINGO__API_KEY at minimum
-make install-dev              # uv sync
-
-# Try the pipeline with the example strategy. __strategies__/ does not exist
-# in a fresh clone — it is left out of git so `git clone <your repo>
-# __strategies__` has an empty destination to land in.
-mkdir -p __strategies__
-cp examples/__strategies__/ema_atr_breakout.py __strategies__/
-
-make routing                  # config/strategies_mapping.toml from the template (git-ignored)
-make audit                    # check what __strategies__/ publishes before running it
-
-make infra                    # redis + postgres + nats
-make db-upgrade               # create the schema (Alembic owns it, not an init script)
-make download                 # provider history → data/parquet/*.parquet
-make backtest STRATEGY=QTE_EXAMPLE_EMA_ATR SYMBOL=XAUUSD
-```
-
-To rehearse the *live* path instead — with no vendor key and no market open —
-set `QTE_MARKET_DATA__PROVIDER=simulator` and drive the feed yourself:
-
-```bash
-make sim                      # terminal 1: the dev websocket feed
-make ingestion                # terminal 2
-make runner                   # terminal 3
-
-qte-simulator replay --symbol XAUUSD --generate 300 --seed 7 --verify
-# → 300/300 candles republished by ingestion
-```
-
-[`docs/simulator.md`](docs/simulator.md) is the step-by-step.
-
-Requires Python 3.13, [uv](https://docs.astral.sh/uv/), and Docker. The
-version is pinned rather than a floor: the runner imports the strategy
-plugins into its own process, and `pandas-ta` — which they use — needs
-≥ 3.12 and pins a `numba` with no 3.14 wheel. See `pyproject.toml`.
-
----
-
 ## Layout
 
 | Path | What it is |
@@ -111,7 +211,8 @@ plugins into its own process, and `pandas-ta` — which they use — needs
 | `engines/strategy_engine/src/qte_strategy_engine/` | The live runner: plugin loading, the NATS event loop, delivery to the broker, audit, and the `qte-control` operator CLI. |
 | `engines/market_simulator/src/qte_simulator/` | **Dev only.** A WebSocket feed you drive by hand, so the whole pipeline can be rehearsed with no market open. Refuses to start unless `QTE_ENV=dev`. `qte-simulator`; see [`docs/simulator.md`](docs/simulator.md). |
 | `engines/strategy_audit/src/qte_strategy_audit/` | The deploy gate: validates every strategy in `__strategies__/` against the QTE signal contract and cross-checks the routing table. `qte-strategy-audit`. |
-| `__strategies__/` | **Git-ignored and untracked.** Your private strategy repo, cloned in whole — its own lockfile, its own tests, its own release cycle. Absent from a fresh checkout by design. |
+| `__strategies__/` | **Git-ignored**, apart from `_boilerplate/`. Your private strategy repo is cloned in here whole — its own lockfile, its own tests, its own release cycle — and nothing it contains reaches this repository's history. |
+| `__strategies__/_boilerplate/` | The committed template of a strategy repo: `manifest.py`, a strategy class with all seven signal methods, the contract restated on its own side, `pyproject.toml`, tests. It imports nothing from `engines/`, and publishes an inert strategy — so it loads and audits without ever trading. |
 | `config/` | `strategies_mapping.example.toml` — the symbol → strategies table's schema. The real `strategies_mapping.toml` beside it is git-ignored. Also the standalone NATS config. |
 | `migrations/` | Alembic. One chain for the whole system; `env.py` imports every engine's models. |
 | `deploy/` | The strategy requirements `make strategy-requirements` freezes for the image build. |
@@ -285,6 +386,11 @@ because someone forgot it was a strategy subclass.
 
 The manifest may sit at the root of `__strategies__/` or one level below it,
 which is what `git clone <repo> __strategies__/<name>` produces.
+[`__strategies__/_boilerplate/`](__strategies__/_boilerplate/) is a working one,
+committed so a fresh checkout shows the whole layout: manifest, package, tests
+and the lockfile that makes the repo its own project. It imports nothing from
+this engine — it restates the contract and owns its indicators — which is the
+arrangement the next two paragraphs describe, in code.
 
 **A manifest repo need not import `qte_shared` at all.** The engine recognises
 a strategy structurally — a concrete `on_candle_closed`, a `name`, a
@@ -817,17 +923,3 @@ A strategy *repository* is free to decide otherwise — it owns its own
 dependencies, and the one in `__strategies__/` builds its indicators on
 `pandas_ta` where the library agrees with TradingView. That is exactly the point
 of the seam: neither side has to win the argument.
-
----
-
-## Releases
-
-[`changelog.md`](changelog.md) — Keep a Changelog format, semantic versioning.
-Pre-1.0: the broker payload contract is pinned by tests, but the plugin and
-provider interfaces may still move.
-
----
-
-## License
-
-MIT.

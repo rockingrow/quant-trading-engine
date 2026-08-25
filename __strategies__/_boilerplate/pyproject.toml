@@ -1,0 +1,52 @@
+# A strategy repository is its own project, with its own lockfile and its own
+# release cycle — that is the point of the plugin seam. This file is what makes
+# that true for a copy of this template; the engine itself never reads it.
+#
+# The engine does read the lockfile beside it, indirectly:
+#   make strategy-deps          # install these into the engine's venv
+#   make strategy-requirements  # freeze them into deploy/ for the image build
+# Both take STRATEGY_REPO, which defaults to __strategies__/quant-trading-strategies.
+[project]
+name = "qte-strategy-boilerplate"
+version = "0.1.0"
+description = "Template for a private QTE strategy repository. Copy it, rename it, put an edge in it."
+readme = "README.md"
+# pandas-ta requires >= 3.12 and hard-pins a numba with no 3.14 wheel, so 3.13
+# is the only interpreter both agree on. The engine that imports these plugins
+# into its own process pins the same version for exactly that reason.
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "numpy>=2.2",
+    "pandas>=2.3",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/boilerplate"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = [
+    # StrategyBase.on_start/on_stop are optional hooks with a no-op default,
+    # not abstract methods every strategy must implement.
+    "B027",
+    # SignalAction mirrors the broker's own `(str, Enum)` declaration. StrEnum
+    # would change what str() returns and drift the wire format from theirs.
+    "UP042",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
