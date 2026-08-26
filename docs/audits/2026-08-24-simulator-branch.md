@@ -10,10 +10,10 @@ Findings are ordered by what they cost. Each says whether it was reproduced by
 running it or established by reading the code; the repro snippets are inline so
 that fixing one starts from a failing case rather than from prose.
 
-**Findings 1–4 are fixed** — see the "Fixed" note at the end of each. The fixes
-landed with 17 regression tests; 10 of them fail against the code as it stood
+**Findings 1–5 are fixed** — see the "Fixed" note at the end of each. The fixes
+landed with regression tests that fail against the code as it stood
 when this audit was written, which is what makes them regression tests rather
-than decoration. Findings 5–10 are still open.
+than decoration. Findings 6–10 are still open.
 
 | # | Severity | What | Where | Status |
 |---|----------|------|-------|--------|
@@ -21,7 +21,7 @@ than decoration. Findings 5–10 are still open.
 | 2 | Medium | A bug in the tick handler is reported as a dropped feed | `simulator/feed.py`, `tiingo/ws.py` | **Fixed** |
 | 3 | Medium | The flush loop has no exception guard | `ingestion/service.py` | **Fixed** |
 | 4 | Medium | An inverted bracket reaches the wire with SL and TP1 at the same price | `signal_factory.py` | **Fixed** |
-| 5 | Medium | A second entry orphans the first trade cycle, silently | `signal_factory.py` | Open |
+| 5 | Medium | A second entry orphans the first trade cycle, silently | `signal_factory.py` | **Fixed** |
 | 6 | Low | A background generator that dies looks like one that finished | `control.py`, `hub.py` | Open |
 | 7 | Low | `/control` throws a traceback on disconnect; `/stream` does not | `server.py` | Open |
 | 8 | Low | `stop_generators` swallows its own caller's cancellation | `hub.py` | Open |
@@ -238,6 +238,12 @@ message. The entry path deserves the same standard.
 both ids so the orphan is greppable. Better: decide the policy explicitly —
 refuse the second entry, or emit a FLAT for the old cycle first — since silently
 pyramiding is unlikely to be what any strategy meant.
+
+**Fixed.** `SignalFactory` now refuses an entry while a cycle is open, and the
+live runner serializes candle and tick callbacks per strategy/symbol slot so
+two concurrent callbacks cannot both observe a flat state. Cycle changes are
+also committed only after successful broker delivery. Regression tests live in
+`tests/test_signal_factory.py` and `tests/test_runner_delivery.py`.
 
 ---
 

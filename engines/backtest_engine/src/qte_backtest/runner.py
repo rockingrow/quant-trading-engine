@@ -10,7 +10,9 @@ from typing import Any
 from qte_shared.config import settings
 from qte_shared.logging_setup import get_logger
 from qte_shared.plugin_loader import StrategyLoader
+from qte_shared.routing import SymbolRouting
 from qte_shared.signal_factory import BracketPolicy
+from qte_shared.sizing import PositionSizer
 
 from qte_backtest.data_store import ParquetStore
 from qte_backtest.db import BacktestRepository
@@ -31,10 +33,18 @@ class BacktestRequest:
     params: dict[str, Any] = field(default_factory=dict)
     spread: float = 0.0
     slippage: float = 0.0
-    commission_per_unit: float = 0.0
-    contract_size: float = 1.0
+    #: Defaulted from ``QTE_ACCOUNT__*`` so a run with no flags is priced and
+    #: capitalised the way the live account is. Pass a value to override one
+    #: without disturbing the rest.
+    commission_per_unit: float = field(default_factory=lambda: settings.account.commission_per_unit)
+    contract_size: float = field(default_factory=lambda: settings.account.contract_size)
+    #: Fallback size for an entry the risk sizer could not size (no stop).
     quantity: float = 1.0
-    starting_equity: float = 10_000.0
+    starting_equity: float = field(default_factory=lambda: settings.account.capital)
+    #: Percent of ``starting_equity`` risked per entry. ``None`` takes it from
+    #: the routing table's entry for this pair, then from
+    #: ``QTE_ACCOUNT__RISK_PERCENT``.
+    risk_percent: float | None = None
     persist: bool = False
     #: Where to write the machine-readable report. ``None`` skips writing it;
     #: the report object is built either way, because the diagnostics are worth
@@ -57,7 +67,13 @@ async def run_backtest(
     cheap enough that making it optional would only invite skipping it.
     """
     loader = StrategyLoader(strategies_dir or settings.engine.strategies_dir)
-    strategy = loader.load_one(request.strategy, request.params)
+    # The routing table is what pairs a strategy with a symbol *and* states the
+    # risk it runs at there. Reading it here is what makes a backtest size its
+    # trades the way the runner will — without it, `--param risk_percent=…` on
+    # the command line would be the only way to reproduce production, and
+    # forgetting it would silently measure a different book.
+    params = {**_routed_params(request), **request.params}
+    strategy = loader.load_one(request.strategy, params)
 
     store = ParquetStore(parquet_dir)
     frame = store.load(request.symbol, request.timeframe, request.start, request.end)
@@ -82,6 +98,9 @@ async def run_backtest(
         starting_equity=request.starting_equity,
         bracket=BracketPolicy(),
         default_quantity=request.quantity,
+        sizer=PositionSizer.from_settings(params, risk_percent=request.risk_percent).replace(
+            capital=request.starting_equity, contract_size=request.contract_size
+        ),
     )
     result = engine.run(frame)
     report = build_report(result)
@@ -119,3 +138,25 @@ async def run_backtest(
         log.info("Backtest persisted run_id=%s", run_id)
 
     return report
+
+
+def _routed_params(request: BacktestRequest) -> dict[str, Any]:
+    """This pair's overrides from ``config/strategies_mapping.toml``, if any.
+
+    A missing table is normal — a fresh clone has none — and an unrouted pair
+    is normal too: backtesting a symbol before deciding to trade it is the
+    usual order of events. Both mean "no overrides", not an error.
+    """
+    routing = SymbolRouting.load(settings.engine.routing_file)
+    if not routing:
+        return {}
+    routed = routing.params_for(request.symbol, request.strategy)
+    if routed:
+        log.info(
+            "Applying %s overrides from %s for %s/%s",
+            ", ".join(sorted(routed)),
+            routing.source,
+            request.symbol,
+            request.strategy,
+        )
+    return routed

@@ -4,7 +4,10 @@ Every figure here is computed from realised, net-of-cost P&L. Two of them are
 easy to get wrong and are spelled out on purpose:
 
 * **Max drawdown** is measured on the running equity curve of closed trades,
-  not on the worst single loss.
+  not on the worst single loss. The curve starts at the account's capital
+  (``QTE_ACCOUNT__CAPITAL``), so ``max_drawdown_pct`` and ``return_pct`` are
+  percentages *of a real balance* rather than of whatever the first trade
+  happened to make.
 * **Sharpe** is annualised from *per-trade* returns using the observed trade
   frequency, not from a daily series. It is a comparison aid between runs of
   the same strategy, not a number to quote at anyone.
@@ -40,6 +43,12 @@ class BacktestMetrics:
     max_drawdown: float = 0.0
     max_drawdown_pct: float | None = None
     sharpe: float | None = None
+    #: The account this was traded on. ``ending_equity`` is
+    #: ``starting_equity + net_pnl``; ``return_pct`` is that as a percentage,
+    #: which is the only figure comparable across two runs sized differently.
+    starting_equity: float = 0.0
+    ending_equity: float = 0.0
+    return_pct: float | None = None
     max_consecutive_losses: int = 0
     max_consecutive_wins: int = 0
     period_start: datetime | None = None
@@ -91,7 +100,9 @@ def compute_metrics(
     total_bars: int = 0,
 ) -> BacktestMetrics:
     closed = [position for position in positions if position.legs]
-    metrics = BacktestMetrics()
+    metrics = BacktestMetrics(
+        starting_equity=round(starting_equity, 6), ending_equity=round(starting_equity, 6)
+    )
     if not closed:
         return metrics
 
@@ -138,6 +149,9 @@ def compute_metrics(
         worst_streak = max(worst_streak, streak)
 
     metrics.equity_curve = [round(point, 6) for point in curve]
+    metrics.ending_equity = round(equity, 6)
+    if starting_equity > 0:
+        metrics.return_pct = round(100.0 * metrics.net_pnl / starting_equity, 4)
     metrics.max_consecutive_wins = _longest_run(pnls, winning=True)
     metrics.max_drawdown = round(max_drawdown, 6)
     metrics.max_drawdown_pct = max_drawdown_pct
@@ -258,6 +272,8 @@ def format_report(metrics: BacktestMetrics, header: str = "") -> str:
         f"Period            {metrics.period_start:%Y-%m-%d} → {metrics.period_end:%Y-%m-%d}",
         f"Trades            {metrics.trades}  (W {metrics.wins} / L {metrics.losses})",
         f"Win rate          {metrics.win_rate:.2f}%",
+        f"Capital           {metrics.starting_equity:,.2f} → {metrics.ending_equity:,.2f}"
+        f"   ({_pct(metrics.return_pct)})",
         f"Net PnL           {metrics.net_pnl:,.2f}   (fees {metrics.total_fees:,.2f})",
         f"Profit factor     {profit_factor}",
         f"Expectancy/trade  {metrics.expectancy:,.4f}",
@@ -267,3 +283,7 @@ def format_report(metrics: BacktestMetrics, header: str = "") -> str:
         f"Sharpe (per-trade){sharpe:>12}",
     ]
     return "\n".join(line for line in lines if line)
+
+
+def _pct(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:+.2f}%"

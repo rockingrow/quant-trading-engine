@@ -70,9 +70,15 @@ class SignalIntent:
     into its own — so the names are the contract, and the set below is the
     whole of it. A strategy may carry fewer than these; it must not rename one.
 
-    ``uxid`` ties a close back to the entry that opened it. Leave it ``None`` on
+    ``signal_uxid`` ties a close back to the entry that opened it, under the same
+    name the Pine strategies and the broker payload use. Leave it ``None`` on
     an entry — the runner mints the trade-cycle id and remembers it — and set it
     to ``context.open_uxid`` on a follow-up that manages an exit.
+
+    ``quantity`` is a proposal, not the size that trades. The runner risk-sizes
+    every entry against the account it was configured with and rescales your
+    closes by the same factor, so the *proportions* you ask for survive and the
+    absolute size stays the operator's decision.
     """
 
     action: SignalAction
@@ -85,11 +91,12 @@ class SignalIntent:
     risk_percent: float | None = None
     tp1_percent: float | None = None
     move_sl_to_be: bool | None = None
+    use_equity_sizing: bool | None = None
     is_running: bool | None = None
     is_scale_position: bool | None = None
     scale_strategy: str | None = None
     scaling: Scaling | None = None
-    uxid: str | None = None
+    signal_uxid: str | None = None
     indicators: dict[str, Any] = field(default_factory=dict)
     inputs: dict[str, Any] = field(default_factory=dict)
     reason: str = ""

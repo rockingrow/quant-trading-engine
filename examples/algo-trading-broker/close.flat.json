@@ -1,0 +1,11 @@
+{
+  "strategy": "MT5_GOLD_M5_V1",
+  "symbol": "OANDA:XAUUSD",
+  "timeframe": "5",
+  "timestamp": "2026-04-25 20:03:00",
+  "signal_uxid": "9f2c4b7e18a3d605",
+  "position": {
+    "action": "FLAT"
+  },
+  "token": "secret_token_tu_tradingview"
+}

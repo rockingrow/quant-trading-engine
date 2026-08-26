@@ -62,7 +62,7 @@ class PluginIntent:
     is_scale_position: bool | None = None
     scale_strategy: str | None = None
     scaling: PluginScaling | None = None
-    uxid: str | None = None
+    signal_uxid: str | None = None
     indicators: dict = field(default_factory=dict)
     inputs: dict = field(default_factory=dict)
     reason: str = ""
@@ -256,7 +256,7 @@ def test_fields_a_plugin_does_not_carry_take_our_defaults() -> None:
 
     assert intent.action is SignalAction.FLAT
     assert intent.indicators == {} and intent.inputs == {}
-    assert intent.reason == "" and intent.uxid is None
+    assert intent.reason == "" and intent.signal_uxid is None
     assert intent.is_running is None, "a field the plugin never heard of stays unset"
 
 
@@ -329,7 +329,7 @@ def test_a_plugin_intent_survives_all_the_way_to_a_broker_signal() -> None:
 
 
 def test_a_plugin_exit_closes_the_cycle_its_entry_opened() -> None:
-    """A close carries no uxid of its own; the factory reuses the entry's."""
+    """A close carries no signal_uxid of its own; the factory reuses the entry's."""
     factory = SignalFactory("PLUGIN_EDGE_V1", timeframe="M15")
     moment = datetime(2024, 3, 5, 12, tzinfo=UTC)
 

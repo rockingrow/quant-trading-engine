@@ -1,0 +1,26 @@
+{
+  "strategy": "MT5_GOLD_M5_V1",
+  "symbol": "OANDA:XAUUSD",
+  "timeframe": "5",
+  "timestamp": "2026-04-11 15:05:00",
+  "signal_uxid": "9f2c4b7e18a3d605",
+  "position": {
+    "action": "TP1",
+    "price": 2345.00,
+    "quantity": 1.8000,
+    "is_running": true,
+    "risk_percent": 3.0,
+    "tp1_percent": 50.0,
+    "move_sl_to_be": false,
+    "is_scale_position": false,
+    "scale_strategy": "LOW_RR_TIER",
+    "scaling": {
+      "tp": 0.5,
+      "sl": 0.5,
+      "quantity": 0.5
+    }
+  },
+  "indicators": {},
+  "inputs": {},
+  "token": "secret_token_tu_tradingview"
+}

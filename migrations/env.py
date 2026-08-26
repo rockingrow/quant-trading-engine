@@ -25,7 +25,7 @@ import qte_backtest.db.models  # noqa: F401,E402  (backtest_runs, backtest_trade
 # ── Model registration ────────────────────────────────────────────────
 # Imported for the side effect of registering tables on Base.metadata.
 import qte_shared.db.models  # noqa: F401,E402  (shared: engine_events)
-import qte_strategy_engine.db.models  # noqa: F401,E402  (signals)
+import qte_strategy_engine.db.models  # noqa: F401,E402  (signals, open_positions)
 from alembic import context
 from qte_shared.config import settings
 from qte_shared.db.base import Base
