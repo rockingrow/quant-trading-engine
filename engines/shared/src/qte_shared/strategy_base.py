@@ -51,9 +51,16 @@ from qte_shared.models import Candle, PositionBlock, Scaling, SignalAction, Tick
 class SignalIntent:
     """What a strategy decided, before it becomes a broker payload.
 
-    ``uxid`` ties a close back to the entry that opened it. Leave it ``None``
+    ``signal_uxid`` ties a close back to the entry that opened it, under the
+    same name the Pine strategies and the broker payload use. Leave it ``None``
     on an entry — the runner mints the cycle id and remembers it — and set it
     on a follow-up when the strategy is managing an exit it opened itself.
+
+    ``quantity`` is a *proposal*. The runner risk-sizes every entry against the
+    configured account and rescales the strategy's closes by the same factor,
+    so a strategy that sizes off its own notional capital still trades the book
+    the operator configured. Leave it ``None`` and the sizing is entirely the
+    runner's; set it and the proportions you asked for are preserved.
     """
 
     action: SignalAction
@@ -66,11 +73,15 @@ class SignalIntent:
     risk_percent: float | None = None
     tp1_percent: float | None = None
     move_sl_to_be: bool | None = None
+    #: Leave it ``None`` and the runner fills it from the pair's
+    #: ``use_equity_sizing`` param. It reaches the broker either way and it
+    #: never changes the size QTE sends — see :mod:`qte_shared.sizing`.
+    use_equity_sizing: bool | None = None
     is_running: bool | None = None
     is_scale_position: bool | None = None
     scale_strategy: str | None = None
     scaling: Scaling | None = None
-    uxid: str | None = None
+    signal_uxid: str | None = None
     indicators: dict[str, Any] = field(default_factory=dict)
     inputs: dict[str, Any] = field(default_factory=dict)
     reason: str = ""
@@ -86,6 +97,7 @@ class SignalIntent:
             risk_percent=self.risk_percent,
             tp1_percent=self.tp1_percent,
             move_sl_to_be=self.move_sl_to_be,
+            use_equity_sizing=self.use_equity_sizing,
             is_running=self.is_running,
             is_scale_position=self.is_scale_position,
             scale_strategy=self.scale_strategy,

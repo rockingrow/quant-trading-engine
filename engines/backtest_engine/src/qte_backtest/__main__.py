@@ -51,14 +51,37 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--timeframe", default="M15")
     run.add_argument("--start", type=_as_datetime, default=None)
     run.add_argument("--end", type=_as_datetime, default=None)
-    run.add_argument("--quantity", type=float, default=1.0)
+    run.add_argument(
+        "--quantity",
+        type=float,
+        default=1.0,
+        help="Fallback size for an entry the risk sizer cannot size (no stop)",
+    )
     run.add_argument(
         "--spread", type=float, default=0.0, help="Full bid/ask distance in price units"
     )
     run.add_argument("--slippage", type=float, default=0.0)
-    run.add_argument("--commission", type=float, default=0.0, help="Per unit, charged each side")
-    run.add_argument("--contract-size", type=float, default=1.0)
-    run.add_argument("--equity", type=float, default=10_000.0)
+    run.add_argument(
+        "--commission",
+        type=float,
+        default=settings.account.commission_per_unit,
+        help="Per unit, charged each side (default: QTE_ACCOUNT__COMMISSION_PER_UNIT)",
+    )
+    run.add_argument("--contract-size", type=float, default=settings.account.contract_size)
+    run.add_argument(
+        "--equity",
+        type=float,
+        default=settings.account.capital,
+        help="Starting capital, and what entries are risk-sized against "
+        "(default: QTE_ACCOUNT__CAPITAL)",
+    )
+    run.add_argument(
+        "--risk-percent",
+        type=float,
+        default=None,
+        help="Percent of --equity risked per entry. Defaults to this pair's "
+        "risk_percent in config/strategies_mapping.toml, then QTE_ACCOUNT__RISK_PERCENT",
+    )
     run.add_argument("--persist", action="store_true", help="Write the run into Postgres")
     run.add_argument(
         "--report",
@@ -141,6 +164,7 @@ async def _run(args: argparse.Namespace) -> None:
             contract_size=args.contract_size,
             quantity=args.quantity,
             starting_equity=args.equity,
+            risk_percent=args.risk_percent,
             persist=args.persist,
             report_dir=report_dir,
             report_formats=_report_formats(args),

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from math import nan
 
 import pytest
 from qte_shared.models import BrokerSignal, PositionBlock, SignalAction, is_valid_uxid, new_uxid
@@ -60,6 +61,7 @@ def test_payload_carries_every_field_the_broker_validates():
         "risk_percent",
         "tp1_percent",
         "move_sl_to_be",
+        "use_equity_sizing",
         "is_running",
         "is_scale_position",
         "scale_strategy",
@@ -139,6 +141,13 @@ def test_entry_with_zero_quantity_is_rejected():
         entry.validate_shape()
 
 
+@pytest.mark.parametrize("field", ["price", "quantity", "sl", "tp1", "tp2"])
+def test_non_finite_order_numbers_are_rejected_instead_of_serialised_as_null(field):
+    values = {"price": 2000.0, "quantity": 1.0, "sl": 1990.0, field: nan}
+    with pytest.raises(ValueError, match="finite number"):
+        PositionBlock(action=SignalAction.LONG, **values)
+
+
 # ── Bracket orientation ───────────────────────────────────────────────────
 #
 # `BracketPolicy` derives targets from `abs(price - sl)`, so it mirrors a
@@ -200,3 +209,15 @@ def test_a_close_is_not_bracket_checked():
     """TP1 closes a long *above* its entry, but the close carries no entry to
     compare against — only entries are oriented."""
     _bracketed(SignalAction.TP1, price=2450.0, sl=2390.0).validate_shape()
+
+
+def test_use_equity_sizing_rides_on_the_position_block():
+    """The broker reads the pair's sizing mode off the payload, as TradingView
+    sends it. QTE reports it and keeps sizing off the fixed account capital."""
+    payload = _entry().model_dump(mode="json")
+    assert payload["position"]["use_equity_sizing"] is None
+
+    stated = PositionBlock(
+        action=SignalAction.LONG, price=2334.5, quantity=6.0, use_equity_sizing=False
+    )
+    assert stated.model_dump(mode="json")["use_equity_sizing"] is False

@@ -51,7 +51,7 @@ log = get_logger(__name__)
 
 #: Bump the major part when a consumer that understood the old shape would
 #: misread the new one.
-SCHEMA_VERSION = "1.1"
+SCHEMA_VERSION = "1.2"
 
 #: A compact orientation for whoever reads the JSON cold. It costs a few
 #: hundred bytes and saves an agent from inferring the conventions — or, worse,
@@ -78,6 +78,14 @@ READING_GUIDE = {
         "TP1/TP2 targets, SL stop, R_SL stop after it moved to breakeven, FLAT a "
         "discretionary close, END_OF_DATA the replay running out of bars with the "
         "position still open — the last one is usually a bug, not a trade."
+    ),
+    "position_sizing": (
+        "Every entry is sized by the engine, not by the strategy: quantity = "
+        "starting_equity x risk_percent / 100 / |entry - stop| / contract_size, so a "
+        "trade loses about that share of the account if its stop is hit. The capital is "
+        "fixed for the whole run — it does not compound — which is what makes two runs "
+        "comparable. use_equity_sizing on the payload reports the pair's configured mode "
+        "to the broker and does not change this number."
     ),
     "single_position": (
         "The engine holds at most one position per symbol, mirroring the live worker, "
@@ -126,6 +134,7 @@ class BacktestReport:
                 "warmup_bars": result.warmup,
                 "default_quantity": result.quantity,
                 "starting_equity": result.starting_equity,
+                "risk_percent": result.risk_percent,
                 "strategy_meta": result.strategy_meta,
             },
             "data": {
@@ -220,6 +229,9 @@ class BacktestReport:
             f"({result.bars} bars, {result.warmup} of warm-up) |",
             f"| Trades | {metrics.trades} — {metrics.wins}W / {metrics.losses}L "
             f"({metrics.win_rate:.1f}%) |",
+            f"| Capital | {metrics.starting_equity:,.2f} → {metrics.ending_equity:,.2f} "
+            f"({_fmt(metrics.return_pct, '{:+.2f}%')}) at "
+            f"{_fmt(result.risk_percent, '{:.2f}%')} risk per entry |",
             f"| Net P&L | {metrics.net_pnl:,.2f} (fees {metrics.total_fees:,.2f}) |",
             f"| Expectancy | {_fmt(metrics.expectancy_r, '{:+.3f}R')} per trade "
             f"({metrics.expectancy:,.4f} currency) |",

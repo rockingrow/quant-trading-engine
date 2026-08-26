@@ -17,13 +17,13 @@ import pytest
 from qte_backtest.db import BacktestRepository, BacktestRun, BacktestTrade
 from qte_shared.config import REPO_ROOT
 from qte_shared.db import Base, EngineEvent, EventRepository
-from qte_strategy_engine.db import SignalAudit, SignalRepository
+from qte_strategy_engine.db import OpenPositionRow, SignalAudit, SignalRepository
 
 MIGRATIONS = REPO_ROOT / "migrations"
 
 
 def test_every_engine_registers_its_tables_on_the_one_shared_base():
-    for model in (EngineEvent, SignalAudit, BacktestRun, BacktestTrade):
+    for model in (EngineEvent, SignalAudit, OpenPositionRow, BacktestRun, BacktestTrade):
         assert issubclass(model, Base), f"{model.__name__} is on a different base"
 
 
@@ -31,6 +31,7 @@ def test_the_metadata_holds_exactly_the_tables_we_expect():
     assert set(Base.metadata.tables) == {
         "engine_events",
         "signals",
+        "open_positions",
         "backtest_runs",
         "backtest_trades",
     }
@@ -40,6 +41,7 @@ def test_tables_are_owned_by_the_engine_that_writes_them():
     # signals is written by the runner, the backtest tables by the replay, and
     # engine_events by all three — which is why only that one lives in shared.
     assert SignalAudit.__module__.startswith("qte_strategy_engine.")
+    assert OpenPositionRow.__module__.startswith("qte_strategy_engine.")
     assert BacktestRun.__module__.startswith("qte_backtest.")
     assert BacktestTrade.__module__.startswith("qte_backtest.")
     assert EngineEvent.__module__.startswith("qte_shared.")

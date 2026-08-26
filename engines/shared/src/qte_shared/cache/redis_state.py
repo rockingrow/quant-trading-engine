@@ -18,7 +18,7 @@ import redis.asyncio as redis
 
 from qte_shared.config import settings
 from qte_shared.logging_setup import get_logger
-from qte_shared.models import Candle, Tick
+from qte_shared.models import Candle, OpenPosition, Tick
 
 log = get_logger(__name__)
 
@@ -97,18 +97,53 @@ class RedisState:
         return Candle.model_validate_json(raw) if raw else None
 
     # ── Strategy cycle state ──────────────────────────────────────────
+    #
+    # One hash per strategy, one field per symbol, holding the whole
+    # :class:`~qte_shared.models.OpenPosition` as JSON. The size matters as
+    # much as the id: a TP1 that closed the entry's full quantity ends the
+    # cycle, and a runner that reloaded only the uxid could not tell that from
+    # a partial. Redis runs with AOF on, so a restart loses at most the last
+    # write — and the strategy runner mirrors the same record into Postgres,
+    # which is what covers a flushed cache.
+
+    async def set_open_position(self, position: OpenPosition) -> None:
+        """Remember the whole cycle *position* describes.
+
+        Every close the strategy emits later must carry its ``signal_uxid``, or
+        the broker renders the exit as an unrelated trade instead of closing
+        the entry's broadcast.
+        """
+        await self.client.hset(
+            self.key("cycle", position.strategy), position.symbol, position.model_dump_json()
+        )
+
+    async def get_open_position(self, strategy: str, symbol: str) -> OpenPosition | None:
+        raw = await self.client.hget(self.key("cycle", strategy), symbol)
+        return _decode_position(raw, strategy=strategy, symbol=symbol)
+
+    async def get_open_positions(self, strategy: str) -> dict[str, OpenPosition]:
+        """Every cycle *strategy* holds, keyed by symbol."""
+        stored = await self.client.hgetall(self.key("cycle", strategy))
+        positions = {}
+        for symbol, raw in (stored or {}).items():
+            position = _decode_position(raw, strategy=strategy, symbol=symbol)
+            if position is not None:
+                positions[symbol] = position
+        return positions
 
     async def set_open_cycle(self, strategy: str, symbol: str, uxid: str) -> None:
-        """Remember the cycle id of the position *strategy* holds on *symbol*.
+        """Remember a cycle by id alone, with no size attached.
 
-        Every close the strategy emits later must carry this id, or the broker
-        renders the exit as an unrelated trade instead of closing the entry's
-        broadcast. Losing it on restart is exactly what Redis-with-AOF prevents.
+        The lossy form of :meth:`set_open_position`, kept for a caller that has
+        nothing but the id.
         """
-        await self.client.hset(self.key("cycle", strategy), symbol, uxid)
+        await self.set_open_position(
+            OpenPosition(signal_uxid=uxid, strategy=strategy, symbol=symbol)
+        )
 
     async def get_open_cycle(self, strategy: str, symbol: str) -> str | None:
-        return await self.client.hget(self.key("cycle", strategy), symbol)
+        position = await self.get_open_position(strategy, symbol)
+        return position.signal_uxid if position else None
 
     async def clear_open_cycle(self, strategy: str, symbol: str) -> None:
         await self.client.hdel(self.key("cycle", strategy), symbol)
@@ -127,3 +162,22 @@ class RedisState:
             return bool(await self.client.ping())
         except Exception:
             return False
+
+
+def _decode_position(raw: str | None, *, strategy: str, symbol: str) -> OpenPosition | None:
+    """Parse a stored cycle, tolerating the bare-uxid values that predate this.
+
+    A value written before the position record existed is just the id. Reading
+    it as one — rather than discarding it as unparseable — is what lets a
+    runner upgraded mid-trade still close the position it is holding.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None
+    if text.startswith("{"):
+        try:
+            return OpenPosition.model_validate_json(text)
+        except ValueError:
+            log.error("Unreadable cycle record for %s %s: %.120r", strategy, symbol, raw)
+            return None
+    return OpenPosition(signal_uxid=text, strategy=strategy, symbol=symbol)

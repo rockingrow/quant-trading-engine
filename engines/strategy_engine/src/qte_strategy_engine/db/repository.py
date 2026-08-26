@@ -1,4 +1,4 @@
-"""Reads and writes against the ``signals`` table."""
+"""Reads and writes against the runner's ``signals`` and ``open_positions`` tables."""
 
 from __future__ import annotations
 
@@ -7,10 +7,11 @@ from datetime import datetime
 
 from qte_shared.db.session import Database, get_database
 from qte_shared.logging_setup import get_logger
-from qte_shared.models import BrokerSignal
-from sqlalchemy import select
+from qte_shared.models import BrokerSignal, OpenPosition
+from sqlalchemy import delete, select
+from sqlalchemy.dialects.postgresql import insert
 
-from qte_strategy_engine.db.models import SignalAudit
+from qte_strategy_engine.db.models import OpenPositionRow, SignalAudit
 
 log = get_logger(__name__)
 
@@ -92,3 +93,105 @@ class SignalRepository:
         )
         async with self._db.session() as session:
             return (await session.execute(statement)).scalars().all()
+
+
+class OpenPositionRepository:
+    """The durable copy of what each (strategy, symbol) pair currently holds.
+
+    Redis is the hot path; this is the backstop. Both are written on every
+    transition and the runner prefers Redis on boot, falling back here when the
+    cache came up empty — a flushed or re-provisioned Redis is otherwise
+    indistinguishable from "flat", and acting on that difference is what mints
+    a second cycle against a position the broker still has open.
+
+    Every method swallows its failures for the same reason the audit write
+    does: by the time these run the signal is already with the broker, and
+    raising would stop a runner that is holding real positions.
+    """
+
+    def __init__(self, database: Database | None = None) -> None:
+        self._db = database or get_database()
+
+    async def upsert(self, position: OpenPosition) -> bool:
+        """Write the pair's current cycle, replacing whatever was there."""
+        values = {
+            "signal_uxid": position.signal_uxid,
+            "action": position.action.value,
+            "opened_at": position.opened_at,
+            "updated_at": position.updated_at,
+            "price": position.price,
+            "quantity": position.quantity,
+            "remaining": position.remaining,
+            "sl": position.sl,
+            "tp1": position.tp1,
+            "tp2": position.tp2,
+            "state": position.model_dump(mode="json"),
+        }
+        statement = (
+            insert(OpenPositionRow)
+            .values(strategy=position.strategy, symbol=position.symbol, **values)
+            .on_conflict_do_update(constraint="uq_open_positions_pair", set_=values)
+        )
+        try:
+            async with self._db.session() as session:
+                await session.execute(statement)
+            return True
+        except Exception as exc:
+            log.error(
+                "Could not persist open position %s %s: %s", position.strategy, position.symbol, exc
+            )
+            return False
+
+    async def clear(self, strategy: str, symbol: str) -> bool:
+        """Drop the pair's row — the cycle is over."""
+        try:
+            async with self._db.session() as session:
+                await session.execute(
+                    delete(OpenPositionRow).where(
+                        OpenPositionRow.strategy == strategy,
+                        OpenPositionRow.symbol == symbol.upper(),
+                    )
+                )
+            return True
+        except Exception as exc:
+            log.error("Could not clear open position %s %s: %s", strategy, symbol, exc)
+            return False
+
+    async def get(self, strategy: str, symbol: str) -> OpenPosition | None:
+        statement = select(OpenPositionRow).where(
+            OpenPositionRow.strategy == strategy, OpenPositionRow.symbol == symbol.upper()
+        )
+        try:
+            async with self._db.session() as session:
+                row = (await session.execute(statement)).scalar_one_or_none()
+        except Exception as exc:
+            log.error("Could not read open position %s %s: %s", strategy, symbol, exc)
+            return None
+        return _as_position(row)
+
+    async def list_open(self, strategy: str | None = None) -> list[OpenPosition]:
+        statement = select(OpenPositionRow).order_by(OpenPositionRow.opened_at.asc())
+        if strategy:
+            statement = statement.where(OpenPositionRow.strategy == strategy)
+        try:
+            async with self._db.session() as session:
+                rows = (await session.execute(statement)).scalars().all()
+        except Exception as exc:
+            log.error("Could not list open positions: %s", exc)
+            return []
+        return [position for position in map(_as_position, rows) if position is not None]
+
+
+def _as_position(row: OpenPositionRow | None) -> OpenPosition | None:
+    """Rebuild the model from ``state``, which is the authoritative copy.
+
+    The columns beside it are a queryable projection of the same record, so
+    reading them back instead would only invite the two disagreeing.
+    """
+    if row is None:
+        return None
+    try:
+        return OpenPosition.model_validate(row.state)
+    except ValueError:
+        log.error("Unreadable open_positions.state for %s %s", row.strategy, row.symbol)
+        return None

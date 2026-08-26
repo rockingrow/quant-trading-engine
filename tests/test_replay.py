@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pandas as pd
 import pytest
-from qte_backtest.execution import CostModel
+from qte_backtest.execution import CostModel, ExitReason
 from qte_backtest.replay import BacktestEngine
 from qte_shared.models import SignalAction
 from qte_shared.strategy_base import IntentResult, SignalIntent, StrategyBase, StrategyContext
@@ -146,3 +146,35 @@ def test_trade_rows_are_shaped_for_the_audit_table(trending_frame):
         "fees",
         "net_pnl",
     }
+
+
+def test_a_strategy_tp1_intent_only_closes_its_configured_share(trending_frame):
+    class PartialExit(BuyOnceStrategy):
+        name = "PARTIAL_EXIT"
+
+        def on_candle_closed(self, df, context):
+            close = float(df["close"].iloc[-1])
+            if self.calls == 0:
+                self.calls += 1
+                return SignalIntent(
+                    action=SignalAction.LONG,
+                    price=close,
+                    quantity=1.0,
+                    sl=close - 10_000,
+                    tp1=close + 10_000,
+                    tp1_percent=25.0,
+                )
+            if self.calls == 1:
+                self.calls += 1
+                return SignalIntent(action=SignalAction.TP1, price=close)
+            return None
+
+    result = BacktestEngine(PartialExit(), symbol="XAUUSD").run(trending_frame)
+    position = result.positions[0]
+
+    # The absolute size is the account's decision — the engine risk-sizes the
+    # entry — so what this pins is the *split*: TP1 takes its configured share
+    # of whatever was opened, and the rest runs on.
+    assert position.legs[0].reason is ExitReason.TP1
+    shares = [leg.quantity / position.quantity for leg in position.legs]
+    assert shares == pytest.approx([0.25, 0.75])

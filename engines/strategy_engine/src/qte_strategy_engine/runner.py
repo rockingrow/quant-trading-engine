@@ -16,6 +16,12 @@ Two ordering rules matter here:
 * **Warm from Redis, not from the feed.** On boot the runner pulls its
   indicator window out of Redis rather than waiting hours for live candles to
   accumulate, so a restart resumes trading on the next close.
+
+Position state is written twice on purpose. The cycle a pair is holding goes to
+Redis (hot, read on every bar) *and* to Postgres (durable), and boot prefers
+Redis and falls back to the table. A re-provisioned cache would otherwise be
+indistinguishable from "flat", and the runner would mint a second cycle against
+a position the broker still has open.
 """
 
 from __future__ import annotations
@@ -33,10 +39,11 @@ from qte_shared.cache import RedisState
 from qte_shared.config import settings
 from qte_shared.db import EventRepository
 from qte_shared.logging_setup import get_logger
-from qte_shared.models import Candle, CandleClosedEvent, SignalAction, TickEvent
+from qte_shared.models import Candle, CandleClosedEvent, OpenPosition, TickEvent
 from qte_shared.plugin_loader import load_strategies
 from qte_shared.routing import SymbolRouting
 from qte_shared.signal_factory import BracketPolicy, SignalFactory
+from qte_shared.sizing import PositionSizer
 from qte_shared.strategy_base import (
     SignalIntent,
     StrategyContext,
@@ -48,7 +55,7 @@ from qte_shared.strategy_base import (
 from qte_shared.timeframes import normalize_timeframe
 
 from qte_strategy_engine.broker_sink import BrokerSink
-from qte_strategy_engine.db import SignalRepository
+from qte_strategy_engine.db import OpenPositionRepository, SignalRepository
 from qte_strategy_engine.preflight import run_preflight_audit
 from qte_strategy_engine.settings import runner_settings
 
@@ -69,6 +76,10 @@ class StrategySlot:
         # lives on the strategy contract so the two drivers cannot drift apart.
         self.buffer: deque[Candle] = deque(maxlen=strategy.history_window())
         self.started = False
+        # Candle and tick subscriptions are independent NATS callbacks. Keep a
+        # strategy instance and its position cycle a single-writer aggregate so
+        # both callbacks cannot decide they are flat and publish two entries.
+        self.lock = asyncio.Lock()
 
     @property
     def key(self) -> tuple[str, str]:
@@ -88,6 +99,7 @@ class StrategyRunner:
         self.subjects = Subjects()
         self.events = EventRepository()
         self.signals = SignalRepository()
+        self.positions = OpenPositionRepository()
         self.sink = sink or BrokerSink()
         self.slots: list[StrategySlot] = []
         self._by_subject: dict[tuple[str, str], list[StrategySlot]] = defaultdict(list)
@@ -166,23 +178,31 @@ class StrategyRunner:
                 # One instance per pair: a strategy carries per-symbol state
                 # between bars, and sharing it across symbols would let gold's
                 # last bar decide what happens on bitcoin's next one.
-                strategy = entry.instantiate({**defaults, **routing.params_for(symbol, entry.name)})
+                params = {**defaults, **routing.params_for(symbol, entry.name)}
+                strategy = entry.instantiate(params)
+                # Size against the account, at the risk this pair is routed at.
+                # The strategy is never told either — see qte_shared.sizing.
+                sizer = PositionSizer.from_settings(params)
                 factory = SignalFactory(
                     strategy.name,
                     timeframe=strategy.timeframe,
                     bracket=BracketPolicy(),
                     inputs=strategy.params,
+                    sizer=sizer,
+                    default_quantity=runner_settings.default_quantity,
                 )
                 slot = StrategySlot(strategy, symbol, factory)
                 self._warn_if_history_exceeds_redis(slot)
                 self.slots.append(slot)
                 self._by_subject[(symbol, slot.timeframe)].append(slot)
                 log.info(
-                    "Slot ready strategy=%s symbol=%s tf=%s warmup=%d",
+                    "Slot ready strategy=%s symbol=%s tf=%s warmup=%d risk=%.3f%% of %.2f",
                     strategy.name,
                     symbol,
                     slot.timeframe,
                     strategy.warmup,
+                    sizer.risk_percent,
+                    sizer.capital,
                 )
 
     @staticmethod
@@ -235,21 +255,13 @@ class StrategyRunner:
             )
 
     async def _restore_state(self) -> None:
-        """Refill candle buffers and open-cycle ids from Redis."""
+        """Refill candle buffers and the open cycle each slot was holding."""
         for slot in self.slots:
             candles = await self.state.get_candles(
                 slot.symbol, slot.timeframe, slot.buffer.maxlen or 0
             )
             slot.buffer.extend(candles)
-            cycle = await self.state.get_open_cycle(slot.strategy.name, slot.symbol)
-            if cycle:
-                slot.factory.restore_cycles({slot.symbol: cycle})
-                log.info(
-                    "Restored open cycle strategy=%s symbol=%s uxid=%s",
-                    slot.strategy.name,
-                    slot.symbol,
-                    cycle,
-                )
+            await self._restore_position(slot)
             log.info(
                 "Warm-up %s/%s %s: %d/%d candles from Redis",
                 slot.strategy.name,
@@ -258,6 +270,37 @@ class StrategyRunner:
                 len(slot.buffer),
                 slot.strategy.warmup,
             )
+
+    async def _restore_position(self, slot: StrategySlot) -> None:
+        """Reload the cycle this slot holds — Redis first, Postgres behind it.
+
+        The fallback is the point. Redis coming up empty is ambiguous: it means
+        "flat" and it means "someone re-provisioned the cache", and acting on
+        the wrong reading opens a second cycle against a position the broker is
+        still carrying. The table settles it, and re-seeds the cache so the
+        next boot is a cache hit again.
+        """
+        strategy, symbol = slot.strategy.name, slot.symbol
+        position = await self.state.get_open_position(strategy, symbol)
+        source = "redis"
+        if position is None:
+            position = await self.positions.get(strategy, symbol)
+            source = "postgres"
+            if position is not None:
+                await self.state.set_open_position(position)
+
+        if position is None:
+            return
+        slot.factory.restore_position(position, symbol=symbol)
+        log.info(
+            "Restored open cycle from %s strategy=%s symbol=%s uxid=%s qty=%s remaining=%s",
+            source,
+            strategy,
+            symbol,
+            position.signal_uxid,
+            position.quantity,
+            position.remaining,
+        )
 
     async def _subscribe(self) -> None:
         for symbol, timeframe in sorted(self._by_subject):
@@ -284,6 +327,10 @@ class StrategyRunner:
             await self._feed_candle(slot, event.candle)
 
     async def _feed_candle(self, slot: StrategySlot, candle: Candle) -> None:
+        async with slot.lock:
+            await self._feed_candle_serialized(slot, candle)
+
+    async def _feed_candle_serialized(self, slot: StrategySlot, candle: Candle) -> None:
         if slot.buffer and candle.open_time <= slot.buffer[-1].open_time:
             # A redelivery or a duplicate close. Acting on it twice would open a
             # second position on a signal the strategy already made once.
@@ -344,21 +391,24 @@ class StrategyRunner:
         for slot in self.slots:
             if slot.symbol != event.symbol or not slot.started:
                 continue
-            context = StrategyContext(
-                symbol=slot.symbol,
-                timeframe=slot.timeframe,
-                now=event.tick.ts,
-                mode="live",
-                params=slot.strategy.params,
-                open_uxid=slot.factory.open_cycle(slot.symbol),
-            )
-            try:
-                result = slot.strategy.on_tick(price, context)
-            except Exception:
-                log.exception("Strategy %s raised on tick for %s", slot.strategy.name, slot.symbol)
-                continue
-            for intent in as_intents(result):
-                await self._emit(slot, intent, price, event.tick.ts)
+            async with slot.lock:
+                context = StrategyContext(
+                    symbol=slot.symbol,
+                    timeframe=slot.timeframe,
+                    now=event.tick.ts,
+                    mode="live",
+                    params=slot.strategy.params,
+                    open_uxid=slot.factory.open_cycle(slot.symbol),
+                )
+                try:
+                    result = slot.strategy.on_tick(price, context)
+                except Exception:
+                    log.exception(
+                        "Strategy %s raised on tick for %s", slot.strategy.name, slot.symbol
+                    )
+                    continue
+                for intent in as_intents(result):
+                    await self._emit(slot, intent, price, event.tick.ts)
 
     async def _on_control_message(self, msg: Msg) -> None:
         """Control plane: today, the shadow-mode switch from the API."""
@@ -401,11 +451,17 @@ class StrategyRunner:
     ) -> None:
         if intent.price is None:
             intent.price = fallback_price
-        if intent.action.is_entry and intent.quantity is None:
-            intent.quantity = runner_settings.default_quantity
 
+        # Size is not filled in here: `build()` risk-sizes the entry against
+        # the account and rescales the strategy's closes to match, so the
+        # backtest and this loop put the same number on the wire.
         try:
-            signal = slot.factory.build(intent, symbol=slot.symbol, moment=moment)
+            signal = slot.factory.build(
+                intent,
+                symbol=slot.symbol,
+                moment=moment,
+                commit=False,
+            )
         except ValueError as exc:
             log.warning("Dropped intent from %s: %s", slot.strategy.name, exc)
             return
@@ -413,10 +469,23 @@ class StrategyRunner:
         result = await self.sink.send(signal)
 
         # Only after a successful send (or a shadow run) does the cycle become
-        # "the position we hold". Recording it after a failed publish would
-        # leave the runner tracking a trade the broker never received.
+        # "the position we hold". Both the in-process factory and Redis are
+        # committed here; build() deliberately left them unchanged.
         if result.status != "failed":
-            await self._track_cycle(slot, signal.position.action, signal.signal_uxid)
+            slot.factory.commit(signal)
+            try:
+                await self._track_cycle(slot)
+            except Exception:
+                # The broker already accepted the signal. Losing the audit row
+                # as well would hide the exact trade that now needs state
+                # reconciliation, so persistence failure is loud but does not
+                # abort the remainder of the emission path.
+                log.exception(
+                    "Failed to persist cycle strategy=%s symbol=%s uxid=%s",
+                    slot.strategy.name,
+                    slot.symbol,
+                    signal.signal_uxid,
+                )
 
         await self.signals.record_signal(
             signal,
@@ -435,11 +504,24 @@ class StrategyRunner:
             },
         )
 
-    async def _track_cycle(self, slot: StrategySlot, action: SignalAction, uxid: str) -> None:
-        if action.is_entry:
-            await self.state.set_open_cycle(slot.strategy.name, slot.symbol, uxid)
-        elif action in (SignalAction.TP2, SignalAction.SL, SignalAction.R_SL, SignalAction.FLAT):
+    async def _track_cycle(self, slot: StrategySlot) -> None:
+        """Mirror the slot's cycle into Redis and Postgres, or clear both.
+
+        Written from what the factory now believes rather than from the action
+        that was just sent, so the "a TP1 taking the whole entry ends the
+        cycle" rule is decided once — in :class:`OpenPosition` — instead of
+        being restated by everything that persists a transition.
+        """
+        position = slot.factory.open_position(slot.symbol)
+        if position is None:
             await self.state.clear_open_cycle(slot.strategy.name, slot.symbol)
+            await self.positions.clear(slot.strategy.name, slot.symbol)
+            return
+        await self._persist_position(position)
+
+    async def _persist_position(self, position: OpenPosition) -> None:
+        await self.state.set_open_position(position)
+        await self.positions.upsert(position)
 
     # ── Shutdown ──────────────────────────────────────────────────────
 

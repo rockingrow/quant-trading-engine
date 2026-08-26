@@ -499,6 +499,59 @@ nothing — which reads exactly like a strategy that found no setups.
 
 ---
 
+## Position sizing and the trade cycle
+
+**The engine decides how big every entry is, not the strategy.** A strategy is
+never told the balance — that is what keeps a backtested file and a traded file
+the same file — so size is settled in one place, `qte_shared.sizing`, and both
+drivers go through it:
+
+```
+quantity = QTE_ACCOUNT__CAPITAL x risk_percent / 100 / |entry - stop| / contract_size
+```
+
+Read it as *risk this many currency units if the stop is hit*. `risk_percent` is
+the pair's own value in `config/strategies_mapping.toml`, falling back to
+`QTE_ACCOUNT__RISK_PERCENT`:
+
+```bash
+QTE_ACCOUNT__CAPITAL=1000.0          # the account, and what a % of risk is a % of
+QTE_ACCOUNT__RISK_PERCENT=1.0        # fallback when a pair states none
+QTE_ACCOUNT__COMMISSION_PER_UNIT=0.0 # backtest cost, charged each side
+QTE_ACCOUNT__CONTRACT_SIZE=1.0
+```
+
+$1,000 at 3% over a $5 stop is 6 units — which is
+`examples/algo-trading-broker/entry.long.json`, the payload the broker actually
+receives.
+
+The capital is **fixed for a run**; it does not compound. Sizing off running
+equity would make later trades depend on earlier P&L, so two backtests differing
+by one early trade would be sized differently for the rest of the file and could
+not be compared. `use_equity_sizing` is carried on the payload for the broker to
+act on and changes nothing on this side. A strategy that proposes a size keeps
+its *proportions* — the ratio to what QTE actually opened is remembered on the
+cycle and its partial exits are rescaled by it.
+
+**One trade cycle per (strategy, symbol) at a time.** `signal_uxid` is that
+cycle: an entry mints it and every close reuses it. A second entry while one is
+open is refused before it reaches the wire, mirroring the worker, which answers
+`REJECTED` rather than stacking.
+
+A cycle ends on `TP2`, `SL`, `R_SL` or `FLAT` — **and on a `TP1` that closes the
+entry's whole quantity**. A "50%" partial of a position sized at one unit has
+finished the trade; calling it a partial would leave the runner holding a cycle
+the broker is done with and refusing every entry after it.
+
+Because that decision needs the sizes, the runner keeps the whole position
+record and writes it to Redis *and* Postgres (`open_positions`, unique per
+pair). Boot reads Redis and falls back to the table — an empty cache means both
+"flat" and "someone re-provisioned Redis", and reading it the wrong way opens a
+second cycle against a position the broker still holds. See
+[`docs/broker-contract.md`](docs/broker-contract.md).
+
+---
+
 ## Auditing what you cloned in
 
 The loader is forgiving by design: what it cannot drive it logs and skips, so
@@ -585,7 +638,22 @@ imports. A strategy problem should stop the one service that has strategies.
 uv run qte-backtest download --symbol XAUUSD --timeframe M15 --start 2023-01-01
 uv run qte-backtest list
 uv run qte-backtest run --strategy MT5_GOLD_M15_V1 --symbol XAUUSD \
-    --spread 0.30 --commission 0.02 --quantity 0.01 --persist
+    --spread 0.30 --persist
+```
+
+The run starts from `QTE_ACCOUNT__CAPITAL` (default **$1,000**) and prices its
+fills with `QTE_ACCOUNT__COMMISSION_PER_UNIT`, so P&L, max drawdown and profit
+factor are figures about a real balance rather than about one arbitrary unit.
+`--equity`, `--commission` and `--risk-percent` override them for a single run.
+Entries are risk-sized against that capital exactly as the live runner sizes
+them, and the pair's overrides in `config/strategies_mapping.toml` are applied
+here too — so a backtest measures the book you actually configured:
+
+```
+Capital           1,000.00 → 1,378.79   (+37.88%)
+Net PnL           378.79   (fees 0.00)
+Profit factor     1.294
+Max drawdown      243.31  (18.50%)
 ```
 
 The simulator is deliberately pessimistic — it is meant to disprove a strategy,
@@ -733,8 +801,10 @@ stream's duplicate window is stored once and a worker opens one position.
 
 `signal_uxid` is the **trade cycle**: an entry mints it and every TP/SL/FLAT
 that follows reuses it, which is how the broker groups a whole trade into one
-broadcast. The runner keeps it in Redis, so a restart mid-trade still closes the
-position it opened.
+broadcast. The runner keeps the whole position — id, sizes, bracket — in Redis
+and in `open_positions`, so a restart mid-trade closes what it opened at the
+size that is left. What ends a cycle, and why a `TP1` sometimes does, is in
+[Position sizing and the trade cycle](#position-sizing-and-the-trade-cycle).
 
 > The engine also mirrors every emitted signal on `QTE.signal.emitted` and rows
 > it into Postgres, whether it was delivered, shadowed or failed.

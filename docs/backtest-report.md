@@ -19,7 +19,7 @@ uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --report --chart
 | Block | Answers |
 | --- | --- |
 | `reading_guide` | The conventions an agent would otherwise have to guess — what R means, what the fill model assumes, why there is only ever one position. |
-| `run` | Strategy, class, module, params, warm-up, starting equity. |
+| `run` | Strategy, class, module, params, warm-up, starting equity and the `risk_percent` every quantity was sized at. |
 | `data` | Bar count, first and last bar, bars left after warm-up, gap count. |
 | `market` | A downsampled OHLC window of the replayed history, plus the buy-and-hold basis — the one thing the trades cannot re-derive. |
 | `costs` | Spread, slippage, commission, contract size, derived round-trip cost. |
@@ -50,6 +50,19 @@ payoff in R and treat the currency figures as scale. A trade that reached the
 market without a stop has `r_multiple: null` and is excluded from every R
 statistic; `metrics.trades_without_stop` counts them, and a critical finding
 fires if there are any.
+
+**Position size is the engine's, not the strategy's.** Every entry is sized
+`starting_equity × risk_percent / 100 / |entry − initial_sl| / contract_size`,
+so a trade risks about `risk_percent` of the account when it stops out — which
+is why `metrics.average_loss` usually lands close to that budget, and why it is
+a red flag when it does not. Both figures are in the `run` block. The capital
+does not compound during a run, so an early trade cannot resize the ones after
+it and two runs stay comparable.
+
+`metrics.starting_equity`, `ending_equity` and `return_pct` are that account
+before and after; `max_drawdown_pct` is measured against the running peak of the
+same curve. Read `return_pct` rather than `net_pnl` when comparing runs sized
+differently.
 
 `initial_sl` is kept separately from `sl` on purpose. Moving a stop to breakeven
 changes `sl`, and measuring R against the moved stop would make every trade's
