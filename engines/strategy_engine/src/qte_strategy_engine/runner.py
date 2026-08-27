@@ -10,9 +10,9 @@ makes a backtested edge and a traded edge the same code path.
 
 Two ordering rules matter here:
 
-* **Publish, then audit.** A slow Postgres must never delay a trade, so the
-  signal goes to the broker first and the audit row is written after — and an
-  audit failure is logged, never raised.
+* **Stage, publish, then commit.** A durable outbox row is written before the
+  broker call. Its UUID is the stable delivery id, so an ambiguous timeout can
+  be retried without manufacturing a second command or a ghost local cycle.
 * **Warm from Redis, not from the feed.** On boot the runner pulls its
   indicator window out of Redis rather than waiting hours for live candles to
   accumulate, so a restart resumes trading on the next close.
@@ -39,7 +39,7 @@ from qte_shared.cache import RedisState
 from qte_shared.config import settings
 from qte_shared.db import EventRepository
 from qte_shared.logging_setup import get_logger
-from qte_shared.models import Candle, CandleClosedEvent, OpenPosition, TickEvent
+from qte_shared.models import BrokerSignal, Candle, CandleClosedEvent, OpenPosition, TickEvent
 from qte_shared.plugin_loader import load_strategies
 from qte_shared.routing import SymbolRouting
 from qte_shared.signal_factory import BracketPolicy, SignalFactory
@@ -54,7 +54,7 @@ from qte_shared.strategy_base import (
 )
 from qte_shared.timeframes import normalize_timeframe
 
-from qte_strategy_engine.broker_sink import BrokerSink
+from qte_strategy_engine.broker_sink import BrokerSink, DeliveryResult
 from qte_strategy_engine.db import OpenPositionRepository, SignalRepository
 from qte_strategy_engine.preflight import run_preflight_audit
 from qte_strategy_engine.settings import runner_settings
@@ -105,6 +105,8 @@ class StrategyRunner:
         self._by_subject: dict[tuple[str, str], list[StrategySlot]] = defaultdict(list)
         self._stopping = asyncio.Event()
         self._tasks: list[asyncio.Task[Any]] = []
+        self._uncertain_pairs: set[tuple[str, str]] = set()
+        self._cleaned = False
 
     # ── Startup ───────────────────────────────────────────────────────
 
@@ -114,36 +116,45 @@ class StrategyRunner:
         # there is no sense opening NATS, Redis and the broker for strategies
         # we are about to reject. Off by configuration is the same call.
         run_preflight_audit()
+        self._cleaned = False
 
-        await self.bus.connect()
-        await self.state.connect()
-        await self.sink.start()
+        try:
+            await self.bus.connect()
+            await self.state.connect()
+            await self.sink.start()
 
-        self._build_slots()
-        if not self.slots:
-            raise RuntimeError(
-                f"No strategies loaded from {settings.engine.strategies_dir}. Clone your "
-                "private strategy repo into __strategies__/ (see README, phase 6)."
+            self._build_slots()
+            if not self.slots:
+                raise RuntimeError(
+                    f"No strategies loaded from {settings.engine.strategies_dir}. Clone your "
+                    "private strategy repo into __strategies__/ (see README, phase 6)."
+                )
+
+            await self._restore_state()
+            await self._recover_pending_deliveries()
+            await self._subscribe()
+            self._tasks.append(
+                asyncio.create_task(self._delivery_retry_loop(), name="signal-outbox-retry")
             )
 
-        await self._restore_state()
-        await self._subscribe()
-
-        await self.events.record_event(
-            service=SERVICE_NAME,
-            event="started",
-            payload={
-                "strategies": [slot.strategy.describe() for slot in self.slots],
-                "shadow_mode": self.sink.shadow_mode,
-                "transport": self.sink.transport,
-            },
-        )
-        log.info(
-            "Runner started slots=%d shadow_mode=%s transport=%s",
-            len(self.slots),
-            self.sink.shadow_mode,
-            self.sink.transport,
-        )
+            await self.events.record_event(
+                service=SERVICE_NAME,
+                event="started",
+                payload={
+                    "strategies": [slot.strategy.describe() for slot in self.slots],
+                    "shadow_mode": self.sink.shadow_mode,
+                    "transport": self.sink.transport,
+                },
+            )
+            log.info(
+                "Runner started slots=%d shadow_mode=%s transport=%s",
+                len(self.slots),
+                self.sink.shadow_mode,
+                self.sink.transport,
+            )
+        except BaseException:
+            await self._close_resources(record_event=False)
+            raise
 
     def _build_slots(self) -> None:
         """Instantiate one slot per (strategy, symbol) pair we are to trade.
@@ -449,6 +460,14 @@ class StrategyRunner:
     async def _emit(
         self, slot: StrategySlot, intent: SignalIntent, fallback_price: float, moment: datetime
     ) -> None:
+        if slot.key in self._uncertain_pairs:
+            log.error(
+                "Dropped intent for uncertain delivery strategy=%s symbol=%s; "
+                "the durable outbox must reconcile first",
+                slot.strategy.name,
+                slot.symbol,
+            )
+            return
         if intent.price is None:
             intent.price = fallback_price
 
@@ -466,45 +485,163 @@ class StrategyRunner:
             log.warning("Dropped intent from %s: %s", slot.strategy.name, exc)
             return
 
-        result = await self.sink.send(signal)
+        delivery_id = await self.signals.stage_signal(
+            signal,
+            transport=self.sink.transport,
+            shadow=self.sink.shadow_mode,
+            recovery_context=slot.factory.pending_delivery_context(slot.symbol),
+        )
+        if delivery_id is None:
+            slot.factory.discard_pending_delivery_context(slot.symbol)
+            log.error(
+                "Signal not sent because its outbox row could not be persisted "
+                "strategy=%s symbol=%s uxid=%s",
+                slot.strategy.name,
+                slot.symbol,
+                signal.signal_uxid,
+            )
+            return
+
+        result = await self.sink.send(signal, delivery_id=delivery_id)
 
         # Only after a successful send (or a shadow run) does the cycle become
         # "the position we hold". Both the in-process factory and Redis are
         # committed here; build() deliberately left them unchanged.
-        if result.status != "failed":
-            slot.factory.commit(signal)
+        if result.status in {"sent", "shadow"}:
+            slot.factory.commit(signal, delivery_id=delivery_id)
             try:
-                await self._track_cycle(slot)
+                persisted = await self._track_cycle(slot)
             except Exception:
-                # The broker already accepted the signal. Losing the audit row
-                # as well would hide the exact trade that now needs state
-                # reconciliation, so persistence failure is loud but does not
-                # abort the remainder of the emission path.
+                # The broker already accepted the signal and the outbox row is
+                # still pending. Keep the pair blocked so startup recovery can
+                # reconcile it before another decision changes the cycle.
                 log.exception(
                     "Failed to persist cycle strategy=%s symbol=%s uxid=%s",
                     slot.strategy.name,
                     slot.symbol,
                     signal.signal_uxid,
                 )
+                persisted = False
+            if persisted:
+                await self.signals.mark_delivery(delivery_id, status=result.status)
+            else:
+                self._uncertain_pairs.add(slot.key)
+        else:
+            await self.signals.mark_delivery(
+                delivery_id,
+                status=result.status,
+                error=result.detail,
+            )
+            if result.status == "unknown":
+                self._uncertain_pairs.add(slot.key)
+            else:
+                slot.factory.discard_pending_delivery_context(slot.symbol)
 
-        await self.signals.record_signal(
-            signal,
-            transport=result.transport,
-            delivery_status=result.status,
-            shadow=self.sink.shadow_mode,
-            delivery_error=result.detail if result.status == "failed" else None,
-        )
         await self.bus.publish(
             self.subjects.signal_emitted(),
             {
                 "signal": signal.model_dump(mode="json"),
-                "delivery": {"status": result.status, "transport": result.transport},
+                "delivery": {
+                    "id": delivery_id,
+                    "status": result.status,
+                    "transport": result.transport,
+                },
                 "reason": intent.reason,
                 "emitted_at": datetime.now(UTC).isoformat(),
             },
         )
 
-    async def _track_cycle(self, slot: StrategySlot) -> None:
+    async def _recover_pending_deliveries(self, *, unknown_only: bool = False) -> None:
+        """Replay durable outbox rows with their original de-duplication ids."""
+        slots = {slot.key: slot for slot in self.slots}
+        rows = (
+            await self.signals.pending_deliveries(statuses=("unknown",))
+            if unknown_only
+            else await self.signals.pending_deliveries()
+        )
+        for row in rows:
+            signal = BrokerSignal.model_validate(row.payload["payload"])
+            key = (signal.strategy, signal.symbol.upper())
+            slot = slots.get(key)
+            if slot is None:
+                self._uncertain_pairs.add(key)
+                log.error(
+                    "Cannot recover signal delivery id=%s: no active slot for %s/%s",
+                    row.id,
+                    *key,
+                )
+                continue
+
+            async with slot.lock:
+                delivery_id = str(row.id)
+                slot.factory.restore_pending_delivery_context(
+                    slot.symbol, self.signals.recovery_context(row)
+                )
+                original_transport = getattr(row, "transport", self.sink.transport)
+                original_shadow = getattr(row, "shadow", self.sink.shadow_mode)
+                if original_transport != self.sink.transport:
+                    self._uncertain_pairs.add(key)
+                    log.error(
+                        "Cannot recover delivery id=%s over %s: it was staged for %s",
+                        delivery_id,
+                        self.sink.transport,
+                        original_transport,
+                    )
+                    continue
+                if original_shadow:
+                    # A staged paper trade must never become live because the
+                    # operator changed configuration before recovery.
+                    result = DeliveryResult(status="shadow", transport=original_transport)
+                elif self.sink.shadow_mode:
+                    # The inverse transition is unsafe too: calling send would
+                    # label a previously-live command as shadow without ever
+                    # reconciling it with the broker.
+                    self._uncertain_pairs.add(key)
+                    log.error(
+                        "Cannot recover live delivery id=%s while shadow mode is enabled",
+                        delivery_id,
+                    )
+                    continue
+                else:
+                    result = await self.sink.send(signal, delivery_id=delivery_id)
+                if result.status in {"sent", "shadow"}:
+                    slot.factory.commit(signal, delivery_id=delivery_id)
+                    try:
+                        persisted = await self._track_cycle(slot)
+                    except Exception:
+                        log.exception(
+                            "Failed to persist recovered cycle delivery_id=%s", delivery_id
+                        )
+                        persisted = False
+                    if persisted:
+                        await self.signals.mark_delivery(delivery_id, status=result.status)
+                        self._uncertain_pairs.discard(key)
+                    else:
+                        self._uncertain_pairs.add(key)
+                else:
+                    await self.signals.mark_delivery(
+                        delivery_id,
+                        status=result.status,
+                        error=result.detail,
+                    )
+                    if result.status == "unknown":
+                        self._uncertain_pairs.add(key)
+                    else:
+                        self._uncertain_pairs.discard(key)
+                        slot.factory.discard_pending_delivery_context(slot.symbol)
+
+    async def _delivery_retry_loop(self) -> None:
+        """Continuously reconcile ambiguous sends without requiring a restart."""
+        while not self._stopping.is_set():
+            await asyncio.sleep(runner_settings.delivery_retry_interval)
+            try:
+                await self._recover_pending_deliveries(unknown_only=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Signal outbox retry failed — retrying at the next interval")
+
+    async def _track_cycle(self, slot: StrategySlot) -> bool:
         """Mirror the slot's cycle into Redis and Postgres, or clear both.
 
         Written from what the factory now believes rather than from the action
@@ -515,13 +652,12 @@ class StrategyRunner:
         position = slot.factory.open_position(slot.symbol)
         if position is None:
             await self.state.clear_open_cycle(slot.strategy.name, slot.symbol)
-            await self.positions.clear(slot.strategy.name, slot.symbol)
-            return
-        await self._persist_position(position)
+            return await self.positions.clear(slot.strategy.name, slot.symbol)
+        return await self._persist_position(position)
 
-    async def _persist_position(self, position: OpenPosition) -> None:
+    async def _persist_position(self, position: OpenPosition) -> bool:
         await self.state.set_open_position(position)
-        await self.positions.upsert(position)
+        return await self.positions.upsert(position)
 
     # ── Shutdown ──────────────────────────────────────────────────────
 
@@ -529,25 +665,44 @@ class StrategyRunner:
         self._stopping.set()
 
     async def run_forever(self) -> None:
-        await self.start()
         try:
+            await self.start()
             await self._stopping.wait()
         finally:
             await self.stop()
 
     async def stop(self) -> None:
+        await self._close_resources(record_event=True)
+
+    async def _close_resources(self, *, record_event: bool) -> None:
+        """Release acquired resources in reverse order; safe after partial start."""
+        if getattr(self, "_cleaned", False):
+            return
+        cleanup_failed = False
         self._stopping.set()
         for task in self._tasks:
             task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            try:
                 await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                cleanup_failed = True
+                log.exception("Task cleanup failed during runner shutdown")
+        self._tasks.clear()
         for slot in self.slots:
             with contextlib.suppress(Exception):
                 slot.strategy.on_stop()
-        await self.events.record_event(service=SERVICE_NAME, event="stopped")
-        await self.sink.stop()
-        await self.bus.close()
-        await self.state.close()
+        if record_event:
+            with contextlib.suppress(Exception):
+                await self.events.record_event(service=SERVICE_NAME, event="stopped")
+        for close in (self.sink.stop, self.state.close, self.bus.close):
+            try:
+                await close()
+            except Exception:
+                cleanup_failed = True
+                log.exception("Resource cleanup failed during runner shutdown")
+        self._cleaned = not cleanup_failed
         log.info("Runner stopped")
 
 

@@ -183,7 +183,7 @@ class SignalFactory:
         self._book.pop(symbol.upper(), None)
         self._pending_scale.pop(symbol.upper(), None)
 
-    def commit(self, signal: BrokerSignal) -> None:
+    def commit(self, signal: BrokerSignal, *, delivery_id: str | None = None) -> None:
         """Apply the cycle transition represented by a delivered signal.
 
         Live delivery is a two-phase operation: first build and validate the
@@ -199,6 +199,12 @@ class SignalFactory:
         action = block.action
 
         if action.is_entry:
+            existing = self._book.get(symbol)
+            if existing is not None and existing.signal_uxid == signal.signal_uxid:
+                # Recovery may replay an outbox entry after its position state
+                # was already committed but before the audit row was marked.
+                # Never reset that cycle's remaining size back to the entry.
+                return
             self._book[symbol] = OpenPosition(
                 signal_uxid=signal.signal_uxid,
                 strategy=signal.strategy,
@@ -220,6 +226,7 @@ class SignalFactory:
                 scale_strategy=block.scale_strategy,
                 scaling=block.scaling,
                 scale=self._pending_scale.pop(symbol, 1.0),
+                applied_delivery_ids=[delivery_id] if delivery_id else [],
             )
             return
 
@@ -230,8 +237,24 @@ class SignalFactory:
         # that happens to use the same strategy and symbol.
         if position.signal_uxid != signal.signal_uxid:
             return
+        if delivery_id and delivery_id in position.applied_delivery_ids:
+            return
         if position.apply_close(action, block.quantity):
             self._book.pop(symbol, None)
+        elif delivery_id:
+            position.applied_delivery_ids.append(delivery_id)
+
+    def pending_delivery_context(self, symbol: str) -> dict[str, float]:
+        """State needed to reconstruct an uncommitted entry after restart."""
+        return {"scale": self._pending_scale.get(symbol.upper(), 1.0)}
+
+    def restore_pending_delivery_context(self, symbol: str, context: dict | None) -> None:
+        if context and "scale" in context:
+            self._pending_scale[symbol.upper()] = float(context["scale"])
+
+    def discard_pending_delivery_context(self, symbol: str) -> None:
+        """Forget build-only state after a delivery is definitively rejected."""
+        self._pending_scale.pop(symbol.upper(), None)
 
     # ── Building ──────────────────────────────────────────────────────
 

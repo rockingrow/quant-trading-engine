@@ -78,6 +78,39 @@ class RedisState:
             pipe.expire(key, settings.redis.ttl_seconds)
         await pipe.execute()
 
+    async def stage_closed_candle(self, candle: Candle, max_len: int | None = None) -> None:
+        """Persist a closed candle and enqueue its event in one Redis transaction.
+
+        The resampler has already retired the bucket by the time this is
+        called.  If NATS is unavailable, the queue is therefore the only place
+        from which the event can be replayed.  Keeping the history write and
+        queue append in one transaction also prevents a restart from seeing a
+        candle in one representation but not the other.
+        """
+        limit = max_len or settings.redis.candle_history
+        history = self.key("candles", candle.symbol, candle.timeframe)
+        outbox = self.key("outbox", "candles")
+        pipe = self.client.pipeline(transaction=True)
+        pipe.rpush(history, candle.model_dump_json())
+        pipe.ltrim(history, -limit, -1)
+        if settings.redis.ttl_seconds:
+            pipe.expire(history, settings.redis.ttl_seconds)
+        pipe.rpush(outbox, candle.model_dump_json())
+        # A quiet-market flush may close the only builder without a following
+        # tick to overwrite this key.  Leaving it behind would resurrect an
+        # already-closed bar after a restart.
+        pipe.delete(self.key("open_candle", candle.symbol, candle.timeframe))
+        await pipe.execute()
+
+    async def peek_pending_candle(self) -> Candle | None:
+        """Oldest closed candle whose NATS event has not been acknowledged."""
+        raw = await self.client.lindex(self.key("outbox", "candles"), 0)
+        return Candle.model_validate_json(raw) if raw else None
+
+    async def ack_pending_candle(self) -> None:
+        """Remove the oldest candle after its Core NATS publish succeeds."""
+        await self.client.lpop(self.key("outbox", "candles"))
+
     async def get_candles(self, symbol: str, timeframe: str, count: int = 0) -> list[Candle]:
         """Oldest-first history; ``count=0`` returns everything stored."""
         key = self.key("candles", symbol, timeframe)

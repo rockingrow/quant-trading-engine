@@ -52,7 +52,7 @@ class SignalAudit(Base):
     inputs: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
 
     transport: Mapped[str] = mapped_column(String(16), default="nats")
-    #: ``sent`` | ``shadow`` | ``failed`` — what actually happened to it.
+    #: ``pending`` | ``unknown`` | ``sent`` | ``shadow`` | ``failed``.
     delivery_status: Mapped[str] = mapped_column(String(16), default="shadow")
     delivery_error: Mapped[str | None] = mapped_column(Text)
     shadow: Mapped[bool] = mapped_column(Boolean, default=True)

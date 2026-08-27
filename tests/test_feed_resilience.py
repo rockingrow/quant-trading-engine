@@ -30,9 +30,40 @@ from qte_shared.providers.tiingo.ws import TiingoLiveFeed
 MOMENT = datetime(2026, 5, 1, 10, 0, tzinfo=UTC)
 
 
+class LifecycleResource:
+    def __init__(self, name: str, events: list[str], *, fail_connect: bool = False) -> None:
+        self.name = name
+        self.events = events
+        self.fail_connect = fail_connect
+
+    async def connect(self) -> None:
+        self.events.append(f"connect:{self.name}")
+        if self.fail_connect:
+            raise RuntimeError(f"{self.name} unavailable")
+
+    async def close(self) -> None:
+        self.events.append(f"close:{self.name}")
+
+
 def _frame(price: float) -> str:
     tick = Tick(symbol="XAUUSD", ts=MOMENT, last=price, volume=1.0)
     return json.dumps(encode_tick(tick, seq=1))
+
+
+async def test_partial_ingestion_startup_closes_resources_already_acquired():
+    events: list[str] = []
+    service = object.__new__(IngestionService)
+    service.bus = LifecycleResource("bus", events)
+    service.state = LifecycleResource("state", events, fail_connect=True)
+    service._feeds = []
+    service._flush_task = None
+    service._stopping = asyncio.Event()
+
+    with pytest.raises(RuntimeError, match="state unavailable"):
+        await service.start()
+    await service.stop()
+
+    assert events == ["connect:bus", "connect:state", "close:state", "close:bus"]
 
 
 # ── The simulator feed ────────────────────────────────────────────────────
@@ -99,12 +130,16 @@ async def test_a_failed_publish_costs_one_cycle_not_the_flush_loop(monkeypatch):
     emitted: list[object] = []
     failing = True
 
-    async def emit(candle: object) -> None:
+    async def emit(candles: list[object]) -> None:
         if failing:
             raise ConnectionError("NATS publish failed")
-        emitted.append(candle)
+        emitted.extend(candles)
 
-    service._emit_candle = emit
+    async def drain() -> None:
+        return None
+
+    service._emit_candles = emit
+    service._drain_candle_outbox = drain
 
     import qte_ingestion.service as service_module
 
@@ -129,3 +164,93 @@ async def test_a_failed_publish_costs_one_cycle_not_the_flush_loop(monkeypatch):
         loop_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await loop_task
+
+
+class CandleOutbox:
+    def __init__(self) -> None:
+        self.pending = []
+        self.staged = []
+
+    async def stage_closed_candle(self, candle) -> None:
+        self.staged.append(candle)
+        self.pending.append(candle)
+
+    async def peek_pending_candle(self):
+        return self.pending[0] if self.pending else None
+
+    async def ack_pending_candle(self) -> None:
+        self.pending.pop(0)
+
+
+class FlakyCandleBus:
+    def __init__(self) -> None:
+        self.fail = True
+        self.published = []
+
+    async def publish(self, subject, payload) -> None:
+        if self.fail:
+            raise ConnectionError("core NATS is unavailable")
+        self.published.append((subject, payload))
+
+
+class YieldingCandleBus(FlakyCandleBus):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail = False
+
+    async def publish(self, subject, payload) -> None:
+        await asyncio.sleep(0)
+        self.published.append((subject, payload))
+
+
+async def test_a_failed_candle_publish_remains_in_the_durable_outbox():
+    service = object.__new__(IngestionService)
+    service.state = CandleOutbox()
+    service.bus = FlakyCandleBus()
+    subject = staticmethod(lambda symbol, timeframe: f"{symbol}.{timeframe}")
+    service.subjects = type("Subjects", (), {"candle_closed": subject})()
+    candle = Resampler("XAUUSD", ["M1"])
+    candle.add_tick(Tick(symbol="XAUUSD", ts=MOMENT, last=2400.0))
+    closed = candle.flush(MOMENT + timedelta(minutes=1))[0]
+
+    with pytest.raises(ConnectionError, match="unavailable"):
+        await service._emit_candle(closed)
+
+    assert service.state.pending == [closed]
+    assert service.state.staged == [closed]
+
+    service.bus.fail = False
+    await service._drain_candle_outbox()
+
+    assert service.state.pending == []
+    assert len(service.bus.published) == 1
+    assert (
+        service.bus.published[0][1]["candle"]["open_time"]
+        == closed.model_dump(mode="json")["open_time"]
+    )
+
+
+async def test_concurrent_feeds_cannot_ack_a_candle_another_feed_has_not_published():
+    service = object.__new__(IngestionService)
+    service.state = CandleOutbox()
+    service.bus = YieldingCandleBus()
+    subject = staticmethod(lambda symbol, timeframe: f"{symbol}.{timeframe}")
+    service.subjects = type("Subjects", (), {"candle_closed": subject})()
+    first = Resampler("XAUUSD", ["M1"])
+    second = Resampler("BTCUSDT", ["M1"])
+    first.add_tick(Tick(symbol="XAUUSD", ts=MOMENT, last=2400.0))
+    second.add_tick(Tick(symbol="BTCUSDT", ts=MOMENT, last=60000.0))
+    service.state.pending.extend(
+        [
+            first.flush(MOMENT + timedelta(minutes=1))[0],
+            second.flush(MOMENT + timedelta(minutes=1))[0],
+        ]
+    )
+
+    await asyncio.gather(service._drain_candle_outbox(), service._drain_candle_outbox())
+
+    assert service.state.pending == []
+    assert [payload["symbol"] for _, payload in service.bus.published] == [
+        "XAUUSD",
+        "BTCUSDT",
+    ]

@@ -227,7 +227,12 @@ class BacktestEngine:
             strategy=self.strategy.name,
             symbol=self.symbol,
             timeframe=self.timeframe,
-            metrics=compute_metrics(self.positions, self.starting_equity, total_bars=len(frame)),
+            metrics=compute_metrics(
+                self.positions,
+                self.starting_equity,
+                total_bars=len(frame),
+                costs=self.simulator.costs,
+            ),
             positions=self.positions,
             signals=self.signals,
             rejected=self._rejected,

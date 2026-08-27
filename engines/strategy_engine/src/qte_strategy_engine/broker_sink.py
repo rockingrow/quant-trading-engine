@@ -22,7 +22,7 @@ and then simply not sent. It is the phase-6 paper-trading switch.
 
 from __future__ import annotations
 
-import uuid
+import hashlib
 from dataclasses import dataclass
 
 import httpx
@@ -38,7 +38,7 @@ log = get_logger(__name__)
 class DeliveryResult:
     """What happened to one signal on its way out."""
 
-    status: str  # "sent" | "shadow" | "failed"
+    status: str  # "sent" | "shadow" | "failed" | "unknown"
     transport: str
     detail: str = ""
 
@@ -105,7 +105,7 @@ class BrokerSink:
 
     # ── Sending ───────────────────────────────────────────────────────
 
-    async def send(self, signal: BrokerSignal) -> DeliveryResult:
+    async def send(self, signal: BrokerSignal, *, delivery_id: str | None = None) -> DeliveryResult:
         """Deliver *signal*, or record why it did not go.
 
         Never raises. A delivery failure is returned so the caller can audit it
@@ -131,9 +131,22 @@ class BrokerSink:
 
         try:
             if self.transport == "nats":
-                detail = await self._send_nats(signal)
+                detail = await self._send_nats(signal, delivery_id=delivery_id)
             else:
-                detail = await self._send_http(signal)
+                detail = await self._send_http(signal, delivery_id=delivery_id)
+        except (TimeoutError, httpx.TimeoutException) as exc:
+            # A timeout is not a negative acknowledgement.  The remote side
+            # may have stored/accepted the request and only lost the response,
+            # so calling it "failed" would invite a fresh entry against an
+            # already-open position.
+            log.error(
+                "Signal delivery UNKNOWN transport=%s strategy=%s uxid=%s: %s",
+                self.transport,
+                signal.strategy,
+                signal.signal_uxid,
+                exc,
+            )
+            return DeliveryResult(status="unknown", transport=self.transport, detail=str(exc))
         except Exception as exc:
             log.error(
                 "Signal delivery FAILED transport=%s strategy=%s uxid=%s: %s",
@@ -155,17 +168,18 @@ class BrokerSink:
         )
         return DeliveryResult(status="sent", transport=self.transport, detail=detail)
 
-    async def _send_nats(self, signal: BrokerSignal) -> str:
+    async def _send_nats(self, signal: BrokerSignal, *, delivery_id: str | None = None) -> str:
         if self._bus is None:
             raise RuntimeError("Broker sink was not started")
         subject = Subjects.broker_signal(signal.strategy)
-        # A fresh Nats-Msg-Id per signal, inside the stream's duplicate window:
-        # if an ack is slow and something retries the publish, JetStream stores
-        # one copy and the worker opens one position.
+        # Stable across retries of this outbox row.  If an ack is lost after
+        # JetStream stored the message, replaying the row produces the same
+        # Nats-Msg-Id and the stream returns a duplicate ack rather than a
+        # second trade command.
         ack = await self._bus.publish_jetstream(
             subject,
             signal.to_envelope(),
-            msg_id=uuid.uuid4().hex,
+            msg_id=delivery_id or signal_delivery_id(signal),
             timeout=settings.broker.publish_timeout,
         )
         return (
@@ -173,9 +187,18 @@ class BrokerSink:
             f"duplicate={getattr(ack, 'duplicate', False)}"
         )
 
-    async def _send_http(self, signal: BrokerSignal) -> str:
+    async def _send_http(self, signal: BrokerSignal, *, delivery_id: str | None = None) -> str:
         if self._http is None:
             raise RuntimeError("Broker sink was not started")
-        response = await self._http.post("/secret/webhook", json=signal.model_dump(mode="json"))
+        response = await self._http.post(
+            "/secret/webhook",
+            json=signal.model_dump(mode="json"),
+            headers={"Idempotency-Key": delivery_id or signal_delivery_id(signal)},
+        )
         response.raise_for_status()
         return f"http {response.status_code} {response.json()}"
+
+
+def signal_delivery_id(signal: BrokerSignal) -> str:
+    """Deterministic fallback id for callers that do not own an outbox row."""
+    return hashlib.sha256(signal.model_dump_json().encode()).hexdigest()

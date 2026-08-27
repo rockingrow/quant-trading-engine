@@ -70,7 +70,6 @@ instance/
 
 # Sphinx documentation
 docs/_build/
-docs/audits/*
 
 # PyBuilder
 .pybuilder/
@@ -255,6 +254,10 @@ __marimo__/
 # accumulate fast; keep the ones that matter somewhere else.
 /data/reports/*
 !/data/reports/.gitkeep
+
+# Audit write-ups. Keep the directory on GitHub but not its contents.
+/data/audits/*
+!/data/audits/.gitkeep
 
 .env
 .env.*
