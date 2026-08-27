@@ -324,6 +324,8 @@ class FillSimulator:
         bar_time: datetime,
         price: float,
         reason: ExitReason = ExitReason.FLAT,
+        *,
+        quantity: float | None = None,
     ) -> None:
         """Discretionary close — a FLAT intent, or the end of the data."""
         if position.is_open:
@@ -331,7 +333,7 @@ class FillSimulator:
                 position,
                 bar_time,
                 self.costs.exit_fill(price, position.direction),
-                position.remaining,
+                position.remaining if quantity is None else quantity,
                 reason,
             )
 

@@ -5,6 +5,96 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Backtest dashboard** (`qte-backtest chart`) — A report rendered as one
+  self-contained HTML page, laid out like a strategy tester: cumulative P&L
+  against buy-and-hold with the per-trade excursion and underwater band as
+  overlays, the price window with every trade marked on it, P&L by
+  day/week/month/year, benchmarking with weekly correlation, alternating
+  run-ups and drawdowns, the returns distribution and streaks, MAE/MFE against
+  realised R, the diagnostics, and the full sortable trade list. The layout is
+  borrowed deliberately — it is the one every discretionary trader already
+  reads, so the numbers land without a legend.
+
+  It takes the report JSON and nothing else, so a run from three months ago
+  still draws on a machine with no parquet history, no strategy installed and
+  no engine; and it fetches nothing when it opens, because a report is
+  something you email or open offline. Statistics the replay never had the data
+  for — intrabar equity, margin, liquidation — are absent rather than
+  approximated: a drawdown that ignores open positions is a smaller number and
+  would read as an improvement. `--report-format json,md,html` (or `--chart`)
+  writes it straight out of a run.
+
+- **Account-based position sizing** (`qte_shared.sizing`) — the engine now
+  decides how big every entry is, in one place both drivers go through:
+  `quantity = QTE_ACCOUNT__CAPITAL x risk_percent / 100 / |entry - stop| /
+  contract_size`. `risk_percent` comes from the pair's entry in
+  `config/strategies_mapping.toml` and falls back to
+  `QTE_ACCOUNT__RISK_PERCENT`; the capital defaults to **$1,000**.
+
+  A strategy is deliberately not told the balance, so one that sized itself
+  against a notional capital of its own was trading a book nobody had
+  configured. Its proposal now survives as a *proportion*: the ratio between
+  what QTE opened and what it asked for is remembered on the cycle, and every
+  partial exit it emits is rescaled by that ratio and clamped to what remains.
+
+  The capital is fixed rather than compounding on purpose — sizing off running
+  equity makes a run's later trades depend on its own earlier P&L, and two
+  backtests differing by one early trade stop being comparable.
+
+- **`position.use_equity_sizing` on the broker payload** — mirrored from the
+  pair's `use_equity_sizing` param, as `examples/algo-trading-broker/` sends it.
+  Reported, not obeyed: sizing is off the fixed capital either way. A close now
+  also restates `risk_percent`, `tp1_percent`, `move_sl_to_be` and the scaling
+  block from its entry, and QTE fills `is_running` when the strategy leaves it
+  unset — true on a partial that leaves a runner behind, false on the action
+  that finishes the trade. `tests/test_broker_examples.py` pins all of it
+  against those example request bodies.
+
+- **`open_positions`** — one row per (strategy, symbol), unique, holding the
+  cycle that pair is currently carrying. The runner writes Redis *and* this
+  table on every transition and prefers Redis on boot, falling back here when
+  the cache has nothing. An empty Redis is otherwise ambiguous — it means
+  "flat" and it means "someone re-provisioned the cache" — and reading it the
+  wrong way mints a second cycle against a position the broker still holds,
+  leaving the first a ghost nobody ever closes. Bare-uxid values from earlier
+  runners are still read.
+
+### Changed
+
+- **A `TP1` that closes the entry's whole quantity ends the trade cycle.**
+  Previously only `TP2`/`SL`/`R_SL`/`FLAT` did, so a strategy taking "50%" of a
+  position sized at one unit left the runner holding a cycle the broker had
+  finished with — and refusing every entry that followed. Deciding it needs the
+  entry size and the remainder, which is why the runner now persists a whole
+  position record instead of a bare cycle id.
+
+- **The backtest starts from a real balance.** `--equity` defaults to
+  `QTE_ACCOUNT__CAPITAL` ($1,000, was a hardcoded $10,000) and `--commission` to
+  `QTE_ACCOUNT__COMMISSION_PER_UNIT`, so net P&L, max drawdown and profit factor
+  are figures about an account rather than about one arbitrary unit. Metrics
+  gained `starting_equity`, `ending_equity` and `return_pct`. `run --report`
+  also applies the pair's overrides from `config/strategies_mapping.toml`, so a
+  backtest measures the book that is actually configured, and fills each trade
+  at the size the payload beside it carries.
+
+- **Report schema 1.2** — `run.risk_percent`, the three equity metrics above,
+  and a `position_sizing` note in the reading guide. Additive: a consumer of 1.1
+  reads a 1.2 report unchanged.
+
+- **Report schema 1.1** — adds a `market` block: a downsampled OHLC window of
+  the replayed history (each row aggregating `bucket_bars` bars — first open,
+  highest high, lowest low, last close) plus the buy-and-hold basis, anchored
+  at the first bar *after* warm-up so the benchmark is not credited with a
+  stretch the strategy was never allowed to trade. It is the one thing the
+  trade list cannot re-derive, and it is for drawing only — every metric in the
+  report still comes from the full series. `run.default_quantity` is recorded
+  alongside it so the benchmark is sized the way the strategy was. Additive:
+  a consumer of 1.0 reads a 1.1 report unchanged.
+
 ## [0.1.0] - 2026-08-24
 
 First release of **Quant Trading Engine** — an event-driven framework for

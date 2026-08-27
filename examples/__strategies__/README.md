@@ -1,22 +1,22 @@
 # Example strategies
 
-`__strategies__/` is git-ignored **and untracked** in this repo — it is where
-your **private** strategy repo gets cloned, whole, so the alpha never lands in
-the public engine's history:
+`__strategies__/` is git-ignored in this repo — it is where your **private**
+strategy repo gets cloned, whole, so the alpha never lands in the public
+engine's history:
 
 ```bash
-git clone git@github.com:you/my-private-strategies.git __strategies__
+git clone git@github.com:you/my-private-strategies.git __strategies__/my-strategies
 ```
 
-Nothing is committed under that path, not even a `.gitkeep`, because `git clone`
-refuses a destination that already contains a file. That means the directory is
-absent from a fresh checkout and you create it yourself when you are not cloning
-into it.
+Clone into a *subdirectory* rather than onto the mount point: `git clone`
+refuses a destination that already contains a file, and one thing is committed
+under that path — [`__strategies__/_boilerplate/`](../../__strategies__/_boilerplate/),
+a template of what a strategy repository looks like from the engine's side.
+Read it for the layout; read this directory for the contract.
 
 To try the pipeline before you have a private repo:
 
 ```bash
-mkdir -p __strategies__
 cp examples/__strategies__/ema_atr_breakout.py __strategies__/
 uv run qte-backtest run --strategy QTE_EXAMPLE_EMA_ATR --symbol XAUUSD --timeframe M15
 ```

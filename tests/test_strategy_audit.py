@@ -335,12 +335,17 @@ def test_a_manifest_that_raises_is_a_failure_not_a_silent_pass(repo):
     """
     write(
         repo / "my-strategies",
-        {"manifest.py": "import pandas_ta\n\n\ndef load_all():\n    return {}\n"},
+        {
+            "manifest.py": (
+                "import qte_dependency_that_must_not_exist_7f31c9\n\n\n"
+                "def load_all():\n    return {}\n"
+            )
+        },
     )
     report = audit_of(repo)
 
     finding = next(f for f in report.all_findings if f.code == "load-failed")
-    assert "pandas_ta" in finding.message
+    assert "qte_dependency_that_must_not_exist_7f31c9" in finding.message
     assert "strategy-deps" in finding.fix
     assert not report.ok, "0 strategies and a green exit code is the failure mode"
 

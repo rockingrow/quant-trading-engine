@@ -55,6 +55,7 @@ def test_the_json_is_valid_and_self_describing(report):
         "reading_guide",
         "run",
         "data",
+        "market",
         "costs",
         "metrics",
         "diagnostics",
@@ -73,6 +74,7 @@ def test_the_reading_guide_explains_the_conventions_an_agent_would_guess_wrong(r
         "fill_assumptions",
         "exit_reasons",
         "single_position",
+        "market_and_benchmark",
     }
 
 
@@ -90,6 +92,39 @@ def test_the_data_block_states_the_span_and_its_gaps(report):
     assert data["bars_after_warmup"] == 380
     assert data["first_bar"] < data["last_bar"]
     assert data["gaps"] == 0  # the fixture is a contiguous M15 series
+
+
+def test_the_market_block_carries_a_drawable_window_and_a_benchmark(report):
+    """The one thing the report cannot re-derive later: what price did.
+
+    Every other block is computed from the trades, but a chart of the run — and
+    any comparison against holding the instrument — needs the series itself. It
+    is aggregated rather than sampled, because a candle drawn from one surviving
+    bar claims a range that was never traded.
+    """
+    market = report.to_dict()["market"]
+    assert market["columns"] == ["t", "o", "h", "l", "c"]
+    assert market["rows"], "a replayed run should carry a window to draw"
+    assert market["bucket_bars"] >= 1
+    for _, open_, high, low, close in market["rows"]:
+        assert high >= max(open_, close) and low <= min(open_, close)
+
+    hold = market["buy_hold"]
+    # Anchored at the first bar the strategy could act on, not at the first bar
+    # of the file: the benchmark must not be credited with the warm-up.
+    assert (
+        hold["from"] == report.to_dict()["data"]["first_bar"]
+        or hold["from"] > (report.to_dict()["data"]["first_bar"])
+    )
+    assert hold["net_pnl"] == pytest.approx(
+        (hold["exit_close"] - hold["entry_close"]) * hold["quantity"] * hold["contract_size"]
+    )
+
+
+def test_the_run_block_records_the_size_an_entry_defaults_to(report):
+    # The buy-and-hold benchmark is sized the same way; without this it would be
+    # comparing one unit of the market against whatever the strategy traded.
+    assert report.to_dict()["run"]["default_quantity"] == 1.0
 
 
 def test_costs_are_recorded_so_a_result_can_be_re_priced(report):

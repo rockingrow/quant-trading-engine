@@ -6,12 +6,23 @@ are.
 ## Why two NATS namespaces
 
 `QTE.*` is ours — ticks and candle closes, on **core** NATS. At twenty ticks a
-second a dropped message is replaced by a fresher one immediately, so paying
-JetStream's persistence cost for market data buys nothing.
+second a dropped tick is replaced by a fresher one immediately, so paying
+JetStream's persistence cost for raw market data buys nothing. Candle closes
+are different: ingestion stages them in a Redis outbox before publishing and
+only removes them after Core NATS accepts the publish. A crash can replay a
+close, and the runner rejects it by candle open time; a publish failure cannot
+silently erase it.
 
 `SIGNALS.<strategy>` is the **broker's**, on JetStream. Losing a signal loses a
 trade. Different guarantees, different transport, and the split is why the
 engine can be casual about one and careful about the other.
+
+Before either NATS or HTTP delivery, the runner inserts the exact signal
+payload into its Postgres audit table with status `pending`. The row UUID is
+also the stable `Nats-Msg-Id` or HTTP `Idempotency-Key`. Timeouts become
+`unknown`, block that strategy-symbol pair, and are replayed with the same ID
+by the retry loop and on startup; position changes carry applied delivery IDs
+so replay is idempotent locally as well as at the broker boundary.
 
 In production both usually live on the same cluster (the broker's). QTE keeps
 two configurable URLs anyway, because "the market data bus" and "the order bus"
@@ -64,8 +75,8 @@ a migration written then, against a schema that exists by then.
 
 ## Why Redis holds state that Postgres does not
 
-Redis is the hot path's memory: the last tick, the warm-up window, the open
-cycle id per (strategy, symbol). It runs with AOF on, so a restart loses at most
+Redis is the hot path's memory: the last tick, the warm-up window, the position
+open on each (strategy, symbol). It runs with AOF on, so a restart loses at most
 the last write. The runner rebuilds its indicator window from Redis on boot
 instead of waiting hours for live candles, which is what makes a restart resume
 trading on the next close.
@@ -74,15 +85,28 @@ Postgres is the audit trail — written *after* the signal has gone out, and its
 failures are logged rather than raised. A logging outage must not become a
 runner that stops trading.
 
+**The open position is the exception, and is written to both.** It is the one
+piece of hot state whose loss is not merely slow to recover from: a runner that
+forgets a live cycle mints a fresh one on the next entry, and the position the
+broker is still carrying becomes a ghost nobody will ever close. An empty Redis
+cannot distinguish "flat" from "the cache was re-provisioned", so `open_positions`
+in Postgres answers that question and the runner re-seeds Redis from it. That
+table is the only mutable row QTE keeps — everything else there is append-only —
+which is exactly why it is a table of its own rather than a column on `signals`.
+
 ## Why the strategy returns intents instead of publishing
 
-Three things a strategy is not allowed to own, all in `SignalFactory`:
+Four things a strategy is not allowed to own, all in `SignalFactory`:
 
 1. **Cycle ids** — an entry mints one, every close reuses it. Getting this wrong
    makes the broker render an exit as an unrelated trade.
 2. **The bracket** — SL/TP from the intent when set, from ATR/percentage
    defaults when not, so "never send a naked entry" is enforced in one place.
-3. **Timeframe spelling** — QTE says `M15`, the broker's contract says `"15"`.
+3. **Size** — risk-sized against `QTE_ACCOUNT__CAPITAL` at the pair's
+   `risk_percent`. A strategy is never told the balance, which is the whole
+   reason the same file can run in a backtest and in production; a strategy
+   that sized itself would be sizing against a number it invented.
+4. **Timeframe spelling** — QTE says `M15`, the broker's contract says `"15"`.
 
 Because both drivers go through the factory, a signal in a backtest report is
 byte-identical to the one a worker would have executed. Reconciliation compares

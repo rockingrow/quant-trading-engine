@@ -61,10 +61,14 @@ def _position(
 
 
 def _context(positions, *, total_bars=3000, warmup=100, rejected=0, costs=None, gaps=0):
+    # The same cost model on both sides. Handing the rules a spread the metrics
+    # were not charged is how a cost rule comes to be tested against a run that
+    # never paid anything.
+    costs = costs or CostModel(spread=0.3)
     return DiagnosticContext(
-        metrics=compute_metrics(positions, 10_000.0, total_bars=total_bars),
+        metrics=compute_metrics(positions, 10_000.0, total_bars=total_bars, costs=costs),
         positions=positions,
-        costs=costs or CostModel(spread=0.3),
+        costs=costs,
         total_bars=total_bars,
         warmup=warmup,
         rejected_entries=rejected,
@@ -97,6 +101,58 @@ def _healthy_positions(count: int = 60) -> list[SimulatedPosition]:
 def test_a_healthy_run_produces_no_critical_findings():
     findings = diagnose(_context(_healthy_positions()))
     assert [f for f in findings if f.severity == CRITICAL] == []
+
+
+def test_spread_only_costs_are_seen_by_the_cost_rule():
+    """The blind spot this rule was written with: commission was the only cost it read.
+
+    Spread and slippage are charged inside the fill prices, so a run with
+    ``commission=0`` — the default, and every FX or CFD backtest written
+    against a spread — reported ``fees 0.00`` and the rule returned before
+    looking at anything. Here the entries make money and a wide spread takes
+    most of it, which is precisely the case it exists to name.
+    """
+    positions = [
+        _position(pnl=2.0 if index % 5 < 3 else -1.0, index=index, direction=1 if index % 2 else -1)
+        for index in range(60)
+    ]
+    context = _context(positions, costs=CostModel(spread=1.4))
+    assert context.metrics.total_fees == 0.0, "no commission was charged"
+    assert context.metrics.spread_slippage_cost > 0, "but the spread was"
+    assert "COSTS_EXCEED_EDGE" in {f.code for f in diagnose(context)}
+
+
+def test_the_cost_rule_stays_quiet_when_the_entries_are_the_problem():
+    """A run that lost money before costs is not a cost problem.
+
+    ``NEGATIVE_EXPECTANCY`` is the finding for that. Raising both would point
+    at two different fixes for one cause.
+    """
+    losers = [_position(pnl=-5.0, index=index) for index in range(40)]
+    codes = _codes(losers, costs=CostModel(spread=1.0))
+    assert "COSTS_EXCEED_EDGE" not in codes
+    assert "NEGATIVE_EXPECTANCY" in codes
+
+
+def test_the_cost_rule_stays_quiet_on_a_run_that_keeps_its_edge():
+    codes = _codes(_healthy_positions(), costs=CostModel(spread=0.3))
+    assert "COSTS_EXCEED_EDGE" not in codes
+
+
+def test_the_cost_split_reconciles_with_net_pnl():
+    """``expectancy_r`` is ``expectancy_r_before_costs`` minus ``friction_r``, exactly.
+
+    The two are only comparable if they share a denominator, and the whole
+    point of the split is that they are compared.
+    """
+    metrics = _context(_healthy_positions(), costs=CostModel(spread=0.4, slippage=0.1)).metrics
+    assert metrics.pnl_before_costs == pytest.approx(metrics.net_pnl + metrics.total_cost)
+    assert metrics.total_cost == pytest.approx(metrics.spread_slippage_cost + metrics.total_fees)
+    # 60 positions of 1 unit, round turn 0.4 + 2 x 0.1
+    assert metrics.spread_slippage_cost == pytest.approx(60 * 0.6)
+    assert metrics.expectancy_r == pytest.approx(
+        metrics.expectancy_r_before_costs - metrics.friction_r, abs=1e-4
+    )
 
 
 def test_no_trades_is_critical():

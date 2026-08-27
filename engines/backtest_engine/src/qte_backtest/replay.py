@@ -24,6 +24,7 @@ import pandas as pd
 from qte_shared.logging_setup import get_logger
 from qte_shared.models import BrokerSignal, SignalAction
 from qte_shared.signal_factory import BracketPolicy, SignalFactory
+from qte_shared.sizing import PositionSizer
 from qte_shared.strategy_base import SignalIntent, StrategyContext, StrategyLike, as_intents
 from qte_shared.timeframes import timeframe_seconds
 
@@ -31,6 +32,39 @@ from qte_backtest.execution import CostModel, ExitReason, FillSimulator, Simulat
 from qte_backtest.metrics import BacktestMetrics, compute_metrics, format_report
 
 log = get_logger(__name__)
+
+
+#: How many OHLC rows the report carries for drawing. Enough that a chart of a
+#: multi-year run still looks like a chart, small enough that the block stays a
+#: rounding error next to the trade list.
+MARKET_ROWS = 480
+
+
+@dataclass(slots=True)
+class MarketWindow:
+    """A downsampled OHLC view of the replayed history — for drawing only.
+
+    Every number in the report is computed from the full series; these rows
+    exist so a chart can show *where* the trades happened without the report
+    carrying a copy of the parquet file. Each row aggregates ``bucket_bars``
+    consecutive bars honestly (first open, highest high, lowest low, last
+    close), so the shape is the market's, only coarser.
+
+    ``benchmark_close`` is the close of the first bar the strategy could act on
+    — the bar after warm-up — which is what a buy-and-hold comparison has to be
+    anchored to. Anchoring it at the first bar of the file would credit or
+    charge the benchmark for a stretch the strategy was never allowed to trade.
+    """
+
+    bucket_bars: int
+    rows: list[list[Any]]
+    benchmark_close: float
+    last_close: float
+    benchmark_from: datetime | None = None
+
+    #: Column order of :attr:`rows`, carried into the JSON so a consumer reads
+    #: the arrays rather than guessing at them.
+    columns: tuple[str, ...] = ("t", "o", "h", "l", "c")
 
 
 @dataclass(slots=True)
@@ -55,6 +89,16 @@ class BacktestResult:
     data_gaps: int = 0
     strategy_meta: dict[str, Any] = field(default_factory=dict)
     starting_equity: float = 0.0
+    #: Percent of the starting equity risked per entry. Together with the stop
+    #: distance it is what produced every ``quantity`` below, so a reader can
+    #: re-derive the sizing rather than take the trade list on faith.
+    risk_percent: float | None = None
+    #: The fallback size an entry that could not be risk-sized — no stop, or a
+    #: stop on the entry — was filled at. Also what sizes the buy-and-hold
+    #: benchmark, rather than comparing one unit of the market against
+    #: whatever the strategy did.
+    quantity: float = 1.0
+    market: MarketWindow | None = None
 
     def report(self) -> str:
         header = f"{self.strategy} — {self.symbol} {self.timeframe}"
@@ -101,6 +145,7 @@ class BacktestEngine:
         starting_equity: float = 0.0,
         bracket: BracketPolicy | None = None,
         default_quantity: float = 1.0,
+        sizer: PositionSizer | None = None,
     ) -> None:
         self.strategy = strategy
         self.symbol = symbol.upper()
@@ -108,11 +153,17 @@ class BacktestEngine:
         self.simulator = FillSimulator(costs or CostModel())
         self.starting_equity = starting_equity
         self.default_quantity = default_quantity
+        # The same sizer the live runner builds, so a backtested trade is the
+        # size the runner would have sent. Without a caller-supplied one it
+        # reads QTE_ACCOUNT__* and the strategy's own params, which is where
+        # the routing table's risk_percent has already landed.
         self.factory = SignalFactory(
             strategy.name,
             timeframe=self.timeframe,
             bracket=bracket,
             inputs=strategy.params,
+            sizer=sizer or PositionSizer.from_settings(strategy.params),
+            default_quantity=default_quantity,
         )
         self.positions: list[SimulatedPosition] = []
         self.signals: list[BrokerSignal] = []
@@ -150,8 +201,8 @@ class BacktestEngine:
             if self._open is not None and self._open.is_open:
                 self.simulator.process_bar(self._open, bar, bar_time)
                 if not self._open.is_open:
-                    self.factory.forget_cycle(self.symbol)
                     self._open = None
+                self._sync_cycle()
 
             context.now = bar_time
             context.open_uxid = self.factory.open_cycle(self.symbol)
@@ -176,7 +227,12 @@ class BacktestEngine:
             strategy=self.strategy.name,
             symbol=self.symbol,
             timeframe=self.timeframe,
-            metrics=compute_metrics(self.positions, self.starting_equity, total_bars=len(frame)),
+            metrics=compute_metrics(
+                self.positions,
+                self.starting_equity,
+                total_bars=len(frame),
+                costs=self.simulator.costs,
+            ),
             positions=self.positions,
             signals=self.signals,
             rejected=self._rejected,
@@ -189,6 +245,9 @@ class BacktestEngine:
             data_gaps=count_gaps(frame, self.timeframe),
             strategy_meta=self.strategy.describe(),
             starting_equity=self.starting_equity,
+            risk_percent=self.factory.sizer.risk_percent,
+            quantity=self.default_quantity,
+            market=sample_market(frame, warmup),
         )
 
     # ── Intent handling ───────────────────────────────────────────────
@@ -196,8 +255,6 @@ class BacktestEngine:
     def _apply(self, intent: SignalIntent, bar_time: datetime, close: float) -> None:
         if intent.price is None:
             intent.price = close
-        if intent.action.is_entry and intent.quantity is None:
-            intent.quantity = self.default_quantity
 
         if intent.action.is_entry and self._open is not None and self._open.is_open:
             # The broker's workers refuse a second position on the same
@@ -214,26 +271,59 @@ class BacktestEngine:
             return
         self.signals.append(signal)
 
+        # Fill what was *published*, not what the strategy proposed. The factory
+        # risk-sizes the entry and rescales the closes, so reading the intent
+        # here would simulate a trade of a different size from the payload sat
+        # beside it in the report.
+        block = signal.position
         if intent.action.is_entry:
             self._open = self.simulator.open_position(
                 symbol=self.symbol,
                 action=intent.action,
                 bar_time=bar_time,
-                price=intent.price,
-                quantity=intent.quantity or self.default_quantity,
-                sl=intent.sl,
-                tp1=intent.tp1,
-                tp2=intent.tp2,
-                tp1_percent=intent.tp1_percent,
-                move_sl_to_be=bool(intent.move_sl_to_be),
+                price=block.price if block.price is not None else close,
+                quantity=block.quantity or self.default_quantity,
+                sl=block.sl,
+                tp1=block.tp1,
+                tp2=block.tp2,
+                tp1_percent=block.tp1_percent,
+                move_sl_to_be=bool(block.move_sl_to_be),
                 signal_uxid=signal.signal_uxid,
             )
             self.positions.append(self._open)
         elif self._open is not None and self._open.is_open:
-            reason = _EXIT_REASONS.get(intent.action, ExitReason.FLAT)
-            self.simulator.close_at(self._open, bar_time, intent.price, reason)
+            self.simulator.close_at(
+                self._open,
+                bar_time,
+                block.price if block.price is not None else close,
+                _EXIT_REASONS.get(intent.action, ExitReason.FLAT),
+                quantity=block.quantity,
+            )
+            if intent.action is SignalAction.TP1:
+                self._open.tp1_filled = True
+                if self._open.move_sl_to_be and self._open.is_open:
+                    self._open.sl = self._open.entry_price
             if not self._open.is_open:
                 self._open = None
+        self._sync_cycle()
+
+    def _sync_cycle(self) -> None:
+        """Tell the factory what the fill simulator actually did.
+
+        The two keep their own books and only one of them sees a bracket fill:
+        a stop or target hit inside :meth:`FillSimulator.process_bar` closes
+        size without any signal being emitted. Left alone, the factory would go
+        on believing the entry quantity is still open and size the next close
+        against it — and, worse, never notice that a ``TP1`` finished the trade.
+        """
+        position = self.factory.open_position(self.symbol)
+        if position is None:
+            return
+        if self._open is None or not self._open.is_open:
+            self.factory.forget_cycle(self.symbol)
+            return
+        position.remaining = self._open.remaining
+        position.tp1_filled = self._open.tp1_filled
 
 
 _EXIT_REASONS = {
@@ -243,6 +333,37 @@ _EXIT_REASONS = {
     SignalAction.R_SL: ExitReason.R_SL,
     SignalAction.FLAT: ExitReason.FLAT,
 }
+
+
+def sample_market(frame: pd.DataFrame, warmup: int, rows: int = MARKET_ROWS) -> MarketWindow:
+    """Aggregate *frame* down to at most *rows* OHLC buckets.
+
+    Aggregation, not sampling: taking every Nth bar would drop the highs and
+    lows that a chart is mostly there to show, and a candle drawn from one
+    surviving bar is a claim about a range that was never traded.
+    """
+    bucket = max(1, -(-len(frame) // max(rows, 1)))
+    ohlc: list[list[Any]] = []
+    for start in range(0, len(frame), bucket):
+        chunk = frame.iloc[start : start + bucket]
+        ohlc.append(
+            [
+                _as_datetime(chunk.index[0]).isoformat(),
+                round(float(chunk["open"].iloc[0]), 8),
+                round(float(chunk["high"].max()), 8),
+                round(float(chunk["low"].min()), 8),
+                round(float(chunk["close"].iloc[-1]), 8),
+            ]
+        )
+
+    anchor = min(warmup, len(frame) - 1)
+    return MarketWindow(
+        bucket_bars=bucket,
+        rows=ohlc,
+        benchmark_close=round(float(frame["close"].iloc[anchor]), 8),
+        last_close=round(float(frame["close"].iloc[-1]), 8),
+        benchmark_from=_as_datetime(frame.index[anchor]),
+    )
 
 
 def count_gaps(frame: pd.DataFrame, timeframe: str) -> int:

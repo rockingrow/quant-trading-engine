@@ -220,11 +220,17 @@ __marimo__/
 # ── QTE ───────────────────────────────────────────────────────────────
 # The private strategy repo is cloned in here at deploy time. It must never
 # reach this public repository's history.
-# Your private strategy repo gets cloned straight into this directory, so it is
-# ignored whole — and left UNTRACKED, with no .gitkeep, because `git clone <repo>
-# __strategies__` refuses a destination that already contains a file. Anchored
-# to the repo root so `examples/__strategies__/` is not swept up by the rule.
-/__strategies__/
+# Your private strategy repo gets cloned into this directory, so it is ignored
+# whole — clone it into a subdirectory (`__strategies__/<name>`, which is what
+# STRATEGY_REPO points at) rather than onto the mount point itself, because
+# `git clone` refuses a destination that already contains a file. Anchored to
+# the repo root so `examples/__strategies__/` is not swept up by the rule.
+/__strategies__/*
+!/__strategies__/.gitkeep
+# The exception: a committed template of what a strategy repo looks like, so a
+# fresh checkout still shows the shape of this directory. It publishes an inert
+# strategy — see __strategies__/_boilerplate/README.md — and is safe to delete.
+!/__strategies__/_boilerplate/
 
 # Frozen out of the strategy repo's lockfile by `make strategy-requirements` so
 # the image build can install what the plugins need. Regenerated per deploy and
@@ -248,6 +254,10 @@ __marimo__/
 # accumulate fast; keep the ones that matter somewhere else.
 /data/reports/*
 !/data/reports/.gitkeep
+
+# Audit write-ups. Keep the directory on GitHub but not its contents.
+/data/audits/*
+!/data/audits/.gitkeep
 
 .env
 .env.*

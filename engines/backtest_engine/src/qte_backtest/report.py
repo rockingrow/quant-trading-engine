@@ -21,6 +21,11 @@ Two format decisions worth stating:
   the same report object, aggregates first, and quotes only the most
   instructive individual trades — for when a human, or a small context window,
   needs the gist.
+* **HTML is the same object again, drawn.** ``qte_backtest.visualize`` turns the
+  JSON into a self-contained dashboard laid out like a strategy tester. It is
+  rendered *from* the report rather than from the engine, so anything the chart
+  can show, a script reading the file can compute — and a report kept from a run
+  months ago still draws.
 
 ``schema_version`` is at the top of the JSON on purpose: a consumer that has
 learned this shape should be able to detect that it changed.
@@ -40,12 +45,13 @@ from qte_shared.logging_setup import get_logger
 from qte_backtest.diagnostics import CRITICAL, INFO, WARNING, DiagnosticContext, Finding, diagnose
 from qte_backtest.execution import SimulatedPosition
 from qte_backtest.replay import BacktestResult
+from qte_backtest.visualize import render_html
 
 log = get_logger(__name__)
 
 #: Bump the major part when a consumer that understood the old shape would
 #: misread the new one.
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.2"
 
 #: A compact orientation for whoever reads the JSON cold. It costs a few
 #: hundred bytes and saves an agent from inferring the conventions — or, worse,
@@ -73,10 +79,27 @@ READING_GUIDE = {
         "discretionary close, END_OF_DATA the replay running out of bars with the "
         "position still open — the last one is usually a bug, not a trade."
     ),
+    "position_sizing": (
+        "Every entry is sized by the engine, not by the strategy: quantity = "
+        "starting_equity x risk_percent / 100 / |entry - stop| / contract_size, so a "
+        "trade loses about that share of the account if its stop is hit. The capital is "
+        "fixed for the whole run — it does not compound — which is what makes two runs "
+        "comparable. use_equity_sizing on the payload reports the pair's configured mode "
+        "to the broker and does not change this number."
+    ),
     "single_position": (
         "The engine holds at most one position per symbol, mirroring the live worker, "
         "which answers REJECTED rather than stacking. rejected_entries counts signals "
         "dropped for that reason."
+    ),
+    "market_and_benchmark": (
+        "The market block is a downsampled OHLC window kept so the run can be *drawn*: "
+        "each row aggregates bucket_bars consecutive bars (first open, highest high, "
+        "lowest low, last close). Never compute a statistic from it — every metric in "
+        "this report comes from the full series. buy_hold is the same instrument held "
+        "at the strategy's default size from the first bar after warm-up to the last, "
+        "paying no spread, no slippage and no commission: the floor a strategy has to "
+        "beat, not a like-for-like trade."
     ),
     "how_to_use_diagnostics": (
         "Findings are sorted most severe first. Each states the threshold it tripped so "
@@ -109,7 +132,9 @@ class BacktestReport:
                 "timeframe": result.timeframe,
                 "params": result.params,
                 "warmup_bars": result.warmup,
+                "default_quantity": result.quantity,
                 "starting_equity": result.starting_equity,
+                "risk_percent": result.risk_percent,
                 "strategy_meta": result.strategy_meta,
             },
             "data": {
@@ -119,6 +144,7 @@ class BacktestReport:
                 "last_bar": _iso(result.data_end),
                 "gaps": result.data_gaps,
             },
+            "market": _market_to_dict(result),
             "costs": {
                 "spread": result.costs.spread,
                 "slippage": result.costs.slippage,
@@ -166,6 +192,15 @@ class BacktestReport:
     def to_json(self, indent: int = 2, include_signals: bool = True) -> str:
         return json.dumps(self.to_dict(include_signals=include_signals), indent=indent, default=str)
 
+    def to_html(self, title: str | None = None) -> str:
+        """The dashboard, as one self-contained page.
+
+        Rendered without the signal payloads: the charts never read them, and
+        carrying every emitted signal would double the size of a file whose
+        whole point is that you can open it anywhere.
+        """
+        return render_html(self.to_dict(include_signals=False), title=title)
+
     def to_markdown(self, max_trades: int = 10) -> str:
         result = self.result
         metrics = result.metrics
@@ -194,6 +229,9 @@ class BacktestReport:
             f"({result.bars} bars, {result.warmup} of warm-up) |",
             f"| Trades | {metrics.trades} — {metrics.wins}W / {metrics.losses}L "
             f"({metrics.win_rate:.1f}%) |",
+            f"| Capital | {metrics.starting_equity:,.2f} → {metrics.ending_equity:,.2f} "
+            f"({_fmt(metrics.return_pct, '{:+.2f}%')}) at "
+            f"{_fmt(result.risk_percent, '{:.2f}%')} risk per entry |",
             f"| Net P&L | {metrics.net_pnl:,.2f} (fees {metrics.total_fees:,.2f}) |",
             f"| Expectancy | {_fmt(metrics.expectancy_r, '{:+.3f}R')} per trade "
             f"({metrics.expectancy:,.4f} currency) |",
@@ -286,8 +324,11 @@ class BacktestReport:
             elif fmt == "md":
                 path = target / f"{name}.md"
                 path.write_text(self.to_markdown(), encoding="utf-8")
+            elif fmt == "html":
+                path = target / f"{name}.html"
+                path.write_text(self.to_html(), encoding="utf-8")
             else:
-                raise ValueError(f"Unknown report format {fmt!r}; expected 'json' or 'md'")
+                raise ValueError(f"Unknown report format {fmt!r}; expected 'json', 'md' or 'html'")
             written.append(path)
             log.info("Wrote %s", path)
         return written
@@ -358,6 +399,39 @@ def _trade_to_dict(index: int, position: SimulatedPosition) -> dict[str, Any]:
             }
             for leg in position.legs
         ],
+    }
+
+
+def _market_to_dict(result: BacktestResult) -> dict[str, Any] | None:
+    """The drawable window, plus what holding the instrument would have returned.
+
+    ``None`` when the result was assembled without a frame in hand — the report
+    stays valid, and a consumer that wanted to draw a price chart learns that
+    there is nothing to draw rather than plotting an empty one.
+    """
+    market = result.market
+    if market is None or not market.rows:
+        return None
+
+    size = result.quantity * result.costs.contract_size
+    hold_pnl = (market.last_close - market.benchmark_close) * size
+    return {
+        "bucket_bars": market.bucket_bars,
+        "columns": list(market.columns),
+        "rows": market.rows,
+        "buy_hold": {
+            "quantity": result.quantity,
+            "contract_size": result.costs.contract_size,
+            "from": _iso(market.benchmark_from),
+            "entry_close": market.benchmark_close,
+            "exit_close": market.last_close,
+            "net_pnl": round(hold_pnl, 8),
+            "return_pct": (
+                round(100.0 * hold_pnl / result.starting_equity, 4)
+                if result.starting_equity
+                else None
+            ),
+        },
     }
 
 

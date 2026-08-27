@@ -81,6 +81,53 @@ class BrokerSettings(BaseSettings):
     shadow_mode: bool = True
 
 
+class AccountSettings(BaseSettings):
+    """The account every driver sizes against, and what trading it costs.
+
+    One capital figure for the whole engine rather than one per driver. A
+    backtest that starts from a different balance than the runner sizes against
+    is measuring a strategy nobody is going to trade, and the divergence is
+    invisible in the report — both runs look internally consistent.
+
+    ``risk_percent`` is only the *fallback*: what a pair risks is normally
+    stated per (symbol, strategy) in ``config/strategies_mapping.toml``, and
+    that value wins. This one covers the pair that declares none.
+
+    ``commission_per_unit`` is a backtest cost — live, the broker charges its
+    own — but it belongs to the account rather than to a run, which is why it
+    sits here and only defaults the CLI flag.
+
+    Alone among the blocks here it also reads ``.env`` directly. The others
+    deliberately do not: their values differ between the host and a container
+    (``nats://nats:4222`` resolves in compose and nowhere else), so a
+    host-side ``qte-backtest`` picking up the compose URL would be a bug. None
+    of that applies to a balance — it is the same number wherever the process
+    runs — and "put the capital in .env" is what an operator expects to work.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="QTE_ACCOUNT__",
+        env_file=(REPO_ROOT / ".env"),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    #: Starting balance. Position size is a share of *this*, not of the equity
+    #: as it moves — see :mod:`qte_shared.sizing`.
+    capital: float = 1000.0
+    #: Percent of :attr:`capital` put at risk on one entry when the routing
+    #: table names no ``risk_percent`` for the pair.
+    risk_percent: float = 1.0
+    #: Charged per unit on entry and on every partial exit, each side.
+    commission_per_unit: float = 0.0
+    #: Units per contract/lot. Scales both P&L and commission.
+    contract_size: float = 1.0
+    #: Hard ceiling on a sized entry. ``0`` means uncapped.
+    max_quantity: float = 0.0
+    #: Decimals a sized quantity is rounded to before it reaches the wire.
+    quantity_precision: int = 4
+
+
 class RedisSettings(BaseSettings):
     """Hot state: last tick, in-flight candles, per-strategy position state."""
 
@@ -150,6 +197,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     nats: NatsSettings = Field(default_factory=NatsSettings)
+    account: AccountSettings = Field(default_factory=AccountSettings)
     broker: BrokerSettings = Field(default_factory=BrokerSettings)
     redis: RedisSettings = Field(default_factory=RedisSettings)
     postgres: PostgresSettings = Field(default_factory=PostgresSettings)

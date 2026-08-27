@@ -53,7 +53,7 @@ def utcnow() -> datetime:
 class Tick(BaseModel):
     """A single quote update off the ingestion feed."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, allow_inf_nan=False)
 
     symbol: str
     ts: datetime
@@ -82,7 +82,7 @@ class Tick(BaseModel):
 class Candle(BaseModel):
     """One completed OHLCV bar, keyed by its **open** time."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, allow_inf_nan=False)
 
     symbol: str
     timeframe: str
@@ -139,6 +139,8 @@ class SignalAction(str, Enum):
 class Scaling(BaseModel):
     """Levels and size used when adding to an existing position."""
 
+    model_config = ConfigDict(allow_inf_nan=False)
+
     tp: float | None = None
     sl: float | None = None
     quantity: float | None = None
@@ -150,7 +152,13 @@ class PositionBlock(BaseModel):
     ``price``/``quantity`` are optional on the wire because a ``FLAT`` carries
     neither — it means "close everything on this strategy". Entries do need
     both, which :meth:`BrokerSignal.validate_shape` enforces before we publish.
+
+    ``quantity`` is the engine's number, not the strategy's: it is risk-sized
+    against the configured account by :class:`~qte_shared.sizing.PositionSizer`
+    on the way through :class:`~qte_shared.signal_factory.SignalFactory`.
     """
+
+    model_config = ConfigDict(allow_inf_nan=False)
 
     action: SignalAction
     price: float | None = None
@@ -161,6 +169,10 @@ class PositionBlock(BaseModel):
     risk_percent: float | None = None
     tp1_percent: float | None = None
     move_sl_to_be: bool | None = None
+    #: Mirrors ``inputs.use_equity_sizing`` so the broker sees the pair's
+    #: configured sizing mode. It is reported, not obeyed: QTE sizes off the
+    #: fixed ``QTE_ACCOUNT__CAPITAL`` either way — see :mod:`qte_shared.sizing`.
+    use_equity_sizing: bool | None = None
     is_running: bool | None = None
     is_scale_position: bool | None = None
     scale_strategy: str | None = None
@@ -270,3 +282,108 @@ class BrokerSignal(BaseModel):
     def to_envelope(self) -> dict[str, Any]:
         """Wrap into the JetStream envelope the broker's ``SignalWorker`` consumes."""
         return {"payload": self.model_dump(mode="json")}
+
+
+# ── Position state (QTE's own, never sent to the broker) ──────────────────
+
+
+#: Actions that end a trade cycle outright, whatever size they name. ``TP1`` is
+#: absent on purpose — it is a *partial* by contract, and only ends the cycle
+#: when it happens to take the whole entry quantity, which is a question about
+#: size rather than about the action. :meth:`OpenPosition.apply_close` answers
+#: it in the one place that knows the remaining size.
+TERMINAL_ACTIONS: frozenset[SignalAction] = frozenset(
+    {SignalAction.TP2, SignalAction.SL, SignalAction.R_SL, SignalAction.FLAT}
+)
+
+#: Below this, a remaining size is rounding dust rather than a live position.
+#: Quantities reach the wire rounded to ``QTE_ACCOUNT__QUANTITY_PRECISION``
+#: decimals, so anything smaller than this cannot be a real residual.
+QUANTITY_EPSILON = 1e-9
+
+
+class OpenPosition(BaseModel):
+    """The one trade cycle currently live on a (strategy, symbol) pair.
+
+    QTE's own state, never published: the broker learns about a position from
+    the signals themselves. This is what the runner has to *remember*, and the
+    reason it is a model rather than a bare ``uxid`` string is the exit rule.
+
+    A cycle ends on ``TP2``/``SL``/``R_SL``/``FLAT``, and also on a ``TP1``
+    that happens to close the entry's whole quantity — a strategy taking "50%"
+    of a position it sized at one lot has closed the trade, and treating it as
+    a partial would leave the runner holding a cycle the broker has finished
+    with. Deciding that needs the entry size and what is left of it, so both
+    live here and both are persisted.
+
+    ``scale`` is the ratio between the size QTE sent and the size the strategy
+    asked for. Strategies emit closes in their own units (``quantity=remaining``
+    off their internal mirror), so a close is multiplied by this to land back
+    on the position QTE actually opened.
+
+    Persisted to Redis on every transition and mirrored into Postgres; see
+    :class:`~qte_shared.cache.RedisState` and the ``open_positions`` table. A
+    restart reloads it, because the alternative — minting a fresh cycle for a
+    position the broker still holds — leaves a ghost nobody will ever close.
+    """
+
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    signal_uxid: str
+    strategy: str = ""
+    symbol: str = ""
+    action: SignalAction = SignalAction.LONG
+    opened_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
+
+    price: float | None = None
+    #: Size the entry was sent with — the denominator of every partial.
+    quantity: float | None = None
+    #: Size still open. ``None`` when the cycle was restored from a record that
+    #: predates size tracking, which reads as "unknown", not as "flat".
+    remaining: float | None = None
+
+    sl: float | None = None
+    tp1: float | None = None
+    tp2: float | None = None
+    risk_percent: float | None = None
+    tp1_percent: float | None = None
+    move_sl_to_be: bool | None = None
+    use_equity_sizing: bool | None = None
+    is_scale_position: bool | None = None
+    scale_strategy: str | None = None
+    scaling: Scaling | None = None
+    #: QTE's entry size ÷ the strategy's proposed entry size.
+    scale: float = 1.0
+    tp1_filled: bool = False
+    #: Stable outbox ids already reflected in ``remaining``.  Persisting them
+    #: makes replay after an acknowledgement/storage crash idempotent.
+    applied_delivery_ids: list[str] = Field(default_factory=list)
+
+    @property
+    def is_flat(self) -> bool:
+        """Whether nothing is left of the position."""
+        return self.remaining is not None and self.remaining <= QUANTITY_EPSILON
+
+    def share(self, percent: float | None) -> float | None:
+        """*percent* of the **entry** size, clamped to what is still open."""
+        if self.quantity is None or percent is None:
+            return None
+        return min(self.quantity * percent / 100.0, self.remaining_or(self.quantity))
+
+    def remaining_or(self, fallback: float | None) -> float:
+        return self.remaining if self.remaining is not None else (fallback or 0.0)
+
+    def apply_close(self, action: SignalAction, quantity: float | None) -> bool:
+        """Book a close against the position; return whether the cycle is over.
+
+        A terminal action ends it regardless of the size it names — a stop is a
+        stop even if the payload rounds its quantity. A ``TP1`` ends it only by
+        taking everything, which is the rule this class exists to hold.
+        """
+        if quantity is not None and self.remaining is not None:
+            self.remaining = max(0.0, self.remaining - abs(quantity))
+        if action is SignalAction.TP1:
+            self.tp1_filled = True
+        self.updated_at = utcnow()
+        return action in TERMINAL_ACTIONS or self.is_flat

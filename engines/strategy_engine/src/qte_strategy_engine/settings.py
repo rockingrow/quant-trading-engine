@@ -28,6 +28,9 @@ class RunnerSettings(BaseSettings):
     #: Subscribe to ticks. Only worth it when a strategy overrides ``on_tick``;
     #: the runner turns it on automatically when one does.
     subscribe_ticks: bool = False
+    #: Seconds between retries of broker deliveries whose acknowledgement
+    #: timed out. The durable row keeps every attempt on the same delivery ID.
+    delivery_retry_interval: float = Field(default=5.0, gt=0)
 
 
 runner_settings = RunnerSettings()

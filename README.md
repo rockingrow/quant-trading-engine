@@ -12,30 +12,177 @@ signal into PostgreSQL, and publishes trade signals over NATS
 to [`algo-trading-broker`](https://github.com/rockingrow/algo-trading-broker),
 which fans them out to MT5 / Binance workers.
 
+## ⚡ Quick Start
+
+### 1. Prerequisites
+
+- Python 3.13 — pinned, not a floor: the runner imports your strategy plugins
+  into its own process, and `pandas-ta` (which they use) needs ≥ 3.12 and pins a
+  `numba` with no 3.14 wheel. See `pyproject.toml`.
+- [uv](https://docs.astral.sh/uv/)
+- Docker & Docker Compose
+
+### 2. Installation
+
+```bash
+git clone https://github.com/rockingrow/quant-trading-engine
+cd quant-trading-engine
+
+cp .env.example .env          # fill in QTE_TIINGO__API_KEY at minimum
+make install-dev              # uv sync
 ```
-provider ─▶ data-ingestion ─▶ Redis (hot state)
-                    │
-                    └─▶ NATS  QTE.candle.closed.<symbol>.<tf>
-                                       │
-                            strategy-runner ──▶ __strategies__/*.py
-                                       │       (paired by config/strategies_mapping.toml)
-                                       │
-                    ┌──────────────────┴──────────────────┐
-                    ▼                                     ▼
-      NATS SIGNALS.<strategy>                   PostgreSQL (audit, JSONB)
-      (algo-trading-broker JetStream)
-                    │
-                    ▼
-             MT5 / Binance workers
+
+### 3. Drop In a Strategy
+
+`__strategies__/` is git-ignored: it is where your **private** strategy repo is
+cloned, whole, so the alpha never lands in this public history. Clone it into a
+subdirectory — `git clone <your private repo> __strategies__/my-strategies` —
+and point `STRATEGY_REPO` at it.
+
+The one thing committed under that path is
+[`__strategies__/_boilerplate/`](__strategies__/_boilerplate/): a template of
+exactly what a strategy repo looks like from the engine's side — `manifest.py`,
+a strategy class with one method per broker action, its own `pyproject.toml`
+and tests. Copy it, or read it and delete it. To see the pipeline move before
+you have written anything, use the worked example instead:
+
+```bash
+cp examples/__strategies__/ema_atr_breakout.py __strategies__/
+
+make routing                  # config/strategies_mapping.toml from the template (git-ignored)
+make audit                    # check what __strategies__/ publishes before running it
 ```
+
+### 4. Start Infrastructure
+
+```bash
+make infra                    # redis + postgres + nats
+```
+
+### 5. Run Database Migrations
+
+```bash
+make db-upgrade               # Alembic owns the schema — there is no init script
+```
+
+### 6. Backtest
+
+```bash
+make download                 # provider history → data/parquet/*.parquet
+make backtest STRATEGY=QTE_EXAMPLE_EMA_ATR SYMBOL=XAUUSD
+```
+
+The report lands in `data/reports/` as JSON + Markdown.
+
+### 7. (Optional) Rehearse the Live Path
+
+To drive the *live* path with no vendor key and no market open, set
+`QTE_MARKET_DATA__PROVIDER=simulator` and feed it by hand:
+
+```bash
+make sim                      # terminal 1: the dev websocket feed
+make ingestion                # terminal 2
+make runner                   # terminal 3
+
+qte-simulator replay --symbol XAUUSD --generate 300 --seed 7 --verify
+# → 300/300 candles republished by ingestion
+```
+
+[`docs/simulator.md`](docs/simulator.md) is the step-by-step. The simulator
+refuses to start unless `QTE_ENV=dev`.
+
+Signals only reach [`algo-trading-broker`](https://github.com/rockingrow/algo-trading-broker)
+once you point `QTE_BROKER__*` at it and turn shadow mode off — see
+[Sending signals to the broker](#sending-signals-to-the-broker) and
+[Going live (phase 6)](#going-live-phase-6).
+
+---
+
+## 🏗️ System Architecture
+
+```mermaid
+flowchart TD
+    subgraph providers["📈 Market data"]
+        TIINGO["Tiingo<br/>live + history"]
+        SIM["qte-simulator<br/>dev only, QTE_ENV=dev"]
+    end
+
+    subgraph qte["⚙️ Quant Trading Engine (public)"]
+        ING["data-ingestion<br/>feed → resampler"]
+        RUN["strategy-runner<br/>plugin loader + event loop"]
+        PLUG["__strategies__/*.py<br/>private alpha, git-ignored"]
+        AUDIT["qte-strategy-audit<br/>deploy gate"]
+        BT["qte-backtest<br/>replay + fills + report"]
+        CTL["qte-control<br/>shadow on/off, ping"]
+        MAP["config/strategies_mapping.toml<br/>symbol → strategies"]
+    end
+
+    subgraph infra["🧱 Infrastructure"]
+        REDIS[("Redis<br/>hot state, signal_uxid, shadow flag")]
+        NATS{{"NATS / JetStream"}}
+        PG[("PostgreSQL<br/>signal audit, JSONB")]
+        PARQUET[("data/parquet<br/>history")]
+    end
+
+    subgraph broker["🤝 algo-trading-broker (separate repo)"]
+        WH["POST /secret/webhook<br/>validates token"]
+        SW["SignalWorker<br/>durable consumer"]
+        MT5["MT5 workers"]
+        BIN["Binance workers"]
+    end
+
+    TIINGO -->|websocket| ING
+    SIM -.->|websocket, dev| ING
+    TIINGO -->|"qte-backtest download"| PARQUET
+
+    ING --> REDIS
+    ING -->|"QTE.candle.closed.&lt;symbol&gt;.&lt;tf&gt;"| NATS
+    NATS --> RUN
+    RUN <-->|"import by path"| PLUG
+    MAP -->|"pairs symbols with strategies"| RUN
+    AUDIT -->|"gate before deploy"| PLUG
+    PARQUET --> BT
+    BT <-->|"same SignalStrategy interface"| PLUG
+
+    RUN -->|"SignalIntent → WebhookPayload"| PG
+    RUN <-->|"trade-cycle signal_uxid"| REDIS
+    RUN -->|"QTE.signal.emitted (mirror)"| NATS
+    CTL -->|"shadow flag"| REDIS
+    CTL -->|"broadcast"| NATS
+
+    RUN ==>|"QTE_BROKER__TRANSPORT=nats (default)<br/>JetStream SIGNALS.&lt;strategy&gt;, Nats-Msg-Id dedupe"| SW
+    RUN -.->|"QTE_BROKER__TRANSPORT=http<br/>token-checked"| WH
+    WH -->|"same stream"| SW
+    SW --> MT5
+    SW --> BIN
+
+    classDef ext fill:#fff4e6,stroke:#e8890c,color:#7a4a00
+    classDef store fill:#eef4ff,stroke:#4a76d8,color:#1c356e
+    classDef alpha fill:#f6ecff,stroke:#8b4ad8,color:#3e1a6b
+    class WH,SW,MT5,BIN ext
+    class REDIS,NATS,PG,PARQUET store
+    class PLUG alpha
+```
+
+**The seam with `algo-trading-broker`.** QTE stops at the payload; the broker
+owns execution. The runner emits exactly the `WebhookPayload` the broker
+validates and — on the default `nats` transport — publishes it straight onto the
+JetStream subject `SIGNALS.<strategy>` that the broker's own webhook endpoint
+writes to, so its `SignalWorker` consumes QTE signals through the same durable,
+de-duplicated path as anything else it receives. The `http` transport posts to
+`/secret/webhook` instead, and is the path that verifies `QTE_BROKER__TOKEN`.
+Either way, the two repos share one contract and nothing else: no shared
+database, no shared process, no import in either direction.
 
 ---
 
 ## Core concepts
 
-**Event-driven.** Nothing blocks anything. Ingestion pushes; the runner reacts
-to a candle close; the broker takes signals off a durable stream. A slow
-Postgres delays a log line, never a trade.
+**Event-driven.** Ingestion pushes; the runner reacts to a candle close; the
+broker takes signals off a durable stream. Completed candles are staged in a
+Redis outbox before Core NATS publish, and live signals are staged in Postgres
+before broker delivery so either path can recover with stable de-duplication
+IDs after a timeout or restart.
 
 **Write once, run anywhere.** A strategy presents one method per broker action
 — `long`, `short`, `tp1`, `tp2`, `sl`, plus an optional `r_sl` and `flat` — and
@@ -56,62 +203,18 @@ half-written.
 
 ---
 
-## Quick start
-
-```bash
-git clone https://github.com/rockingrow/quant-trading-engine
-cd quant-trading-engine
-
-cp .env.example .env          # fill in QTE_TIINGO__API_KEY at minimum
-make install-dev              # uv sync
-
-# Try the pipeline with the example strategy. __strategies__/ does not exist
-# in a fresh clone — it is left out of git so `git clone <your repo>
-# __strategies__` has an empty destination to land in.
-mkdir -p __strategies__
-cp examples/__strategies__/ema_atr_breakout.py __strategies__/
-
-make routing                  # config/strategies_mapping.toml from the template (git-ignored)
-make audit                    # check what __strategies__/ publishes before running it
-
-make infra                    # redis + postgres + nats
-make db-upgrade               # create the schema (Alembic owns it, not an init script)
-make download                 # provider history → data/parquet/*.parquet
-make backtest STRATEGY=QTE_EXAMPLE_EMA_ATR SYMBOL=XAUUSD
-```
-
-To rehearse the *live* path instead — with no vendor key and no market open —
-set `QTE_MARKET_DATA__PROVIDER=simulator` and drive the feed yourself:
-
-```bash
-make sim                      # terminal 1: the dev websocket feed
-make ingestion                # terminal 2
-make runner                   # terminal 3
-
-qte-simulator replay --symbol XAUUSD --generate 300 --seed 7 --verify
-# → 300/300 candles republished by ingestion
-```
-
-[`docs/simulator.md`](docs/simulator.md) is the step-by-step.
-
-Requires Python 3.13, [uv](https://docs.astral.sh/uv/), and Docker. The
-version is pinned rather than a floor: the runner imports the strategy
-plugins into its own process, and `pandas-ta` — which they use — needs
-≥ 3.12 and pins a `numba` with no 3.14 wheel. See `pyproject.toml`.
-
----
-
 ## Layout
 
 | Path | What it is |
 | --- | --- |
 | `engines/shared/src/qte_shared/` | — models, indicators, `StrategyBase`, NATS/Redis/Postgres adapters, the plugin loader, the signal factory, `interfaces/` (the contracts engines program against) and `providers/` (the market data vendors behind them). Every other engine depends on this and on nothing else in the repo. |
 | `engines/data_ingestion/src/qte_ingestion/` | Provider live feed → resampler → Redis + NATS. |
-| `engines/backtest_engine/src/qte_backtest/` | History downloader, parquet store, replay loop, fill simulator, metrics, reports, `qte-backtest` CLI. |
+| `engines/backtest_engine/src/qte_backtest/` | History downloader, parquet store, replay loop, fill simulator, metrics, reports, the HTML dashboard, `qte-backtest` CLI. |
 | `engines/strategy_engine/src/qte_strategy_engine/` | The live runner: plugin loading, the NATS event loop, delivery to the broker, audit, and the `qte-control` operator CLI. |
 | `engines/market_simulator/src/qte_simulator/` | **Dev only.** A WebSocket feed you drive by hand, so the whole pipeline can be rehearsed with no market open. Refuses to start unless `QTE_ENV=dev`. `qte-simulator`; see [`docs/simulator.md`](docs/simulator.md). |
 | `engines/strategy_audit/src/qte_strategy_audit/` | The deploy gate: validates every strategy in `__strategies__/` against the QTE signal contract and cross-checks the routing table. `qte-strategy-audit`. |
-| `__strategies__/` | **Git-ignored and untracked.** Your private strategy repo, cloned in whole — its own lockfile, its own tests, its own release cycle. Absent from a fresh checkout by design. |
+| `__strategies__/` | **Git-ignored**, apart from `_boilerplate/`. Your private strategy repo is cloned in here whole — its own lockfile, its own tests, its own release cycle — and nothing it contains reaches this repository's history. |
+| `__strategies__/_boilerplate/` | The committed template of a strategy repo: `manifest.py`, a strategy class with all seven signal methods, the contract restated on its own side, `pyproject.toml`, tests. It imports nothing from `engines/`, and publishes an inert strategy — so it loads and audits without ever trading. |
 | `config/` | `strategies_mapping.example.toml` — the symbol → strategies table's schema. The real `strategies_mapping.toml` beside it is git-ignored. Also the standalone NATS config. |
 | `migrations/` | Alembic. One chain for the whole system; `env.py` imports every engine's models. |
 | `deploy/` | The strategy requirements `make strategy-requirements` freezes for the image build. |
@@ -285,6 +388,11 @@ because someone forgot it was a strategy subclass.
 
 The manifest may sit at the root of `__strategies__/` or one level below it,
 which is what `git clone <repo> __strategies__/<name>` produces.
+[`__strategies__/_boilerplate/`](__strategies__/_boilerplate/) is a working one,
+committed so a fresh checkout shows the whole layout: manifest, package, tests
+and the lockfile that makes the repo its own project. It imports nothing from
+this engine — it restates the contract and owns its indicators — which is the
+arrangement the next two paragraphs describe, in code.
 
 **A manifest repo need not import `qte_shared` at all.** The engine recognises
 a strategy structurally — a concrete `on_candle_closed`, a `name`, a
@@ -393,6 +501,59 @@ nothing — which reads exactly like a strategy that found no setups.
 
 ---
 
+## Position sizing and the trade cycle
+
+**The engine decides how big every entry is, not the strategy.** A strategy is
+never told the balance — that is what keeps a backtested file and a traded file
+the same file — so size is settled in one place, `qte_shared.sizing`, and both
+drivers go through it:
+
+```
+quantity = QTE_ACCOUNT__CAPITAL x risk_percent / 100 / |entry - stop| / contract_size
+```
+
+Read it as *risk this many currency units if the stop is hit*. `risk_percent` is
+the pair's own value in `config/strategies_mapping.toml`, falling back to
+`QTE_ACCOUNT__RISK_PERCENT`:
+
+```bash
+QTE_ACCOUNT__CAPITAL=1000.0          # the account, and what a % of risk is a % of
+QTE_ACCOUNT__RISK_PERCENT=1.0        # fallback when a pair states none
+QTE_ACCOUNT__COMMISSION_PER_UNIT=0.0 # backtest cost, charged each side
+QTE_ACCOUNT__CONTRACT_SIZE=1.0
+```
+
+$1,000 at 3% over a $5 stop is 6 units — which is
+`examples/algo-trading-broker/entry.long.json`, the payload the broker actually
+receives.
+
+The capital is **fixed for a run**; it does not compound. Sizing off running
+equity would make later trades depend on earlier P&L, so two backtests differing
+by one early trade would be sized differently for the rest of the file and could
+not be compared. `use_equity_sizing` is carried on the payload for the broker to
+act on and changes nothing on this side. A strategy that proposes a size keeps
+its *proportions* — the ratio to what QTE actually opened is remembered on the
+cycle and its partial exits are rescaled by it.
+
+**One trade cycle per (strategy, symbol) at a time.** `signal_uxid` is that
+cycle: an entry mints it and every close reuses it. A second entry while one is
+open is refused before it reaches the wire, mirroring the worker, which answers
+`REJECTED` rather than stacking.
+
+A cycle ends on `TP2`, `SL`, `R_SL` or `FLAT` — **and on a `TP1` that closes the
+entry's whole quantity**. A "50%" partial of a position sized at one unit has
+finished the trade; calling it a partial would leave the runner holding a cycle
+the broker is done with and refusing every entry after it.
+
+Because that decision needs the sizes, the runner keeps the whole position
+record and writes it to Redis *and* Postgres (`open_positions`, unique per
+pair). Boot reads Redis and falls back to the table — an empty cache means both
+"flat" and "someone re-provisioned Redis", and reading it the wrong way opens a
+second cycle against a position the broker still holds. See
+[`docs/broker-contract.md`](docs/broker-contract.md).
+
+---
+
 ## Auditing what you cloned in
 
 The loader is forgiving by design: what it cannot drive it logs and skips, so
@@ -479,7 +640,22 @@ imports. A strategy problem should stop the one service that has strategies.
 uv run qte-backtest download --symbol XAUUSD --timeframe M15 --start 2023-01-01
 uv run qte-backtest list
 uv run qte-backtest run --strategy MT5_GOLD_M15_V1 --symbol XAUUSD \
-    --spread 0.30 --commission 0.02 --quantity 0.01 --persist
+    --spread 0.30 --persist
+```
+
+The run starts from `QTE_ACCOUNT__CAPITAL` (default **$1,000**) and prices its
+fills with `QTE_ACCOUNT__COMMISSION_PER_UNIT`, so P&L, max drawdown and profit
+factor are figures about a real balance rather than about one arbitrary unit.
+`--equity`, `--commission` and `--risk-percent` override them for a single run.
+Entries are risk-sized against that capital exactly as the live runner sizes
+them, and the pair's overrides in `config/strategies_mapping.toml` are applied
+here too — so a backtest measures the book you actually configured:
+
+```
+Capital           1,000.00 → 1,378.79   (+37.88%)
+Net PnL           378.79   (fees 0.00)
+Profit factor     1.294
+Max drawdown      243.31  (18.50%)
 ```
 
 The simulator is deliberately pessimistic — it is meant to disprove a strategy,
@@ -530,6 +706,30 @@ Diagnostics       2 critical, 1 info
 `report.is_trustworthy` is false whenever anything critical fired, so an agent
 knows to stop reading the metrics as meaningful. The rule table and the JSON
 schema are in [`docs/backtest-report.md`](docs/backtest-report.md).
+
+### Seeing it
+
+`qte-backtest chart` renders a report into one self-contained HTML page, laid
+out like a strategy tester — the layout every discretionary trader already
+reads:
+
+```bash
+uv run qte-backtest chart data/reports/MY_EDGE_XAUUSD_M15_20260823T150404Z.json
+make chart REPORT=data/reports/MY_EDGE_XAUUSD_M15_20260823T150404Z.json
+uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --report --chart
+```
+
+The equity curve against buy-and-hold, the price window with every trade marked
+on it, P&L by period, the returns distribution, streaks, run-ups and drawdowns,
+MAE/MFE against realised R, the diagnostics and the full sortable trade list.
+
+Three things it will not do. It fetches **nothing** when it opens — stylesheet,
+script and data are inlined, so a report opens on a machine with no network. It
+takes the **JSON and nothing else**, so a run from three months ago still draws
+without its history, its strategy or this engine. And it **invents nothing**:
+statistics that need data the replay never had — intrabar equity, margin,
+liquidation — are absent rather than approximated, which is why there is no
+margin panel.
 
 ---
 
@@ -603,8 +803,10 @@ stream's duplicate window is stored once and a worker opens one position.
 
 `signal_uxid` is the **trade cycle**: an entry mints it and every TP/SL/FLAT
 that follows reuses it, which is how the broker groups a whole trade into one
-broadcast. The runner keeps it in Redis, so a restart mid-trade still closes the
-position it opened.
+broadcast. The runner keeps the whole position — id, sizes, bracket — in Redis
+and in `open_positions`, so a restart mid-trade closes what it opened at the
+size that is left. What ends a cycle, and why a `TP1` sometimes does, is in
+[Position sizing and the trade cycle](#position-sizing-and-the-trade-cycle).
 
 > The engine also mirrors every emitted signal on `QTE.signal.emitted` and rows
 > it into Postgres, whether it was delivered, shadowed or failed.
@@ -640,6 +842,7 @@ Everything else the engine knows is a CLI command or a SQL query:
 | One trade cycle end to end | `SELECT * FROM signals WHERE signal_uxid = '…' ORDER BY created_at` |
 | Backtest a strategy | `uv run qte-backtest run --strategy … --symbol … --report` |
 | Read a report | `data/reports/*.json` — the file an agent analyses |
+| Look at a report | `uv run qte-backtest chart data/reports/….json`, then open the HTML |
 | Rehearse the live path | `make sim`, then `qte-simulator replay --symbol … --generate 300 --verify` (dev only) |
 
 ## Database
@@ -792,17 +995,3 @@ A strategy *repository* is free to decide otherwise — it owns its own
 dependencies, and the one in `__strategies__/` builds its indicators on
 `pandas_ta` where the library agrees with TradingView. That is exactly the point
 of the seam: neither side has to win the argument.
-
----
-
-## Releases
-
-[`changelog.md`](changelog.md) — Keep a Changelog format, semantic versioning.
-Pre-1.0: the broker payload contract is pinned by tests, but the plugin and
-provider interfaces may still move.
-
----
-
-## License
-
-MIT.
