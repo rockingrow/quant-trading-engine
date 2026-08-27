@@ -17,9 +17,9 @@ class FakeAck:
 class FakeBus:
     """Records what would have gone to JetStream."""
 
-    def __init__(self, fail: bool = False) -> None:
+    def __init__(self, failure: Exception | None = None) -> None:
         self.published: list[tuple[str, dict, str | None]] = []
-        self.fail = fail
+        self.failure = failure
         self.connected = False
 
     async def connect(self) -> None:
@@ -29,9 +29,9 @@ class FakeBus:
         self.connected = False
 
     async def publish_jetstream(self, subject, payload, *, msg_id=None, timeout=None):
-        if self.fail:
-            raise ConnectionError("NATS is not connected")
         self.published.append((subject, payload, msg_id))
+        if self.failure:
+            raise self.failure
         return FakeAck()
 
 
@@ -85,15 +85,55 @@ async def test_each_signal_carries_its_own_dedup_id():
     assert bus.published[0][2] != bus.published[1][2]
 
 
+async def test_retrying_the_same_signal_reuses_the_same_dedup_id():
+    bus = FakeBus()
+    sink = BrokerSink(transport="nats", bus=bus, shadow_mode=False)
+    await sink.start()
+    signal = _signal()
+
+    await sink.send(signal)
+    await sink.send(signal)
+
+    assert bus.published[0][2] == bus.published[1][2]
+
+
+async def test_an_outbox_delivery_id_is_forwarded_to_jetstream():
+    bus = FakeBus()
+    sink = BrokerSink(transport="nats", bus=bus, shadow_mode=False)
+    await sink.start()
+
+    await sink.send(_signal(), delivery_id="stable-row-id")
+
+    assert bus.published[0][2] == "stable-row-id"
+
+
 async def test_a_delivery_failure_is_reported_not_raised():
     # Raising here would take the runner down and stop every other strategy.
-    sink = BrokerSink(transport="nats", bus=FakeBus(fail=True), shadow_mode=False)
+    sink = BrokerSink(
+        transport="nats",
+        bus=FakeBus(failure=ConnectionError("NATS is not connected")),
+        shadow_mode=False,
+    )
     await sink.start()
 
     result = await sink.send(_signal())
 
     assert result.status == "failed"
     assert "not connected" in result.detail
+
+
+async def test_a_timeout_is_ambiguous_instead_of_a_definite_failure():
+    sink = BrokerSink(
+        transport="nats",
+        bus=FakeBus(failure=TimeoutError("ack timed out")),
+        shadow_mode=False,
+    )
+    await sink.start()
+
+    result = await sink.send(_signal(), delivery_id="stable-row-id")
+
+    assert result.status == "unknown"
+    assert "timed out" in result.detail
 
 
 async def test_an_invalid_signal_is_rejected_before_any_transport_runs():

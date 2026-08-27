@@ -6,12 +6,23 @@ are.
 ## Why two NATS namespaces
 
 `QTE.*` is ours — ticks and candle closes, on **core** NATS. At twenty ticks a
-second a dropped message is replaced by a fresher one immediately, so paying
-JetStream's persistence cost for market data buys nothing.
+second a dropped tick is replaced by a fresher one immediately, so paying
+JetStream's persistence cost for raw market data buys nothing. Candle closes
+are different: ingestion stages them in a Redis outbox before publishing and
+only removes them after Core NATS accepts the publish. A crash can replay a
+close, and the runner rejects it by candle open time; a publish failure cannot
+silently erase it.
 
 `SIGNALS.<strategy>` is the **broker's**, on JetStream. Losing a signal loses a
 trade. Different guarantees, different transport, and the split is why the
 engine can be casual about one and careful about the other.
+
+Before either NATS or HTTP delivery, the runner inserts the exact signal
+payload into its Postgres audit table with status `pending`. The row UUID is
+also the stable `Nats-Msg-Id` or HTTP `Idempotency-Key`. Timeouts become
+`unknown`, block that strategy-symbol pair, and are replayed with the same ID
+by the retry loop and on startup; position changes carry applied delivery IDs
+so replay is idempotent locally as well as at the broker boundary.
 
 In production both usually live on the same cluster (the broker's). QTE keeps
 two configurable URLs anyway, because "the market data bus" and "the order bus"

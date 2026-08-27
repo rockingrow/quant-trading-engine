@@ -356,6 +356,9 @@ class OpenPosition(BaseModel):
     #: QTE's entry size ÷ the strategy's proposed entry size.
     scale: float = 1.0
     tp1_filled: bool = False
+    #: Stable outbox ids already reflected in ``remaining``.  Persisting them
+    #: makes replay after an acknowledgement/storage crash idempotent.
+    applied_delivery_ids: list[str] = Field(default_factory=list)
 
     @property
     def is_flat(self) -> bool:

@@ -178,3 +178,47 @@ async def test_the_audit_runs_before_anything_is_connected(strategies, monkeypat
     with pytest.raises(StrategyAuditFailed):
         await runner.start()
     assert connected == []
+
+
+async def test_partial_runner_startup_unwinds_resources_in_reverse_order(monkeypatch):
+    from qte_strategy_engine.runner import StrategyRunner
+
+    events: list[str] = []
+
+    class Resource:
+        def __init__(self, name, *, fail_start=False):
+            self.name = name
+            self.fail_start = fail_start
+
+        async def connect(self):
+            events.append(f"start:{self.name}")
+
+        async def start(self):
+            events.append(f"start:{self.name}")
+            if self.fail_start:
+                raise RuntimeError("broker unavailable")
+
+        async def close(self):
+            events.append(f"stop:{self.name}")
+
+        async def stop(self):
+            events.append(f"stop:{self.name}")
+
+    monkeypatch.setattr("qte_strategy_engine.runner.run_preflight_audit", lambda: None)
+    runner = StrategyRunner()
+    runner.bus = Resource("bus")
+    runner.state = Resource("state")
+    runner.sink = Resource("sink", fail_start=True)
+
+    with pytest.raises(RuntimeError, match="broker unavailable"):
+        await runner.start()
+    await runner.stop()
+
+    assert events == [
+        "start:bus",
+        "start:state",
+        "start:sink",
+        "stop:sink",
+        "stop:state",
+        "stop:bus",
+    ]

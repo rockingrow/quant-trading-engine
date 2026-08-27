@@ -10,7 +10,9 @@ table — because an empty cache is otherwise indistinguishable from being flat.
 
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
 from qte_shared.models import OpenPosition, SignalAction
@@ -34,17 +36,41 @@ class ProbeStrategy(StrategyBase):
 
 class FailedSink:
     shadow_mode = False
+    transport = "nats"
 
-    async def send(self, signal):
+    async def send(self, signal, *, delivery_id=None):
         return DeliveryResult(status="failed", transport="nats", detail="no ack")
 
 
 class RecordingSignals:
-    def __init__(self):
+    def __init__(self, pending=None):
         self.rows = []
+        self.pending = list(pending or [])
+        self._by_id = {}
 
-    async def record_signal(self, signal, **delivery):
-        self.rows.append((signal, delivery))
+    async def stage_signal(self, signal, **delivery):
+        delivery_id = str(uuid.uuid4())
+        metadata = {**delivery, "delivery_id": delivery_id, "delivery_status": "pending"}
+        self.rows.append((signal, metadata))
+        self._by_id[delivery_id] = metadata
+        return delivery_id
+
+    async def mark_delivery(self, delivery_id, *, status, error=None):
+        metadata = self._by_id.get(delivery_id)
+        if metadata is not None:
+            metadata.update(delivery_status=status, delivery_error=error)
+        for row in self.pending:
+            if str(row.id) == delivery_id:
+                row.delivery_status = status
+                row.delivery_error = error
+        return True
+
+    async def pending_deliveries(self, *, statuses=("pending", "unknown")):
+        return [row for row in self.pending if row.delivery_status in set(statuses)]
+
+    @staticmethod
+    def recovery_context(row):
+        return row.inputs.get("__qte_outbox__", {})
 
 
 class RecordingBus:
@@ -84,8 +110,13 @@ async def test_failed_entry_delivery_does_not_create_a_ghost_live_cycle():
 
 class AcceptingSink:
     shadow_mode = False
+    transport = "nats"
 
-    async def send(self, signal):
+    def __init__(self):
+        self.delivery_ids = []
+
+    async def send(self, signal, *, delivery_id=None):
+        self.delivery_ids.append(delivery_id)
         return DeliveryResult(status="sent", transport="nats")
 
 
@@ -217,6 +248,40 @@ async def test_a_failed_delivery_persists_nothing_at_all():
     assert runner.positions.held == {}
 
 
+class UnknownSink(AcceptingSink):
+    async def send(self, signal, *, delivery_id=None):
+        self.delivery_ids.append(delivery_id)
+        return DeliveryResult(status="unknown", transport="nats", detail="ack timed out")
+
+
+class UnwritableOutbox(RecordingSignals):
+    async def stage_signal(self, signal, **delivery):
+        return None
+
+
+async def test_an_unknown_delivery_does_not_commit_and_blocks_the_pair():
+    sink = UnknownSink()
+    runner, slot = _runner(sink=sink), _slot()
+
+    await _enter(runner, slot)
+
+    assert slot.factory.open_cycle("XAUUSD") is None
+    assert runner.state.held == {}
+    assert runner.signals.rows[0][1]["delivery_status"] == "unknown"
+    assert slot.key in runner._uncertain_pairs
+
+
+async def test_a_signal_is_not_sent_when_the_durable_outbox_cannot_be_written():
+    sink = AcceptingSink()
+    runner, slot = _runner(sink=sink), _slot()
+    runner.signals = UnwritableOutbox()
+
+    await _enter(runner, slot)
+
+    assert sink.delivery_ids == []
+    assert slot.factory.open_cycle("XAUUSD") is None
+
+
 # ── Restoring after a restart ────────────────────────────────────────────
 
 
@@ -275,3 +340,85 @@ async def test_a_restored_runner_closes_the_position_at_the_size_that_is_left():
     assert signal.signal_uxid == "9F2C4B7E18A3D605"
     assert signal.position.quantity == pytest.approx(4.2)
     assert runner.state.held == {}
+
+
+async def test_startup_replays_a_pending_signal_with_its_original_delivery_id():
+    delivery_id = uuid.uuid4()
+    source = _slot()
+    intent = SignalIntent(action=SignalAction.LONG, price=2334.50, sl=2329.50)
+    signal = source.factory.build(intent, symbol="XAUUSD", moment=MOMENT, commit=False)
+    row = SimpleNamespace(
+        id=delivery_id,
+        payload=signal.to_envelope(),
+        inputs={"__qte_outbox__": source.factory.pending_delivery_context("XAUUSD")},
+        delivery_status="pending",
+        delivery_error=None,
+        transport="nats",
+        shadow=False,
+    )
+    sink = AcceptingSink()
+    runner, slot = _runner(sink=sink), _slot()
+    runner.signals = RecordingSignals([row])
+    runner.slots = [slot]
+
+    await runner._recover_pending_deliveries()
+
+    assert sink.delivery_ids == [str(delivery_id)]
+    assert slot.factory.open_cycle("XAUUSD") == signal.signal_uxid
+    assert row.delivery_status == "sent"
+    assert runner.state.held[("DELIVERY_PROBE", "XAUUSD")].applied_delivery_ids == [
+        str(delivery_id)
+    ]
+
+
+async def test_a_pending_shadow_signal_cannot_turn_live_during_recovery():
+    delivery_id = uuid.uuid4()
+    source = _slot()
+    signal = source.factory.build(
+        SignalIntent(action=SignalAction.LONG, price=2334.50, sl=2329.50),
+        symbol="XAUUSD",
+        moment=MOMENT,
+        commit=False,
+    )
+    row = SimpleNamespace(
+        id=delivery_id,
+        payload=signal.to_envelope(),
+        inputs={"__qte_outbox__": source.factory.pending_delivery_context("XAUUSD")},
+        delivery_status="pending",
+        delivery_error=None,
+        transport="nats",
+        shadow=True,
+    )
+    sink = AcceptingSink()
+    runner, slot = _runner(sink=sink), _slot()
+    runner.signals = RecordingSignals([row])
+    runner.slots = [slot]
+
+    await runner._recover_pending_deliveries()
+
+    assert sink.delivery_ids == []
+    assert row.delivery_status == "shadow"
+    assert slot.factory.open_cycle("XAUUSD") == signal.signal_uxid
+
+
+def test_replaying_the_same_partial_close_does_not_reduce_position_twice():
+    factory = _slot().factory
+    entry = factory.build(
+        SignalIntent(action=SignalAction.LONG, price=2334.50, sl=2329.50),
+        symbol="XAUUSD",
+        moment=MOMENT,
+        commit=False,
+    )
+    factory.commit(entry, delivery_id="entry-id")
+    partial = factory.build(
+        SignalIntent(action=SignalAction.TP1, price=2345.0),
+        symbol="XAUUSD",
+        moment=MOMENT,
+        commit=False,
+    )
+
+    factory.commit(partial, delivery_id="partial-id")
+    remaining = factory.open_position("XAUUSD").remaining
+    factory.commit(partial, delivery_id="partial-id")
+
+    assert factory.open_position("XAUUSD").remaining == remaining

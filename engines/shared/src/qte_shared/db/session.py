@@ -23,9 +23,9 @@ log = get_logger(__name__)
 class Database:
     """Owns the engine and hands out sessions.
 
-    Nothing here is on the trading hot path: a signal is published to the
-    broker first and audited second, so a slow or unreachable Postgres delays a
-    log line, never a trade.
+    Signal delivery deliberately uses Postgres as a durable outbox. A live
+    command is staged here before it reaches the broker so an ambiguous timeout
+    can be replayed with the same de-duplication id.
     """
 
     def __init__(self, dsn: str | None = None) -> None:

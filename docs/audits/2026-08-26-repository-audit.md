@@ -17,49 +17,40 @@ are clean. Reverified after the lifecycle/position-sizing branch was merged into
 | Medium | A strategy-emitted `TP1` closed the entire simulated position, unlike broker-side partial target handling. | Replay now closes the explicit quantity or the entry's `tp1_percent`, and applies breakeven-stop state consistently. |
 | Medium | `NaN`/infinite prices passed `validate_shape()` and serialized to JSON `null`. | Market-data and broker numeric models now reject non-finite values at validation. |
 | Low | The strategy-audit test assumed `pandas_ta` was absent, so installing it made the suite fail. | The fixture imports a unique deliberately nonexistent module. |
+| High | A failed Core NATS publish permanently lost an already-retired candle close. | Completed candles are staged atomically with history in a Redis outbox, published oldest-first, and acknowledged only after publish succeeds. Duplicate crash recovery is rejected downstream by candle open time. |
+| High | Broker timeouts were treated as definite failures and every retry received a new de-duplication ID. | Signals are staged in a Postgres outbox first; the row UUID is reused as `Nats-Msg-Id`/HTTP `Idempotency-Key`, timeouts remain `unknown`, affected pairs are blocked, and the retry loop/startup recovery replay the exact payload idempotently. |
+| Medium | A failure halfway through service startup leaked NATS, Redis, broker, or feed connections. | Ingestion and strategy startup now unwind acquired resources in reverse order, including half-started feeds, and shutdown is idempotent. |
 
-## Open findings
+## Resolved follow-up findings
 
-### 1. Candle-close delivery is not recoverable after a publish failure — High
+### 1. Candle-close delivery survives publish failure — High
 
-`Resampler` advances/deletes the completed bucket before
-`IngestionService._emit_candle()` publishes it. `_emit_candle()` writes the bar
-to Redis and then uses Core NATS. If that publish raises, the flush guard keeps
-the task alive but nothing queues the candle for retry, and the runner does not
-poll Redis for missed closes. The next flush therefore cannot recover the lost
-strategy decision.
+`RedisState.stage_closed_candle()` now writes candle history and appends the
+same candle to an ordered Redis outbox in one transaction. Ingestion drains the
+outbox before accepting new ticks and before every timed flush, acknowledging a
+row only after Core NATS publish returns. A crash in the final publish/ack gap
+may replay the candle; the runner's existing open-time guard makes that replay
+idempotent.
 
-Recommended design: a durable candle-close outbox/JetStream consumer, or at
-minimum an ordered retry queue whose entries are persisted before the
-resampler's close is considered delivered. In-memory retry alone does not cover
-a process crash between the Redis write and NATS publish.
+### 2. Broker timeout is durable and explicitly ambiguous — High
 
-### 2. A broker publish timeout has an ambiguous outcome — High
+The runner now stages the exact broker envelope as a `pending` signal row before
+sending. Its UUID is the delivery ID for every attempt. `BrokerSink` reports
+timeouts as `unknown`; the runner leaves position state unchanged, blocks new
+decisions for that pair, retries `unknown` rows continuously, and replays all
+`pending`/`unknown` rows at startup with the same ID. Applied IDs are persisted
+on partial positions so a replay cannot reduce `remaining` twice.
 
-`BrokerSink` maps every exception to `failed`, and the runner intentionally does
-not commit a failed cycle. A JetStream timeout can mean the message was stored
-but its acknowledgement was lost; in that case the broker opens the trade while
-the runner remains flat. The current `Nats-Msg-Id` is random on every call, so a
-later retry would not deduplicate the original publish.
+### 3. Partial startup failures unwind opened resources — Medium
 
-Recommended design: persist a signal outbox before sending, derive a stable
-delivery id from that outbox row, retry with the same `Nats-Msg-Id`, and model
-timeouts as `unknown` until JetStream/broker reconciliation resolves them.
-
-### 3. Partial startup failures leak opened resources — Medium
-
-Both service `run_forever()` methods call `start()` before entering their
-`try/finally`. If NATS connects and Redis, the broker sink, provider startup, or
-slot discovery then fails, `stop()` is never reached. This is especially easy
-to hit in the strategy runner, which opens three clients before rejecting an
-empty strategy set.
-
-Recommended design: make startup transactional—track acquired resources and
-unwind them in reverse order on any exception—then keep shutdown idempotent.
+Both service `start()` methods now catch any interrupted/failed acquisition and
+run the same idempotent cleanup path as normal shutdown. Tasks, feeds, broker,
+Redis, and NATS are released in reverse acquisition order, and a feed is tracked
+before its `start()` hook so a half-started provider is still stopped.
 
 ## Verification
 
-- `python -m pytest -q` → 547 passed on `6183b92`
+- `python -m pytest -q` → 559 passed
 - `ruff check .` → clean
 - `ruff format --check .` → 128 files already formatted
 - `git diff --check` → clean

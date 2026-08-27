@@ -178,9 +178,11 @@ database, no shared process, no import in either direction.
 
 ## Core concepts
 
-**Event-driven.** Nothing blocks anything. Ingestion pushes; the runner reacts
-to a candle close; the broker takes signals off a durable stream. A slow
-Postgres delays a log line, never a trade.
+**Event-driven.** Ingestion pushes; the runner reacts to a candle close; the
+broker takes signals off a durable stream. Completed candles are staged in a
+Redis outbox before Core NATS publish, and live signals are staged in Postgres
+before broker delivery so either path can recover with stable de-duplication
+IDs after a timeout or restart.
 
 **Write once, run anywhere.** A strategy presents one method per broker action
 — `long`, `short`, `tp1`, `tp2`, `sl`, plus an optional `r_sl` and `flat` — and
