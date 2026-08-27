@@ -371,29 +371,80 @@ def _stop_inside_costs(context: DiagnosticContext) -> Finding | None:
 # ── Economics and where the edge leaks ────────────────────────────────
 
 
+#: Share of the pre-cost P&L that may go to the broker before the result is
+#: worth a second look. Half is already a hard bar to clear: the entries have
+#: to be twice as good as the balance suggests for the account to break even,
+#: and every estimate that goes into the cost model is doubled with them.
+MAX_COST_SHARE_PCT = 50.0
+
+
 def _costs_exceed_edge(context: DiagnosticContext) -> Finding | None:
+    """Accept or reject on gross edge against friction, not on net P&L.
+
+    Net P&L answers the question with the answer already subtracted out of it.
+    Two strategies both ending at zero are not the same finding: one has no
+    edge and wants different entries, the other has a real edge and is handing
+    it to the broker, which wants wider stops or fewer trades. Only the split
+    tells them apart.
+
+    This used to test ``total_fees``, which is commission alone. Spread and
+    slippage are charged inside the fill prices, so on any zero-commission run
+    — the default, and every FX or CFD backtest written against a spread — the
+    rule returned ``None`` before looking at anything and the largest cost in
+    the report was the one thing it could not see.
+    """
     metrics = context.metrics
-    if metrics.trades == 0 or metrics.total_fees <= 0:
+    if metrics.trades == 0 or metrics.total_cost <= 0:
         return None
-    if metrics.total_fees < metrics.gross_profit:
+    # A run that lost money before costs is not a cost problem; the entries
+    # are. ``NEGATIVE_EXPECTANCY`` is the finding for that, and saying both
+    # would point at two different fixes for one cause.
+    if metrics.pnl_before_costs <= 0:
         return None
+    share = metrics.cost_share_pct
+    if share is None or share < MAX_COST_SHARE_PCT:
+        return None
+
+    took_everything = metrics.net_pnl <= 0
+    title = (
+        "Costs turned a positive edge negative"
+        if took_everything
+        else f"Costs take {share:.0f}% of the gross result"
+    )
+    detail = (
+        f"The entries made {metrics.pnl_before_costs:,.2f} before costs and "
+        f"{metrics.total_cost:,.2f} went to spread, slippage and commission, leaving "
+        f"{metrics.net_pnl:,.2f}."
+    )
+    if metrics.friction_r is not None:
+        detail += (
+            f" Per trade that is {metrics.expectancy_r_before_costs:+.4f}R of edge against "
+            f"{metrics.friction_r:.4f}R of friction."
+        )
+    if took_everything:
+        detail += (
+            " The signal is not the problem — the cost of acting on it is, and no amount of"
+            " parameter tuning on the entries will recover it."
+        )
     return Finding(
         code="COSTS_EXCEED_EDGE",
         severity=WARNING,
-        title="Fees alone exceed the gross profit",
-        detail=(
-            f"Gross profit was {metrics.gross_profit:,.2f} and fees {metrics.total_fees:,.2f}. "
-            "Whatever edge the entries have is being consumed by transaction costs before "
-            "the losing trades are even counted."
-        ),
+        title=title,
+        detail=detail,
         suggestion=(
-            "Trade less often (tighter filter), hold longer per trade, or move to an "
-            "instrument with lower per-unit commission. Parameter tuning will not fix a "
-            "cost problem."
+            "Friction is round_trip_cost / stop_distance of every R, and it is known before "
+            "the order is sent. Widen the stop, move to a larger timeframe, or refuse the "
+            "setups whose stop is too tight to pay for itself — and check the --spread you "
+            "passed matches your broker before acting on any of it."
         ),
         evidence={
-            "gross_profit": metrics.gross_profit,
+            "pnl_before_costs": metrics.pnl_before_costs,
+            "total_cost": metrics.total_cost,
+            "spread_slippage_cost": metrics.spread_slippage_cost,
             "total_fees": metrics.total_fees,
+            "cost_share_pct": share,
+            "expectancy_r_before_costs": metrics.expectancy_r_before_costs,
+            "friction_r": metrics.friction_r,
             "trades": metrics.trades,
         },
     )

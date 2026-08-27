@@ -21,7 +21,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any
 
-from qte_backtest.execution import SimulatedPosition
+from qte_backtest.execution import CostModel, SimulatedPosition
 
 
 @dataclass(slots=True)
@@ -66,6 +66,26 @@ class BacktestMetrics:
     payoff_ratio: float | None = None
     trades_without_stop: int = 0
 
+    # ── What the broker took ──────────────────────────────────────────
+    # Commission lands in ``total_fees``. Spread and slippage do not: they are
+    # paid inside the fill prices, so they never appear as a line item and a
+    # zero-commission run reads as a zero-cost run. They are the larger number
+    # in most retail backtests. Both are here because a strategy is accepted or
+    # rejected on its gross edge against total friction — never on net P&L,
+    # which has already had the answer subtracted out of it.
+    spread_slippage_cost: float = 0.0
+    total_cost: float = 0.0
+    #: Net P&L with every transaction cost added back. Distinct from
+    #: ``gross_profit``, which is the sum of the winning trades.
+    pnl_before_costs: float = 0.0
+    #: Total cost as a percentage of ``pnl_before_costs``. Over 100 means the
+    #: entries had an edge and the broker took all of it.
+    cost_share_pct: float | None = None
+    #: The same split per trade, in R. ``expectancy_r_before_costs`` is what
+    #: the entries are worth; ``friction_r`` is what it costs to hold them.
+    friction_r: float | None = None
+    expectancy_r_before_costs: float | None = None
+
     # ── Excursion ─────────────────────────────────────────────────────
     # What price did while the trade was open. The gap between MFE and realised
     # P&L is where exit logic leaks money; MAE on winners is where the stop is
@@ -98,6 +118,7 @@ def compute_metrics(
     positions: Sequence[SimulatedPosition],
     starting_equity: float = 0.0,
     total_bars: int = 0,
+    costs: CostModel | None = None,
 ) -> BacktestMetrics:
     closed = [position for position in positions if position.legs]
     metrics = BacktestMetrics(
@@ -160,6 +181,7 @@ def compute_metrics(
     metrics.period_end = closed[-1].closed_at or closed[-1].opened_at
     metrics.sharpe = _sharpe(pnls, metrics.period_start, metrics.period_end)
     _add_risk_normalised(metrics, closed)
+    _add_cost_economics(metrics, closed, costs or CostModel())
     _add_excursion(metrics, closed)
     _add_shape(metrics, closed, total_bars)
     return metrics
@@ -186,6 +208,48 @@ def _add_risk_normalised(metrics: BacktestMetrics, closed: Sequence[SimulatedPos
         # it against win rate: 30% at 3:1 and 60% at 0.8:1 are both viable, and
         # neither number means anything on its own.
         metrics.payoff_ratio = round(metrics.average_win_r / abs(metrics.average_loss_r), 4)
+
+
+def _add_cost_economics(
+    metrics: BacktestMetrics, closed: Sequence[SimulatedPosition], costs: CostModel
+) -> None:
+    """Split realised P&L into the edge and what the broker charged for it.
+
+    Spread and slippage are charged inside the fill prices, so unlike
+    commission they leave no trace in the P&L they reduce. Reconstructing them
+    is arithmetic rather than estimation: every position crosses the spread
+    once and pays slippage on each side, whatever the exit legs did, so the
+    round turn per unit is ``spread + 2 x slippage`` and the position's share
+    of it is that times its size.
+
+    The R figures use the same denominator ``r_multiple`` does, which makes
+    ``expectancy_r == expectancy_r_before_costs - friction_r`` hold exactly and
+    lets the two be compared against each other directly.
+    """
+    round_trip = costs.spread + 2.0 * costs.slippage
+    friction = sum(
+        abs(position.quantity) * position.contract_size * round_trip for position in closed
+    )
+    metrics.spread_slippage_cost = round(friction, 6)
+    metrics.total_cost = round(friction + metrics.total_fees, 6)
+    metrics.pnl_before_costs = round(metrics.net_pnl + metrics.total_cost, 6)
+    if metrics.pnl_before_costs > 0:
+        metrics.cost_share_pct = round(100.0 * metrics.total_cost / metrics.pnl_before_costs, 4)
+
+    if metrics.expectancy_r is None:
+        return
+    shares: list[float] = []
+    for position in closed:
+        risk = position.initial_risk
+        if not risk or not position.quantity:
+            continue
+        exposure = risk * abs(position.quantity) * position.contract_size
+        cost = abs(position.quantity) * position.contract_size * round_trip + position.fees
+        shares.append(cost / exposure)
+    if not shares:
+        return
+    metrics.friction_r = round(sum(shares) / len(shares), 4)
+    metrics.expectancy_r_before_costs = round(metrics.expectancy_r + metrics.friction_r, 4)
 
 
 def _add_excursion(metrics: BacktestMetrics, closed: Sequence[SimulatedPosition]) -> None:
@@ -266,6 +330,23 @@ def format_report(metrics: BacktestMetrics, header: str = "") -> str:
     )
     drawdown_pct = "n/a" if metrics.max_drawdown_pct is None else f"{metrics.max_drawdown_pct:.2f}%"
     sharpe = "n/a" if metrics.sharpe is None else f"{metrics.sharpe:.3f}"
+    # Spread and slippage are invisible in net P&L, so a run that pays no
+    # commission reads as costing nothing. Print the split whenever there was
+    # one to print, above the ratios it explains.
+    cost_line = ""
+    if metrics.total_cost > 0:
+        share = (
+            "" if metrics.cost_share_pct is None else f"  ({metrics.cost_share_pct:.0f}% of gross)"
+        )
+        cost_line = (
+            f"Cost / gross P&L  {metrics.total_cost:,.2f} / {metrics.pnl_before_costs:,.2f}{share}"
+        )
+    edge_line = ""
+    if metrics.friction_r is not None:
+        edge_line = (
+            f"Edge vs friction  {metrics.expectancy_r_before_costs:+.4f}R gross"
+            f"  −{metrics.friction_r:.4f}R cost"
+        )
     lines = [
         header,
         "─" * max(len(header), 46),
@@ -275,6 +356,8 @@ def format_report(metrics: BacktestMetrics, header: str = "") -> str:
         f"Capital           {metrics.starting_equity:,.2f} → {metrics.ending_equity:,.2f}"
         f"   ({_pct(metrics.return_pct)})",
         f"Net PnL           {metrics.net_pnl:,.2f}   (fees {metrics.total_fees:,.2f})",
+        cost_line,
+        edge_line,
         f"Profit factor     {profit_factor}",
         f"Expectancy/trade  {metrics.expectancy:,.4f}",
         f"Avg win / loss    {metrics.average_win:,.2f} / {metrics.average_loss:,.2f}",
