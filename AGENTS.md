@@ -30,9 +30,9 @@ table and the check commands; read it before you commit or open a PR.
    (`bid`, `atr`). Do not rename legacy variables the task does not touch.
 4. **Pull requests always target `dev`** — `gh pr create --base dev`. Never
    `master`. Opening the PR is the user's call.
-5. **Artefacts**: backtest output to `data/reports/` (git-ignored), audits to
-   `data/audits/` (committed, `YYYY-MM-DD-<topic>.md`). Never into `docs/` or
-   the repository root.
+5. **Artefacts**: backtest output to `data/reports/`, audits to `data/audits/`
+   (`YYYY-MM-DD-<topic>.md`) — both git-ignored and local-only, never pushed to
+   GitHub. Never into `docs/` or the repository root.
 
 ## Working approach
 

@@ -255,6 +255,10 @@ __marimo__/
 /data/reports/*
 !/data/reports/.gitkeep
 
+# Audit write-ups. Keep the directory on GitHub but not its contents.
+/data/audits/*
+!/data/audits/.gitkeep
+
 .env
 .env.*
 !.env.example

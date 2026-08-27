@@ -39,8 +39,8 @@ git log -1 --format=%B | grep -Eiq 'claude|anthropic|codex|generated with|co-aut
 
 Applies to inline comments, docstrings, `TODO` / `FIXME` notes, identifiers
 (variables, functions, classes, modules), log and exception message strings,
-and every committed Markdown file (`README.md`, `docs/`, `data/audits/`, PR
-bodies).
+every committed Markdown file (`README.md`, `docs/`, PR bodies), and the
+local audit write-ups under `data/audits/`.
 
 Vietnamese belongs in chat and in PR *conversation*, never in the tree. If a
 comment is worth writing in Vietnamese, it is worth translating before it is
@@ -126,8 +126,11 @@ line to be understood costs a reader (and an agent) a file jump every time.
 | Artefact | Directory | Tracked in git |
 | --- | --- | --- |
 | Backtest reports — JSON, Markdown, HTML dashboards | `data/reports/` | No, git-ignored: regenerated per run and timestamped |
-| Audits, reviews, quality write-ups | `data/audits/` | **Yes, committed** |
+| Audits, reviews, quality write-ups | `data/audits/` | No, git-ignored: a dated local snapshot, never pushed to GitHub |
 
+- Generated artefacts live only on the machine that produced them. `data/reports/`
+  and `data/audits/` both keep just their `.gitkeep`; everything else in them is
+  ignored. Do not commit an audit, and do not force-add one past the ignore rule.
 - Backtests are written there by the tooling already (`make backtest`,
   `make chart`); do not redirect them elsewhere and do not hand-edit them.
 - Audits are named `YYYY-MM-DD-<topic>.md` — for example
@@ -147,6 +150,6 @@ line to be understood costs a reader (and an agent) a file jump every time.
 - [ ] `make check` passes (Ruff + pytest)
 - [ ] Comments, docstrings and Markdown are English (rule 2)
 - [ ] New names are explicit and ≥ 6 characters (rule 3)
-- [ ] Reports in `data/reports/`, audits in `data/audits/` (rule 5)
+- [ ] Reports in `data/reports/`, audits in `data/audits/`, both git-ignored (rule 5)
 - [ ] Commit message is English with no generated-by footer (rule 1)
 - [ ] PR base branch is `dev` (rule 4)
