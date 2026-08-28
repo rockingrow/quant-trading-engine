@@ -545,7 +545,22 @@ def run(argv: list[str] | None = None) -> int:
         return 2
 
 
+def _force_utf8_stdio() -> None:
+    """Windows' default console codec (cp1252) cannot encode the arrows and
+    check marks the CLI prints; a stray ``→`` in a status line crashes the
+    whole command before ``--verify`` gets to run. Reconfiguring stdio to UTF-8
+    is a no-op wherever the terminal already speaks it."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
+
+
 def main() -> None:
+    _force_utf8_stdio()
     raise SystemExit(run())
 
 

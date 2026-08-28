@@ -74,8 +74,19 @@ infra: ## Start redis, postgres and nats only
 up: strategy-requirements ## Start the whole stack
 	docker compose up -d --build
 
+start: strategy-requirements ## `up` + wait for db-migrate to finish; the local dev entry point
+	docker compose up -d --build
+	@echo "Stack is up. Data-ingestion / strategy-runner block until db-migrate exits 0."
+	@echo "Drive the simulator with: make bar O=2400 H=2412.5 L=2396.25 C=2408.75"
+
+stop: ## Stop the stack (volumes survive) — alias of `down`
+	docker compose down
+
 down: ## Stop the stack (volumes survive)
 	docker compose down
+
+restart: ## Recreate every app container (keeps volumes and infra)
+	docker compose up -d --build --force-recreate data-ingestion strategy-runner market-simulator
 
 logs: ## Tail every service
 	docker compose logs -f --tail=100
@@ -135,29 +146,55 @@ runner: ## Run the strategy runner locally
 SIM_SYMBOL ?= XAUUSD
 SIM_TF     ?= M15
 SIM_BARS   ?= 300
+# Where a successful vendor fetch parks its bars. `warmup-cache` replays these
+# into the simulator, so a dev stack rehearses on prices that really printed
+# without spending a request against a rate-limited plan.
+HISTORY_CACHE ?= data/parquet/tiingo
+# Bars replayed by `warmup-cache`. Defaults to the Redis retention so one run
+# fills the window the runner will actually read.
+CACHE_BARS ?= 6000
 
 sim: ## Run the dev websocket market data simulator (QTE_ENV=dev only)
 	uv run qte-simulator serve
 
-sim-up: ## Same, in compose, on the dev profile
-	docker compose --profile dev up -d --build market-simulator
+sim-up: ## (Re)build and start just the market-simulator container
+	docker compose up -d --build market-simulator
 
 sim-status: ## What the simulator is doing, and who is attached to it
 	uv run qte-simulator status
 
-sim-replay: ## Warm the engine: make sim-replay [SIM_SYMBOL=XAUUSD] [SIM_BARS=300]
+warmup-cache: ## Warm the engine from real cached bars: make warmup-cache [CACHE_BARS=6000]
 	uv run qte-simulator replay --symbol $(SIM_SYMBOL) --timeframe $(SIM_TF) \
-		--generate $(SIM_BARS) --seed 7
+		--file $(HISTORY_CACHE)/$(SIM_SYMBOL)_$(SIM_TF).parquet \
+		--limit $(CACHE_BARS) --verify
 
-sim-bar: ## Send one bar and check the candle comes back: make sim-bar O=.. H=.. L=.. C=..
+sim-replay warmup: ## Warm the engine with synthetic bars: make warmup [SIM_BARS=300]
+	uv run qte-simulator replay --symbol $(SIM_SYMBOL) --timeframe $(SIM_TF) \
+		--generate $(SIM_BARS) --seed 7 --verify
+
+sim-bar bar: ## One bar, round-tripped: make bar O=2400 H=2412.5 L=2396.25 C=2408.75 [V=150]
 	uv run qte-simulator bar --symbol $(SIM_SYMBOL) --timeframe $(SIM_TF) \
-		--open $(O) --high $(H) --low $(L) --close $(C) --verify
+		--open $(O) --high $(H) --low $(L) --close $(C) \
+		$(if $(V),--volume $(V),) --verify
+
+signal: ## Warmup + drift replay expected to fire a signal (fails if none does)
+	uv run qte-simulator replay --symbol $(SIM_SYMBOL) --timeframe $(SIM_TF) \
+		--generate $(SIM_BARS) --seed 7 --verify
+	uv run qte-simulator replay --symbol $(SIM_SYMBOL) --timeframe $(SIM_TF) \
+		--generate 60 --seed 3 --drift 0.004 --volatility 0.0015 \
+		--verify --expect-signal
 
 sim-walk: ## Stream a live-ish random walk until stopped
 	uv run qte-simulator walk --symbol $(SIM_SYMBOL) --rate 5
 
 sim-stop: ## Stop every background generator
 	uv run qte-simulator stop
+
+sim-reset: ## Clear Redis + reset the simulator cursor + restart ingestion (fixes 'no candle arrived')
+	-uv run qte-simulator stop
+	-uv run qte-simulator reset
+	docker compose exec -T redis-cache redis-cli FLUSHDB
+	docker compose restart data-ingestion strategy-runner
 
 sim-watch: ## Tail closed candles and emitted signals on NATS
 	uv run qte-simulator watch --symbol $(SIM_SYMBOL) --timeframe $(SIM_TF)
@@ -174,9 +211,9 @@ shadow-off: ## Resume delivery to the broker (GOES LIVE — prompts to confirm)
 ping: ## Ask the running runners to identify themselves
 	uv run qte-control ping
 
-.PHONY: help install install-dev lock test lint format check infra up down logs nuke \
+.PHONY: help install install-dev lock test lint format check infra up start stop down restart logs nuke \
 	strategy-deps strategy-requirements strategy-test strategies audit audit-strict routing \
 	db-upgrade db-downgrade db-revision db-current db-history db-check \
 	download history backtest chart reports ingestion runner csv-import \
-	sim sim-up sim-status sim-replay sim-bar sim-walk sim-stop sim-watch \
+	sim sim-up sim-status sim-replay warmup warmup-cache sim-bar bar signal sim-walk sim-stop sim-reset sim-watch \
 	shadow-status shadow-on shadow-off ping

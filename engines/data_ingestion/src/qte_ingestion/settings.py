@@ -22,6 +22,11 @@ class IngestionSettings(BaseSettings):
     #: Persist the in-progress bar to Redis on each closed candle so a restart
     #: mid-bar resumes rather than losing it.
     persist_open_candles: bool = True
+    #: Top Redis up to ``QTE_REDIS__CANDLE_HISTORY`` bars from the provider at
+    #: boot, so the runner warms its indicator window on the first close rather
+    #: than days later. Only providers that serve history do anything here; see
+    #: :mod:`qte_ingestion.backfill`.
+    backfill_history: bool = True
 
 
 ingestion_settings = IngestionSettings()

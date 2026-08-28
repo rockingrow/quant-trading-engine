@@ -11,6 +11,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
+from dotenv import load_dotenv
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -38,6 +39,15 @@ def _find_repo_root() -> Path:
 
 
 REPO_ROOT = _find_repo_root()
+
+# Load the workspace ``.env`` into ``os.environ`` once, at import. Every nested
+# ``BaseSettings`` block reads from the process environment, so this is what
+# makes ``QTE_NATS__URL=…`` in ``.env`` take effect for ``NatsSettings`` and its
+# siblings — pydantic-settings only wires ``env_file`` into the class that
+# declares it, not into ``Field(default_factory=NatsSettings)`` children.
+# ``override=False`` keeps shell exports winning, so a targeted
+# ``QTE_POSTGRES__DSN=… make db-upgrade`` still overrides the file.
+load_dotenv(REPO_ROOT / ".env", override=False)
 
 
 class NatsSettings(BaseSettings):
@@ -96,21 +106,9 @@ class AccountSettings(BaseSettings):
     ``commission_per_unit`` is a backtest cost — live, the broker charges its
     own — but it belongs to the account rather than to a run, which is why it
     sits here and only defaults the CLI flag.
-
-    Alone among the blocks here it also reads ``.env`` directly. The others
-    deliberately do not: their values differ between the host and a container
-    (``nats://nats:4222`` resolves in compose and nowhere else), so a
-    host-side ``qte-backtest`` picking up the compose URL would be a bug. None
-    of that applies to a balance — it is the same number wherever the process
-    runs — and "put the capital in .env" is what an operator expects to work.
     """
 
-    model_config = SettingsConfigDict(
-        env_prefix="QTE_ACCOUNT__",
-        env_file=(REPO_ROOT / ".env"),
-        env_file_encoding="utf-8",
-        extra="ignore",
-    )
+    model_config = SettingsConfigDict(env_prefix="QTE_ACCOUNT__", extra="ignore")
 
     #: Starting balance. Position size is a share of *this*, not of the equity
     #: as it moves — see :mod:`qte_shared.sizing`.

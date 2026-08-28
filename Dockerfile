@@ -21,8 +21,11 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 WORKDIR /app
 
-# Which workspace member this image is for.
+# Which workspace member this image is for. QTE_EXTRA_PACKAGES adds sibling
+# packages to the same sync (space-separated), needed by the migrations image
+# whose env.py imports models from every engine that owns tables.
 ARG QTE_PACKAGE=qte-strategy-engine
+ARG QTE_EXTRA_PACKAGES=
 
 # Manifests first: the dependency layer is then cached across every change that
 # does not touch a pyproject or the lockfile. Every member's manifest is copied
@@ -37,14 +40,16 @@ COPY engines/strategy_audit/pyproject.toml engines/strategy_audit/
 COPY engines/market_simulator/pyproject.toml engines/market_simulator/
 
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-install-workspace --no-dev --package ${QTE_PACKAGE}
+    uv sync --frozen --no-install-workspace --no-dev --package ${QTE_PACKAGE} \
+        $(for p in ${QTE_EXTRA_PACKAGES}; do echo --package $p; done)
 
 COPY engines/ engines/
 COPY migrations/ migrations/
 COPY alembic.ini ./
 
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev --package ${QTE_PACKAGE}
+    uv sync --frozen --no-dev --package ${QTE_PACKAGE} \
+        $(for p in ${QTE_EXTRA_PACKAGES}; do echo --package $p; done)
 
 # Strategies bring their own dependencies (pandas-ta and whatever else the
 # private repo needs), and they are imported into *this* process — so they have
