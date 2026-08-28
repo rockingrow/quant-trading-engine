@@ -13,6 +13,11 @@ Redis is written first and NATS second on purpose. The runner rebuilds its
 warm-up window from Redis when it starts, so a candle that reached the bus but
 not the cache would be a bar the engine acts on now and cannot see after a
 restart.
+
+Start-up also *seeds* that cache from vendor history when the provider serves
+it -- see :mod:`qte_ingestion.backfill`. Without it a cold Redis means the
+runner has no indicator window until enough bars have printed live, which on
+M15 is days.
 """
 
 from __future__ import annotations
@@ -32,6 +37,7 @@ from qte_shared.providers import create_provider
 from qte_shared.symbols import build_specs
 from qte_shared.timeframes import normalize_timeframe
 
+from qte_ingestion.backfill import HistoryBackfiller
 from qte_ingestion.resampler import Resampler
 from qte_ingestion.settings import ingestion_settings
 
@@ -71,6 +77,9 @@ class IngestionService:
             # cannot arrive after a newer close for the same strategy window.
             await self._drain_candle_outbox()
             await self._restore_open_candles()
+            # Before the first live tick: a bar backfilled from the vendor must
+            # not land behind one this process just resampled.
+            await HistoryBackfiller(self.state, self.specs, self.timeframes).run()
 
             started = 0
             for feed in self.provider.live_feeds(self.specs, self._handle_tick):

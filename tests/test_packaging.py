@@ -130,17 +130,19 @@ def test_compose_builds_a_different_image_per_service():
     assert "QTE_PACKAGE: qte-simulator" in compose
 
 
-def test_the_simulator_is_behind_a_compose_profile():
-    """`docker compose up` must not start a service that invents prices.
-
-    The dev-env guard would refuse it anywhere but QTE_ENV=dev — but a stack
-    that starts it *in* dev alongside the real feed gives two sources for one
-    symbol, and the resampler drops whichever arrives second as a late tick.
-    Starting it is a decision, so it takes a flag.
-    """
-    compose = (REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
-    simulator = compose.split("market-simulator:", 1)[1]
-    assert 'profiles: ["dev"]' in simulator.split("\n\n", 1)[0]
+def test_the_simulator_still_refuses_outside_dev():
+    """`docker compose up` starts the simulator, so the in-process guard is
+    what stands between an invented feed and a non-dev environment. Both
+    server and provider call ``require_dev_env()``; if either loses that call
+    a compose ``up`` would happily fabricate prices in staging or prod."""
+    server = (
+        REPO_ROOT / "engines/market_simulator/src/qte_simulator/server.py"
+    ).read_text(encoding="utf-8")
+    provider = (
+        REPO_ROOT / "engines/shared/src/qte_shared/providers/simulator/provider.py"
+    ).read_text(encoding="utf-8")
+    assert "require_dev_env" in server
+    assert "require_dev_env" in provider
 
 
 def test_the_lockfile_points_at_the_renamed_engine_folders():

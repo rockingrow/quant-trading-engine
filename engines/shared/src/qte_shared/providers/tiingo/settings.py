@@ -25,3 +25,16 @@ class TiingoSettings(ProviderSettings):
     fx_threshold: int = 5
     crypto_threshold: int = 2
     request_timeout: float = 30.0
+    #: Bars asked for in a single REST call. Tiingo caps an intraday response
+    #: at a few thousand rows and signals it with a *200 and fewer bars* -- not
+    #: an error -- so a range wider than the cap comes back quietly short. The
+    #: history source pages under this budget instead; measured truncation on a
+    #: free plan began between 5k and 7k rows, so the default leaves headroom.
+    #: A paid plan can raise it to cut the number of round trips.
+    max_rows_per_request: int = 5000
+    #: Hard stop on pages for one range, so a vendor that stops making progress
+    #: cannot spin forever. It has to clear the widest range a caller can ask
+    #: for by default: `qte-backtest download` uses three years, which on M1 is
+    #: a three-day page span and so ~365 pages. A lower ceiling would turn the
+    #: silent truncation this module fixes back on at a different layer.
+    max_pages: int = 600

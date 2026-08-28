@@ -42,6 +42,11 @@ def build_parser() -> argparse.ArgumentParser:
     download.add_argument(
         "--market", choices=["fx", "crypto"], default=None, help="Override the inferred market"
     )
+    download.add_argument(
+        "--replace",
+        action="store_true",
+        help="Overwrite the parquet instead of merging into it (discards bars outside the range)",
+    )
 
     subparsers.add_parser("list", help="Show the history already on disk")
 
@@ -141,7 +146,8 @@ async def _download(args: argparse.Namespace) -> None:
                     start=args.start,
                     end=args.end,
                     market=args.market,
-                )
+                ),
+                replace=args.replace,
             )
 
 

@@ -230,7 +230,8 @@ def test_tiingo_reaches_a_different_endpoint_per_market(market, expected_path):
         end=date(2024, 1, 2),
         market=market,
     )
-    url, params = source._endpoint(request.normalized())
+    normalized = request.normalized()
+    url, params = source._endpoint(normalized, normalized.start, normalized.end)
     assert url.endswith(expected_path if market == "fx" else expected_path)
     assert params["resampleFreq"] == "15min"
 

@@ -449,8 +449,17 @@ dependencies = [
     { name = "qte-shared", extra = ["simulator", "tiingo"] },
 ]
 
+[package.optional-dependencies]
+history-cache = [
+    { name = "pyarrow" },
+]
+
 [package.metadata]
-requires-dist = [{ name = "qte-shared", extras = ["tiingo", "simulator"], editable = "engines/shared" }]
+requires-dist = [
+    { name = "pyarrow", marker = "extra == 'history-cache'", specifier = ">=16.0" },
+    { name = "qte-shared", extras = ["tiingo", "simulator"], editable = "engines/shared" },
+]
+provides-extras = ["history-cache"]
 
 [[package]]
 name = "qte-shared"
