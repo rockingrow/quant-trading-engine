@@ -222,11 +222,11 @@ __marimo__/
 # reach this public repository's history.
 # Your private strategy repo gets cloned into this directory, so it is ignored
 # whole — clone it into a subdirectory (`__strategies__/<name>`, which is what
-# STRATEGY_REPO points at) rather than onto the mount point itself, because
-# `git clone` refuses a destination that already contains a file. Anchored to
-# the repo root so `examples/__strategies__/` is not swept up by the rule.
+# `make strategy-mount STRATEGY=<name>` points at) rather than onto the mount
+# point itself, because `git clone` refuses a destination that already
+# contains a file. Anchored to the repo root so `examples/__strategies__/` is
+# not swept up by the rule.
 /__strategies__/*
-!/__strategies__/.gitkeep
 # The exception: a committed template of what a strategy repo looks like, so a
 # fresh checkout still shows the shape of this directory. It publishes an inert
 # strategy — see __strategies__/_boilerplate/README.md — and is safe to delete.

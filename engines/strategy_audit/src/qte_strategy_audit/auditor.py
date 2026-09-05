@@ -135,7 +135,7 @@ def _load_failures(failures: list[LoadFailure]) -> list[Finding]:
     carries on, which in a running process is right; here it would mean a repo
     whose every strategy failed to import passing as "0 strategies, 0 errors" —
     a green deploy that trades nothing. The commonest cause is a dependency the
-    plugins need and the venv does not have, which is `make strategy-deps`.
+    plugins need and the venv does not have, which is `make strategy-mount`.
     """
     return [
         Finding(
@@ -145,7 +145,7 @@ def _load_failures(failures: list[LoadFailure]) -> list[Finding]:
             message=failure.detail,
             fix=(
                 "if it is a missing import, install the plugin repo's dependencies with "
-                "`make strategy-deps STRATEGY_REPO=<path>` - they are imported into the "
+                "`make strategy-mount STRATEGY=<name>` - they are imported into the "
                 "runner's own process"
             ),
             source=failure.path,

@@ -11,9 +11,9 @@ So the pairing moves out of the code and into a file the operator owns:
 .. code-block:: toml
 
     [symbols.XAUUSD]
-    strategies = ["MT5_GOLD_M15_V1", "MT5_GOLD_M5_SCALP"]
+    strategies = ["MT5_GOLD_M5_SCALP"]
 
-    [symbols.XAUUSD.params.MT5_GOLD_M15_V1]
+    [symbols.XAUUSD.params.MT5_GOLD_M5_SCALP]
     risk_percent = 1.0
 
 **The real file is git-ignored; the template beside it is not.** What pairs

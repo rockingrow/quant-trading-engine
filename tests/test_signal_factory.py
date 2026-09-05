@@ -10,7 +10,7 @@ NOW = datetime(2026, 5, 1, 10, 0, tzinfo=UTC)
 
 
 def _factory(**kwargs) -> SignalFactory:
-    return SignalFactory("MT5_GOLD_M5_V1", timeframe="M15", token="tok", **kwargs)
+    return SignalFactory("MT5_GOLD_SCALP", timeframe="M15", token="tok", **kwargs)
 
 
 def test_entry_mints_a_cycle_and_the_close_reuses_it():
@@ -189,7 +189,7 @@ def test_a_second_entry_cannot_orphan_the_open_cycle():
 def _priced(**kwargs) -> SignalFactory:
     """A factory sizing against a $1,000 account, as the contract example does."""
     return SignalFactory(
-        "MT5_GOLD_M5_V1",
+        "MT5_GOLD_SCALP",
         timeframe="M5",
         token="tok",
         sizer=PositionSizer(capital=1000.0, risk_percent=3.0),

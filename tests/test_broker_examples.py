@@ -48,7 +48,7 @@ IDS = [name for name, _ in DOCUMENTS]
 
 def _factory() -> SignalFactory:
     return SignalFactory(
-        "MT5_GOLD_M5_V1",
+        "MT5_GOLD_SCALP",
         timeframe="M5",
         token="secret_token_tu_tradingview",
         sizer=PositionSizer(capital=CAPITAL, risk_percent=RISK_PERCENT),

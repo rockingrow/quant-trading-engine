@@ -20,7 +20,7 @@ __strategies__/                  ← mount point, git-ignored, read-only in the 
 │   │   └── _helpers.py          ← leading `_` — never mistaken for a strategy
 │   └── tests/
 │       └── test_my_edge.py      ← `tests/` is never walked by the plugin scan
-├── quant-trading-strategies/    ← your real repo, cloned whole
+├── my-strategy/    ← your real repo, cloned whole
 └── one_off.py                   ← a loose file also works — the "scan" path
 ```
 
@@ -44,12 +44,12 @@ Then, in order:
 
 Its dependencies are not automatic: the runner imports plugins into its own
 process, so whatever the repo needs has to be installed alongside the engine.
-Both targets take `STRATEGY_REPO`, which defaults to
-`__strategies__/quant-trading-strategies`:
+Both targets take `STRATEGY`, the checkout's name under `__strategies__/`
+(leave it unset to act on every checkout there instead):
 
 ```bash
-make strategy-deps         STRATEGY_REPO=__strategies__/my-strategies
-make strategy-requirements STRATEGY_REPO=__strategies__/my-strategies
+make strategy-mount         STRATEGY=my-strategies
+make strategy-requirements  STRATEGY=my-strategies
 ```
 
 ## Isolation: this repo imports nothing from the engine

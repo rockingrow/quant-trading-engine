@@ -346,7 +346,7 @@ def test_a_manifest_that_raises_is_a_failure_not_a_silent_pass(repo):
 
     finding = next(f for f in report.all_findings if f.code == "load-failed")
     assert "qte_dependency_that_must_not_exist_7f31c9" in finding.message
-    assert "strategy-deps" in finding.fix
+    assert "strategy-mount" in finding.fix
     assert not report.ok, "0 strategies and a green exit code is the failure mode"
 
 

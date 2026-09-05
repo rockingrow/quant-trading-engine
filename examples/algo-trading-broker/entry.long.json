@@ -1,5 +1,5 @@
 {
-  "strategy": "MT5_GOLD_M5_V1",
+  "strategy": "MT5_GOLD_SCALP",
   "symbol": "OANDA:XAUUSD",
   "timeframe": "5",
   "timestamp": "2026-04-10 22:55:00",

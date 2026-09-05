@@ -233,7 +233,7 @@ def pandas_ta_frame(df: pd.DataFrame):
     QTE does not depend on it (see the module docstring), but a strategy that
     wants its 270-odd extra indicators can ``uv add pandas-ta`` and reach them
     through here without importing it at module scope everywhere. It is already
-    installed if you ran ``make strategy-deps`` for a plugin repo that uses it.
+    installed if you ran ``make strategy-mount`` for a plugin repo that uses it.
     """
     try:
         import pandas_ta  # noqa: F401

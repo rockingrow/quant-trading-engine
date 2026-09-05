@@ -37,7 +37,7 @@ make install-dev              # uv sync
 `__strategies__/` is git-ignored: it is where your **private** strategy repo is
 cloned, whole, so the alpha never lands in this public history. Clone it into a
 subdirectory — `git clone <your private repo> __strategies__/my-strategies` —
-and point `STRATEGY_REPO` at it.
+and point `STRATEGY` at it (`make strategy-mount STRATEGY=my-strategies`).
 
 The one thing committed under that path is
 [`__strategies__/_boilerplate/`](__strategies__/_boilerplate/): a template of
@@ -49,7 +49,7 @@ you have written anything, use the worked example instead:
 ```bash
 cp examples/__strategies__/ema_atr_breakout.py __strategies__/
 
-make routing                  # config/strategies_mapping.toml from the template (git-ignored)
+make strategy-mapping         # config/strategies_mapping.toml from the template (git-ignored)
 make audit                    # check what __strategies__/ publishes before running it
 ```
 
@@ -236,7 +236,7 @@ from qte_shared.strategy_base import SignalIntent, SignalStrategy
 
 
 class MyEdge(SignalStrategy):
-    name = "MT5_GOLD_M15_V1"  # ← the NATS subject workers subscribe to
+    name = "MT5_GOLD_SCALP"  # ← the NATS subject workers subscribe to
     symbols = ("XAUUSD",)  # ← a default; config/strategies_mapping.toml overrides it
     timeframe = "M15"
     warmup = 220
@@ -373,7 +373,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 from mine.gold.m5 import GoldEdge
 
-ALIASES = {"MT5_GOLD_M5_V1": GoldEdge}
+ALIASES = {"MT5_GOLD_M5_SCALP": GoldEdge}
 
 
 def load_all():
@@ -404,17 +404,28 @@ restates `SignalStrategy` is still checked for all seven signal methods.
 
 **Its dependencies are not automatic.** The plugins are imported into the
 runner's process, so whatever they need has to be installed alongside the
-engine:
+engine. `STRATEGY=<name>` targets a single checkout under `__strategies__/`;
+leave it unset on `strategy-mount` to sweep every checkout there instead:
 
 ```bash
-make strategy-deps          # into this venv, from the plugin repo's lockfile
-make strategy-requirements  # freeze into deploy/ for the image build
-make strategy-test          # run the plugin repo's own suite
-make strategies             # list what the engine can see
-make audit                  # check that what it sees is fit to trade
+make strategy-mount                          # every __strategies__/<name> with a pyproject.toml
+make strategy-mount STRATEGY=my-strategies   # just that one
+make strategy-audit STRATEGY=my-strategies   # true/false on stdout — what strategy-mount runs per repo
+make strategy-requirements                   # freeze the audit-passing repos (from __strategies__/strategies.toml) into deploy/
+make strategy-test STRATEGY=my-strategies    # run that repo's own suite (STRATEGY required)
+make strategies                              # list what the engine can see
+make audit                                   # check that what it sees is fit to trade
 ```
 
-`make up` runs the freeze for you before building.
+`strategy-mount` installs a repo's deps, then runs `strategy-audit` against it
+— the same `qte-strategy-audit` check as `make audit`, scoped to that one
+repo — and records the result in `__strategies__/strategies.toml`, an
+auto-generated file: never hand-edit or delete it. `true` means that repo
+passed audit the last time it was mounted; `strategy-requirements` freezes
+only the `true` entries. `make up`/`make start` read this file to run the
+freeze for you before building, and refuse to start without it, even if it
+lists nothing: run `make strategy-mount` at least once first, whether or not
+you have a private repo to mount.
 
 ### A directory scan — for a single file
 
@@ -455,15 +466,15 @@ the code:
 
 ```toml
 [symbols.XAUUSD]
-strategies = ["MT5_GOLD_M15_V1", "MT5_GOLD_M5_SCALP"]
+strategies = ["MT5_GOLD_M5_SCALP"]
 
 # Per-pair overrides. They beat QTE_RUNNER__STRATEGY_PARAMS, so one strategy
 # can run tighter on gold than it does on everything else.
-[symbols.XAUUSD.params.MT5_GOLD_M15_V1]
+[symbols.XAUUSD.params.MT5_GOLD_M5_SCALP]
 risk_percent = 1.0
 
 [symbols.BTCUSDT]
-strategies = ["MT5_GOLD_M15_V1"]
+strategies = ["MT5_GOLD_M5_SCALP"]
 
 # Parks a symbol without deleting its configuration.
 [symbols.EURUSD]
@@ -472,8 +483,8 @@ strategies = ["MT5_FX_M15_V1"]
 ```
 
 ```bash
-make routing   # cp config/strategies_mapping.example.toml config/strategies_mapping.toml (never overwrites)
-make audit     # verify every name in it against what __strategies__/ publishes
+make strategy-mapping   # cp config/strategies_mapping.example.toml config/strategies_mapping.toml (never overwrites)
+make audit              # verify every name in it against what __strategies__/ publishes
 ```
 
 **The real file is git-ignored; `config/strategies_mapping.example.toml` is not.** What you
@@ -575,10 +586,10 @@ docker compose run --rm strategy-audit  # the same, in the deployed image
 Strategy audit - /app/__strategies__
 Routing table  - /app/config/strategies_mapping.toml
 
-  [FAIL] MT5_GOLD_M15_V1  (GoldEdge, via manifest)
+  [FAIL] MT5_GOLD_M5_SCALP  (GoldEdge, via manifest)
          /app/__strategies__/my-strategies/manifest.py
          signals: long, short, tp1, sl
-         FAIL MT5_GOLD_M15_V1.tp2: required signal method tp2() is not implemented
+         FAIL MT5_GOLD_M5_SCALP.tp2: required signal method tp2() is not implemented
               -> def tp2(self, df, context) -> IntentResult: return None - an explicit
                  'never' is an answer; an absence is not
 
@@ -639,7 +650,7 @@ imports. A strategy problem should stop the one service that has strategies.
 ```bash
 uv run qte-backtest download --symbol XAUUSD --timeframe M15 --start 2023-01-01
 uv run qte-backtest list
-uv run qte-backtest run --strategy MT5_GOLD_M15_V1 --symbol XAUUSD \
+uv run qte-backtest run --strategy MT5_GOLD_M5_SCALP --symbol XAUUSD \
     --spread 0.30 --persist
 ```
 
@@ -902,13 +913,14 @@ cd quant-trading-engine && cp .env.example .env   # then edit it
 mkdir -p __strategies__
 git clone git@github.com:you/my-private-strategies.git __strategies__/my-strategies
 
-# 3. Its dependencies, which the runner imports into its own process.
-#    STRATEGY_REPO defaults to __strategies__/quant-trading-strategies.
-make strategy-deps STRATEGY_REPO=__strategies__/my-strategies
+# 3. Its dependencies, which the runner imports into its own process. STRATEGY
+#    names the checkout under __strategies__/; leave it unset to mount every
+#    checkout there instead.
+make strategy-mount STRATEGY=my-strategies
 make strategies                      # confirm the engine can see them
 
 # 4. Pair symbols with strategies, then check the whole thing before it trades.
-make routing                         # config/strategies_mapping.toml, git-ignored — edit it
+make strategy-mapping                # config/strategies_mapping.toml, git-ignored — edit it
 make audit-strict                    # fails on anything the runner would skip
 
 # 5. Up, then create the schema. `make up` freezes the plugin repo's
