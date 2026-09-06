@@ -61,7 +61,7 @@ BROKEN = """
 
 @pytest.fixture
 def strategies(monkeypatch, tmp_path) -> Path:
-    """Point the audit at a directory of our own, with no routing table.
+    """Point the audit at a directory of our own, with no mapping table.
 
     `audit()` reads the process settings, which otherwise resolve to the repo's
     real `__strategies__/` — whatever the developer running the suite happens
@@ -70,7 +70,7 @@ def strategies(monkeypatch, tmp_path) -> Path:
     directory = tmp_path / "__strategies__"
     directory.mkdir()
     monkeypatch.setattr(settings.engine, "strategies_dir", directory)
-    monkeypatch.setattr(settings.engine, "routing_file", tmp_path / "no-such-table.toml")
+    monkeypatch.setattr(settings.engine, "mapping_file", tmp_path / "no-such-table.toml")
     return directory
 
 
@@ -132,7 +132,7 @@ def test_error_starts_on_a_clean_directory(strategies):
 def test_error_tolerates_warnings(monkeypatch, tmp_path):
     """A missing directory is a warning — `error` is not `strict`."""
     monkeypatch.setattr(settings.engine, "strategies_dir", tmp_path / "never-cloned")
-    monkeypatch.setattr(settings.engine, "routing_file", tmp_path / "no-such-table.toml")
+    monkeypatch.setattr(settings.engine, "mapping_file", tmp_path / "no-such-table.toml")
     report = run_preflight_audit("error")
 
     assert report.warnings and not report.errors
@@ -143,7 +143,7 @@ def test_error_tolerates_warnings(monkeypatch, tmp_path):
 
 def test_strict_refuses_on_a_warning(monkeypatch, tmp_path):
     monkeypatch.setattr(settings.engine, "strategies_dir", tmp_path / "never-cloned")
-    monkeypatch.setattr(settings.engine, "routing_file", tmp_path / "no-such-table.toml")
+    monkeypatch.setattr(settings.engine, "mapping_file", tmp_path / "no-such-table.toml")
     with pytest.raises(StrategyAuditFailed):
         run_preflight_audit("strict")
 

@@ -63,7 +63,7 @@ class TiingoHistorySource(HistorySource):
     def __init__(self, config: TiingoSettings) -> None:
         if not config.api_key:
             raise ProviderNotConfigured(
-                "QTE_TIINGO__API_KEY is not set; Tiingo cannot serve historical bars"
+                "QTE_DATA_PROVIDER_API_KEY is not set; Tiingo cannot serve historical bars"
             )
         self._config = config
 

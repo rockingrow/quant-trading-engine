@@ -17,6 +17,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 import websockets
 from qte_ingestion.resampler import Resampler
+from qte_shared.config import settings
 from qte_shared.dev_only import DevOnlyError, require_dev_env
 from qte_shared.models import Candle, Tick
 from qte_shared.providers import available_providers, create_provider
@@ -30,6 +31,7 @@ from qte_shared.providers.simulator.protocol import (
 )
 from qte_shared.symbols import build_specs
 from qte_shared.timeframes import floor_to_bucket, timeframe_seconds
+from qte_simulator import cli
 from qte_simulator.bars import (
     TICKS_PER_BAR,
     BarError,
@@ -41,9 +43,10 @@ from qte_simulator.bars import (
     seal_tick,
 )
 from qte_simulator.client import ControlClient
-from qte_simulator.control import CommandError, dispatch
+from qte_simulator.control import MAX_BARS, CommandError, dispatch
 from qte_simulator.hub import SimulatorHub
 from qte_simulator.server import SimulatorServer
+from qte_simulator.settings import simulator_settings
 from qte_simulator.sources import SourceError, load_bars
 from qte_simulator.verify import compare
 
@@ -417,6 +420,70 @@ def test_a_file_without_ohlc_says_which_columns_are_missing(tmp_path):
     assert "open" in str(excinfo.value)
 
 
+# ── What the CLI defaults to, and how it sends a long run ─────────────────
+
+
+def test_a_bare_replay_warms_from_the_cached_parquet(monkeypatch):
+    """`make warmup-cache` passes no arguments; .env is what points it at a file."""
+    monkeypatch.setattr(simulator_settings, "parquet_file", "data/parquet/tiingo/X_M15.parquet")
+    arguments = cli.build_parser().parse_args(["replay"])
+    assert cli._source_file(arguments) == "data/parquet/tiingo/X_M15.parquet"
+    assert arguments.limit == simulator_settings.cache_bars
+
+    generated = cli.build_parser().parse_args(["replay", "--generate"])
+    assert cli._source_file(generated) is None
+    assert generated.generate == simulator_settings.generate_bars
+
+
+def test_replay_without_bars_or_a_cached_file_says_so(monkeypatch, capsys):
+    monkeypatch.setattr(simulator_settings, "parquet_file", "")
+    arguments = cli.build_parser().parse_args(["replay", "--symbol", "XAUUSD"])
+    assert asyncio.run(cli._replay(arguments)) == 2
+    assert "QTE_SIMULATOR_PARQUET_FILE" in capsys.readouterr().err
+
+
+def test_real_history_is_anchored_in_the_past_and_synthetic_bars_ahead():
+    """Prices that printed carry timestamps that already happened; a random walk
+    does not, and forward anchoring is what keeps the flush timer off it."""
+    arguments = cli.build_parser().parse_args(["replay"])
+    assert cli._resolve_anchor(arguments, from_file=True) == "past"
+    assert cli._resolve_anchor(arguments, from_file=False) == "next"
+
+    explicit = cli.build_parser().parse_args(["replay", "--anchor", "next"])
+    assert cli._resolve_anchor(explicit, from_file=True) == "next"
+
+
+def test_a_missing_symbol_falls_back_to_the_one_the_engine_watches(monkeypatch):
+    monkeypatch.setattr(settings.engine, "symbols", ["BTCUSDT", "XAUUSD"])
+    arguments = cli.build_parser().parse_args(["walk"])
+    assert cli._fill_in_symbol(arguments)
+    assert arguments.symbol == "BTCUSDT"
+
+    monkeypatch.setattr(settings.engine, "symbols", [])
+    assert not cli._fill_in_symbol(cli.build_parser().parse_args(["walk"]))
+
+
+async def test_a_warm_up_larger_than_one_command_still_ends_at_the_clock(monkeypatch):
+    """A cache warm-up is sized to the Redis retention, which is larger than the
+    server takes in one command. Going over in batches must not show: the run
+    stays contiguous, seals once, and ends where an unbatched `past` would."""
+    hub = SimulatorHub()
+    monkeypatch.setattr(cli, "ControlClient", lambda url=None: _loopback(hub))
+    rows = [{"open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5}] * (MAX_BARS + 2)
+    arguments = cli.build_parser().parse_args(
+        ["replay", "--symbol", "XAUUSD", "--timeframe", "M15", "--anchor", "past"]
+    )
+
+    result = await cli._send_bars(arguments, "M15", rows)
+
+    assert result["bars"] == len(rows)
+    assert result["ticks"] == len(rows) * TICKS_PER_BAR + 1  # one seal, on the last batch
+    times = [datetime.fromisoformat(row["open_time"]) for row in result["expected"]]
+    steps = {later - earlier for earlier, later in zip(times, times[1:], strict=False)}
+    assert steps == {timedelta(minutes=15)}
+    assert times[-1] == floor_to_bucket(datetime.now(UTC), "M15") - timedelta(minutes=15)
+
+
 # ── Verification ──────────────────────────────────────────────────────────
 
 
@@ -545,3 +612,23 @@ async def _until(predicate, timeout: float = 5.0) -> None:
 
 async def _noop(_tick) -> None:  # pragma: no cover - handler is never invoked
     return None
+
+
+def _loopback(hub: SimulatorHub):
+    """A ControlClient that dispatches into *hub* in-process.
+
+    The CLI's batching is about what the server is asked to do, not about the
+    socket, and a real one would only add a port to the test.
+    """
+
+    class _LoopbackClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc) -> None:
+            return None
+
+        async def send(self, op: str, **arguments):
+            return await dispatch(hub, {"op": op, **arguments})
+
+    return _LoopbackClient()

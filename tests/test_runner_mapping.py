@@ -1,4 +1,4 @@
-"""The runner turning a routing table into slots.
+"""The runner turning a mapping table into slots.
 
 `_build_slots` is the only place the table has any effect, and it is the place
 where getting it wrong is expensive: a missing pair trades nothing, a spurious
@@ -15,8 +15,8 @@ import textwrap
 from pathlib import Path
 
 import pytest
-from qte_shared.routing import SymbolRouting
-from qte_shared.strategy_base import SignalStrategy
+from qte_shared.strategies.mapping import SymbolMapping
+from qte_shared.strategies.strategy_base import SignalStrategy
 from qte_strategy_engine.runner import StrategyRunner
 
 
@@ -56,7 +56,7 @@ def table(tmp_path: Path, body: str) -> Path:
 @pytest.fixture
 def runner(monkeypatch, tmp_path):
     """A runner whose loader returns our two strategies and nothing else."""
-    from qte_shared.plugin_loader import LoadedStrategy
+    from qte_shared.strategies.plugin_loader import LoadedStrategy
 
     discovered = [
         LoadedStrategy(name="GOLD_M15", cls=Edge, source=tmp_path / "edge.py"),
@@ -68,11 +68,11 @@ def runner(monkeypatch, tmp_path):
     return StrategyRunner()
 
 
-def build(runner, monkeypatch, routing_file: Path | None):
+def build(runner, monkeypatch, mapping_file: Path | None):
     from qte_shared.config import settings
 
     monkeypatch.setattr(
-        settings.engine, "routing_file", routing_file or Path("does-not-exist.toml")
+        settings.engine, "mapping_file", mapping_file or Path("does-not-exist.toml")
     )
     runner._build_slots()
     return {(slot.strategy.name, slot.symbol) for slot in runner.slots}
@@ -80,7 +80,7 @@ def build(runner, monkeypatch, routing_file: Path | None):
 
 def test_the_table_decides_the_pairs(runner, monkeypatch, tmp_path):
     """Including a symbol the strategy never declared on itself."""
-    routing = table(
+    mapping = table(
         tmp_path,
         """
         [symbols.XAUUSD]
@@ -90,7 +90,7 @@ def test_the_table_decides_the_pairs(runner, monkeypatch, tmp_path):
         strategies = ["GOLD_M15"]
         """,
     )
-    assert build(runner, monkeypatch, routing) == {
+    assert build(runner, monkeypatch, mapping) == {
         ("GOLD_M15", "XAUUSD"),
         ("GOLD_SCALP", "XAUUSD"),
         ("GOLD_M15", "BTCUSDT"),
@@ -99,8 +99,8 @@ def test_the_table_decides_the_pairs(runner, monkeypatch, tmp_path):
 
 def test_a_strategy_the_table_never_mentions_does_not_run(runner, monkeypatch, tmp_path):
     """Loaded is not the same as deployed, once there is a table saying so."""
-    routing = table(tmp_path, '[symbols.XAUUSD]\nstrategies = ["GOLD_M15"]\n')
-    assert build(runner, monkeypatch, routing) == {("GOLD_M15", "XAUUSD")}
+    mapping = table(tmp_path, '[symbols.XAUUSD]\nstrategies = ["GOLD_M15"]\n')
+    assert build(runner, monkeypatch, mapping) == {("GOLD_M15", "XAUUSD")}
 
 
 def test_without_a_table_each_strategy_keeps_its_own_symbols(runner, monkeypatch):
@@ -113,7 +113,7 @@ def test_without_a_table_each_strategy_keeps_its_own_symbols(runner, monkeypatch
 
 def test_each_pair_gets_its_own_instance(runner, monkeypatch, tmp_path):
     """A strategy carries state between bars; sharing it across symbols leaks it."""
-    routing = table(
+    mapping = table(
         tmp_path,
         """
         [symbols.XAUUSD]
@@ -123,7 +123,7 @@ def test_each_pair_gets_its_own_instance(runner, monkeypatch, tmp_path):
         strategies = ["GOLD_M15"]
         """,
     )
-    build(runner, monkeypatch, routing)
+    build(runner, monkeypatch, mapping)
     instances = [slot.strategy for slot in runner.slots]
     assert len(instances) == 2
     assert instances[0] is not instances[1]
@@ -134,7 +134,7 @@ def test_per_pair_params_beat_the_per_strategy_default(runner, monkeypatch, tmp_
     from qte_strategy_engine.settings import runner_settings
 
     monkeypatch.setitem(runner_settings.strategy_params, "GOLD_M15", {"risk_percent": 2.0})
-    routing = table(
+    mapping = table(
         tmp_path,
         """
         [symbols.XAUUSD]
@@ -147,7 +147,7 @@ def test_per_pair_params_beat_the_per_strategy_default(runner, monkeypatch, tmp_
         strategies = ["GOLD_M15"]
         """,
     )
-    build(runner, monkeypatch, routing)
+    build(runner, monkeypatch, mapping)
     by_symbol = {slot.symbol: slot.strategy.params for slot in runner.slots}
 
     assert by_symbol["XAUUSD"]["risk_percent"] == 0.5
@@ -156,17 +156,17 @@ def test_per_pair_params_beat_the_per_strategy_default(runner, monkeypatch, tmp_
 
 def test_a_name_nobody_publishes_is_logged_as_an_error(runner, monkeypatch, tmp_path, caplog):
     """Otherwise the symbol trades nothing and it reads like patience."""
-    routing = table(tmp_path, '[symbols.XAUUSD]\nstrategies = ["TYPOD_NAME"]\n')
+    mapping = table(tmp_path, '[symbols.XAUUSD]\nstrategies = ["TYPOD_NAME"]\n')
     with caplog.at_level("ERROR"):
-        build(runner, monkeypatch, routing)
+        build(runner, monkeypatch, mapping)
 
     assert "TYPOD_NAME" in caplog.text
     assert not runner.slots
 
 
-def test_a_table_that_routes_nothing_trades_nothing(runner, monkeypatch, tmp_path):
+def test_a_table_that_maps_nothing_trades_nothing(runner, monkeypatch, tmp_path):
     """Not the same as no table at all — those two differ by a deploy."""
-    routing = table(
+    mapping = table(
         tmp_path,
         """
         [symbols.XAUUSD]
@@ -174,13 +174,13 @@ def test_a_table_that_routes_nothing_trades_nothing(runner, monkeypatch, tmp_pat
         strategies = ["GOLD_M15"]
         """,
     )
-    assert build(runner, monkeypatch, routing) == set()
+    assert build(runner, monkeypatch, mapping) == set()
 
 
-def test_the_routed_symbols_reach_the_signal_factory(runner, monkeypatch, tmp_path):
+def test_the_mapped_symbols_reach_the_signal_factory(runner, monkeypatch, tmp_path):
     """A slot is only useful if it is subscribed and named correctly."""
-    routing = table(tmp_path, '[symbols.btcusdt]\nstrategies = ["GOLD_SCALP"]\n')
-    build(runner, monkeypatch, routing)
+    mapping = table(tmp_path, '[symbols.btcusdt]\nstrategies = ["GOLD_SCALP"]\n')
+    build(runner, monkeypatch, mapping)
 
     slot = runner.slots[0]
     assert slot.symbol == "BTCUSDT", "the table may be lower case; the wire is not"
@@ -188,7 +188,7 @@ def test_the_routed_symbols_reach_the_signal_factory(runner, monkeypatch, tmp_pa
     assert runner._by_subject[("BTCUSDT", "M15")] == [slot]
 
 
-def test_an_empty_routing_object_is_falsy_but_a_read_one_is_not():
+def test_an_empty_mapping_object_is_falsy_but_a_read_one_is_not():
     """The distinction `_build_slots` branches on."""
-    assert not SymbolRouting()
-    assert SymbolRouting(source=Path("strategies_mapping.toml"))
+    assert not SymbolMapping()
+    assert SymbolMapping(source=Path("strategies_mapping.toml"))

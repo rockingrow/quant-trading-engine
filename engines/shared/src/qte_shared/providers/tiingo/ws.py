@@ -76,7 +76,7 @@ class TiingoLiveFeed(LiveFeed):
             return None
         if not self._config.api_key:
             raise ProviderNotConfigured(
-                "QTE_TIINGO__API_KEY is not set; the Tiingo WebSocket cannot authenticate"
+                "QTE_DATA_PROVIDER_API_KEY is not set; the Tiingo WebSocket cannot authenticate"
             )
         self._running = True
         self._task = asyncio.create_task(self._run(), name=self.name)

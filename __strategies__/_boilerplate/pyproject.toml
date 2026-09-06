@@ -3,9 +3,10 @@
 # that true for a copy of this template; the engine itself never reads it.
 #
 # The engine does read the lockfile beside it, indirectly:
-#   make strategy-deps          # install these into the engine's venv
+#   make strategy-mount         # install these into the engine's venv
 #   make strategy-requirements  # freeze them into deploy/ for the image build
-# Both take STRATEGY_REPO, which defaults to __strategies__/quant-trading-strategies.
+# Both take STRATEGY=<name>, the checkout's name under __strategies__/; leave
+# it unset to act on every mounted checkout instead.
 [project]
 name = "qte-strategy-boilerplate"
 version = "0.1.0"

@@ -19,8 +19,8 @@ from enum import Enum
 
 import pytest
 from qte_shared.models import Scaling, SignalAction
-from qte_shared.signal_factory import SignalFactory
-from qte_shared.strategy_base import (
+from qte_shared.strategies.signal_factory import SignalFactory
+from qte_shared.strategies.strategy_base import (
     INTENT_FIELDS,
     SignalIntent,
     StrategyBase,

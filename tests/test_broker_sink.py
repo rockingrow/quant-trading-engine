@@ -37,7 +37,7 @@ class FakeBus:
 
 def _signal(action: SignalAction = SignalAction.LONG) -> BrokerSignal:
     return BrokerSignal(
-        strategy="MT5_GOLD_M5_V1",
+        strategy="MT5_GOLD_SCALP",
         symbol="XAUUSD",
         timeframe="15",
         timestamp=datetime(2026, 5, 1, tzinfo=UTC),
@@ -68,7 +68,7 @@ async def test_live_send_goes_to_the_strategys_own_subject():
     assert result.status == "sent"
     subject, payload, msg_id = bus.published[0]
     # Workers subscribe per strategy; the subject is the strategy name.
-    assert subject == "SIGNALS.MT5_GOLD_M5_V1"
+    assert subject == "SIGNALS.MT5_GOLD_SCALP"
     assert list(payload) == ["payload"]
     assert payload["payload"]["symbol"] == "XAUUSD"
     assert msg_id  # Nats-Msg-Id, so a retried publish de-duplicates

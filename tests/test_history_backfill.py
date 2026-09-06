@@ -22,8 +22,8 @@ from qte_shared.cache.redis_state import RedisState
 from qte_shared.config import settings
 from qte_shared.history_cache import fetch_history
 from qte_shared.interfaces import HistoryRequest, HistorySource, UnsupportedCapability
+from qte_shared.market_data_plan import SymbolFeed
 from qte_shared.models import Candle
-from qte_shared.symbols import build_specs
 
 START = datetime(2026, 1, 1, tzinfo=UTC)
 
@@ -87,7 +87,9 @@ def backfiller(state, target: int = 100, cache=None) -> HistoryBackfiller:
     # The cache is always injected: a default one would write parquet into the
     # repository's own data/ directory as a side effect of running the suite.
     instance = HistoryBackfiller(
-        state, build_specs(["XAUUSD"], {}), ["M15"], cache=cache or NullCache()
+        state,
+        [SymbolFeed(symbol="XAUUSD", market="fx", timeframes=("M15",))],
+        cache=cache or NullCache(),
     )
     instance.target = target
     return instance

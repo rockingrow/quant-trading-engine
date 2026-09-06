@@ -9,7 +9,7 @@ from qte_backtest.execution import CostModel
 from qte_backtest.replay import BacktestEngine
 from qte_backtest.report import SCHEMA_VERSION, build_report
 from qte_shared.models import SignalAction
-from qte_shared.strategy_base import SignalIntent, StrategyBase
+from qte_shared.strategies.strategy_base import SignalIntent, StrategyBase
 
 
 class TwoTradeStrategy(StrategyBase):

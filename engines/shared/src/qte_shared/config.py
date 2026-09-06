@@ -15,6 +15,8 @@ from dotenv import load_dotenv
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from qte_shared.market_data_plan import MarketDataPlan
+
 
 def _find_repo_root() -> Path:
     """Walk up from this file until the workspace root is found.
@@ -111,9 +113,9 @@ class AccountSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="QTE_ACCOUNT__", extra="ignore")
 
     #: Starting balance. Position size is a share of *this*, not of the equity
-    #: as it moves — see :mod:`qte_shared.sizing`.
+    #: as it moves — see :mod:`qte_shared.strategies.sizing`.
     capital: float = 1000.0
-    #: Percent of :attr:`capital` put at risk on one entry when the routing
+    #: Percent of :attr:`capital` put at risk on one entry when the mapping
     #: table names no ``risk_percent`` for the pair.
     risk_percent: float = 1.0
     #: Charged per unit on entry and on every partial exit, each side.
@@ -150,33 +152,69 @@ class PostgresSettings(BaseSettings):
 
 
 class MarketDataSettings(BaseSettings):
-    """Which market data vendor the process uses.
+    """Which market data vendor the process uses, and where its plan is.
 
-    Only the *choice* lives here. A vendor's own endpoints and credentials sit
-    with its provider (``QTE_TIINGO__*`` with
-    :mod:`qte_shared.providers.tiingo`), so adding a second vendor never edits
-    this file — see :mod:`qte_shared.interfaces.market_data`.
+    Only the *choice* lives here. A vendor's own endpoints sit with its
+    provider (:mod:`qte_shared.providers.tiingo`) and its key comes from one
+    generic ``QTE_DATA_PROVIDER_API_KEY``, so adding a second vendor never
+    edits this file — see :mod:`qte_shared.interfaces.market_data`.
     """
 
     model_config = SettingsConfigDict(env_prefix="QTE_MARKET_DATA__", extra="ignore")
 
     provider: str = "tiingo"
+    #: What the provider is asked to feed: symbols, timeframes and its own
+    #: knobs (:mod:`qte_shared.market_data_plan`). Empty means the conventional path
+    #: for whichever provider is on, so switching vendor switches plan with it.
+    config_file: Path | None = None
+
+    @property
+    def plan_file(self) -> Path:
+        """The plan this provider reads. Named after it, unless overridden."""
+        return self.config_file or REPO_ROOT / "config" / f"{self.provider}.toml"
+
+
+#: Resolved once, before :class:`Settings` is built: :class:`EngineSettings`
+#: takes its defaults from the plan, so the plan has to be readable first.
+market_data_settings = MarketDataSettings()
+
+
+@lru_cache(maxsize=1)
+def market_data_plan() -> MarketDataPlan:
+    """The market-data plan, parsed once per process.
+
+    Cached because it is read on every settings construction and its file does
+    not change under a running service; a test that writes a plan calls
+    ``market_data_plan.cache_clear()``.
+    """
+    return MarketDataPlan.load(market_data_settings.plan_file)
 
 
 class EngineSettings(BaseSettings):
-    """What the running engine trades and how much history it keeps warm."""
+    """What the running engine trades and how much history it keeps warm.
+
+    The first three fields are the market-data plan's, not this block's:
+    ``config/<provider>.toml`` states them per symbol, and these read whatever
+    it says. The environment variables still exist and still win — a
+    ``default_factory`` only runs when the variable is unset — so a one-off
+    ``QTE_ENGINE__SYMBOLS='["EURUSD"]' make backtest`` overrides the file
+    without editing it. With no plan on disk the defaults below apply, which is
+    what a simulator dev stack runs on.
+    """
 
     model_config = SettingsConfigDict(env_prefix="QTE_ENGINE__", extra="ignore")
 
-    symbols: list[str] = Field(default_factory=lambda: ["XAUUSD", "BTCUSDT"])
-    timeframes: list[str] = Field(default_factory=lambda: ["M1", "M15"])
-    signal_timeframe: str = "M15"
+    symbols: list[str] = Field(default_factory=lambda: market_data_plan().symbols or ["XAUUSD"])
+    timeframes: list[str] = Field(default_factory=lambda: market_data_plan().timeframes or ["M15"])
+    signal_timeframe: str = Field(
+        default_factory=lambda: market_data_plan().signal_timeframe or "M15"
+    )
     warmup_candles: int = 300
     strategies_dir: Path = REPO_ROOT / "__strategies__"
     #: Symbol → strategies table. Git-ignored, with a tracked template beside
-    #: it; see :mod:`qte_shared.routing`. Absent means every strategy keeps the
-    #: symbols it declares on itself.
-    routing_file: Path = REPO_ROOT / "config" / "strategies_mapping.toml"
+    #: it; see :mod:`qte_shared.strategies.mapping`. Absent means every
+    #: strategy keeps the symbols it declares on itself.
+    mapping_file: Path = REPO_ROOT / "config" / "strategies_mapping.toml"
     parquet_dir: Path = REPO_ROOT / "data" / "parquet"
     reports_dir: Path = REPO_ROOT / "data" / "reports"
 

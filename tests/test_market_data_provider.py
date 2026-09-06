@@ -201,18 +201,24 @@ def test_tiingo_owns_the_ticker_spelling_so_symbolspec_does_not():
 def test_tiingo_history_needs_its_key_before_it_needs_the_network():
     from qte_shared.interfaces import ProviderNotConfigured
 
-    with pytest.raises(ProviderNotConfigured, match="QTE_TIINGO__API_KEY"):
+    with pytest.raises(ProviderNotConfigured, match="QTE_DATA_PROVIDER_API_KEY"):
         TiingoProvider(TiingoSettings(api_key="")).history_source()
 
 
-def test_tiingo_settings_keep_their_env_names():
+def test_the_vendor_key_is_read_from_one_generic_name():
+    """One key name for whichever vendor is switched on.
+
+    A per-vendor `QTE_TIINGO__API_KEY` meant a deployed secret was invalidated
+    by changing provider — the credential is the one setting that must not
+    move file when the vendor does.
+    """
     import os
 
-    os.environ["QTE_TIINGO__API_KEY"] = "from-env"
+    os.environ["QTE_DATA_PROVIDER_API_KEY"] = "from-env"
     try:
         assert TiingoSettings().api_key == "from-env"
     finally:
-        del os.environ["QTE_TIINGO__API_KEY"]
+        del os.environ["QTE_DATA_PROVIDER_API_KEY"]
 
 
 @pytest.mark.parametrize(

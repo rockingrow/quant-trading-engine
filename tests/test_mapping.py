@@ -12,7 +12,7 @@ import textwrap
 from pathlib import Path
 
 import pytest
-from qte_shared.routing import SymbolRouting
+from qte_shared.strategies.mapping import SymbolMapping
 
 TABLE = """
     [symbols.XAUUSD]
@@ -33,42 +33,42 @@ def write(tmp_path: Path, body: str, name: str = "strategies_mapping.toml") -> P
 
 
 @pytest.fixture
-def routing(tmp_path: Path) -> SymbolRouting:
-    return SymbolRouting.load(write(tmp_path, TABLE))
+def mapping(tmp_path: Path) -> SymbolMapping:
+    return SymbolMapping.load(write(tmp_path, TABLE))
 
 
 # ── Reading it ───────────────────────────────────────────────────────────
 
 
-def test_a_symbol_can_run_several_strategies(routing):
-    assert routing.strategies_for("XAUUSD") == ["GOLD_M15", "GOLD_SCALP"]
+def test_a_symbol_can_run_several_strategies(mapping):
+    assert mapping.strategies_for("XAUUSD") == ["GOLD_M15", "GOLD_SCALP"]
 
 
-def test_a_strategy_can_run_on_several_symbols(routing):
+def test_a_strategy_can_run_on_several_symbols(mapping):
     """The runner asks this way round: it loops over what the loader found."""
-    assert routing.symbols_for("GOLD_M15") == ["XAUUSD", "BTCUSDT"]
-    assert routing.symbols_for("GOLD_SCALP") == ["XAUUSD"]
+    assert mapping.symbols_for("GOLD_M15") == ["XAUUSD", "BTCUSDT"]
+    assert mapping.symbols_for("GOLD_SCALP") == ["XAUUSD"]
 
 
 def test_symbols_are_upper_cased_on_the_way_in(tmp_path):
-    routing = SymbolRouting.load(write(tmp_path, '[symbols.xauusd]\nstrategies = ["A"]\n'))
-    assert routing.symbols == ["XAUUSD"]
-    assert routing.strategies_for("xauusd") == ["A"]
+    mapping = SymbolMapping.load(write(tmp_path, '[symbols.xauusd]\nstrategies = ["A"]\n'))
+    assert mapping.symbols == ["XAUUSD"]
+    assert mapping.strategies_for("xauusd") == ["A"]
 
 
-def test_params_are_per_pair_not_per_strategy(routing):
+def test_params_are_per_pair_not_per_strategy(mapping):
     """One strategy running tighter on gold than on bitcoin is the point."""
-    assert routing.params_for("XAUUSD", "GOLD_M15") == {"risk_percent": 1.0}
-    assert routing.params_for("BTCUSDT", "GOLD_M15") == {}
+    assert mapping.params_for("XAUUSD", "GOLD_M15") == {"risk_percent": 1.0}
+    assert mapping.params_for("BTCUSDT", "GOLD_M15") == {}
 
 
-def test_params_for_a_pair_that_is_not_routed_is_empty(routing):
-    assert routing.params_for("EURUSD", "GOLD_M15") == {}
+def test_params_for_a_pair_that_is_not_mapped_is_empty(mapping):
+    assert mapping.params_for("EURUSD", "GOLD_M15") == {}
 
 
-def test_an_unknown_strategy_routes_to_nothing_rather_than_raising(routing):
+def test_an_unknown_strategy_maps_to_nothing_rather_than_raising(mapping):
     """The runner reports this itself; the parser is not where it is decided."""
-    assert routing.symbols_for("NOT_DEPLOYED") == []
+    assert mapping.symbols_for("NOT_DEPLOYED") == []
 
 
 # ── Absence, and switching things off ────────────────────────────────────
@@ -80,13 +80,13 @@ def test_no_file_is_an_empty_table_not_an_error(tmp_path):
     Empty is falsy, which is what the runner tests to decide whether to fall
     back to each strategy's own ``symbols`` attribute.
     """
-    routing = SymbolRouting.load(tmp_path / "absent.toml")
-    assert not routing
-    assert routing.routes == () and routing.source is None
+    mapping = SymbolMapping.load(tmp_path / "absent.toml")
+    assert not mapping
+    assert mapping.pairings == () and mapping.source is None
 
 
 def test_a_disabled_symbol_keeps_its_configuration_but_trades_nothing(tmp_path):
-    routing = SymbolRouting.load(
+    mapping = SymbolMapping.load(
         write(
             tmp_path,
             """
@@ -96,12 +96,12 @@ def test_a_disabled_symbol_keeps_its_configuration_but_trades_nothing(tmp_path):
             """,
         )
     )
-    assert routing.strategies_for("EURUSD") == []
-    assert routing, "a table that routes nothing is still a table — trade nothing, not the fallback"
+    assert mapping.strategies_for("EURUSD") == []
+    assert mapping, "a table that maps nothing is still a table — trade nothing, not the fallback"
 
 
 def test_defaults_apply_only_where_a_symbol_named_nothing(tmp_path):
-    routing = SymbolRouting.load(
+    mapping = SymbolMapping.load(
         write(
             tmp_path,
             """
@@ -115,8 +115,8 @@ def test_defaults_apply_only_where_a_symbol_named_nothing(tmp_path):
             """,
         )
     )
-    assert routing.strategies_for("XAUUSD") == ["GOLD_M15"]
-    assert routing.strategies_for("BTCUSDT") == ["HOUSE_EDGE"]
+    assert mapping.strategies_for("XAUUSD") == ["GOLD_M15"]
+    assert mapping.strategies_for("BTCUSDT") == ["HOUSE_EDGE"]
 
 
 # ── Refusing a table that would trade the wrong book ─────────────────────
@@ -125,23 +125,23 @@ def test_defaults_apply_only_where_a_symbol_named_nothing(tmp_path):
 def test_the_same_pair_twice_is_refused(tmp_path):
     """Two slots for one pair run the same strategy against itself."""
     with pytest.raises(ValueError, match="twice"):
-        SymbolRouting.load(write(tmp_path, '[symbols.XAUUSD]\nstrategies = ["A", "A"]\n'))
+        SymbolMapping.load(write(tmp_path, '[symbols.XAUUSD]\nstrategies = ["A", "A"]\n'))
 
 
 def test_a_bare_string_says_to_write_a_list(tmp_path):
     """``strategies = "GOLD_M15"`` would otherwise iterate as ten characters."""
     with pytest.raises(ValueError, match=r'strategies = \["GOLD_M15"\]'):
-        SymbolRouting.load(write(tmp_path, '[symbols.XAUUSD]\nstrategies = "GOLD_M15"\n'))
+        SymbolMapping.load(write(tmp_path, '[symbols.XAUUSD]\nstrategies = "GOLD_M15"\n'))
 
 
 def test_a_non_table_symbol_entry_is_refused(tmp_path):
     with pytest.raises(ValueError, match="must be a table"):
-        SymbolRouting.load(write(tmp_path, "[symbols]\nXAUUSD = 1\n"))
+        SymbolMapping.load(write(tmp_path, "[symbols]\nXAUUSD = 1\n"))
 
 
 def test_params_that_are_not_keyed_by_strategy_are_refused(tmp_path):
     with pytest.raises(ValueError, match="params"):
-        SymbolRouting.load(
+        SymbolMapping.load(
             write(
                 tmp_path,
                 """
@@ -158,7 +158,7 @@ def test_malformed_toml_reaches_the_caller(tmp_path):
     import tomllib
 
     with pytest.raises(tomllib.TOMLDecodeError):
-        SymbolRouting.load(write(tmp_path, "[symbols.XAUUSD\n"))
+        SymbolMapping.load(write(tmp_path, "[symbols.XAUUSD\n"))
 
 
 # ── The template is the schema ───────────────────────────────────────────
@@ -168,11 +168,11 @@ def test_the_committed_template_parses():
     """It is the only version of this file anyone can review, so it must be valid."""
     from qte_shared.config import REPO_ROOT
 
-    routing = SymbolRouting.load(REPO_ROOT / "config" / "strategies_mapping.example.toml")
+    mapping = SymbolMapping.load(REPO_ROOT / "config" / "strategies_mapping.example.toml")
 
-    assert routing, "the template should demonstrate at least one pairing"
-    assert "XAUUSD" in routing.symbols
-    assert "EURUSD" not in routing.symbols, "the template's disabled symbol stays disabled"
+    assert mapping, "the template should demonstrate at least one pairing"
+    assert "XAUUSD" in mapping.symbols
+    assert "EURUSD" not in mapping.symbols, "the template's disabled symbol stays disabled"
 
 
 def test_the_real_table_is_not_committed():

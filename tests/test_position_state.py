@@ -22,7 +22,7 @@ NOW = datetime(2026, 5, 1, 10, 0, tzinfo=UTC)
 def _position(**kwargs) -> OpenPosition:
     defaults = {
         "signal_uxid": "9F2C4B7E18A3D605",
-        "strategy": "MT5_GOLD_M5_V1",
+        "strategy": "MT5_GOLD_SCALP",
         "symbol": "XAUUSD",
         "action": SignalAction.LONG,
         "opened_at": NOW,
@@ -113,7 +113,7 @@ def test_a_position_survives_a_json_round_trip():
 def test_redis_reads_back_what_it_wrote():
     position = _position()
     decoded = _decode_position(
-        position.model_dump_json(), strategy="MT5_GOLD_M5_V1", symbol="XAUUSD"
+        position.model_dump_json(), strategy="MT5_GOLD_SCALP", symbol="XAUUSD"
     )
     assert decoded == position
 
@@ -121,10 +121,10 @@ def test_redis_reads_back_what_it_wrote():
 def test_a_cycle_stored_before_this_record_existed_is_still_readable():
     """Redis holds bare uxid strings from older runners. Discarding one would
     orphan a live position at exactly the moment the runner is upgraded."""
-    decoded = _decode_position("9F2C4B7E18A3D605", strategy="MT5_GOLD_M5_V1", symbol="XAUUSD")
+    decoded = _decode_position("9F2C4B7E18A3D605", strategy="MT5_GOLD_SCALP", symbol="XAUUSD")
     assert decoded is not None
     assert decoded.signal_uxid == "9F2C4B7E18A3D605"
-    assert decoded.strategy == "MT5_GOLD_M5_V1"
+    assert decoded.strategy == "MT5_GOLD_SCALP"
     assert decoded.remaining is None
 
 

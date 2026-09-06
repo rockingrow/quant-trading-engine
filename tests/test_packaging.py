@@ -135,9 +135,9 @@ def test_the_simulator_still_refuses_outside_dev():
     what stands between an invented feed and a non-dev environment. Both
     server and provider call ``require_dev_env()``; if either loses that call
     a compose ``up`` would happily fabricate prices in staging or prod."""
-    server = (
-        REPO_ROOT / "engines/market_simulator/src/qte_simulator/server.py"
-    ).read_text(encoding="utf-8")
+    server = (REPO_ROOT / "engines/market_simulator/src/qte_simulator/server.py").read_text(
+        encoding="utf-8"
+    )
     provider = (
         REPO_ROOT / "engines/shared/src/qte_shared/providers/simulator/provider.py"
     ).read_text(encoding="utf-8")

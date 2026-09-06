@@ -1,6 +1,6 @@
 """What "a valid QTE strategy" means, expressed as checks that name their fix.
 
-:mod:`qte_shared.strategy_base` holds the contract; this holds the *diagnosis*.
+:mod:`qte_shared.strategies.strategy_base` holds the contract; this holds the *diagnosis*.
 The split is deliberate: the loader only ever needs a yes or no, and paying for
 signature inspection and instantiation on every process start to produce a
 richer answer nobody reads would be the wrong trade. The audit is where the
@@ -19,7 +19,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from qte_shared.strategy_base import (
+from qte_shared.strategies.strategy_base import (
     OPTIONAL_SIGNAL_METHODS,
     REQUIRED_SIGNAL_METHODS,
     SIGNAL_METHOD_ARITY,
@@ -103,7 +103,7 @@ def check_strategy(name: str, candidate: Any, source: Path, via: str) -> Strateg
     Checks are structural throughout — ``getattr`` and ``inspect``, never
     ``issubclass`` — because a plugin repository restates the contract on its
     own side rather than importing ours. See the module docstring of
-    :mod:`qte_shared.strategy_base`.
+    :mod:`qte_shared.strategies.strategy_base`.
     """
     audit = StrategyAudit(
         name=name,
@@ -142,7 +142,7 @@ def _check_drivable(name: str, candidate: Any, source: Path) -> list[Finding]:
                 "name, timeframe and warmup attributes"
             ),
             fix=(
-                "subclass qte_shared.strategy_base.SignalStrategy, or restate that "
+                "subclass qte_shared.strategies.strategy_base.SignalStrategy, or restate that "
                 "interface on the plugin's side - see 'How strategies are found' in "
                 "the README"
             ),

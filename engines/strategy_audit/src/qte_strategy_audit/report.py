@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from qte_shared.routing import SymbolRouting
+from qte_shared.strategies.mapping import SymbolMapping
 
 from qte_strategy_audit.contract import Finding, Severity, StrategyAudit
 
@@ -22,9 +22,9 @@ class AuditReport:
 
     directory: Path
     strategies: list[StrategyAudit] = field(default_factory=list)
-    #: Findings about the directory or the routing table rather than one class.
+    #: Findings about the directory or the mapping table rather than one class.
     findings: list[Finding] = field(default_factory=list)
-    routing: SymbolRouting = field(default_factory=SymbolRouting)
+    mapping: SymbolMapping = field(default_factory=SymbolMapping)
 
     # ── Rollup ────────────────────────────────────────────────────────
 
@@ -53,7 +53,7 @@ class AuditReport:
     def as_dict(self) -> dict[str, Any]:
         return {
             "directory": str(self.directory),
-            "routing": str(self.routing.source) if self.routing.source else None,
+            "mapping": str(self.mapping.source) if self.mapping.source else None,
             "ok": self.ok,
             "counts": {
                 "strategies": len(self.strategies),
@@ -75,8 +75,8 @@ class AuditReport:
         renderings below are written for files and keep their typography.
         """
         lines = [f"Strategy audit - {self.directory}"]
-        if self.routing.source:
-            lines.append(f"Routing table  - {self.routing.source}")
+        if self.mapping.source:
+            lines.append(f"Mapping table  - {self.mapping.source}")
         lines.append("")
 
         if not self.strategies:
@@ -91,7 +91,7 @@ class AuditReport:
             lines.append("")
 
         if self.findings:
-            lines.append("  Directory and routing")
+            lines.append("  Directory and mapping")
             lines.extend(_finding_lines(self.findings, indent=9))
             lines.append("")
 
@@ -109,8 +109,8 @@ class AuditReport:
             "",
             f"- Directory: `{self.directory}`",
         ]
-        if self.routing.source:
-            lines.append(f"- Routing: `{self.routing.source}`")
+        if self.mapping.source:
+            lines.append(f"- Mapping: `{self.mapping.source}`")
         lines += [
             f"- {len(self.strategies)} strategies, {len(self.errors)} errors, "
             f"{len(self.warnings)} warnings",
