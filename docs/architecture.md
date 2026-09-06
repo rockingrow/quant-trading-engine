@@ -246,10 +246,12 @@ is deployed is worse than no audit. Judgement is what it adds: signature arity,
 instantiability, the signal surface, duplicate names, and the mapping table
 cross-checked in both directions.
 
-It is its own workspace member because it has no business in the runner's image.
+It is its own service, and its own container, because auditing is not trading.
 The runner imports strategies to trade them; the auditor imports them to refuse
-them, and mixing the two would put `inspect.signature` calls and a findings
-model in the process that is supposed to be reacting to a candle close.
+them, and merging the two would put `inspect.signature` calls and a findings
+model in the code path that is supposed to be reacting to a candle close. The
+runner does reach for it once, at start-up, and that is the single exception
+`tests/test_packaging.py` records by name.
 
 ## Why symbol → strategy pairing lives in a file
 
@@ -326,15 +328,22 @@ strategy backtests profitably.
 ## Why the repo root is searched for, not counted
 
 `qte_shared.config` resolves `.env`, `__strategies__/` and `data/` relative to
-the workspace root, and it finds that root by walking up until it hits the
-`pyproject.toml` that declares `[tool.uv.workspace]` — not by counting parent
+the repository root, and it finds that root by walking up until it hits the
+`pyproject.toml` carrying the `[tool.qte]` table — not by counting parent
 directories.
 
-The difference matters because the counted version does not break loudly. Moving
-`shared/` to `engines/shared/` adds one level, and `parents[2]` then points at
-`engines/`: the engine keeps starting, silently reads no `.env`, and looks for
-strategies in a directory that does not exist. Identifying the root by its
-marker makes the layout free to change.
+The difference matters because the counted version does not break loudly.
+`engines/shared/src/qte_shared/` became `src/qte_shared/` and lost two levels;
+a `parents[3]` would now point somewhere inside the repository, and the engine
+would keep starting, silently read no `.env`, and look for strategies in a
+directory that does not exist. Identifying the root by a marker is what made
+that move a rename rather than a debugging session.
+
+The marker is a table with one key in it and no settings, which is exactly why
+`tests/test_packaging.py` asserts it exists: it looks like clutter, and nothing
+else would fail loudly if someone tidied it away. It cannot be `[project]`,
+which every mounted strategy repo also has, or the first `pyproject.toml` above
+a plugin would win.
 
 ## Why the strategy sees a bounded window
 
@@ -357,15 +366,28 @@ between bars, which is a real design change rather than a tuning exercise.
 
 ## Why each service builds its own image
 
-The workspace was split so that `uv sync --package` would have a boundary to cut
-along; the Dockerfile now actually cuts there. `QTE_PACKAGE` selects one member,
-and the difference is not cosmetic — the full workspace venv is 352 MB against
-~142 MB per service, mostly pyarrow, which only the backtest engine needs.
+This used to be a uv workspace of six distributions, and `uv sync --package`
+cut the images along that seam. It no longer is, because the seam was in the
+wrong place: all six services are 612 KB of Python against a 364 MB venv, so
+splitting the *code* six ways bought nothing. What costs money is what gets
+installed — pyarrow alone is 84 MB, and numba plus llvmlite, which the mounted
+strategy plugins drag into the runner's process, are another 104 MB.
 
-The boundary only holds if the manifests stay honest, so
-`tests/test_packaging.py` asserts the dependency graph is a star: leaf engines
-may depend on `qte-shared` and nothing else in the workspace. A direct edge
-between two leaves is how a microservice boundary quietly stops being one.
+So the images are cut by `[project.optional-dependencies]` instead. `QTE_EXTRAS`
+in the Dockerfile selects them and `docker-compose.yml` passes the set each
+service needs: ingestion takes `tiingo simulator`, the runner takes `broker`,
+and the auditor and the migrator take none at all. A live container that never
+replays history therefore never installs a parquet stack, which was the point
+all along.
+
+Collapsing the workspace cost one thing worth naming. A resolver refuses to
+install what a manifest does not declare; a single package cannot refuse
+anything, so `from qte_backtest.replay import ...` inside ingestion would simply
+work. `tests/test_packaging.py` replaces that guarantee by parsing the imports
+themselves and asserting the graph is still a star: a service may reach
+`qte_shared` and nothing else. That is strictly the better check — a declared
+dependency was only ever a proxy for the import — but it is a check somebody
+has to keep running, where the resolver enforced it for free.
 
 ## Why the market data vendor sits behind an interface
 

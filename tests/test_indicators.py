@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+
 from qte_shared.indicators import (
     atr,
     bollinger,

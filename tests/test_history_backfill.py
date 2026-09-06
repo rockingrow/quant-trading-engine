@@ -13,6 +13,7 @@ from datetime import UTC, datetime, timedelta
 
 import pandas as pd
 import pytest
+
 from qte_ingestion.backfill import (
     HistoryBackfiller,
     _frame_to_candles,

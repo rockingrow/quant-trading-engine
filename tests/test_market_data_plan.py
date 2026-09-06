@@ -12,6 +12,7 @@ a live feed: a malformed file, and a credential written into a tracked file.
 from __future__ import annotations
 
 import pytest
+
 from qte_shared.market_data_plan import MarketDataPlan, SymbolFeed
 
 EXAMPLE = "config/tiingo.example.toml"

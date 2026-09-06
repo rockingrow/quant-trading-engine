@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import pandas as pd
 import pytest
+
 from qte_backtest.replay import BacktestEngine
 from qte_shared.strategies.strategy_base import MIN_HISTORY_WINDOW, StrategyBase
 

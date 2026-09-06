@@ -1,9 +1,9 @@
 # Local development overlay — `make dev` loads it with
 # `-f docker-compose.yml -f docker-compose.dev.yml`; nothing else does.
 #
-# It bind-mounts the workspace source over the copy baked into the image. The
-# engines are installed editable in the image (uv writes _editable_impl_qte_*.pth
-# pointing at /app/engines/<pkg>/src), so a host edit is live in the container at
+# It bind-mounts the source over the copy baked into the image. The project is
+# installed editable in the image (uv writes an _editable_impl_*.pth pointing at
+# /app/src), so a host edit is live in the container at
 # once — restart the process to pick it up (`make dev-restart`), no rebuild.
 #
 # Compose merges the `volumes:` list by appending, so the read-only
@@ -19,20 +19,20 @@ name: qte
 services:
   data-ingestion:
     volumes:
-      - ./engines:/app/engines
+      - ./src:/app/src
 
   strategy-runner:
     volumes:
-      - ./engines:/app/engines
+      - ./src:/app/src
 
   market-simulator:
     volumes:
-      - ./engines:/app/engines
+      - ./src:/app/src
 
   # The one-shot migrator reads the migrations tree and alembic.ini too, so a
   # migration can be iterated without rebuilding its image.
   db-migrate:
     volumes:
-      - ./engines:/app/engines
+      - ./src:/app/src
       - ./migrations:/app/migrations
       - ./alembic.ini:/app/alembic.ini

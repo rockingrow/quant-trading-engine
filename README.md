@@ -75,7 +75,7 @@ turn shadow mode off — see
 
 **Development — no vendor key, no market open.**
 
-`make dev` is the same stack with `engines/` bind-mounted for live editing, and
+`make dev` is the same stack with `src/` bind-mounted for live editing, and
 `QTE_MARKET_DATA__PROVIDER=simulator` swaps the vendor for a WebSocket feed you
 drive by hand, so the real pipeline runs on invented prices.
 
@@ -713,11 +713,14 @@ make up
 make logs
 ```
 
-Each service builds its **own image**: `QTE_PACKAGE` selects one workspace
-member, so the ingestion container does not carry pyarrow (152 MB, backtest
-only) or the backtest engine at all. A full-workspace venv is 352 MB; each
-service's is ~142 MB. The backtest CLI is deliberately in no container —
-replaying history is done on the host, not inside the live trading process.
+Each service builds its **own image**: `QTE_EXTRAS` selects which
+`[project.optional-dependencies]` get installed, so the ingestion container
+carries the vendor's socket but no pyarrow (84 MB, backtest only), and the
+runner carries the broker's HTTP client and neither of the other two. Every
+image ships all six services' modules, which is 612 KB against a venv of a few
+hundred; the dependencies are the whole difference. The backtest CLI is
+deliberately in no container — replaying history is done on the host, not
+inside the live trading process.
 
 `docker-compose.yml` ships a `nats` service for standalone development. In
 production you normally point `QTE_BROKER__NATS_URL` at the **broker's** NATS,

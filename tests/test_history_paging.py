@@ -13,6 +13,7 @@ from datetime import date, datetime, timedelta
 import httpx
 import pandas as pd
 import pytest
+
 from qte_shared.history_cache import HistoryCache, covers, merge_frames
 from qte_shared.interfaces import HistoryRequest
 from qte_shared.providers.tiingo import TiingoSettings

@@ -1,177 +1,266 @@
-"""The workspace boundaries that let each service ship its own image.
+"""The boundaries that let one distribution still ship as several images.
 
-`uv sync --package X` can only cut along a boundary the manifests actually
-declare. If an engine picks up a dependency it does not need — or reaches into
-another engine's modules — the images silently converge back into one.
+There is no uv workspace any more: a single package carries every service's
+modules, 612 KB of them against a venv two orders of magnitude larger. Two
+things follow, and this file asserts both.
+
+What separates the images is now which ``[project.optional-dependencies]`` an
+image installs, not which modules it carries -- so the extras have to stay
+honest about who actually opens a socket or reads a parquet file.
+
+What keeps the services separable is no longer a manifest, which could not
+express a bad import even when it wanted to. It is
+``test_no_service_imports_another_except_through_shared`` below, which reads the
+imports themselves. That is a stricter check than the manifest graph it
+replaced: a declared dependency was only ever a proxy for the import.
 """
 
 from __future__ import annotations
 
+import ast
+import re
 import tomllib
 from pathlib import Path
 
 import pytest
+
 from qte_shared.config import REPO_ROOT
 
-ENGINES = REPO_ROOT / "engines"
+SRC = REPO_ROOT / "src"
 
-#: Every workspace member, so a new engine is covered by these checks the
-#: moment it exists rather than whenever someone remembers to list it.
-ALL_ENGINES = (
-    "shared",
-    "data_ingestion",
-    "backtest_engine",
-    "strategy_engine",
-    "strategy_audit",
-    "market_simulator",
+#: Every service package, so a new one is covered by these checks the moment it
+#: exists rather than whenever someone remembers to list it.
+SERVICES = (
+    "qte_shared",
+    "qte_ingestion",
+    "qte_backtest",
+    "qte_strategy_engine",
+    "qte_strategy_audit",
+    "qte_simulator",
 )
 
-#: The leaves. `shared` is the hub every one of them depends on.
-LEAF_ENGINES = tuple(name for name in ALL_ENGINES if name != "shared")
+#: The leaves. ``qte_shared`` is the hub every one of them depends on.
+LEAF_SERVICES = tuple(name for name in SERVICES if name != "qte_shared")
 
 #: The one edge between two leaves, and the reason it is not a hole in the star.
 #:
-#: The runner audits its own book before it trades — QTE_RUNNER__AUDIT_ON_START,
-#: see `qte_strategy_engine.preflight` — so the runner image carries the auditor.
-#: The rule exists so an image does not pick up weight it has no use for, and
-#: qte-strategy-audit brings nothing but qte-shared; the test below keeps it that
-#: way, which is what makes this exception cost nothing. Any other pair of leaves
-#: still has to meet in shared.
-ALLOWED_LEAF_EDGES = {("strategy_engine", "strategy_audit")}
+#: The runner audits its own book before it trades -- QTE_RUNNER__AUDIT_ON_START,
+#: see ``qte_strategy_engine.preflight`` -- so the runner imports the auditor.
+#: The rule exists so a service does not grow a private line to another; the
+#: auditor reaches for nothing but ``qte_shared``, which the check below keeps
+#: true. Any other pair of leaves still has to meet in shared.
+ALLOWED_LEAF_EDGES = {("qte_strategy_engine", "qte_strategy_audit")}
+
+#: Standard-library roots the auditor is allowed to import. Everything outside
+#: this set and outside SERVICES is a third-party dependency, which is what
+#: ``test_the_audited_leaf_edge_carries_no_third_party_weight`` is watching for.
+STANDARD_LIBRARY = {
+    "__future__",
+    "argparse",
+    "collections",
+    "contextlib",
+    "dataclasses",
+    "enum",
+    "importlib",
+    "inspect",
+    "json",
+    "logging",
+    "os",
+    "pathlib",
+    "sys",
+    "tomllib",
+    "types",
+    "typing",
+}
 
 
-def _manifest(name: str) -> dict:
-    return tomllib.loads((ENGINES / name / "pyproject.toml").read_text(encoding="utf-8"))
+def _manifest() -> dict:
+    return tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
 
-def _dependencies(name: str) -> list[str]:
-    return _manifest(name)["project"].get("dependencies", [])
+def _dependencies() -> list[str]:
+    return _manifest()["project"]["dependencies"]
+
+
+def _extras() -> dict[str, list[str]]:
+    return _manifest()["project"].get("optional-dependencies", {})
 
 
 def _distribution(requirement: str) -> str:
-    """The distribution a requirement names, with any extras/specifier stripped.
-
-    `qte-shared[tiingo]` is still an edge to `qte-shared`; without this the
-    extras syntax would slip past the star-graph check below unnoticed.
-    """
+    """The distribution a requirement names, with any extras/specifier stripped."""
     for separator in ("[", ">", "<", "=", "!", "~", ";", " "):
         requirement = requirement.split(separator)[0]
     return requirement.strip()
 
 
-@pytest.mark.parametrize("engine", ALL_ENGINES)
-def test_every_engine_uses_the_src_layout(engine):
-    manifest = _manifest(engine)
-    packages = manifest["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"]
-    assert len(packages) == 1
-    package = packages[0]
-    assert package.startswith("src/"), "the importable package lives under src/"
-    assert (ENGINES / engine / package).is_dir()
+def _imported_roots(path: Path) -> set[str]:
+    """Top-level module names this file imports, absolute imports only.
+
+    A relative import cannot leave its own package, so it is not a boundary
+    crossing and does not need to be resolved here.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    roots: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            roots.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            roots.add(node.module.split(".")[0])
+    return roots
 
 
-@pytest.mark.parametrize("engine", ALL_ENGINES)
-def test_engine_folders_use_underscores(engine):
-    assert "-" not in engine
+def _service_files(service: str) -> list[Path]:
+    return sorted((SRC / service).rglob("*.py"))
 
 
-def test_only_the_backtest_engine_pulls_in_pyarrow():
-    """It is 152 MB of the venv; the live containers must not carry it."""
-    assert any(dep.startswith("pyarrow") for dep in _dependencies("backtest_engine"))
-    for other in (name for name in ALL_ENGINES if name != "backtest_engine"):
-        assert not any(dep.startswith("pyarrow") for dep in _dependencies(other))
+# -- Layout -----------------------------------------------------------------
 
 
-def test_no_engine_depends_on_another_engine_except_through_shared():
+@pytest.mark.parametrize("service", SERVICES)
+def test_every_service_sits_directly_under_src(service):
+    """One level from src/ to the code, and the folder is the import name.
+
+    The folder name is a global in site-packages, which is what the ``qte_``
+    prefix is for; nothing may sit between src/ and it.
+    """
+    package = SRC / service
+    assert package.is_dir()
+    assert (package / "__init__.py").is_file()
+    assert package.parent == SRC
+
+
+def test_the_wheel_ships_exactly_the_services_on_disk():
+    """A service that exists but is not listed simply is not installed.
+
+    hatchling packages what ``packages`` names and nothing else, so a new folder
+    under src/ that nobody added there imports fine in the editable dev venv and
+    is missing from every image.
+    """
+    declared = set(_manifest()["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"])
+    on_disk = {f"src/{path.name}" for path in SRC.iterdir() if (path / "__init__.py").is_file()}
+    assert declared == on_disk
+
+
+def test_no_source_file_lives_outside_a_service_package():
+    strays = list(SRC.glob("*.py"))
+    assert not strays, f"src/ has Python files outside a service package: {strays}"
+
+
+# -- The boundary ------------------------------------------------------------
+
+
+def test_no_service_imports_another_except_through_shared():
     """The dependency graph is a star, not a mesh.
 
-    Anything two engines both need belongs in shared. A direct edge between two
-    leaf engines is how a microservice boundary quietly stops being one.
+    Anything two services both need belongs in shared. A direct edge between two
+    leaves is how a service boundary quietly stops being one -- and with a single
+    distribution there is no resolver left to notice, so this is the only thing
+    standing there.
     """
-    workspace_packages = {
-        "qte-shared": "shared",
-        "qte-ingestion": "data_ingestion",
-        "qte-backtest": "backtest_engine",
-        "qte-strategy-engine": "strategy_engine",
-        "qte-strategy-audit": "strategy_audit",
-        "qte-simulator": "market_simulator",
-    }
-    for engine in LEAF_ENGINES:
-        for dep in _dependencies(engine):
-            owner = workspace_packages.get(_distribution(dep))
-            if (engine, owner) in ALLOWED_LEAF_EDGES:
-                continue
-            assert owner in (None, "shared"), (
-                f"{engine} depends on {dep}; route it through qte-shared instead"
-            )
-    assert not any(_distribution(dep) in workspace_packages for dep in _dependencies("shared"))
+    offenders: list[str] = []
+    for service in LEAF_SERVICES:
+        for path in _service_files(service):
+            for imported in _imported_roots(path):
+                if imported not in SERVICES or imported in (service, "qte_shared"):
+                    continue
+                if (service, imported) in ALLOWED_LEAF_EDGES:
+                    continue
+                offenders.append(f"{path.relative_to(REPO_ROOT)} imports {imported}")
+    assert not offenders, "route these through qte_shared instead: " + "; ".join(offenders)
+
+
+def test_shared_imports_no_service():
+    """The hub may not reach back into a spoke.
+
+    An import in this direction is a cycle: the service that shared reaches for
+    already imports shared, and every other service then carries it too.
+    """
+    offenders: list[str] = []
+    for path in _service_files("qte_shared"):
+        for imported in _imported_roots(path):
+            if imported in LEAF_SERVICES:
+                offenders.append(f"{path.relative_to(REPO_ROOT)} imports {imported}")
+    assert not offenders, "shared reached into a service: " + "; ".join(offenders)
 
 
 def test_the_audited_leaf_edge_carries_no_third_party_weight():
     """What makes ALLOWED_LEAF_EDGES safe, asserted rather than assumed.
 
-    The runner is allowed to depend on the auditor because depending on it
-    installs four modules and nothing else. The day qte-strategy-audit grows a
-    dependency of its own, that stops being true and this fails — which is the
-    moment to decide whether the runner should still carry it.
+    The runner is allowed to import the auditor because the auditor imports
+    nothing but shared, pandas and the standard library. The day it grows a
+    dependency of its own that stops being true, and this is the moment to
+    decide whether the runner should still carry it.
     """
-    assert [_distribution(dep) for dep in _dependencies("strategy_audit")] == ["qte-shared"]
+    third_party: set[str] = set()
+    for path in _service_files("qte_strategy_audit"):
+        third_party |= {
+            imported
+            for imported in _imported_roots(path)
+            if imported not in SERVICES and imported not in STANDARD_LIBRARY
+        }
+    assert third_party <= {"pandas"}, f"the auditor grew dependencies: {sorted(third_party)}"
 
 
-def test_the_dockerfile_selects_a_single_package():
-    dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
-    assert "ARG QTE_PACKAGE" in dockerfile
-    assert "--package ${QTE_PACKAGE}" in dockerfile
+def test_no_python_file_still_imports_from_a_stale_path():
+    for path in SRC.rglob("*.py"):
+        source = path.read_text(encoding="utf-8")
+        assert "qte_api" not in source, f"{path} references the removed API gateway"
 
 
-def test_compose_builds_a_different_image_per_service():
-    compose = (REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
-    assert "QTE_PACKAGE: qte-ingestion" in compose
-    assert "QTE_PACKAGE: qte-strategy-engine" in compose
-    assert "QTE_PACKAGE: qte-simulator" in compose
+# -- What an image installs --------------------------------------------------
 
 
-def test_the_simulator_still_refuses_outside_dev():
-    """`docker compose up` starts the simulator, so the in-process guard is
-    what stands between an invented feed and a non-dev environment. Both
-    server and provider call ``require_dev_env()``; if either loses that call
-    a compose ``up`` would happily fabricate prices in staging or prod."""
-    server = (REPO_ROOT / "engines/market_simulator/src/qte_simulator/server.py").read_text(
-        encoding="utf-8"
-    )
-    provider = (
-        REPO_ROOT / "engines/shared/src/qte_shared/providers/simulator/provider.py"
-    ).read_text(encoding="utf-8")
-    assert "require_dev_env" in server
-    assert "require_dev_env" in provider
+def test_pyarrow_is_an_extra_not_a_core_dependency():
+    """It is 84 MB of the venv; the live containers must not carry it."""
+    assert not any(_distribution(dep) == "pyarrow" for dep in _dependencies())
+    assert any(dep.startswith("pyarrow") for dep in _extras()["parquet"])
 
 
-def test_the_lockfile_points_at_the_renamed_engine_folders():
-    lock = (REPO_ROOT / "uv.lock").read_text(encoding="utf-8")
-    for engine in ALL_ENGINES:
-        assert f'editable = "engines/{engine}"' in lock
-    assert "engines/data-ingestion" not in lock
+def test_a_market_data_vendors_client_libraries_are_an_extra():
+    """The runner opens no socket to a data vendor; it must not install one.
 
-
-def test_no_source_file_lives_outside_a_src_directory():
-    for engine in ENGINES.iterdir():
-        if not engine.is_dir():
-            continue
-        strays = [path for path in engine.glob("*.py") if path.name != "setup.py"]
-        assert not strays, f"{engine.name} has Python files outside src/: {strays}"
-
-
-def test_the_repo_root_is_not_itself_an_installable_package():
-    root = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    assert root["tool"]["uv"]["package"] is False
-    assert root["tool"]["uv"]["workspace"]["members"] == ["engines/*"]
-
-
-def test_paths_in_the_dockerfile_match_the_engines_on_disk():
-    dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
-    for engine in ALL_ENGINES:
-        assert f"engines/{engine}/pyproject.toml" in dockerfile, (
-            f"Dockerfile does not copy {engine}'s manifest; the frozen sync would fail"
+    Vendor clients hang off an extra, so an image pulls in only the provider it
+    is configured to use -- see ``qte_shared.providers``.
+    """
+    extras = _extras()
+    assert "tiingo" in extras
+    for dep in _dependencies():
+        assert _distribution(dep) not in ("httpx", "websockets"), (
+            f"{dep} belongs in a provider extra, not in the core dependencies"
         )
+
+
+def test_the_dockerfile_selects_extras_rather_than_packages():
+    dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert "ARG QTE_EXTRAS" in dockerfile
+    assert "--extra $extra" in dockerfile
+    assert "COPY src/ src/" in dockerfile
+    assert "QTE_PACKAGE" not in dockerfile, "the workspace is gone; so is --package"
+
+
+def test_compose_gives_each_service_only_the_extras_it_opens():
+    compose = (REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    assert 'QTE_EXTRAS: "tiingo simulator"' in compose, "ingestion reads the vendor feed"
+    assert 'QTE_EXTRAS: "broker"' in compose, "the runner posts to algo-trading-broker"
+    assert 'QTE_EXTRAS: "simulator"' in compose, "the simulator serves a WebSocket"
+    selected = re.findall(r'QTE_EXTRAS:\s*"([^"]*)"', compose)
+    assert selected, "no service selects its extras"
+    assert not any("parquet" in extras for extras in selected), (
+        "no live container installs the parquet stack; replay is a host job"
+    )
+
+
+def test_the_image_carries_what_the_wheel_build_reads():
+    """The root manifest names a readme, so the build needs the file itself.
+
+    Nothing in the dev venv notices: the editable install is already built by
+    the time anyone runs a test. Only `docker build` fails, and only on the
+    layer after the dependency cache, which is a slow place to learn it.
+    """
+    dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    readme = _manifest()["project"].get("readme")
+    assert readme, "drop this test if the manifest stops naming a readme"
+    assert readme in dockerfile, f"the image never copies {readme}; the wheel build will fail"
 
 
 def test_migrations_are_copied_into_the_image():
@@ -181,71 +270,72 @@ def test_migrations_are_copied_into_the_image():
     assert "COPY alembic.ini" in dockerfile
 
 
-def test_docs_do_not_reference_the_old_hyphenated_folders():
-    for document in (REPO_ROOT / "README.md", *(REPO_ROOT / "docs").glob("*.md")):
-        text = document.read_text(encoding="utf-8")
-        for stale in ("data-ingestion/", "backtest-engine/", "strategy-engine/"):
-            assert stale not in text, f"{document.name} still says {stale}"
+# -- The manifest ------------------------------------------------------------
 
 
-def test_no_python_file_still_imports_from_a_stale_path():
-    for path in ENGINES.rglob("*.py"):
-        source = path.read_text(encoding="utf-8")
-        assert "qte_api" not in source, f"{path} references the removed API gateway"
+def test_the_repo_root_declares_the_marker_table():
+    """``qte_shared.config._find_repo_root()`` walks up looking for this table.
+
+    It has no settings in it and exists only to be found, which is exactly why
+    it is worth a test: nothing else would fail loudly if someone tidied it away.
+    """
+    assert _manifest()["tool"]["qte"]["repo-root"] is True
 
 
-def test_src_layout_keeps_tests_off_the_source_tree(monkeypatch):
-    import qte_shared
-
-    location = Path(qte_shared.__file__).resolve()
-    # Editable installs still point at the tree, but through src/ — which is the
-    # marker that the thing being imported is the packaged artefact.
-    assert location.parent.parent.name == "src"
+def test_the_lockfile_describes_one_editable_root():
+    lock = (REPO_ROOT / "uv.lock").read_text(encoding="utf-8")
+    assert 'source = { editable = "." }' in lock
+    assert 'editable = "engines/' not in lock, "a workspace member survived the merge"
 
 
-def test_every_manifest_pins_the_same_python() -> None:
+def test_python_is_pinned_to_the_one_interpreter_the_plugins_run_on() -> None:
     """One process runs the engine *and* the plugins, so one interpreter does.
 
-    `pandas-ta` — which the mounted strategy repo builds its indicators on —
-    requires >=3.12 and hard-pins a numba with no 3.14 wheel. A workspace member
-    left on a wider range would resolve differently from the rest and only fail
-    on whichever machine picked the other version.
+    ``pandas-ta`` -- which the mounted strategy repo builds its indicators on --
+    requires >=3.12 and hard-pins a numba with no 3.14 wheel.
     """
-    root = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    expected = root["project"]["requires-python"]
-
-    assert expected == ">=3.13,<3.14"
-    for engine in ALL_ENGINES:
-        assert _manifest(engine)["project"]["requires-python"] == expected, engine
+    assert _manifest()["project"]["requires-python"] == ">=3.13,<3.14"
 
 
 def test_the_numpy_ceiling_the_plugins_need_is_declared() -> None:
     """numba refuses NumPy above 2.2, and it is in the runner's process.
 
-    Expressed as a uv constraint rather than an upper bound on qte-shared's own
-    numpy dependency, because nothing in this repo actually needs the ceiling —
-    see `[tool.uv]` in the root manifest.
+    Expressed as a uv constraint rather than an upper bound on the numpy
+    dependency, because nothing in this repo actually needs the ceiling -- see
+    ``[tool.uv]`` in the manifest.
     """
-    root = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    assert "numpy<2.3" in root["tool"]["uv"]["constraint-dependencies"]
+    assert "numpy<2.3" in _manifest()["tool"]["uv"]["constraint-dependencies"]
 
 
-def test_a_market_data_vendors_client_libraries_are_an_extra_not_a_core_dependency():
-    """The runner opens no socket to a data vendor; it must not install one.
+# -- Runtime -----------------------------------------------------------------
 
-    Vendor clients hang off `qte-shared` as extras, so an image pulls in only
-    the provider it is configured to use — see `qte_shared.providers`.
-    """
-    shared = _manifest("shared")["project"]
-    extras = shared.get("optional-dependencies", {})
-    assert "tiingo" in extras
-    vendor_clients = ("httpx", "websockets")
-    for dep in shared["dependencies"]:
-        assert not _distribution(dep).startswith(vendor_clients), (
-            f"{dep} belongs in a provider extra, not in qte-shared's core dependencies"
-        )
-    for engine in ("strategy_engine", "strategy_audit"):
-        for dep in _dependencies(engine):
-            assert "[" not in dep or not dep.startswith("qte-shared["), (
-                f"{engine} pulls a market data vendor it does not use: {dep}"
-            )
+
+def test_the_simulator_still_refuses_outside_dev():
+    """``docker compose up`` starts the simulator, so the in-process guard is
+    what stands between an invented feed and a non-dev environment. Both
+    server and provider call ``require_dev_env()``; if either loses that call
+    a compose ``up`` would happily fabricate prices in staging or prod."""
+    server = (SRC / "qte_simulator" / "server.py").read_text(encoding="utf-8")
+    provider = (SRC / "qte_shared" / "providers" / "simulator" / "provider.py").read_text(
+        encoding="utf-8"
+    )
+    assert "require_dev_env" in server
+    assert "require_dev_env" in provider
+
+
+def test_the_imported_package_is_the_source_tree():
+    import qte_shared
+
+    location = Path(qte_shared.__file__).resolve()
+    # src/qte_shared/__init__.py -- the editable install puts src/ on sys.path,
+    # so an import that resolved anywhere else (a stale wheel, a copy left in the
+    # working tree) shows up here rather than as a behaviour difference nobody
+    # traces back to packaging.
+    assert location.parent.parent == SRC.resolve()
+
+
+def test_docs_do_not_reference_the_old_hyphenated_folders():
+    for document in (REPO_ROOT / "README.md", *(REPO_ROOT / "docs").glob("*.md")):
+        text = document.read_text(encoding="utf-8")
+        for stale in ("data-ingestion/", "backtest-engine/", "strategy-engine/"):
+            assert stale not in text, f"{document.name} still says {stale}"

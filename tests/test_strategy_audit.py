@@ -17,6 +17,7 @@ import textwrap
 from pathlib import Path
 
 import pytest
+
 from qte_strategy_audit import Severity, StrategyAuditor
 
 #: A plugin repo's own restatement of the QTE interface — five abstract signal
