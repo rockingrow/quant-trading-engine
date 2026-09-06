@@ -9,13 +9,16 @@ help: ## Show this help, grouped by section
 		$(MAKEFILE_LIST)
 	@echo
 
-##@ Workspace
+##@ Project
 
-install: ## Sync the uv workspace (runtime deps only)
-	uv sync --no-dev
+# --all-extras locally: one venv has to run every entry point, including
+# `make backtest` (pyarrow) and `make simulator` (websockets). The images are
+# the place where extras get selected, not the developer's machine.
+install: ## Sync the environment (runtime deps only)
+	uv sync --no-dev --all-extras
 
-install-dev: ## Sync the workspace with dev tooling
-	uv sync
+install-dev: ## Sync the environment with dev tooling
+	uv sync --all-extras
 
 lock: ## Refresh uv.lock
 	uv lock
@@ -212,9 +215,6 @@ market-plan: ## Fail unless the configured provider has its plan file
 
 ##@ Stack
 
-infra: ## Start redis, postgres and nats only
-	docker compose up -d redis-cache postgres-audit nats
-
 up: market-plan strategy-requirements ## Start the whole stack
 	docker compose up -d --build
 
@@ -241,7 +241,7 @@ restart: ## Recreate every app container (keeps volumes and infra)
 
 DEV_COMPOSE := -f docker-compose.yml -f docker-compose.dev.yml
 
-dev: market-plan strategy-requirements ## `start` with engines/ bind-mounted for live editing
+dev: market-plan strategy-requirements ## `start` with src/ bind-mounted for live editing
 	docker compose $(DEV_COMPOSE) up -d --build
 
 dev-restart: ## Reload code after an edit — restart the app processes, no rebuild
@@ -327,9 +327,6 @@ runner: ## Run the strategy runner locally
 sim: ## Run the dev websocket market data simulator (QTE_ENV=dev only)
 	uv run qte-simulator serve
 
-sim-up: ## (Re)build and start just the market-simulator container
-	docker compose up -d --build market-simulator
-
 sim-status: ## What the simulator is doing, and who is attached to it
 	uv run qte-simulator status
 
@@ -382,9 +379,9 @@ ping: ## Ask the running runners to identify themselves
 	uv run qte-control ping
 
 .PHONY: help install install-dev lock test lint format check tiingo market-plan \
-	infra up start stop down restart dev dev-restart logs nuke \
+	up start stop down restart dev dev-restart logs nuke \
 	strategy-mount strategy-audit strategy-requirements strategy-test strategies audit audit-strict strategy-mapping \
 	db-upgrade db-downgrade db-revision db-current db-history db-check \
 	download history backtest chart reports ingestion runner csv-import \
-	sim sim-up sim-status sim-replay warmup warmup-cache sim-bar bar signal sim-walk sim-stop sim-reset sim-watch \
+	sim sim-status sim-replay warmup warmup-cache sim-bar bar signal sim-walk sim-stop sim-reset sim-watch \
 	shadow-status shadow-on shadow-off ping

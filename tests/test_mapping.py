@@ -12,6 +12,7 @@ import textwrap
 from pathlib import Path
 
 import pytest
+
 from qte_shared.strategies.mapping import SymbolMapping
 
 TABLE = """

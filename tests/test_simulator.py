@@ -16,6 +16,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 import websockets
+
 from qte_ingestion.resampler import Resampler
 from qte_shared.config import settings
 from qte_shared.dev_only import DevOnlyError, require_dev_env

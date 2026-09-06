@@ -9,6 +9,7 @@ if this arithmetic drifts the payloads stop matching the contract they document.
 from __future__ import annotations
 
 import pytest
+
 from qte_shared.config import settings
 from qte_shared.strategies.sizing import PositionSizer, resolve_use_equity_sizing
 

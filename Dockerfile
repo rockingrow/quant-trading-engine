@@ -1,12 +1,13 @@
 # One Dockerfile, one image per service.
 #
-# QTE_PACKAGE selects which workspace member gets installed, so the ingestion
-# image does not carry pyarrow (152 MB, backtest only) and neither carries the
-# other's dependencies. docker-compose.yml passes it per service; the default
-# builds the strategy runner.
+# QTE_EXTRAS selects which optional dependency sets get installed, so the
+# ingestion image does not carry pyarrow (84 MB, backtest only) and the runner
+# carries no socket to a market data vendor. docker-compose.yml passes the set
+# each service needs; the default builds the strategy runner.
 #
-# The workspace layout is what makes this possible: each engine declares only
-# what it needs, so `uv sync --package` has a real boundary to cut along.
+# Every image ships every service's modules — 612 KB against a venv two orders
+# of magnitude larger — so the extras are what the boundary is actually made
+# of. See `[project.optional-dependencies]` in pyproject.toml.
 
 FROM python:3.13-slim AS base
 
@@ -21,35 +22,28 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 WORKDIR /app
 
-# Which workspace member this image is for. QTE_EXTRA_PACKAGES adds sibling
-# packages to the same sync (space-separated), needed by the migrations image
-# whose env.py imports models from every engine that owns tables.
-ARG QTE_PACKAGE=qte-strategy-engine
-ARG QTE_EXTRA_PACKAGES=
+# Which optional dependency sets this image installs, space-separated. Empty
+# means core only, which is what the auditor and the migrations image need.
+ARG QTE_EXTRAS="broker"
 
-# Manifests first: the dependency layer is then cached across every change that
-# does not touch a pyproject or the lockfile. Every member's manifest is copied
-# even though only one is installed — the lockfile describes the whole
-# workspace, and uv reads all of them to resolve against it.
-COPY pyproject.toml uv.lock ./
-COPY engines/shared/pyproject.toml engines/shared/
-COPY engines/data_ingestion/pyproject.toml engines/data_ingestion/
-COPY engines/backtest_engine/pyproject.toml engines/backtest_engine/
-COPY engines/strategy_engine/pyproject.toml engines/strategy_engine/
-COPY engines/strategy_audit/pyproject.toml engines/strategy_audit/
-COPY engines/market_simulator/pyproject.toml engines/market_simulator/
+# Manifest first: the dependency layer is then cached across every change that
+# does not touch pyproject.toml or the lockfile. One manifest describes every
+# service now, so there is nothing else to copy ahead of the source -- except
+# README.md, which the root manifest names as its `readme` and which hatchling
+# therefore refuses to build the wheel without.
+COPY pyproject.toml uv.lock README.md ./
 
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-install-workspace --no-dev --package ${QTE_PACKAGE} \
-        $(for p in ${QTE_EXTRA_PACKAGES}; do echo --package $p; done)
+    uv sync --frozen --no-install-project --no-dev \
+        $(for extra in ${QTE_EXTRAS}; do echo --extra $extra; done)
 
-COPY engines/ engines/
+COPY src/ src/
 COPY migrations/ migrations/
 COPY alembic.ini ./
 
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev --package ${QTE_PACKAGE} \
-        $(for p in ${QTE_EXTRA_PACKAGES}; do echo --package $p; done)
+    uv sync --frozen --no-dev \
+        $(for extra in ${QTE_EXTRAS}; do echo --extra $extra; done)
 
 # Strategies bring their own dependencies (pandas-ta and whatever else the
 # private repo needs), and they are imported into *this* process — so they have

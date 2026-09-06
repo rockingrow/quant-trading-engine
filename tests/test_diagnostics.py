@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
+
 from qte_backtest.diagnostics import (
     CRITICAL,
     MIN_TRADES_FOR_STATISTICS,

@@ -251,16 +251,21 @@ simulator feed, and the runner listing the strategies it loaded.
 ### Running the services on the host
 
 When you want a debugger on `data-ingestion` or `strategy-runner`, run them
-straight from the workspace instead of in containers, with `make infra`
-providing Redis, Postgres and NATS. The `.env` above already points the host
+straight from the source tree instead of in containers, with only the three
+infrastructure containers up. The `.env` above already points the host
 addresses at `127.0.0.1`, so nothing needs editing.
 
+There is no Make target for that first line on purpose: `make` starts the whole
+stack or nothing, so a half-started system is something you ask compose for
+explicitly rather than something a one-word command can leave behind.
+
 ```bash
-make infra                       # terminal 0: redis + postgres + nats
-make db-upgrade                  # apply the schema once (skip if QTE_POSTGRES__ENABLED=false)
-make sim                         # terminal 1: the simulator
-make ingestion                   # terminal 2: data-ingestion
-make runner                      # terminal 3: strategy-runner
+docker compose up -d redis-cache postgres-audit nats   # terminal 0: the three of them
+
+make db-upgrade    # apply the schema once (skip if QTE_POSTGRES__ENABLED=false)
+make sim           # terminal 1: the simulator
+make ingestion     # terminal 2: data-ingestion
+make runner        # terminal 3: strategy-runner
 ```
 
 Ingestion should say it attached:
@@ -553,7 +558,6 @@ containers.
 make logs                   # tail every service
 make restart                # recreate the app containers, keep volumes and infra
 make down                   # stop the stack; volumes survive
-make infra                  # only redis + postgres + nats, for host-side runs
 make db-current             # which migration the database is on
 make sim-reset              # clear Redis, reset the simulator cursor, restart ingestion
 ```
@@ -682,7 +686,6 @@ source reads `QTE_SIMULATOR_PARQUET_FILE`.
 | Target | Runs |
 | --- | --- |
 | `make sim` | `qte-simulator serve` |
-| `make sim-up` | (re)build and start just the `market-simulator` container |
 | `make sim-status` | `qte-simulator status` |
 | `make bar O= H= L= C= [V=]` | one bar, round-tripped with `--verify` |
 | `make warmup` | synthetic warm-up replay, seeded, `--verify` (`QTE_SIMULATOR__GENERATE_BARS`) |

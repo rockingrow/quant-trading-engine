@@ -6,6 +6,7 @@ import textwrap
 from pathlib import Path
 
 import pytest
+
 from qte_shared.strategies.plugin_loader import StrategyLoader, load_strategies
 
 STRATEGY_SOURCE = textwrap.dedent(

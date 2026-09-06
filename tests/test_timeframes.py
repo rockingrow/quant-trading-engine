@@ -1,6 +1,7 @@
 from datetime import UTC, datetime
 
 import pytest
+
 from qte_shared.timeframes import (
     floor_to_bucket,
     next_bucket,

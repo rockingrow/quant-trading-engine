@@ -13,6 +13,7 @@ import re
 from datetime import UTC, datetime, timedelta
 
 import pytest
+
 from qte_backtest.execution import CostModel
 from qte_backtest.replay import BacktestEngine
 from qte_backtest.report import build_report

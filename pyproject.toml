@@ -10,14 +10,56 @@ readme = "README.md"
 # only interpreter the engine and its plugins both run on. Widen this only
 # after checking what the mounted strategy repo needs.
 requires-python = ">=3.13,<3.14"
+# What every service needs. Anything only one service opens is an extra below,
+# so an image installs the sockets and file formats it actually uses.
 dependencies = [
-    "qte-shared",
-    "qte-ingestion",
-    "qte-backtest",
-    "qte-strategy-engine",
-    "qte-strategy-audit",
-    "qte-simulator",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "nats-py>=2.7",
+    "redis>=5.0",
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg>=0.29",
+    "alembic>=1.13",
+    "orjson>=3.10",
 ]
+
+# The image boundary. One distribution ships every service's code — 612 KB, next
+# to a 364 MB venv — so what actually separates the images is which of these an
+# image installs, not which modules it carries. `QTE_EXTRAS` in the Dockerfile
+# selects them; docker-compose.yml passes the set each service needs.
+[project.optional-dependencies]
+# Market data vendors ship with the engine but their client libraries do not:
+# the strategy runner opens no socket to a vendor and must not install one.
+tiingo = [
+    "httpx>=0.27",
+    "websockets>=12.0",
+]
+# The dev-only simulator's feed is a WebSocket client like any vendor's, so it
+# is an extra like any vendor's.
+simulator = [
+    "websockets>=12.0",
+]
+# The runner's HTTP client for algo-trading-broker. See qte_strategy_engine.broker_sink.
+broker = [
+    "httpx>=0.27",
+]
+# 84 MB, and only two callers touch parquet: the backtest history store, which
+# cannot work without it, and ingestion's boot-time warm-up cache, which
+# degrades to "no cache" when it is absent (see qte_shared.history_cache). The
+# live containers must not carry it by default.
+parquet = [
+    "pyarrow>=16.0",
+]
+
+[project.scripts]
+qte-backtest = "qte_backtest.__main__:main"
+qte-ingestion = "qte_ingestion.main:run"
+qte-strategy-runner = "qte_strategy_engine.main:run"
+qte-control = "qte_strategy_engine.control:main"
+qte-strategy-audit = "qte_strategy_audit.main:run"
+qte-simulator = "qte_simulator.cli:main"
 
 [dependency-groups]
 dev = [
@@ -27,25 +69,38 @@ dev = [
     "httpx>=0.27",
 ]
 
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# One package per service, all under src/, all shipped together. The folder name
+# is the import name, which is a global in site-packages — hence the `qte_`
+# prefix on every one of them.
+[tool.hatch.build.targets.wheel]
+packages = [
+    "src/qte_shared",
+    "src/qte_ingestion",
+    "src/qte_backtest",
+    "src/qte_strategy_engine",
+    "src/qte_strategy_audit",
+    "src/qte_simulator",
+]
+
+# Marks this file as the repository root for `qte_shared.config._find_repo_root()`,
+# which walks up from the package looking for it rather than counting parent
+# directories. A counted root does not fail when the layout moves — it silently
+# resolves .env, __strategies__/ and data/ one level off. This table is the
+# marker; do not remove it because it looks empty of settings.
+[tool.qte]
+repo-root = true
+
 [tool.uv]
-package = false
 # The runner imports the plugins in __strategies__/ into its own process, so
 # one environment has to satisfy both resolutions. numba — which pandas-ta
 # pins — refuses NumPy above 2.2, and nothing here needs a newer one, so the
-# constraint lives here rather than as a bogus upper bound on qte-shared's own
-# numpy dependency. Drop it if the strategy repo ever stops needing numba.
+# constraint lives here rather than as a bogus upper bound on the numpy
+# dependency above. Drop it if the strategy repo ever stops needing numba.
 constraint-dependencies = ["numpy<2.3"]
-
-[tool.uv.workspace]
-members = ["engines/*"]
-
-[tool.uv.sources]
-qte-shared = { workspace = true }
-qte-ingestion = { workspace = true }
-qte-backtest = { workspace = true }
-qte-strategy-engine = { workspace = true }
-qte-strategy-audit = { workspace = true }
-qte-simulator = { workspace = true }
 
 [tool.ruff]
 line-length = 100

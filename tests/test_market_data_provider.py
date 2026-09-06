@@ -13,6 +13,7 @@ from datetime import date
 
 import pandas as pd
 import pytest
+
 from qte_shared.config import REPO_ROOT
 from qte_shared.indicators import OHLCV_COLUMNS
 from qte_shared.interfaces import (
@@ -263,7 +264,7 @@ def test_no_engine_outside_the_providers_package_imports_a_vendor():
     Docstrings may still say "Tiingo" — naming the example that motivated a
     design is not a dependency. An import, a class or an attribute is.
     """
-    providers_dir = REPO_ROOT / "engines" / "shared" / "src" / "qte_shared" / "providers"
+    providers_dir = REPO_ROOT / "engines" / "shared" / "qte_shared" / "providers"
     offenders: list[str] = []
     for path in (REPO_ROOT / "engines").rglob("*.py"):
         if providers_dir in path.parents or "__pycache__" in path.parts:
@@ -293,7 +294,7 @@ def test_only_the_simulator_engine_knows_the_simulator_provider_exists():
     through `create_provider`, by a name in configuration.
     """
     allowed = REPO_ROOT / "engines" / "market_simulator"
-    providers_dir = REPO_ROOT / "engines" / "shared" / "src" / "qte_shared" / "providers"
+    providers_dir = REPO_ROOT / "engines" / "shared" / "qte_shared" / "providers"
     offenders: list[str] = []
     for path in (REPO_ROOT / "engines").rglob("*.py"):
         if providers_dir in path.parents or allowed in path.parents:

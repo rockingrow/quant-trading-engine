@@ -20,18 +20,19 @@ from __future__ import annotations
 import asyncio
 from logging.config import fileConfig
 
+from alembic import context
+from sqlalchemy import pool
+from sqlalchemy.engine import Connection
+from sqlalchemy.ext.asyncio import async_engine_from_config
+
 import qte_backtest.db.models  # noqa: F401,E402  (backtest_runs, backtest_trades)
 
 # ── Model registration ────────────────────────────────────────────────
 # Imported for the side effect of registering tables on Base.metadata.
 import qte_shared.db.models  # noqa: F401,E402  (shared: engine_events)
 import qte_strategy_engine.db.models  # noqa: F401,E402  (signals, open_positions)
-from alembic import context
 from qte_shared.config import settings
 from qte_shared.db.base import Base
-from sqlalchemy import pool
-from sqlalchemy.engine import Connection
-from sqlalchemy.ext.asyncio import async_engine_from_config
 
 config = context.config
 if config.config_file_name is not None:

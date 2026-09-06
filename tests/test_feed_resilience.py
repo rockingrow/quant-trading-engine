@@ -19,6 +19,7 @@ import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
+
 from qte_ingestion.resampler import Resampler
 from qte_ingestion.service import IngestionService
 from qte_shared.models import Tick

@@ -37,6 +37,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pandas as pd
+
 from qte_shared.config import settings
 from qte_shared.timeframes import normalize_timeframe
 

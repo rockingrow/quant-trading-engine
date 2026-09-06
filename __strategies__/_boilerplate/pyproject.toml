@@ -27,6 +27,18 @@ dev = [
     "ruff>=0.6",
 ]
 
+# `make strategy-mount` installs this lockfile into the *engine's* venv, and the
+# engine imports the plugins into its own process. So this repo does not get to
+# resolve in a vacuum: whatever it locks has to be installable next to whatever
+# the other mounted repos need. pandas-ta - which a real strategy repo almost
+# certainly uses, and which is why the engine pins 3.13 - hard-pins a numba that
+# refuses NumPy above 2.2. Nothing here needs that ceiling for itself, which is
+# exactly why it is a constraint rather than an upper bound on the numpy
+# dependency above. The engine's root manifest carries the same line for the
+# same reason; drop it here only when pandas-ta stops needing numba there.
+[tool.uv]
+constraint-dependencies = ["numpy<2.3"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

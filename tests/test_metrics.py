@@ -1,6 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
 import pytest
+
 from qte_backtest.execution import ClosedLeg, ExitReason, SimulatedPosition
 from qte_backtest.metrics import compute_metrics, format_report
 

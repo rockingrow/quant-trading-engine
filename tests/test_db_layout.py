@@ -12,8 +12,10 @@ Two failures this file exists to prevent, both silent:
 from __future__ import annotations
 
 import ast
+import tomllib
 
 import pytest
+
 from qte_backtest.db import BacktestRepository, BacktestRun, BacktestTrade
 from qte_shared.config import REPO_ROOT
 from qte_shared.db import Base, EngineEvent, EventRepository
@@ -58,7 +60,7 @@ def test_ingestion_owns_no_tables_of_its_own():
 
     Inventing a table to justify a folder would be the wrong way round.
     """
-    assert not (REPO_ROOT / "engines" / "data_ingestion" / "src" / "qte_ingestion" / "db").exists()
+    assert not (REPO_ROOT / "engines" / "data_ingestion" / "qte_ingestion" / "db").exists()
 
 
 # ── Alembic wiring ────────────────────────────────────────────────────
@@ -178,9 +180,11 @@ def test_compose_pins_a_stock_postgres_image():
 def test_both_service_images_can_run_migrations():
     """Alembic must be reachable from any container that can reach the database.
 
-    It sits in qte-shared's dependencies rather than a dev group precisely so
-    `alembic upgrade` is available wherever the DSN is.
+    It sits in the core dependencies rather than an extra or a dev group
+    precisely so `alembic upgrade` is available wherever the DSN is -- the
+    migrations image installs no extras at all.
     """
-    shared = (REPO_ROOT / "engines" / "shared" / "pyproject.toml").read_text(encoding="utf-8")
-    dependencies = shared[shared.index("dependencies = [") : shared.index("[build-system]")]
-    assert "alembic" in dependencies
+    manifest = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    assert any(dep.startswith("alembic") for dep in manifest["project"]["dependencies"]), (
+        "alembic must stay a core dependency, not an extra"
+    )

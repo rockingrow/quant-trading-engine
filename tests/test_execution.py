@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 
 import pandas as pd
 import pytest
+
 from qte_backtest.execution import CostModel, ExitReason, FillSimulator
 from qte_shared.models import SignalAction
 
