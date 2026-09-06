@@ -1,7 +1,7 @@
 [project]
 name = "qte-strategy-audit"
 version = "0.1.0"
-description = "QTE strategy audit: validate the plugins in __strategies__/ against the QTE signal contract and the routing table."
+description = "QTE strategy audit: validate the plugins in __strategies__/ against the QTE signal contract and the mapping table."
 requires-python = ">=3.13,<3.14"
 dependencies = [
     "qte-shared",

@@ -118,6 +118,34 @@ class RedisState:
         raw = await self.client.lrange(key, start, -1)
         return [Candle.model_validate_json(item) for item in raw]
 
+    async def count_candles(self, symbol: str, timeframe: str) -> int:
+        """How many bars the history list holds, without decoding any of them."""
+        return int(await self.client.llen(self.key("candles", symbol, timeframe)))
+
+    async def replace_candles(
+        self, symbol: str, timeframe: str, candles: list[Candle], max_len: int | None = None
+    ) -> int:
+        """Rewrite the whole history list, oldest first, in one transaction.
+
+        Warm-up backfill cannot use :meth:`push_candle`: appending historical
+        bars to a list that already ends at *now* would leave the newest bar in
+        the middle, and the runner reads the tail as its most recent window. So
+        the merged series is written whole, and a reader either sees the old
+        list or the new one -- never a half-filled key.
+        """
+        if not candles:
+            return 0
+        limit = max_len or settings.redis.candle_history
+        retained = candles[-limit:]
+        key = self.key("candles", symbol, timeframe)
+        pipe = self.client.pipeline()
+        pipe.delete(key)
+        pipe.rpush(key, *[candle.model_dump_json() for candle in retained])
+        if settings.redis.ttl_seconds:
+            pipe.expire(key, settings.redis.ttl_seconds)
+        await pipe.execute()
+        return len(retained)
+
     async def set_open_candle(self, candle: Candle) -> None:
         """Persist the bar currently being built so a restart mid-bar resumes it."""
         await self.client.set(

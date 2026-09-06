@@ -12,6 +12,17 @@ dependencies = [
     "qte-shared[tiingo,simulator]",
 ]
 
+[project.optional-dependencies]
+# The boot-time warm-up parks what it fetched in data/parquet/<provider>/ so a
+# dev restart replays it instead of spending another request against a rate
+# limited plan. That is a *dev* affordance and pyarrow is 152 MB, so it stays an
+# extra: QTE_ENV=prod bypasses the cache by policy anyway, and a production
+# image without this installed simply always asks the vendor. See
+# `qte_shared.history_cache`, which degrades to "no cache" when pyarrow is absent.
+history-cache = [
+    "pyarrow>=16.0",
+]
+
 [project.scripts]
 qte-ingestion = "qte_ingestion.main:run"
 

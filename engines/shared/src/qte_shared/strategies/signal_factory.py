@@ -14,7 +14,7 @@ The factory owns four things a strategy is deliberately not allowed to:
   strategy set them and from ATR/percentage defaults when it did not, so
   "never send a naked entry" is enforced in one place.
 * **Size.** ``quantity`` is risk-sized against the configured account — see
-  :mod:`qte_shared.sizing` — because a strategy is not told the balance, and a
+  :mod:`qte_shared.strategies.sizing` — because a strategy is not told the balance, and a
   strategy that sized itself against a notional one would trade a book nobody
   configured. A strategy's own proposal survives as a *proportion*: the ratio
   between what QTE sent and what it asked for is remembered on the cycle, and
@@ -45,8 +45,8 @@ from qte_shared.models import (
     SignalAction,
     new_uxid,
 )
-from qte_shared.sizing import PositionSizer, resolve_use_equity_sizing
-from qte_shared.strategy_base import SignalIntent
+from qte_shared.strategies.sizing import PositionSizer, resolve_use_equity_sizing
+from qte_shared.strategies.strategy_base import SignalIntent
 from qte_shared.timeframes import to_broker_timeframe
 
 log = get_logger(__name__)
@@ -127,7 +127,7 @@ class SignalFactory:
         self.bracket = bracket or BracketPolicy()
         self.inputs = dict(inputs or {})
         #: Risk sizing for this pair. Built from ``QTE_ACCOUNT__*`` and the
-        #: pair's own params, so the routing table's ``risk_percent`` is
+        #: pair's own params, so the mapping table's ``risk_percent`` is
         #: honoured without every caller having to dig it out.
         self.sizer = sizer or PositionSizer.from_settings(
             self.inputs, risk_percent=self.bracket.risk_percent

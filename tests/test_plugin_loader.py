@@ -6,12 +6,12 @@ import textwrap
 from pathlib import Path
 
 import pytest
-from qte_shared.plugin_loader import StrategyLoader, load_strategies
+from qte_shared.strategies.plugin_loader import StrategyLoader, load_strategies
 
 STRATEGY_SOURCE = textwrap.dedent(
     """
     from qte_shared.models import SignalAction
-    from qte_shared.strategy_base import SignalIntent, StrategyBase
+    from qte_shared.strategies.strategy_base import SignalIntent, StrategyBase
 
 
     class MyEdge(StrategyBase):
@@ -53,7 +53,9 @@ def test_private_and_cache_files_are_ignored(plugin_dir):
 
 
 def test_the_abstract_base_is_never_registered_as_a_strategy(plugin_dir):
-    (plugin_dir / "reexport.py").write_text("from qte_shared.strategy_base import StrategyBase\n")
+    (plugin_dir / "reexport.py").write_text(
+        "from qte_shared.strategies.strategy_base import StrategyBase\n"
+    )
     assert [entry.name for entry in StrategyLoader(plugin_dir).discover()] == ["MY_EDGE"]
 
 

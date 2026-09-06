@@ -13,6 +13,11 @@ Redis is written first and NATS second on purpose. The runner rebuilds its
 warm-up window from Redis when it starts, so a candle that reached the bus but
 not the cache would be a bar the engine acts on now and cannot see after a
 restart.
+
+Start-up also *seeds* that cache from vendor history when the provider serves
+it -- see :mod:`qte_ingestion.backfill`. Without it a cold Redis means the
+runner has no indicator window until enough bars have printed live, which on
+M15 is days.
 """
 
 from __future__ import annotations
@@ -23,15 +28,17 @@ from datetime import UTC, datetime
 
 from qte_shared.bus import NatsBus, Subjects
 from qte_shared.cache import RedisState
-from qte_shared.config import settings
+from qte_shared.config import market_data_plan, settings
 from qte_shared.db import EventRepository
 from qte_shared.interfaces.market_data import Capability, LiveFeed
 from qte_shared.logging_setup import get_logger
+from qte_shared.market_data_plan import SymbolFeed
 from qte_shared.models import Candle, CandleClosedEvent, Tick, TickEvent
 from qte_shared.providers import create_provider
 from qte_shared.symbols import build_specs
 from qte_shared.timeframes import normalize_timeframe
 
+from qte_ingestion.backfill import HistoryBackfiller
 from qte_ingestion.resampler import Resampler
 from qte_ingestion.settings import ingestion_settings
 
@@ -40,19 +47,48 @@ log = get_logger(__name__)
 SERVICE_NAME = "data-ingestion"
 
 
+def resolve_subscriptions() -> list[SymbolFeed]:
+    """What this process subscribes to, and where that was decided.
+
+    ``config/<provider>.toml`` is the answer when it exists: it states the
+    symbols, each one's market and the timeframes it is resampled to, which is
+    the only form that can differ per symbol. With no plan on disk the engine
+    falls back to what it read before the file existed —
+    ``QTE_ENGINE__SYMBOLS`` × ``QTE_ENGINE__TIMEFRAMES``, with markets from
+    ``QTE_INGESTION__MARKET_OVERRIDES`` — which is what a simulator dev stack
+    runs on.
+    """
+    plan = market_data_plan()
+    if plan.feeds:
+        return list(plan.feeds)
+
+    timeframes = tuple(normalize_timeframe(label) for label in settings.engine.timeframes)
+    return [
+        SymbolFeed(symbol=spec.symbol, market=spec.market, timeframes=timeframes)
+        for spec in build_specs(settings.engine.symbols, ingestion_settings.market_overrides)
+    ]
+
+
 class IngestionService:
     """Owns the live feeds, the resamplers and the publish loop."""
 
     def __init__(self) -> None:
-        self.specs = build_specs(settings.engine.symbols, ingestion_settings.market_overrides)
-        self.timeframes = [normalize_timeframe(tf) for tf in settings.engine.timeframes]
+        self.subscriptions = resolve_subscriptions()
+        self.specs = [feed.spec for feed in self.subscriptions]
+        #: Every timeframe anything is resampled to — for the log, the start
+        #: event and the outbox drain. What a given symbol gets is its own
+        #: :attr:`~qte_shared.market_data_plan.SymbolFeed.timeframes`.
+        self.timeframes = list(
+            dict.fromkeys(tf for feed in self.subscriptions for tf in feed.timeframes)
+        )
         self.bus = NatsBus(name="qte-ingestion")
         self.state = RedisState()
         self.subjects = Subjects()
         self.events = EventRepository()
         self.provider = create_provider(capability=Capability.LIVE)
         self._resamplers: dict[str, Resampler] = {
-            spec.symbol: Resampler(spec.symbol, self.timeframes) for spec in self.specs
+            feed.symbol: Resampler(feed.symbol, list(feed.timeframes))
+            for feed in self.subscriptions
         }
         self._feeds: list[LiveFeed] = []
         self._flush_task: asyncio.Task[None] | None = None
@@ -71,6 +107,9 @@ class IngestionService:
             # cannot arrive after a newer close for the same strategy window.
             await self._drain_candle_outbox()
             await self._restore_open_candles()
+            # Before the first live tick: a bar backfilled from the vendor must
+            # not land behind one this process just resampled.
+            await HistoryBackfiller(self.state, self.subscriptions).run()
 
             started = 0
             for feed in self.provider.live_feeds(self.specs, self._handle_tick):
@@ -82,7 +121,8 @@ class IngestionService:
 
             if not started:
                 raise RuntimeError(
-                    f"Provider {self.provider.name!r} started no feeds — check QTE_ENGINE__SYMBOLS"
+                    f"Provider {self.provider.name!r} started no feeds — check the symbols "
+                    f"in {market_data_plan().source or 'QTE_ENGINE__SYMBOLS'}"
                 )
 
             self._flush_task = asyncio.create_task(self._flush_loop(), name="candle-flush")
@@ -160,14 +200,14 @@ class IngestionService:
         """Reload bars that were mid-build when this process last died."""
         if not ingestion_settings.persist_open_candles:
             return
-        for spec in self.specs:
-            for timeframe in self.timeframes:
-                candle = await self.state.get_open_candle(spec.symbol, timeframe)
+        for feed in self.subscriptions:
+            for timeframe in feed.timeframes:
+                candle = await self.state.get_open_candle(feed.symbol, timeframe)
                 if candle is not None:
-                    self._resamplers[spec.symbol].restore(candle)
+                    self._resamplers[feed.symbol].restore(candle)
                     log.info(
                         "Restored open bar symbol=%s tf=%s open_time=%s",
-                        spec.symbol,
+                        feed.symbol,
                         timeframe,
                         candle.open_time,
                     )

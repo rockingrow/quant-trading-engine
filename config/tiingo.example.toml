@@ -1,0 +1,96 @@
+# What Tiingo is asked to feed: which symbols, at which bars, and how its
+# history is fetched.
+#
+#   make tiingo         # writes config/tiingo.toml from this template
+#
+# The engine reads `config/<QTE_MARKET_DATA__PROVIDER>.toml`, so this file is
+# the plan for the `tiingo` provider and a second vendor gets its own beside
+# it. `make start` refuses to bring the stack up without it while the provider
+# is tiingo, because a missing plan does not fail loudly at runtime — it
+# quietly subscribes to the built-in defaults instead.
+#
+# This template is tracked; `config/tiingo.toml` is git-ignored, for the same
+# reason as `config/strategies_mapping.example.toml`: what a desk trades is
+# position information and this repository is public. Keep the two in step —
+# a key added here is a key an operator can use, and a key only in the real
+# file is one nobody can review.
+#
+# **The API key is not here.** It is a secret and stays in `.env`:
+#
+#   QTE_DATA_PROVIDER_API_KEY=<your key>
+#
+# One name whichever vendor is switched on, so changing provider does not
+# invalidate a deployed secret. A credential written into this file is ignored
+# with a warning rather than used.
+#
+# Everything below still has an environment variable, and the environment still
+# wins: `QTE_ENGINE__SYMBOLS='["EURUSD"]' make backtest` is a one-run override
+# that does not touch the plan. The file is where the standing answer lives.
+
+
+# ── The feed as a whole ─────────────────────────────────────────────────
+#
+# Applied to any symbol that names none of its own.
+
+[feed]
+# Bars resampled from the tick stream (QTE_ENGINE__TIMEFRAMES). Every entry
+# here costs a Redis list per symbol and a backfill request per symbol at boot,
+# so ask for the ones strategies actually read.
+timeframes = ["M15"]
+# The bar a strategy decides on (QTE_ENGINE__SIGNAL_TIMEFRAME). It has to be
+# one of the timeframes above, or nothing ever closes for it.
+signal_timeframe = "M15"
+
+
+# ── The vendor's own knobs ──────────────────────────────────────────────
+#
+# Read by whichever provider is on — the table is generic, the keys are that
+# provider's settings fields (`qte_shared.providers.tiingo.settings`).
+
+[provider]
+# Fill Redis from vendor history at boot, so the runner warms its indicator
+# window on the first close rather than days later
+# (QTE_INGESTION__BACKFILL_HISTORY). Providers that serve no history — the dev
+# simulator — skip it whatever this says.
+backfill_history = true
+# Bars asked for in one REST call (QTE_TIINGO__MAX_ROWS_PER_REQUEST). Tiingo
+# signals truncation with a *200 and fewer bars*, not an error, so a range
+# wider than the cap comes back quietly short and history pages under this
+# budget instead. Measured truncation on a free plan began between 5k and 7k
+# rows; raise it on a paid plan to cut the number of round trips.
+max_rows_per_request = 5000
+# Hard stop on pages for one range, so a vendor that stops making progress
+# cannot spin forever. It must clear the widest range a caller can ask for:
+# `qte-backtest download` uses three years, which on M1 is ~365 pages.
+#max_pages = 600
+#request_timeout = 30.0
+# Tiingo's WebSocket "thresholdLevel": 5 = top-of-book quotes only, 0 = every
+# trade. Raising the FX one is the cheapest way to cut tick volume.
+#fx_threshold = 5
+#crypto_threshold = 2
+
+
+# ── One table per symbol ────────────────────────────────────────────────
+#
+# The symbol name is the *broker* spelling — what ends up in the signal a
+# worker executes. Translating it into the vendor's ticker is the provider's
+# job (`MarketDataProvider.ticker_for`), not this file's.
+
+[symbols.XAUUSD]
+# Which socket the provider opens for it. Inferred when omitted, and worth
+# stating for anything ambiguous: BTCUSD is a crypto pair on an exchange and
+# an FX CFD on a broker's book (this replaces QTE_INGESTION__MARKET_OVERRIDES).
+market = "fx"
+# Overrides [feed].timeframes for this symbol alone. Ingestion resamples
+# exactly this list, and the boot backfill warms exactly these windows.
+timeframes = ["M15"]
+
+[symbols.BTCUSDT]
+market = "crypto"
+timeframes = ["M15"]
+
+# `enabled = false` parks a symbol without deleting its settings, so turning it
+# back on is a one-word edit and the diff says what happened.
+[symbols.EURUSD]
+enabled = false
+market = "fx"

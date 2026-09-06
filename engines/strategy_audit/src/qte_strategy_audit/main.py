@@ -32,15 +32,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Strategies directory; defaults to QTE_ENGINE__STRATEGIES_DIR",
     )
     parser.add_argument(
-        "--routing",
+        "--mapping",
         type=Path,
         default=None,
-        help="Routing table; defaults to QTE_ENGINE__ROUTING_FILE",
+        help="Mapping table; defaults to QTE_ENGINE__MAPPING_FILE",
     )
     parser.add_argument(
-        "--no-routing",
+        "--no-mapping",
         action="store_true",
-        help="Audit the strategies only, without cross-checking any routing table",
+        help="Audit the strategies only, without cross-checking any mapping table",
     )
     parser.add_argument("--format", choices=["text", "markdown", "json"], default="text")
     parser.add_argument(
@@ -63,10 +63,10 @@ def main(argv: list[str] | None = None) -> int:
     with contextlib.suppress(AttributeError, ValueError):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-    routing = None if args.no_routing else (args.routing or settings.engine.routing_file)
+    mapping = None if args.no_mapping else (args.mapping or settings.engine.mapping_file)
     report = StrategyAuditor(
         directory=args.dir or settings.engine.strategies_dir,
-        routing_file=routing,
+        mapping_file=mapping,
     ).run()
 
     if args.format == "json":

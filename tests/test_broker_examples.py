@@ -22,9 +22,9 @@ from datetime import UTC, datetime
 import pytest
 from qte_shared.config import REPO_ROOT
 from qte_shared.models import BrokerSignal, PositionBlock, SignalAction
-from qte_shared.signal_factory import SignalFactory
-from qte_shared.sizing import PositionSizer
-from qte_shared.strategy_base import SignalIntent
+from qte_shared.strategies.signal_factory import SignalFactory
+from qte_shared.strategies.sizing import PositionSizer
+from qte_shared.strategies.strategy_base import SignalIntent
 
 EXAMPLES = REPO_ROOT / "examples" / "algo-trading-broker"
 NOW = datetime(2026, 4, 10, 22, 55, tzinfo=UTC)
@@ -48,7 +48,7 @@ IDS = [name for name, _ in DOCUMENTS]
 
 def _factory() -> SignalFactory:
     return SignalFactory(
-        "MT5_GOLD_M5_V1",
+        "MT5_GOLD_SCALP",
         timeframe="M5",
         token="secret_token_tu_tradingview",
         sizer=PositionSizer(capital=CAPITAL, risk_percent=RISK_PERCENT),

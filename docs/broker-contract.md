@@ -13,7 +13,7 @@ QTE emits the broker's `WebhookPayload` (`broker/schemas/webhook_schema.py`):
 
 ```json
 {
-  "strategy": "MT5_GOLD_M15_V1",
+  "strategy": "MT5_GOLD_SCALP",
   "symbol": "XAUUSD",
   "timeframe": "15",
   "timestamp": "2026-04-10T22:55:00Z",

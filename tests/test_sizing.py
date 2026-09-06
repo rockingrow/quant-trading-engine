@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 from qte_shared.config import settings
-from qte_shared.sizing import PositionSizer, resolve_use_equity_sizing
+from qte_shared.strategies.sizing import PositionSizer, resolve_use_equity_sizing
 
 
 def test_the_worked_example_from_the_broker_contract():
@@ -93,7 +93,7 @@ def test_an_explicit_argument_beats_both():
 
 @pytest.mark.parametrize("junk", [None, "", "not-a-number", True, False])
 def test_an_unusable_risk_percent_in_the_table_falls_back_rather_than_crashing(junk):
-    # A routing table is hand-edited. Refusing to start over one bad cell would
+    # A mapping table is hand-edited. Refusing to start over one bad cell would
     # stop the whole book from trading; the fallback is the safer failure.
     sizer = PositionSizer.from_settings({"risk_percent": junk})
     assert sizer.risk_percent == pytest.approx(settings.account.risk_percent)
@@ -122,7 +122,7 @@ def test_an_undeclared_equity_sizing_stays_absent_rather_than_becoming_false():
 
 
 def test_equity_sizing_does_not_change_the_size():
-    """It is reported to the broker, never obeyed here — see qte_shared.sizing.
+    """It is reported to the broker, never obeyed here — see qte_shared.strategies.sizing.
 
     Compounding would make a run's later sizes depend on its own earlier P&L,
     and two backtests differing by one early trade would stop being comparable.

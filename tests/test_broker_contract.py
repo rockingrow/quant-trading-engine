@@ -18,7 +18,7 @@ from qte_shared.models import BrokerSignal, PositionBlock, SignalAction, is_vali
 
 def _entry() -> BrokerSignal:
     return BrokerSignal(
-        strategy="MT5_GOLD_M5_V1",
+        strategy="MT5_GOLD_SCALP",
         symbol="XAUUSD",
         timeframe="15",
         timestamp=datetime(2026, 4, 10, 22, 55, tzinfo=UTC),
@@ -78,7 +78,7 @@ def test_envelope_matches_the_jetstream_webhook_wrapper():
     # The broker's SignalWorker reads envelope["payload"], nothing else.
     envelope = _entry().to_envelope()
     assert list(envelope) == ["payload"]
-    assert envelope["payload"]["strategy"] == "MT5_GOLD_M5_V1"
+    assert envelope["payload"]["strategy"] == "MT5_GOLD_SCALP"
     json.dumps(envelope)  # must be plainly serialisable — no datetimes left
 
 
@@ -108,7 +108,7 @@ def test_blank_uxid_is_treated_as_absent():
 
 def test_flat_needs_neither_price_nor_quantity():
     flat = BrokerSignal(
-        strategy="MT5_GOLD_M5_V1",
+        strategy="MT5_GOLD_SCALP",
         symbol="XAUUSD",
         timeframe="15",
         position=PositionBlock(action=SignalAction.FLAT),

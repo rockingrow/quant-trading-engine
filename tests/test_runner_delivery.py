@@ -16,9 +16,9 @@ from types import SimpleNamespace
 
 import pytest
 from qte_shared.models import OpenPosition, SignalAction
-from qte_shared.signal_factory import SignalFactory
-from qte_shared.sizing import PositionSizer
-from qte_shared.strategy_base import SignalIntent, StrategyBase
+from qte_shared.strategies.signal_factory import SignalFactory
+from qte_shared.strategies.sizing import PositionSizer
+from qte_shared.strategies.strategy_base import SignalIntent, StrategyBase
 from qte_strategy_engine.broker_sink import DeliveryResult
 from qte_strategy_engine.runner import StrategyRunner, StrategySlot
 

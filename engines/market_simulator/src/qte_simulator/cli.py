@@ -10,6 +10,13 @@
     qte-simulator watch   --symbol XAUUSD
     qte-simulator status
 
+``--symbol`` defaults to the first of ``QTE_ENGINE__SYMBOLS`` and
+``--timeframe`` to ``QTE_ENGINE__SIGNAL_TIMEFRAME``, so in a configured dev
+stack the two warm-ups are argument-free: ``replay --generate`` synthesises
+``QTE_SIMULATOR__GENERATE_BARS`` bars, and a bare ``replay`` plays the last
+``QTE_SIMULATOR__CACHE_BARS`` of ``QTE_SIMULATOR_PARQUET_FILE`` — real vendor
+history, re-anchored onto the buckets that end at the current one.
+
 ``--verify`` is the part worth knowing about: it subscribes to QTE's own NATS
 subjects before sending anything, then reports, bar by bar, whether the candle
 ingestion published matches the bar that was played into it — and, with
@@ -34,8 +41,9 @@ from qte_shared.logging_setup import configure_logging, get_logger
 from qte_shared.models import Candle
 from qte_shared.timeframes import normalize_timeframe
 
-from qte_simulator.bars import generate_bars, reference_price
+from qte_simulator.bars import anchor_open_times, generate_bars, reference_price
 from qte_simulator.client import ControlClient, ControlError, SimulatorUnreachable
+from qte_simulator.control import MAX_BARS
 from qte_simulator.settings import simulator_settings
 from qte_simulator.sources import SourceError, load_bars
 from qte_simulator.verify import CandleCheck, FlowWatcher
@@ -44,6 +52,11 @@ log = get_logger(__name__)
 
 
 # ── Parser ────────────────────────────────────────────────────────────────
+
+#: Every command works on one symbol, and in a dev stack it is the symbol the
+#: engine is watching — asking for it again on the command line is how a
+#: rehearsal ends up aimed at a symbol ingestion never subscribed to.
+_SYMBOL_HELP = "Defaults to the first of QTE_ENGINE__SYMBOLS"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -61,7 +74,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--port", type=int, default=None)
 
     tick = subparsers.add_parser("tick", help="Send a single tick")
-    tick.add_argument("--symbol", required=True)
+    tick.add_argument("--symbol", default=None, help=_SYMBOL_HELP)
     tick.add_argument("--bid", type=float)
     tick.add_argument("--ask", type=float)
     tick.add_argument("--last", type=float)
@@ -69,7 +82,7 @@ def build_parser() -> argparse.ArgumentParser:
     tick.add_argument("--ts", default=None, help="ISO-8601; defaults to now")
 
     bar = subparsers.add_parser("bar", help="Send one bar as ticks, and optionally verify it")
-    bar.add_argument("--symbol", required=True)
+    bar.add_argument("--symbol", default=None, help=_SYMBOL_HELP)
     bar.add_argument("--timeframe", default=None, help="Defaults to QTE_ENGINE__SIGNAL_TIMEFRAME")
     bar.add_argument("--open", type=float, required=True, dest="open_")
     bar.add_argument("--high", type=float, required=True)
@@ -80,12 +93,34 @@ def build_parser() -> argparse.ArgumentParser:
     _add_verify_arguments(bar)
 
     replay = subparsers.add_parser("replay", help="Play a run of bars from a file or generated")
-    replay.add_argument("--symbol", required=True)
+    replay.add_argument("--symbol", default=None, help=_SYMBOL_HELP)
     replay.add_argument("--timeframe", default=None)
-    source = replay.add_mutually_exclusive_group(required=True)
-    source.add_argument("--file", help="parquet / csv / jsonl of OHLCV bars")
-    source.add_argument("--generate", type=int, metavar="N", help="Synthesise N bars instead")
-    replay.add_argument("--limit", type=int, default=None, help="Take only the last N file bars")
+    source = replay.add_mutually_exclusive_group()
+    source.add_argument(
+        "--file",
+        default=None,
+        help="parquet / csv / jsonl of OHLCV bars; defaults to QTE_SIMULATOR_PARQUET_FILE",
+    )
+    source.add_argument(
+        "--generate",
+        type=int,
+        nargs="?",
+        const=simulator_settings.generate_bars,
+        metavar="N",
+        help=(
+            "Synthesise N bars instead of reading a file; bare --generate uses "
+            f"QTE_SIMULATOR__GENERATE_BARS ({simulator_settings.generate_bars})"
+        ),
+    )
+    replay.add_argument(
+        "--limit",
+        type=int,
+        default=simulator_settings.cache_bars,
+        help=(
+            "Take only the last N bars of the file. Default QTE_SIMULATOR__CACHE_BARS "
+            f"({simulator_settings.cache_bars})"
+        ),
+    )
     replay.add_argument("--start-price", type=float, default=None)
     replay.add_argument("--volatility", type=float, default=0.002)
     replay.add_argument("--drift", type=float, default=0.0)
@@ -93,11 +128,11 @@ def build_parser() -> argparse.ArgumentParser:
     replay.add_argument(
         "--rate", type=float, default=0.0, help="Bars per second; 0 = as fast as possible"
     )
-    _add_placement_arguments(replay, default_anchor="next")
+    _add_placement_arguments(replay, default_anchor="auto")
     _add_verify_arguments(replay)
 
     walk = subparsers.add_parser("walk", help="Stream a random walk in the background")
-    walk.add_argument("--symbol", required=True)
+    walk.add_argument("--symbol", default=None, help=_SYMBOL_HELP)
     walk.add_argument("--rate", type=float, default=2.0, help="Ticks per second (real time)")
     walk.add_argument("--ticks", type=int, default=0, help="0 = until stopped")
     walk.add_argument("--price", type=float, default=None)
@@ -121,7 +156,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("reset", help="Forget cursors and counters")
 
     watch = subparsers.add_parser("watch", help="Tail closed candles and emitted signals on NATS")
-    watch.add_argument("--symbol", required=True)
+    watch.add_argument("--symbol", default=None, help=_SYMBOL_HELP)
     watch.add_argument("--timeframe", default=None)
     watch.add_argument("--seconds", type=float, default=0.0, help="0 = until Ctrl-C")
 
@@ -135,8 +170,9 @@ def _add_placement_arguments(parser: argparse.ArgumentParser, *, default_anchor:
         help=(
             "next = the first bucket nothing has been sent into yet, marching forward "
             "(nothing the wall-clock flush can race); past = end on the last completed "
-            "bucket instead, letting that flush close it; or an ISO-8601 open time for "
-            f"the first bar. Default: {default_anchor}"
+            "bucket instead, letting that flush close it; auto = past for a file and "
+            "next for generated bars; or an ISO-8601 open time for the first bar. "
+            f"Default: {default_anchor}"
         ),
     )
     parser.add_argument("--spread", type=float, default=0.0, help="Decorate ticks with bid/ask")
@@ -201,13 +237,22 @@ async def _bar(args: argparse.Namespace) -> int:
 
 async def _replay(args: argparse.Namespace) -> int:
     timeframe = _timeframe(args)
-    if args.file:
+    source_file = _source_file(args)
+    args.anchor = _resolve_anchor(args, from_file=source_file is not None)
+    if source_file is not None:
         try:
-            rows = load_bars(args.file, limit=args.limit)
+            rows = load_bars(source_file, limit=args.limit)
         except SourceError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
-        print(f"Loaded {len(rows)} bars from {args.file}")
+        print(f"Loaded {len(rows)} bars from {source_file}")
+    elif args.generate is None:
+        print(
+            "error: replay needs bars — pass --file, pass --generate, or point "
+            "QTE_SIMULATOR_PARQUET_FILE at a cached history file",
+            file=sys.stderr,
+        )
+        return 2
     else:
         if args.generate < 1:
             print("error: --generate needs a positive number of bars", file=sys.stderr)
@@ -237,6 +282,42 @@ async def _replay(args: argparse.Namespace) -> int:
         ]
         print(f"Generated {len(rows)} {timeframe} bars from {start:g} (seed={args.seed})")
     return await _play(args, rows)
+
+
+def _source_file(args: argparse.Namespace) -> str | None:
+    """Which file this replay reads, if any.
+
+    ``--file`` wins; a bare ``replay`` falls back to the cached vendor history
+    named by ``QTE_SIMULATOR_PARQUET_FILE``, which is what makes a warm-up a
+    command with no arguments. ``--generate`` says "synthesise instead" and
+    suppresses the fallback even when the setting is filled in.
+    """
+    if args.file:
+        return args.file
+    if args.generate is not None:
+        return None
+    return simulator_settings.parquet_file or None
+
+
+def _resolve_anchor(args: argparse.Namespace, *, from_file: bool) -> str:
+    """``auto``: real history goes in the past, synthetic bars in the future.
+
+    A file carries prices that printed. Re-anchoring them onto buckets that
+    have not happened yet leaves Redis holding a warm-up stamped days ahead of
+    the clock — legible to a strategy, but nothing like what it reads on a live
+    feed. So a file replay ends on the last completed bucket and runs backwards
+    from there: ``--limit`` bars of history landing where history belongs.
+
+    The cost is the one :func:`~qte_simulator.bars.anchor_open_times` warns
+    about. Every bucket the run fills is already over, so ingestion's
+    wall-clock flush can land between two ticks of the same bar and publish
+    half of it — once per ``QTE_INGESTION__FLUSH_INTERVAL`` for as long as the
+    replay takes. A warm-up survives losing a bar in a few hundred; use
+    ``--anchor next`` when it must not.
+    """
+    if args.anchor != "auto":
+        return args.anchor
+    return "past" if from_file else "next"
 
 
 async def _continue_from(args: argparse.Namespace) -> float:
@@ -275,17 +356,7 @@ async def _play(args: argparse.Namespace, rows: list[dict[str, Any]]) -> int:
             return 2
 
     try:
-        async with ControlClient(args.url) as client:
-            result = await client.send(
-                "bars",
-                symbol=args.symbol,
-                timeframe=timeframe,
-                bars=rows,
-                anchor=args.anchor,
-                spread=args.spread,
-                seal=args.seal,
-                rate=getattr(args, "rate", 0.0),
-            )
+        result = await _send_bars(args, timeframe, rows)
 
         if args.json:
             _print_json(result)
@@ -311,6 +382,68 @@ async def _play(args: argparse.Namespace, rows: list[dict[str, Any]]) -> int:
     finally:
         if watcher is not None:
             await watcher.stop()
+
+
+async def _send_bars(
+    args: argparse.Namespace, timeframe: str, rows: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Play *rows* as one `bars` command, or as several, and merge the answers.
+
+    The server caps a single command at :data:`~qte_simulator.control.MAX_BARS`
+    bars, and a cache warm-up sized to the Redis retention is routinely larger
+    than that, so a long run goes over in batches. Only the first batch is
+    placed on the clock; the rest continue the series it left, which is exactly
+    what ``anchor=next`` means. Sealing is left to the last batch — a seal
+    between two batches opens a one-tick bucket in the middle of the run, and
+    the batch after it would start one bucket late.
+    """
+    batches = [rows[start : start + MAX_BARS] for start in range(0, len(rows), MAX_BARS)]
+    anchor = args.anchor
+    if len(batches) > 1:
+        anchor = _first_open_time(args.anchor, len(rows), timeframe)
+    results: list[dict[str, Any]] = []
+    async with ControlClient(args.url) as client:
+        for position, batch in enumerate(batches):
+            results.append(
+                await client.send(
+                    "bars",
+                    symbol=args.symbol,
+                    timeframe=timeframe,
+                    bars=batch,
+                    anchor=anchor if position == 0 else "next",
+                    spread=args.spread,
+                    seal=args.seal and position == len(batches) - 1,
+                    rate=getattr(args, "rate", 0.0),
+                )
+            )
+    return _merge_acknowledgements(results)
+
+
+def _first_open_time(anchor: str, count: int, timeframe: str) -> str:
+    """Resolve ``past`` to the explicit open time the whole run starts at.
+
+    Batching hides the length of the run from the server, and ``past`` is
+    defined by where the run *ends*: left alone, the server would place the
+    first batch against the clock and every later batch after it, so the run
+    would finish that many bars into the future. Computing the first bucket
+    here keeps a batched run landing exactly where an unbatched one would.
+    """
+    if anchor != "past":
+        return anchor
+    return anchor_open_times(count, timeframe, mode="past")[0].isoformat()
+
+
+def _merge_acknowledgements(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """One acknowledgement for a run that went over in several commands.
+
+    Counts add up; the rest of the run is described by its last batch, which is
+    the one that sealed it and the one whose delivery count is current.
+    """
+    merged = dict(results[-1])
+    merged["bars"] = sum(result["bars"] for result in results)
+    merged["ticks"] = sum(result["ticks"] for result in results)
+    merged["expected"] = [row for result in results for row in result["expected"]]
+    return merged
 
 
 async def _report_verification(
@@ -353,7 +486,7 @@ async def _report_verification(
             print(
                 f"\nSignals none within {args.timeout:g}s. That is a pass for the pipeline and\n"
                 "  a question for the strategy: is it still warming up (the runner logs\n"
-                "  'Warm-up n/m candles'), is it routed to this symbol in\n"
+                "  'Warm-up n/m candles'), is it mapped to this symbol in\n"
                 "  config/strategies_mapping.toml, and did this bar actually meet its rule?"
             )
             exit_code = 1
@@ -500,6 +633,28 @@ def _timeframe(args: argparse.Namespace) -> str:
     return normalize_timeframe(args.timeframe or settings.engine.signal_timeframe)
 
 
+def _fill_in_symbol(args: argparse.Namespace) -> bool:
+    """Default ``--symbol`` to the symbol the engine is actually watching.
+
+    Ingestion subscribes to ``QTE_ENGINE__SYMBOLS`` and nothing else, so a
+    rehearsal on any other symbol is delivered to the simulator and then
+    silently ignored downstream. Taking the default from the same setting makes
+    the common case a command with no arguments and the mistake impossible to
+    make by omission.
+    """
+    if not hasattr(args, "symbol") or args.symbol is not None:
+        return True
+    if not settings.engine.symbols:
+        print(
+            "error: no --symbol, and QTE_ENGINE__SYMBOLS is empty — there is nothing "
+            "for the engine to receive this on",
+            file=sys.stderr,
+        )
+        return False
+    args.symbol = settings.engine.symbols[0]
+    return True
+
+
 def _print_json(payload: Any) -> int:
     print(json.dumps(payload, indent=2, default=str))
     return 0
@@ -533,6 +688,9 @@ def run(argv: list[str] | None = None) -> int:
             return 3
         return 0
 
+    if not _fill_in_symbol(args):
+        return 2
+
     try:
         return asyncio.run(_COMMANDS[args.command](args))
     except KeyboardInterrupt:
@@ -545,7 +703,22 @@ def run(argv: list[str] | None = None) -> int:
         return 2
 
 
+def _force_utf8_stdio() -> None:
+    """Windows' default console codec (cp1252) cannot encode the arrows and
+    check marks the CLI prints; a stray ``→`` in a status line crashes the
+    whole command before ``--verify`` gets to run. Reconfiguring stdio to UTF-8
+    is a no-op wherever the terminal already speaks it."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
+
+
 def main() -> None:
+    _force_utf8_stdio()
     raise SystemExit(run())
 
 

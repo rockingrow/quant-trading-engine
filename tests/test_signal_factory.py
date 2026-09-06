@@ -2,15 +2,15 @@ from datetime import UTC, datetime
 
 import pytest
 from qte_shared.models import SignalAction, is_valid_uxid
-from qte_shared.signal_factory import BracketPolicy, SignalFactory
-from qte_shared.sizing import PositionSizer
-from qte_shared.strategy_base import SignalIntent
+from qte_shared.strategies.signal_factory import BracketPolicy, SignalFactory
+from qte_shared.strategies.sizing import PositionSizer
+from qte_shared.strategies.strategy_base import SignalIntent
 
 NOW = datetime(2026, 5, 1, 10, 0, tzinfo=UTC)
 
 
 def _factory(**kwargs) -> SignalFactory:
-    return SignalFactory("MT5_GOLD_M5_V1", timeframe="M15", token="tok", **kwargs)
+    return SignalFactory("MT5_GOLD_SCALP", timeframe="M15", token="tok", **kwargs)
 
 
 def test_entry_mints_a_cycle_and_the_close_reuses_it():
@@ -189,7 +189,7 @@ def test_a_second_entry_cannot_orphan_the_open_cycle():
 def _priced(**kwargs) -> SignalFactory:
     """A factory sizing against a $1,000 account, as the contract example does."""
     return SignalFactory(
-        "MT5_GOLD_M5_V1",
+        "MT5_GOLD_SCALP",
         timeframe="M5",
         token="tok",
         sizer=PositionSizer(capital=1000.0, risk_percent=3.0),

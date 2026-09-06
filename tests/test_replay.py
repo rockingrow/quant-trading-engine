@@ -7,7 +7,12 @@ import pytest
 from qte_backtest.execution import CostModel, ExitReason
 from qte_backtest.replay import BacktestEngine
 from qte_shared.models import SignalAction
-from qte_shared.strategy_base import IntentResult, SignalIntent, StrategyBase, StrategyContext
+from qte_shared.strategies.strategy_base import (
+    IntentResult,
+    SignalIntent,
+    StrategyBase,
+    StrategyContext,
+)
 
 
 class BuyOnceStrategy(StrategyBase):

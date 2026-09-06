@@ -9,7 +9,7 @@ import sys
 from datetime import UTC, date, datetime
 from pathlib import Path
 
-from qte_shared.config import settings
+from qte_shared.config import market_data_plan, settings
 from qte_shared.logging_setup import configure_logging, get_logger
 
 from qte_backtest.data_store import ParquetStore
@@ -29,18 +29,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--symbol",
         action="append",
         default=None,
-        help="Repeatable; defaults to QTE_ENGINE__SYMBOLS",
+        help="Repeatable; defaults to the symbols in the market-data plan",
     )
     download.add_argument(
         "--timeframe",
         action="append",
         default=None,
-        help="Repeatable; defaults to QTE_ENGINE__TIMEFRAMES",
+        help="Repeatable; defaults to the timeframes each planned symbol asks for",
     )
     download.add_argument("--start", type=_as_date, default=None, help="YYYY-MM-DD")
     download.add_argument("--end", type=_as_date, default=None, help="YYYY-MM-DD")
     download.add_argument(
         "--market", choices=["fx", "crypto"], default=None, help="Override the inferred market"
+    )
+    download.add_argument(
+        "--replace",
+        action="store_true",
+        help="Overwrite the parquet instead of merging into it (discards bars outside the range)",
     )
 
     subparsers.add_parser("list", help="Show the history already on disk")
@@ -129,20 +134,41 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 async def _download(args: argparse.Namespace) -> None:
-    symbols = args.symbol or settings.engine.symbols
-    timeframes = args.timeframe or settings.engine.timeframes
     downloader = HistoryDownloader()
-    for symbol in symbols:
-        for timeframe in timeframes:
-            await downloader.download(
-                DownloadRequest(
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    start=args.start,
-                    end=args.end,
-                    market=args.market,
-                )
-            )
+    for symbol, timeframe, market in _download_targets(args):
+        await downloader.download(
+            DownloadRequest(
+                symbol=symbol,
+                timeframe=timeframe,
+                start=args.start,
+                end=args.end,
+                market=market,
+            ),
+            replace=args.replace,
+        )
+
+
+def _download_targets(args: argparse.Namespace) -> list[tuple[str, str, str | None]]:
+    """Which (symbol, timeframe, market) triples to fetch.
+
+    With no flags this is the market-data plan itself, pair for pair: fetching
+    the cross product of every symbol with every timeframe would ask the vendor
+    for bars nothing subscribes to, and on a rate-limited plan those requests
+    come out of the ones that matter. A flag drops back to the cross product,
+    because then the operator has said exactly what they want.
+    """
+    plan = market_data_plan()
+    if not args.symbol and not args.timeframe and plan.feeds:
+        return [
+            (feed.symbol, timeframe, args.market or feed.market)
+            for feed in plan.feeds
+            for timeframe in feed.timeframes
+        ]
+    return [
+        (symbol, timeframe, args.market)
+        for symbol in (args.symbol or settings.engine.symbols)
+        for timeframe in (args.timeframe or settings.engine.timeframes)
+    ]
 
 
 async def _run(args: argparse.Namespace) -> None:

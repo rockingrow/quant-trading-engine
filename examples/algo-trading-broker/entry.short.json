@@ -1,5 +1,5 @@
 {
-  "strategy": "MT5_GOLD_M5_V1",
+  "strategy": "MT5_GOLD_SCALP",
   "inputs": {},
   "symbol": "OANDA:XAUUSD",
   "position": {

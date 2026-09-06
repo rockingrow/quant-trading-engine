@@ -2,7 +2,14 @@
 
 It lives with the provider rather than on root :class:`Settings`, so the core
 config has no vendor-shaped hole in it and a second vendor adds a file instead
-of a field. The env names are unchanged, so an existing ``.env`` keeps working.
+of a field.
+
+Three places can set a field here, highest first: the environment
+(``QTE_TIINGO__MAX_ROWS_PER_REQUEST``, for a one-run override), the
+``[provider]`` table of ``config/tiingo.toml``, and the defaults below. The API
+key is not among them -- it is inherited from
+:class:`~qte_shared.interfaces.market_data.ProviderSettings` and read from
+``QTE_DATA_PROVIDER_API_KEY``, one name whichever vendor is switched on.
 """
 
 from __future__ import annotations
@@ -17,7 +24,6 @@ class TiingoSettings(ProviderSettings):
 
     model_config = SettingsConfigDict(env_prefix="QTE_TIINGO__", extra="ignore")
 
-    api_key: str = ""
     rest_url: str = "https://api.tiingo.com"
     fx_ws_url: str = "wss://api.tiingo.com/fx"
     crypto_ws_url: str = "wss://api.tiingo.com/crypto"
@@ -25,3 +31,17 @@ class TiingoSettings(ProviderSettings):
     fx_threshold: int = 5
     crypto_threshold: int = 2
     request_timeout: float = 30.0
+    #: Bars asked for in a single REST call, normally set in ``[provider]`` of
+    #: ``config/tiingo.toml``. Tiingo caps an intraday response
+    #: at a few thousand rows and signals it with a *200 and fewer bars* -- not
+    #: an error -- so a range wider than the cap comes back quietly short. The
+    #: history source pages under this budget instead; measured truncation on a
+    #: free plan began between 5k and 7k rows, so the default leaves headroom.
+    #: A paid plan can raise it to cut the number of round trips.
+    max_rows_per_request: int = 5000
+    #: Hard stop on pages for one range, so a vendor that stops making progress
+    #: cannot spin forever. It has to clear the widest range a caller can ask
+    #: for by default: `qte-backtest download` uses three years, which on M1 is
+    #: a three-day page span and so ~365 pages. A lower ceiling would turn the
+    #: silent truncation this module fixes back on at a different layer.
+    max_pages: int = 600
