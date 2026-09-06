@@ -11,33 +11,32 @@ from pathlib import Path
 
 from qte_shared.config import REPO_ROOT, _find_repo_root, settings
 
+MARKER = '[project]\nname = "x"\n\n[tool.qte]\nrepo-root = true\n'
 
-def test_the_repo_root_is_the_directory_holding_the_workspace_manifest():
+
+def test_the_repo_root_is_the_directory_holding_the_marked_manifest():
     manifest = REPO_ROOT / "pyproject.toml"
     assert manifest.is_file()
-    assert "[tool.uv.workspace]" in manifest.read_text(encoding="utf-8")
+    assert "[tool.qte]" in manifest.read_text(encoding="utf-8")
 
 
 def test_the_root_is_identified_not_counted(tmp_path, monkeypatch):
     # Same package, moved one level deeper: the answer must not change shape.
     nested = tmp_path / "engines" / "shared" / "qte_shared"
     nested.mkdir(parents=True)
-    (tmp_path / "pyproject.toml").write_text(
-        '[project]\nname = "x"\n\n[tool.uv.workspace]\nmembers = ["engines/*"]\n'
-    )
+    (tmp_path / "pyproject.toml").write_text(MARKER)
     monkeypatch.setattr("qte_shared.config.__file__", str(nested / "config.py"), raising=False)
     assert _find_repo_root() == tmp_path.resolve()
 
 
-def test_a_pyproject_without_the_workspace_table_is_not_the_root(tmp_path, monkeypatch):
-    # Every member has a pyproject.toml; only the root declares the workspace.
-    member = tmp_path / "engines" / "shared"
-    package = member / "qte_shared"
+def test_a_pyproject_without_the_marker_table_is_not_the_root(tmp_path, monkeypatch):
+    # A mounted strategy repo brings its own pyproject.toml and sits under
+    # __strategies__/, i.e. *below* the root. Only the marker separates them.
+    checkout = tmp_path / "__strategies__" / "my-strategies"
+    package = checkout / "src" / "edges"
     package.mkdir(parents=True)
-    (member / "pyproject.toml").write_text('[project]\nname = "qte-shared"\n')
-    (tmp_path / "pyproject.toml").write_text(
-        '[project]\nname = "x"\n\n[tool.uv.workspace]\nmembers = ["engines/*"]\n'
-    )
+    (checkout / "pyproject.toml").write_text('[project]\nname = "my-strategies"\n')
+    (tmp_path / "pyproject.toml").write_text(MARKER)
     monkeypatch.setattr("qte_shared.config.__file__", str(package / "config.py"), raising=False)
     assert _find_repo_root() == tmp_path.resolve()
 
@@ -48,29 +47,29 @@ def test_the_defaults_hang_off_the_root_rather_than_the_working_directory():
     assert settings.engine.reports_dir == REPO_ROOT / "data" / "reports"
 
 
-def test_the_shared_package_really_lives_under_engines():
-    assert (REPO_ROOT / "engines" / "shared" / "src" / "qte_shared" / "config.py").is_file()
-    assert not (REPO_ROOT / "shared").exists()
+def test_the_shared_package_really_lives_under_src():
+    assert (REPO_ROOT / "src" / "qte_shared" / "config.py").is_file()
+    assert not (REPO_ROOT / "engines").exists()
+    assert not (REPO_ROOT / "qte_shared").exists()
 
 
-def test_every_workspace_member_is_an_engine():
-    members = sorted(path.name for path in (REPO_ROOT / "engines").iterdir() if path.is_dir())
+def test_src_holds_the_services_and_nothing_else():
+    members = sorted(path.name for path in (REPO_ROOT / "src").iterdir() if path.is_dir())
     assert members == [
-        "backtest_engine",
-        "data_ingestion",
-        "market_simulator",
-        "shared",
-        "strategy_audit",
-        "strategy_engine",
+        "qte_backtest",
+        "qte_ingestion",
+        "qte_shared",
+        "qte_simulator",
+        "qte_strategy_audit",
+        "qte_strategy_engine",
     ]
     for name in members:
-        assert (REPO_ROOT / "engines" / name / "pyproject.toml").is_file()
-        # src-layout: the importable package is one level down, so the engine
-        # folder and the package name never sit adjacent looking near-identical.
-        assert (REPO_ROOT / "engines" / name / "src").is_dir()
+        # One level from src/ to the code: the folder *is* the import name, so
+        # there is nothing between them to get out of step.
+        assert (REPO_ROOT / "src" / name / "__init__.py").is_file()
 
 
 def test_no_stray_path_assumptions_survive_outside_the_root():
     # REPO_ROOT must be an ancestor of the package, never a sibling or below it.
-    package = Path(__file__).resolve().parents[1] / "engines" / "shared" / "src"
+    package = Path(__file__).resolve().parents[1] / "src" / "qte_shared"
     assert package.is_relative_to(REPO_ROOT)

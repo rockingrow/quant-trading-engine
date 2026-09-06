@@ -15,6 +15,7 @@ import textwrap
 from pathlib import Path
 
 import pytest
+
 from qte_shared.strategies.mapping import SymbolMapping
 from qte_shared.strategies.strategy_base import SignalStrategy
 from qte_strategy_engine.runner import StrategyRunner

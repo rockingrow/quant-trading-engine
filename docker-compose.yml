@@ -100,13 +100,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      # env.py imports models from every engine that owns tables; the runner
-      # image ships only its own, so ask the builder for the sibling packages
-      # too. Backtest brings pyarrow, which is why the runner image itself
-      # deliberately does not — but a one-shot migrator can afford it.
-      args:
-        QTE_PACKAGE: qte-strategy-engine
-        QTE_EXTRA_PACKAGES: qte-backtest qte-ingestion
+      # env.py imports the models of every service that owns tables, and one
+      # package ships all of them, so this needs no extras at all: migrating is
+      # SQLAlchemy metadata plus a driver, both core dependencies.
+      args: {QTE_EXTRAS: ""}
     depends_on:
       postgres-audit: {condition: service_healthy}
     command: ["alembic", "upgrade", "head"]
@@ -117,8 +114,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      # No pyarrow, no backtest engine — this container only reads the feed.
-      args: {QTE_PACKAGE: qte-ingestion}
+      # The vendor client and the dev simulator's socket, nothing else. No
+      # pyarrow: the boot-time warm-up cache degrades to "no cache" without it.
+      args: {QTE_EXTRAS: "tiingo simulator"}
     command: ["qte-ingestion"]
 
   strategy-runner:
@@ -126,10 +124,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      # Ships qte-strategy-runner and qte-control. NOT the backtest engine:
-      # strategy-engine does not depend on it, so replaying history is done on
-      # the host with `make backtest`, not inside the live trading container.
-      args: {QTE_PACKAGE: qte-strategy-engine}
+      # The broker's HTTP client and nothing else. No vendor socket (the runner
+      # reads candles off NATS) and no pyarrow, so replaying history stays a
+      # host job via `make backtest`, not something the live container can do.
+      args: {QTE_EXTRAS: "broker"}
     command: ["qte-strategy-runner"]
 
   # The dev-only market data simulator.
@@ -151,7 +149,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      args: {QTE_PACKAGE: qte-simulator}
+      args: {QTE_EXTRAS: "simulator"}
     command: ["qte-simulator", "serve"]
     # Published so the CLI on the host can drive it:
     #   qte-simulator replay --symbol XAUUSD --generate 300
@@ -185,7 +183,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      args: {QTE_PACKAGE: qte-strategy-audit}
+      # The auditor imports plugins and checks their shape; it opens no socket.
+      args: {QTE_EXTRAS: ""}
     volumes:
       - ./__strategies__:/app/__strategies__:ro
       - ./config:/app/config:ro

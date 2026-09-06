@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from math import nan
 
 import pytest
+
 from qte_shared.models import BrokerSignal, PositionBlock, SignalAction, is_valid_uxid, new_uxid
 
 

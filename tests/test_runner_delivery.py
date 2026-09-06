@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
+
 from qte_shared.models import OpenPosition, SignalAction
 from qte_shared.strategies.signal_factory import SignalFactory
 from qte_shared.strategies.sizing import PositionSizer

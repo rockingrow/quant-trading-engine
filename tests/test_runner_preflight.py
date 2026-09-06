@@ -16,6 +16,7 @@ import textwrap
 from pathlib import Path
 
 import pytest
+
 from qte_shared.config import settings
 from qte_strategy_engine.preflight import StrategyAuditFailed, run_preflight_audit
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pandas as pd
 import pytest
+
 from qte_backtest.execution import CostModel, ExitReason
 from qte_backtest.replay import BacktestEngine
 from qte_shared.models import SignalAction

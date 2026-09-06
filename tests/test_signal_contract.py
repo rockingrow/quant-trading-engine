@@ -15,6 +15,7 @@ from abc import ABC, abstractmethod
 from datetime import UTC, datetime
 
 import pytest
+
 from qte_shared.models import SignalAction
 from qte_shared.strategies.strategy_base import (
     ENTRY_SIGNAL_ORDER,

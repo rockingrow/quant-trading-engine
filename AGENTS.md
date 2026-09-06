@@ -12,7 +12,8 @@ Follow a more specific `AGENTS.md` in a subdirectory when one exists.
 Event-driven quant trading engine. Ingestion → Redis/NATS → strategy runner →
 `algo-trading-broker`; the backtest engine replays the same strategy interface
 offline. The engine is public, the alpha is not: strategies load by path from
-the git-ignored `__strategies__/`. Python 3.13, uv workspace over `engines/*`.
+the git-ignored `__strategies__/`. Python 3.13, one uv package, one folder
+per service under `src/`.
 
 ## Rules — [AUDIT.md](AUDIT.md) is the authority
 
@@ -57,7 +58,6 @@ make audit          # validate __strategies__/ against the signal contract
 make tiingo         # write config/tiingo.toml — what the vendor is asked to feed
 make db-check       # fail if the models drifted from the migrations
 make db-upgrade     # Alembic; there is no init script
-make infra          # redis + postgres + nats only
 make backtest STRATEGY=QTE_EXAMPLE_EMA_ATR SYMBOL=XAUUSD [TF=M15]
 make chart REPORT=data/reports/<file>.json
 make help           # every target, one line each
@@ -71,33 +71,33 @@ package; never scan from the repository root.
 1. Table below, to find the owning package.
 2. `sed -n '1,25p' <file>` — **every module opens with a docstring** stating its
    job and its trade-offs. That usually answers "does this file do X".
-3. `rg -n "<symbol>" <owning-package>/src tests` — scope the search.
+3. `rg -n "<symbol>" <owning-package> tests` — scope the search.
 4. `tests/test_<topic>.py` — the suite is organised by topic and reads as the
    executable spec for that module.
 
 | Task or concept | Primary location |
 | --- | --- |
-| Wire models, enums, candles, ticks, `SignalIntent` | `engines/shared/src/qte_shared/models.py` |
-| Strategy contract and its seven methods | `engines/shared/src/qte_shared/strategies/strategy_base.py` |
-| Strategy discovery and manifests | `engines/shared/src/qte_shared/strategies/plugin_loader.py` |
-| Intent to broker payload | `engines/shared/src/qte_shared/strategies/signal_factory.py` |
-| Position sizing and account risk | `engines/shared/src/qte_shared/strategies/sizing.py` |
-| Indicators (pure, arrays in and out) | `engines/shared/src/qte_shared/indicators.py` |
-| Timeframes, candle buckets, symbol markets | `engines/shared/src/qte_shared/{timeframes,symbols}.py` |
-| Symbol to strategy mapping | `engines/shared/src/qte_shared/strategies/mapping.py`, `config/strategies_mapping.example.toml` |
-| What the vendor feeds: symbols, markets, timeframes, vendor knobs | `engines/shared/src/qte_shared/market_data_plan.py`, `config/tiingo.example.toml` |
-| Settings and `QTE_*` environment variables | `engines/shared/src/qte_shared/config.py`, each service's `settings.py`, `.env.example` |
-| NATS subjects and publishing | `engines/shared/src/qte_shared/bus/{subjects,nats_bus}.py` |
-| Redis state and the candle outbox | `engines/shared/src/qte_shared/cache/redis_state.py` |
-| Postgres models and repositories | `engines/shared/src/qte_shared/db/`, each engine's `db/`, `migrations/versions/` |
-| Market data interface and vendors | `engines/shared/src/qte_shared/interfaces/market_data.py`, `providers/` (`registry.py`, `tiingo/`, `simulator/`) |
-| Live feed, resampling, Redis and NATS | `engines/data_ingestion/src/qte_ingestion/{service,resampler}.py` |
-| Live loop, broker delivery, control CLI | `engines/strategy_engine/src/qte_strategy_engine/{runner,broker_sink,preflight,control}.py` |
-| Backtest replay, fills, metrics, reports | `engines/backtest_engine/src/qte_backtest/{replay,execution,metrics,report,diagnostics}.py` |
-| Parquet history: download, read, list | `engines/backtest_engine/src/qte_backtest/{downloader,data_store}.py` |
-| Backtest HTML dashboard | `engines/backtest_engine/src/qte_backtest/visualize/` |
-| Strategy deploy audit | `engines/strategy_audit/src/qte_strategy_audit/{auditor,contract}.py` |
-| Dev-only WebSocket simulator | `engines/market_simulator/src/qte_simulator/` (refuses to run unless `QTE_ENV=dev`) |
+| Wire models, enums, candles, ticks, `SignalIntent` | `src/qte_shared/models.py` |
+| Strategy contract and its seven methods | `src/qte_shared/strategies/strategy_base.py` |
+| Strategy discovery and manifests | `src/qte_shared/strategies/plugin_loader.py` |
+| Intent to broker payload | `src/qte_shared/strategies/signal_factory.py` |
+| Position sizing and account risk | `src/qte_shared/strategies/sizing.py` |
+| Indicators (pure, arrays in and out) | `src/qte_shared/indicators.py` |
+| Timeframes, candle buckets, symbol markets | `src/qte_shared/{timeframes,symbols}.py` |
+| Symbol to strategy mapping | `src/qte_shared/strategies/mapping.py`, `config/strategies_mapping.example.toml` |
+| What the vendor feeds: symbols, markets, timeframes, vendor knobs | `src/qte_shared/market_data_plan.py`, `config/tiingo.example.toml` |
+| Settings and `QTE_*` environment variables | `src/qte_shared/config.py`, each service's `settings.py`, `.env.example` |
+| NATS subjects and publishing | `src/qte_shared/bus/{subjects,nats_bus}.py` |
+| Redis state and the candle outbox | `src/qte_shared/cache/redis_state.py` |
+| Postgres models and repositories | `src/qte_shared/db/`, each engine's `db/`, `migrations/versions/` |
+| Market data interface and vendors | `src/qte_shared/interfaces/market_data.py`, `providers/` (`registry.py`, `tiingo/`, `simulator/`) |
+| Live feed, resampling, Redis and NATS | `src/qte_ingestion/{service,resampler}.py` |
+| Live loop, broker delivery, control CLI | `src/qte_strategy_engine/{runner,broker_sink,preflight,control}.py` |
+| Backtest replay, fills, metrics, reports | `src/qte_backtest/{replay,execution,metrics,report,diagnostics}.py` |
+| Parquet history: download, read, list | `src/qte_backtest/{downloader,data_store}.py` |
+| Backtest HTML dashboard | `src/qte_backtest/visualize/` |
+| Strategy deploy audit | `src/qte_strategy_audit/{auditor,contract}.py` |
+| Dev-only WebSocket simulator | `src/qte_simulator/` (refuses to run unless `QTE_ENV=dev`) |
 | **Why** something is built this way | `docs/architecture.md` — 20 "Why X" sections; run `rg -n '^## ' docs/architecture.md`, then read only the one you need |
 | Broker payload contract | `docs/broker-contract.md` |
 | Backtest report schema | `docs/backtest-report.md` |
@@ -117,16 +117,19 @@ the plugin shape.
 
 ## Architecture invariants
 
-- `qte_shared` must not import another engine. Every other engine depends on
-  `qte_shared` and on nothing else in the repository.
+- `qte_shared` must not import another service, and no service may import a
+  sibling except through it. One package now ships all six, so nothing in the
+  resolver enforces this any more — `tests/test_packaging.py` reads the
+  imports themselves instead. The one allowed exception is listed there.
+  Anything two services both need belongs in `qte_shared`; anything only one of
+  them uses belongs in that service, not in `qte_shared`.
 - Signal behaviour must stay identical between `qte_backtest.replay` and
   `qte_strategy_engine.runner`, and both must keep going through
   `signal_factory` — otherwise a backtest stops predicting live behaviour.
 - The plugin contract is **structural, not nominal**: a strategy repo restates
   the interface on its own side. Changing `strategies/strategy_base.py` or
   `models.py` is a contract change — check
-  `engines/strategy_audit/src/qte_strategy_audit/contract.py` and run
-  `make audit`.
+  `src/qte_strategy_audit/contract.py` and run `make audit`.
 - Schema changes go through the single Alembic chain under `migrations/`
   (`make db-revision M="add x"`); `env.py` there imports every engine's models.
   No ad-hoc schemas.
@@ -135,7 +138,7 @@ the plugin shape.
 
 ## Code style
 
-- Python 3.13, `uv` workspace. Run Python tooling through `uv run`.
+- Python 3.13, one `uv` package. Run Python tooling through `uv run`.
 - Ruff rules `E,F,I,UP,B`, line length 100. Run `make format` before committing.
 - Async throughout the services; pytest runs with `asyncio_mode = "auto"`.
 - Prefer explicit types and domain terminology over clever, compressed code.

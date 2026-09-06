@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 import pytest
+
 from qte_backtest.execution import CostModel
 from qte_backtest.replay import BacktestEngine
 from qte_backtest.report import SCHEMA_VERSION, build_report

@@ -13,6 +13,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
+
 from qte_shared.cache.redis_state import _decode_position
 from qte_shared.models import TERMINAL_ACTIONS, OpenPosition, SignalAction
 
