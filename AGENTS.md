@@ -101,7 +101,7 @@ package; never scan from the repository root.
 | **Why** something is built this way | `docs/architecture.md` — 20 "Why X" sections; run `rg -n '^## ' docs/architecture.md`, then read only the one you need |
 | Broker payload contract | `docs/broker-contract.md` |
 | Backtest report schema | `docs/backtest-report.md` |
-| Simulator walkthrough | `docs/simulator.md` |
+| Simulator walkthrough, and running the whole stack locally with no vendor | `docs/simulator.md` |
 
 CLI entry points: `qte-backtest`, `qte-ingestion`, `qte-strategy-runner`,
 `qte-control`, `qte-strategy-audit`, `qte-simulator`.

@@ -232,6 +232,21 @@ down: ## Stop the stack (volumes survive)
 restart: ## Recreate every app container (keeps volumes and infra)
 	docker compose up -d --build --force-recreate data-ingestion strategy-runner market-simulator
 
+# ── Live-editing dev loop ──────────────────────────────────────────────
+#
+# `make dev` is `start` with the workspace source bind-mounted over the copy in
+# the image (docker-compose.dev.yml). Build it once; after that a code edit is
+# live in the container, so the loop is: edit -> `make dev-restart` (seconds,
+# no rebuild) -> `make logs`. A dependency change still needs `make dev` again.
+
+DEV_COMPOSE := -f docker-compose.yml -f docker-compose.dev.yml
+
+dev: market-plan strategy-requirements ## `start` with engines/ bind-mounted for live editing
+	docker compose $(DEV_COMPOSE) up -d --build
+
+dev-restart: ## Reload code after an edit — restart the app processes, no rebuild
+	docker compose $(DEV_COMPOSE) restart data-ingestion strategy-runner market-simulator
+
 logs: ## Tail every service
 	docker compose logs -f --tail=100
 
@@ -367,7 +382,7 @@ ping: ## Ask the running runners to identify themselves
 	uv run qte-control ping
 
 .PHONY: help install install-dev lock test lint format check tiingo market-plan \
-	infra up start stop down restart logs nuke \
+	infra up start stop down restart dev dev-restart logs nuke \
 	strategy-mount strategy-audit strategy-requirements strategy-test strategies audit audit-strict strategy-mapping \
 	db-upgrade db-downgrade db-revision db-current db-history db-check \
 	download history backtest chart reports ingestion runner csv-import \

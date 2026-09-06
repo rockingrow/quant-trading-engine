@@ -19,7 +19,7 @@ name: qte
 # these overrides swap them for the compose service names once the process is
 # inside the network. `environment:` wins over `env_file:` in compose, so the
 # same .env drives both worlds.
-x-container-urls: &container-urls
+x-container-envs: &container-envs
   QTE_NATS__URL: nats://nats:4222
   QTE_REDIS__URL: redis://redis-cache:6379/0
   QTE_POSTGRES__DSN: postgresql+asyncpg://qte:qte@postgres-audit:5432/qte_audit
@@ -27,7 +27,7 @@ x-container-urls: &container-urls
 
 x-app: &app
   env_file: [.env]
-  environment: *container-urls
+  environment: *container-envs
   restart: unless-stopped
   volumes:
     # The private strategy repo, mounted read-only: the engine loads it and
@@ -96,7 +96,7 @@ services:
   # would burn a second slot for no gain.
   db-migrate:
     env_file: [.env]
-    environment: *container-urls
+    environment: *container-envs
     build:
       context: .
       dockerfile: Dockerfile
@@ -146,7 +146,7 @@ services:
   # pipeline — which is what makes the rehearsal worth running.
   market-simulator:
     env_file: [.env]
-    environment: *container-urls
+    environment: *container-envs
     restart: unless-stopped
     build:
       context: .
