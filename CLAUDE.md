@@ -28,7 +28,8 @@ Use plan mode, and confirm the approach, before editing:
 - `engines/strategy_engine/src/qte_strategy_engine/{broker_sink,runner}.py` —
   the live delivery path; a mistake here sends or loses real orders.
 - `migrations/versions/` — one Alembic chain for every engine.
-- `engines/shared/src/qte_shared/{models,strategy_base}.py` — a contract change
+- `engines/shared/src/qte_shared/models.py` and
+  `engines/shared/src/qte_shared/strategies/strategy_base.py` — a contract change
   for every private strategy repo, which this repository cannot see.
 
 ## Session hygiene

@@ -28,7 +28,8 @@ from enum import Enum
 from typing import Any, ClassVar
 
 import pandas as pd
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
 from qte_shared.config import REPO_ROOT
 from qte_shared.indicators import OHLCV_COLUMNS
@@ -78,15 +79,70 @@ class ProviderSettings(BaseSettings):
 
     Each provider owns its settings -- root :class:`~qte_shared.config.Settings`
     deliberately carries no vendor block, so adding a vendor never edits the
-    core config. Subclasses set only ``env_prefix``; the ``.env`` wiring is
-    inherited so an operator fills one file regardless of which vendor is on.
+    core config. Subclasses set only ``env_prefix``; the wiring below is
+    inherited, so an operator fills the same two places regardless of which
+    vendor is on:
+
+    * the **key** in ``.env`` as ``QTE_DATA_PROVIDER_API_KEY`` -- one name for
+      whichever vendor is switched on, because a secret is the one thing that
+      must not move file when the vendor changes;
+    * the **knobs** in ``[provider]`` of ``config/<provider>.toml``, beside the
+      symbols they are fetched for (:mod:`qte_shared.market_data_plan`).
+
+    Environment still wins over the file, so ``QTE_TIINGO__MAX_ROWS_PER_REQUEST``
+    remains a one-run override rather than an edit.
     """
 
     model_config = SettingsConfigDict(
         env_file=(REPO_ROOT / ".env"),
         env_file_encoding="utf-8",
         extra="ignore",
+        # `api_key` is read from an env name that is not its field name, and
+        # without this that alias would also be the only accepted *keyword* —
+        # `TiingoSettings(api_key=...)` in a test would silently do nothing.
+        populate_by_name=True,
     )
+
+    #: The vendor credential. Deliberately not prefixed per vendor: an operator
+    #: running one provider should not have to know which block its key lives
+    #: in, and a rename of the vendor should not invalidate a deployed secret.
+    api_key: str = Field(default="", validation_alias="QTE_DATA_PROVIDER_API_KEY")
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        """Insert ``[provider]`` from the plan, below the environment."""
+        return (
+            init_settings,
+            env_settings,
+            dotenv_settings,
+            _MarketDataPlanOptions(settings_cls),
+            file_secret_settings,
+        )
+
+
+class _MarketDataPlanOptions(PydanticBaseSettingsSource):
+    """``[provider]`` from ``config/<provider>.toml``, as a settings source.
+
+    Generic on purpose: whatever a vendor's settings class declares can be
+    written in that table, so a second vendor needs no wiring of its own here.
+    The plan drops credential-shaped keys before this sees them.
+    """
+
+    def get_field_value(self, field: Any, field_name: str) -> tuple[Any, str, bool]:
+        # Never called: __call__ returns the whole table in one go.
+        return None, field_name, False  # pragma: no cover
+
+    def __call__(self) -> dict[str, Any]:
+        from qte_shared.config import market_data_plan
+
+        return dict(market_data_plan().options)
 
 
 # -- Values on the wire ----------------------------------------------------

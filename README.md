@@ -28,7 +28,8 @@ which fans them out to MT5 / Binance workers.
 git clone https://github.com/rockingrow/quant-trading-engine
 cd quant-trading-engine
 
-cp .env.example .env          # fill in QTE_TIINGO__API_KEY at minimum
+cp .env.example .env          # fill in QTE_DATA_PROVIDER_API_KEY at minimum
+make tiingo                   # config/tiingo.toml: which symbols to feed
 make install-dev              # uv sync
 ```
 
@@ -207,15 +208,15 @@ half-written.
 
 | Path | What it is |
 | --- | --- |
-| `engines/shared/src/qte_shared/` | — models, indicators, `StrategyBase`, NATS/Redis/Postgres adapters, the plugin loader, the signal factory, `interfaces/` (the contracts engines program against) and `providers/` (the market data vendors behind them). Every other engine depends on this and on nothing else in the repo. |
+| `engines/shared/src/qte_shared/` | — models, indicators, NATS/Redis/Postgres adapters, `strategies/` (the plugin seam: `StrategyBase`, the loader, the mapping table, sizing and the signal factory), `interfaces/` (the contracts engines program against) and `providers/` (the market data vendors behind them). Every other engine depends on this and on nothing else in the repo. |
 | `engines/data_ingestion/src/qte_ingestion/` | Provider live feed → resampler → Redis + NATS. |
 | `engines/backtest_engine/src/qte_backtest/` | History downloader, parquet store, replay loop, fill simulator, metrics, reports, the HTML dashboard, `qte-backtest` CLI. |
 | `engines/strategy_engine/src/qte_strategy_engine/` | The live runner: plugin loading, the NATS event loop, delivery to the broker, audit, and the `qte-control` operator CLI. |
 | `engines/market_simulator/src/qte_simulator/` | **Dev only.** A WebSocket feed you drive by hand, so the whole pipeline can be rehearsed with no market open. Refuses to start unless `QTE_ENV=dev`. `qte-simulator`; see [`docs/simulator.md`](docs/simulator.md). |
-| `engines/strategy_audit/src/qte_strategy_audit/` | The deploy gate: validates every strategy in `__strategies__/` against the QTE signal contract and cross-checks the routing table. `qte-strategy-audit`. |
+| `engines/strategy_audit/src/qte_strategy_audit/` | The deploy gate: validates every strategy in `__strategies__/` against the QTE signal contract and cross-checks the mapping table. `qte-strategy-audit`. |
 | `__strategies__/` | **Git-ignored**, apart from `_boilerplate/`. Your private strategy repo is cloned in here whole — its own lockfile, its own tests, its own release cycle — and nothing it contains reaches this repository's history. |
 | `__strategies__/_boilerplate/` | The committed template of a strategy repo: `manifest.py`, a strategy class with all seven signal methods, the contract restated on its own side, `pyproject.toml`, tests. It imports nothing from `engines/`, and publishes an inert strategy — so it loads and audits without ever trading. |
-| `config/` | `strategies_mapping.example.toml` — the symbol → strategies table's schema. The real `strategies_mapping.toml` beside it is git-ignored. Also the standalone NATS config. |
+| `config/` | `strategies_mapping.example.toml` — the symbol → strategies table's schema — and `tiingo.example.toml`, the market-data plan: which symbols the vendor feeds, at which timeframes, and its own knobs. The real files beside them are git-ignored (`make strategy-mapping`, `make tiingo`). Also the standalone NATS config. |
 | `migrations/` | Alembic. One chain for the whole system; `env.py` imports every engine's models. |
 | `deploy/` | The strategy requirements `make strategy-requirements` freezes for the image build. |
 | `data/reports/` | Backtest reports, JSON + Markdown. Git-ignored. |
@@ -232,7 +233,7 @@ break-even or trailed) and `flat` (a close that is neither a target nor a stop).
 ```python
 from qte_shared.indicators import atr, crossover, ema
 from qte_shared.models import SignalAction
-from qte_shared.strategy_base import SignalIntent, SignalStrategy
+from qte_shared.strategies.strategy_base import SignalIntent, SignalStrategy
 
 
 class MyEdge(SignalStrategy):
@@ -336,9 +337,9 @@ flowchart TD
     judge -- no --> dropped["logged and skipped<br/>(an error when a manifest named it)"]
     judge -- yes --> registry["LoadedStrategy<br/>name · class · source"]
 
-    registry --> routing{"config/strategies_mapping.toml<br/>present?"}
-    routing -- yes --> pairs["one slot per (symbol, strategy)<br/>pair the table lists"]
-    routing -- "no" --> fallback["one slot per symbol the<br/>strategy declares itself"]
+    registry --> mapping{"config/strategies_mapping.toml<br/>present?"}
+    mapping -- yes --> pairs["one slot per (symbol, strategy)<br/>pair the table lists"]
+    mapping -- "no" --> fallback["one slot per symbol the<br/>strategy declares itself"]
 
     pairs --> slots["StrategySlot<br/>candle buffer · SignalFactory"]
     fallback --> slots
@@ -349,7 +350,7 @@ flowchart TD
 
     audit["qte-strategy-audit"]
     loader -. "same collect(), nothing discarded" .-> audit
-    audit --> verdict["per-class findings + exit code:<br/>missing long/short/tp1/tp2/sl,<br/>bad arity, routing that names<br/>a strategy nobody publishes"]
+    audit --> verdict["per-class findings + exit code:<br/>missing long/short/tp1/tp2/sl,<br/>bad arity, mapping that names<br/>a strategy nobody publishes"]
 
     style disk fill:none,stroke-dasharray:4 4
     style dropped stroke-dasharray:4 4
@@ -397,10 +398,11 @@ arrangement the next two paragraphs describe, in code.
 **A manifest repo need not import `qte_shared` at all.** The engine recognises
 a strategy structurally — a concrete `on_candle_closed`, a `name`, a
 `history_window()` — and converts the intents it returns into its own models
-(`qte_shared.strategy_base.coerce_intent`). Restating the contract on the
-plugin's side is what lets that repo run its own lint, test and release cycle
-with this one nowhere in sight. The audit reads it the same way, so a repo that
-restates `SignalStrategy` is still checked for all seven signal methods.
+(`qte_shared.strategies.strategy_base.coerce_intent`). Restating the contract
+on the plugin's side is what lets that repo run its own lint, test and release
+cycle with this one nowhere in sight. The audit reads it the same way, so a
+repo that restates `SignalStrategy` is still checked for all seven signal
+methods.
 
 **Its dependencies are not automatic.** The plugins are imported into the
 runner's process, so whatever they need has to be installed alongside the
@@ -439,9 +441,10 @@ The scan walks recursively, so a subfolder per instrument is fine. Because the
 directory may be a whole cloned repo rather than a tidy folder, it skips hidden
 directories (`.git`, `.venv`, …) and the usual repo furniture — `tests/`,
 `docs/`, `build/`, `node_modules/` and friends
-(`qte_shared.plugin_loader.EXCLUDED_DIRECTORIES`). Files starting with `_` are
-skipped too, so shared helpers live in `_helpers.py`. A file that fails to
-import is logged and skipped: one broken strategy does not stop the others.
+(`qte_shared.strategies.plugin_loader.EXCLUDED_DIRECTORIES`). Files starting
+with `_` are skipped too, so shared helpers live in `_helpers.py`. A file that
+fails to import is logged and skipped: one broken strategy does not stop the
+others.
 
 ### The two contracts, and why there are two
 
@@ -491,17 +494,17 @@ make audit              # verify every name in it against what __strategies__/ p
 trade, and at what risk, is position information and this repo is public — so
 the schema stays reviewable in history while the book does not. Keep the two in
 step: a key only in the real file is one nobody can review. Point
-`QTE_ENGINE__ROUTING_FILE` elsewhere to mount it as a secret in production;
+`QTE_ENGINE__MAPPING_FILE` elsewhere to mount it as a secret in production;
 compose already mounts `./config` read-only into both service containers.
 
 Why a TOML file rather than environment variables: this is a matrix — symbol ×
-strategy × parameters — and flattening a matrix into `QTE_ROUTING__XAUUSD_0` is
+strategy × parameters — and flattening a matrix into `QTE_MAPPING__XAUUSD_0` is
 how it stops being reviewable. TOML rather than YAML because `tomllib` is in the
 standard library and this file is parsed inside the trading process.
 
 **With no file at all nothing breaks.** Each strategy falls back to its own
 `symbols` attribute, or to `QTE_ENGINE__SYMBOLS` when it declares none — the
-behaviour that existed before the table did. A file that exists but routes
+behaviour that existed before the table did. A file that exists but maps
 nothing means *trade nothing*, which is a different thing and is treated as one.
 
 The runner builds one instance per `(symbol, strategy)` pair, so a strategy
@@ -516,8 +519,8 @@ nothing — which reads exactly like a strategy that found no setups.
 
 **The engine decides how big every entry is, not the strategy.** A strategy is
 never told the balance — that is what keeps a backtested file and a traded file
-the same file — so size is settled in one place, `qte_shared.sizing`, and both
-drivers go through it:
+the same file — so size is settled in one place,
+`qte_shared.strategies.sizing`, and both drivers go through it:
 
 ```
 quantity = QTE_ACCOUNT__CAPITAL x risk_percent / 100 / |entry - stop| / contract_size
@@ -584,7 +587,7 @@ docker compose run --rm strategy-audit  # the same, in the deployed image
 
 ```
 Strategy audit - /app/__strategies__
-Routing table  - /app/config/strategies_mapping.toml
+Mapping table  - /app/config/strategies_mapping.toml
 
   [FAIL] MT5_GOLD_M5_SCALP  (GoldEdge, via manifest)
          /app/__strategies__/my-strategies/manifest.py
@@ -608,9 +611,9 @@ What it checks, and why each one is worth a deploy failing over:
 | `bad-timeframe`, `bad-warmup` | error | at boot, or as indicators running on a half-warm window |
 | `duplicate-name` | error | as two algorithms closing each other's positions |
 | `ambiguous-manifest` | error | as whichever alias table the lookup order happened to pick |
-| `routed-to-nothing` | error | as a symbol that trades nothing and looks like patience |
-| `routing-unreadable` | error | as the runner failing to start |
-| `unrouted-strategy` | warning | never — usually the forgotten half of a rename |
+| `mapped-to-nothing` | error | as a symbol that trades nothing and looks like patience |
+| `mapping-unreadable` | error | as the runner failing to start |
+| `unmapped-strategy` | warning | never — usually the forgotten half of a rename |
 | `no-manifest` | warning | as an experiment in the tree that started trading |
 | `unnamed` | warning | as signals on a subject nobody configured a worker for |
 
@@ -919,7 +922,8 @@ git clone git@github.com:you/my-private-strategies.git __strategies__/my-strateg
 make strategy-mount STRATEGY=my-strategies
 make strategies                      # confirm the engine can see them
 
-# 4. Pair symbols with strategies, then check the whole thing before it trades.
+# 4. Say what to feed and what trades it, then check the whole thing.
+make tiingo                          # config/tiingo.toml — symbols, timeframes, vendor knobs
 make strategy-mapping                # config/strategies_mapping.toml, git-ignored — edit it
 make audit-strict                    # fails on anything the runner would skip
 

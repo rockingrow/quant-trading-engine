@@ -18,7 +18,7 @@ from qte_backtest.replay import BacktestEngine
 from qte_backtest.report import build_report
 from qte_backtest.visualize import build_view, render_html
 from qte_shared.models import SignalAction
-from qte_shared.strategy_base import SignalIntent, StrategyBase
+from qte_shared.strategies.strategy_base import SignalIntent, StrategyBase
 
 START = datetime(2026, 3, 2, tzinfo=UTC)
 

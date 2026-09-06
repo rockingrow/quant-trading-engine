@@ -9,10 +9,10 @@ from typing import Any
 
 from qte_shared.config import settings
 from qte_shared.logging_setup import get_logger
-from qte_shared.plugin_loader import StrategyLoader
-from qte_shared.routing import SymbolRouting
-from qte_shared.signal_factory import BracketPolicy
-from qte_shared.sizing import PositionSizer
+from qte_shared.strategies.mapping import SymbolMapping
+from qte_shared.strategies.plugin_loader import StrategyLoader
+from qte_shared.strategies.signal_factory import BracketPolicy
+from qte_shared.strategies.sizing import PositionSizer
 
 from qte_backtest.data_store import ParquetStore
 from qte_backtest.db import BacktestRepository
@@ -42,7 +42,7 @@ class BacktestRequest:
     quantity: float = 1.0
     starting_equity: float = field(default_factory=lambda: settings.account.capital)
     #: Percent of ``starting_equity`` risked per entry. ``None`` takes it from
-    #: the routing table's entry for this pair, then from
+    #: the mapping table's entry for this pair, then from
     #: ``QTE_ACCOUNT__RISK_PERCENT``.
     risk_percent: float | None = None
     persist: bool = False
@@ -67,12 +67,12 @@ async def run_backtest(
     cheap enough that making it optional would only invite skipping it.
     """
     loader = StrategyLoader(strategies_dir or settings.engine.strategies_dir)
-    # The routing table is what pairs a strategy with a symbol *and* states the
+    # The mapping table is what pairs a strategy with a symbol *and* states the
     # risk it runs at there. Reading it here is what makes a backtest size its
     # trades the way the runner will — without it, `--param risk_percent=…` on
     # the command line would be the only way to reproduce production, and
     # forgetting it would silently measure a different book.
-    params = {**_routed_params(request), **request.params}
+    params = {**_mapped_params(request), **request.params}
     strategy = loader.load_one(request.strategy, params)
 
     store = ParquetStore(parquet_dir)
@@ -140,23 +140,23 @@ async def run_backtest(
     return report
 
 
-def _routed_params(request: BacktestRequest) -> dict[str, Any]:
+def _mapped_params(request: BacktestRequest) -> dict[str, Any]:
     """This pair's overrides from ``config/strategies_mapping.toml``, if any.
 
-    A missing table is normal — a fresh clone has none — and an unrouted pair
+    A missing table is normal — a fresh clone has none — and an unmapped pair
     is normal too: backtesting a symbol before deciding to trade it is the
     usual order of events. Both mean "no overrides", not an error.
     """
-    routing = SymbolRouting.load(settings.engine.routing_file)
-    if not routing:
+    mapping = SymbolMapping.load(settings.engine.mapping_file)
+    if not mapping:
         return {}
-    routed = routing.params_for(request.symbol, request.strategy)
-    if routed:
+    mapped = mapping.params_for(request.symbol, request.strategy)
+    if mapped:
         log.info(
             "Applying %s overrides from %s for %s/%s",
-            ", ".join(sorted(routed)),
-            routing.source,
+            ", ".join(sorted(mapped)),
+            mapping.source,
             request.symbol,
             request.strategy,
         )
-    return routed
+    return mapped

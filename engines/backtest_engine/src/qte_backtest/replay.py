@@ -23,9 +23,14 @@ from typing import Any
 import pandas as pd
 from qte_shared.logging_setup import get_logger
 from qte_shared.models import BrokerSignal, SignalAction
-from qte_shared.signal_factory import BracketPolicy, SignalFactory
-from qte_shared.sizing import PositionSizer
-from qte_shared.strategy_base import SignalIntent, StrategyContext, StrategyLike, as_intents
+from qte_shared.strategies.signal_factory import BracketPolicy, SignalFactory
+from qte_shared.strategies.sizing import PositionSizer
+from qte_shared.strategies.strategy_base import (
+    SignalIntent,
+    StrategyContext,
+    StrategyLike,
+    as_intents,
+)
 from qte_shared.timeframes import timeframe_seconds
 
 from qte_backtest.execution import CostModel, ExitReason, FillSimulator, SimulatedPosition
@@ -156,7 +161,7 @@ class BacktestEngine:
         # The same sizer the live runner builds, so a backtested trade is the
         # size the runner would have sent. Without a caller-supplied one it
         # reads QTE_ACCOUNT__* and the strategy's own params, which is where
-        # the routing table's risk_percent has already landed.
+        # the mapping table's risk_percent has already landed.
         self.factory = SignalFactory(
             strategy.name,
             timeframe=self.timeframe,

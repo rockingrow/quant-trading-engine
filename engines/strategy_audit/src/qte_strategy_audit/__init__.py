@@ -7,7 +7,7 @@ identical in a log until the P&L does not arrive.
 
 This service is the strict reading of the same directory. It collects every
 class each mounted repo offers, checks it against the QTE signal contract in
-:mod:`qte_shared.strategy_base`, cross-checks the routing table against what was
+:mod:`qte_shared.strategies.strategy_base`, cross-checks the mapping table against what was
 actually found, and exits non-zero when something is wrong. Run it in CI and
 before ``make up``.
 """

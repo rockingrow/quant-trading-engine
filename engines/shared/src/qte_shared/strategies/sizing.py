@@ -1,10 +1,10 @@
 """How big an entry is — decided by the engine, never by the strategy.
 
 A strategy is not told the account balance (see
-:class:`~qte_shared.strategy_base.StrategyContext`), which is exactly what lets
+:class:`~qte_shared.strategies.strategy_base.StrategyContext`), which is exactly what lets
 the same file run in a backtest and in production. Size is therefore the
 runner's decision, and it is the same decision in both drivers because both go
-through :class:`~qte_shared.signal_factory.SignalFactory`, which owns one of
+through :class:`~qte_shared.strategies.signal_factory.SignalFactory`, which owns one of
 these.
 
 The rule is the one a risk-per-trade book uses::
@@ -35,7 +35,7 @@ from qte_shared.logging_setup import get_logger
 
 log = get_logger(__name__)
 
-#: Key the routing table and ``QTE_RUNNER__STRATEGY_PARAMS`` use to state a
+#: Key the mapping table and ``QTE_RUNNER__STRATEGY_PARAMS`` use to state a
 #: pair's risk. Read off a strategy's params, which is where both land.
 RISK_PERCENT_KEY = "risk_percent"
 
@@ -67,7 +67,7 @@ class PositionSizer:
     ) -> PositionSizer:
         """Build one from ``QTE_ACCOUNT__*`` and a pair's strategy params.
 
-        *params* is what ``config/strategies_mapping.toml`` routed to this pair
+        *params* is what ``config/strategies_mapping.toml`` mapped to this pair
         (merged over ``QTE_RUNNER__STRATEGY_PARAMS``), so a ``risk_percent``
         stated there wins over the account default. An explicit *risk_percent*
         argument wins over both — that is the caller saying it already resolved

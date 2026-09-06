@@ -156,8 +156,8 @@ def repo(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def audit_of(directory: Path, routing: Path | None = None):
-    return StrategyAuditor(directory=directory, routing_file=routing).run()
+def audit_of(directory: Path, mapping: Path | None = None):
+    return StrategyAuditor(directory=directory, mapping_file=mapping).run()
 
 
 def codes(report) -> set[str]:
@@ -384,53 +384,53 @@ def test_a_missing_directory_is_a_warning(tmp_path):
     assert report.ok and report.exit_code(strict=True) == 1
 
 
-# ── Cross-checking the routing table ─────────────────────────────────────
+# ── Cross-checking the mapping table ─────────────────────────────────────
 
 
-def routing_file(tmp_path: Path, body: str) -> Path:
+def mapping_file(tmp_path: Path, body: str) -> Path:
     path = tmp_path / "strategies_mapping.toml"
     path.write_text(textwrap.dedent(body).lstrip(), encoding="utf-8")
     return path
 
 
-def test_a_routing_entry_nobody_publishes_fails(repo, tmp_path):
+def test_a_mapping_entry_nobody_publishes_fails(repo, tmp_path):
     """The symptom without this is a symbol that quietly trades nothing."""
-    table = routing_file(tmp_path, '[symbols.XAUUSD]\nstrategies = ["TYPOD_NAME"]\n')
-    report = audit_of(repo, routing=table)
+    table = mapping_file(tmp_path, '[symbols.XAUUSD]\nstrategies = ["TYPOD_NAME"]\n')
+    report = audit_of(repo, mapping=table)
 
-    finding = next(f for f in report.all_findings if f.code == "routed-to-nothing")
+    finding = next(f for f in report.all_findings if f.code == "mapped-to-nothing")
     assert finding.subject == "TYPOD_NAME" and "XAUUSD" in finding.message
     assert not report.ok
 
 
-def test_a_strategy_nobody_routed_is_a_warning(repo, tmp_path):
-    table = routing_file(tmp_path, "[symbols.XAUUSD]\nstrategies = []\n")
-    report = audit_of(repo, routing=table)
+def test_a_strategy_nothing_maps_to_is_a_warning(repo, tmp_path):
+    table = mapping_file(tmp_path, "[symbols.XAUUSD]\nstrategies = []\n")
+    report = audit_of(repo, mapping=table)
 
-    assert "unrouted-strategy" in codes(report)
+    assert "unmapped-strategy" in codes(report)
     assert report.ok, "deployed and never called is harmless, if usually a forgotten rename"
 
 
 def test_a_matching_table_passes(repo, tmp_path):
-    table = routing_file(tmp_path, '[symbols.XAUUSD]\nstrategies = ["GOLD_EDGE_V1"]\n')
-    report = audit_of(repo, routing=table)
+    table = mapping_file(tmp_path, '[symbols.XAUUSD]\nstrategies = ["GOLD_EDGE_V1"]\n')
+    report = audit_of(repo, mapping=table)
 
     assert report.ok and not report.all_findings
-    assert report.routing.symbols_for("GOLD_EDGE_V1") == ["XAUUSD"]
+    assert report.mapping.symbols_for("GOLD_EDGE_V1") == ["XAUUSD"]
 
 
 def test_a_table_that_will_not_parse_is_reported_rather_than_raised(repo, tmp_path):
     """It takes the runner down at boot; better to learn that in CI."""
-    table = routing_file(tmp_path, '[symbols.XAUUSD]\nstrategies = "GOLD_EDGE_V1"\n')
-    report = audit_of(repo, routing=table)
+    table = mapping_file(tmp_path, '[symbols.XAUUSD]\nstrategies = "GOLD_EDGE_V1"\n')
+    report = audit_of(repo, mapping=table)
 
-    assert "routing-unreadable" in codes(report)
+    assert "mapping-unreadable" in codes(report)
     assert not report.ok
 
 
-def test_no_routing_file_means_no_routing_findings(repo, tmp_path):
-    report = audit_of(repo, routing=tmp_path / "absent.toml")
-    assert not codes(report) & {"routed-to-nothing", "unrouted-strategy"}
+def test_no_mapping_file_means_no_mapping_findings(repo, tmp_path):
+    report = audit_of(repo, mapping=tmp_path / "absent.toml")
+    assert not codes(report) & {"mapped-to-nothing", "unmapped-strategy"}
 
 
 # ── Rendering ────────────────────────────────────────────────────────────

@@ -40,11 +40,11 @@ from qte_shared.config import settings
 from qte_shared.db import EventRepository
 from qte_shared.logging_setup import get_logger
 from qte_shared.models import BrokerSignal, Candle, CandleClosedEvent, OpenPosition, TickEvent
-from qte_shared.plugin_loader import load_strategies
-from qte_shared.routing import SymbolRouting
-from qte_shared.signal_factory import BracketPolicy, SignalFactory
-from qte_shared.sizing import PositionSizer
-from qte_shared.strategy_base import (
+from qte_shared.strategies.mapping import SymbolMapping
+from qte_shared.strategies.plugin_loader import load_strategies
+from qte_shared.strategies.signal_factory import BracketPolicy, SignalFactory
+from qte_shared.strategies.sizing import PositionSizer
+from qte_shared.strategies.strategy_base import (
     SignalIntent,
     StrategyContext,
     StrategyLike,
@@ -159,26 +159,26 @@ class StrategyRunner:
     def _build_slots(self) -> None:
         """Instantiate one slot per (strategy, symbol) pair we are to trade.
 
-        The routing table decides the pairs when there is one. Without it each
+        The mapping table decides the pairs when there is one. Without it each
         strategy keeps the symbols it declares on itself, which is what
-        happened before the table existed — see :mod:`qte_shared.routing`.
+        happened before the table existed — see :mod:`qte_shared.strategies.mapping`.
         """
-        routing = SymbolRouting.load(settings.engine.routing_file)
+        mapping = SymbolMapping.load(settings.engine.mapping_file)
         discovered = load_strategies(
             settings.engine.strategies_dir, runner_settings.enabled_strategies or None
         )
-        if routing:
-            self._warn_on_unrouted(routing, [entry.name for entry in discovered])
+        if mapping:
+            self._warn_on_unmapped(mapping, [entry.name for entry in discovered])
 
         for entry in discovered:
             defaults = runner_settings.strategy_params.get(entry.name, {})
-            if routing:
-                symbols = routing.symbols_for(entry.name)
+            if mapping:
+                symbols = mapping.symbols_for(entry.name)
                 if not symbols:
                     log.info(
-                        "Strategy %s is loaded but routed to no symbol in %s — not running it",
+                        "Strategy %s is loaded but mapped to no symbol in %s — not running it",
                         entry.name,
-                        routing.source,
+                        mapping.source,
                     )
                     continue
             else:
@@ -189,10 +189,10 @@ class StrategyRunner:
                 # One instance per pair: a strategy carries per-symbol state
                 # between bars, and sharing it across symbols would let gold's
                 # last bar decide what happens on bitcoin's next one.
-                params = {**defaults, **routing.params_for(symbol, entry.name)}
+                params = {**defaults, **mapping.params_for(symbol, entry.name)}
                 strategy = entry.instantiate(params)
-                # Size against the account, at the risk this pair is routed at.
-                # The strategy is never told either — see qte_shared.sizing.
+                # Size against the account, at the risk this pair is mapped at.
+                # The strategy is never told either — see qte_shared.strategies.sizing.
                 sizer = PositionSizer.from_settings(params)
                 factory = SignalFactory(
                     strategy.name,
@@ -217,19 +217,19 @@ class StrategyRunner:
                 )
 
     @staticmethod
-    def _warn_on_unrouted(routing: SymbolRouting, loaded: list[str]) -> None:
+    def _warn_on_unmapped(mapping: SymbolMapping, loaded: list[str]) -> None:
         """Say so when the table names a strategy the loader never found.
 
         Almost always a typo or a stale name after a rename, and the symptom
         without this line is a symbol that quietly trades nothing — which reads
         exactly like a strategy that found no setups.
         """
-        unknown = [name for name in routing.strategies if name not in set(loaded)]
+        unknown = [name for name in mapping.strategies if name not in set(loaded)]
         if unknown:
             log.error(
-                "Routing table %s names %s, which %s did not publish. Those symbols will "
+                "Mapping table %s names %s, which %s did not publish. Those symbols will "
                 "trade nothing. Available: %s",
-                routing.source,
+                mapping.source,
                 ", ".join(sorted(unknown)),
                 settings.engine.strategies_dir,
                 ", ".join(sorted(loaded)) or "none",

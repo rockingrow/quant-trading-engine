@@ -75,7 +75,7 @@ class SignalIntent:
     move_sl_to_be: bool | None = None
     #: Leave it ``None`` and the runner fills it from the pair's
     #: ``use_equity_sizing`` param. It reaches the broker either way and it
-    #: never changes the size QTE sends — see :mod:`qte_shared.sizing`.
+    #: never changes the size QTE sends — see :mod:`qte_shared.strategies.sizing`.
     use_equity_sizing: bool | None = None
     is_running: bool | None = None
     is_scale_position: bool | None = None

@@ -138,7 +138,8 @@ services:
   # (`qte_shared.dev_only`) refuses to run outside dev, so leaving it out of
   # a profile is safe. Two feeds on one symbol still race the resampler; when
   # you want a real vendor instead, set QTE_MARKET_DATA__PROVIDER=tiingo (or
-  # equivalent) and stop this service explicitly.
+  # equivalent), write its plan (`make tiingo`) and stop this service
+  # explicitly.
   #
   # It depends on nothing: no Redis, no Postgres, no NATS. It owns a socket and
   # the ticks it is told to send, and everything downstream of that is the real

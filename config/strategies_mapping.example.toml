@@ -9,13 +9,13 @@
 # nobody can review.
 #
 # The runner reads `config/strategies_mapping.toml` on boot. Override the path with
-# QTE_ENGINE__ROUTING_FILE to mount it as a secret instead. With no file at
+# QTE_ENGINE__MAPPING_FILE to mount it as a secret instead. With no file at
 # all, nothing breaks: each strategy falls back to its own `symbols` attribute,
 # or to QTE_ENGINE__SYMBOLS when it declares none.
 #
 # Validate a table before deploying it:
 #
-#   make audit          # checks routing against what __strategies__/ publishes
+#   make audit          # checks mapping against what __strategies__/ publishes
 #
 # Names on the right-hand side are *strategy names* — the `name` attribute, or
 # the manifest alias — not class names. `make strategies` lists what is loaded.

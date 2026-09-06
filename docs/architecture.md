@@ -243,7 +243,7 @@ and "there were none" are the same line in a log until the P&L does not arrive.
 It reuses `StrategyLoader.collect()` rather than growing a second walker — a
 second one would drift, and an audit that disagrees with the loader about what
 is deployed is worse than no audit. Judgement is what it adds: signature arity,
-instantiability, the signal surface, duplicate names, and the routing table
+instantiability, the signal surface, duplicate names, and the mapping table
 cross-checked in both directions.
 
 It is its own workspace member because it has no business in the runner's image.
@@ -260,7 +260,7 @@ redeploying that repo — a code change to express an operational decision.
 
 `config/strategies_mapping.toml` moves the pairing out of the code. It is a
 matrix — symbol × strategy × parameters — which is why it is a file rather
-than environment variables: flattening a matrix into `QTE_ROUTING__XAUUSD_0`
+than environment variables: flattening a matrix into `QTE_MAPPING__XAUUSD_0`
 is how it stops being reviewable. TOML rather than YAML because `tomllib` is
 in the standard library and this is parsed inside the trading process.
 
@@ -278,7 +278,7 @@ Three details earn their complexity:
   deciding bitcoin's next one.
 - **An absent file is not an empty one.** No file means fall back to what each
   strategy declares — the behaviour from before the table existed. A file that
-  routes nothing means trade nothing. Those differ by a deploy, so the table's
+  maps nothing means trade nothing. Those differ by a deploy, so the table's
   truthiness is "was a file read", not "does it list anything".
 - **A name nobody publishes is an error at boot**, not a shrug. The symptom
   otherwise is a symbol that quietly trades nothing, which in a log is
@@ -390,8 +390,11 @@ Three consequences are worth naming:
   is an environment variable.
 * **The vendor's configuration lives with the vendor.** Root `Settings` carries
   the *choice* (`market_data.provider`) and no vendor block, so a second vendor
-  never edits the core config. `QTE_TIINGO__*` is unchanged and now read by
-  `qte_shared.providers.tiingo`.
+  never edits the core config. `QTE_TIINGO__*` is read by
+  `qte_shared.providers.tiingo`, its standing values come from the `[provider]`
+  table of `config/<provider>.toml` (`qte_shared.market_data_plan`), and its key comes
+  from one generic `QTE_DATA_PROVIDER_API_KEY` — a credential is the one
+  setting that must not be invalidated by changing vendor.
 * **Images stay split.** Built-ins are registered as import-path strings and
   imported only when created, and the vendor's client libraries are an extra on
   `qte-shared` (`qte-shared[tiingo]`) rather than a hard dependency. The

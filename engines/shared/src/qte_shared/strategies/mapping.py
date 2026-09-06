@@ -21,11 +21,11 @@ with what — and at what risk — is position information, and this repo is
 public. ``config/strategies_mapping.example.toml`` carries the schema and
 dummy values so the shape stays reviewable in history;
 ``config/strategies_mapping.toml`` carries the book. Point
-``QTE_ENGINE__ROUTING_FILE`` somewhere else to mount it as a secret in
+``QTE_ENGINE__MAPPING_FILE`` somewhere else to mount it as a secret in
 production.
 
 TOML rather than environment variables because this is a matrix — symbol ×
-strategy × parameters — and flattening a matrix into ``QTE_ROUTING__XAUUSD_0``
+strategy × parameters — and flattening a matrix into ``QTE_MAPPING__XAUUSD_0``
 is how it stops being reviewable. TOML rather than YAML because ``tomllib`` is
 in the standard library and this file is read inside the trading process.
 """
@@ -49,7 +49,7 @@ DEFAULTS_TABLE = "defaults"
 
 
 @dataclass(frozen=True, slots=True)
-class Route:
+class Pairing:
     """One (symbol, strategy) pair the engine is to run, and its overrides."""
 
     symbol: str
@@ -62,14 +62,14 @@ class Route:
 
 
 @dataclass(slots=True)
-class SymbolRouting:
-    """The parsed routing table. Falsy means "no file — use the fallback"."""
+class SymbolMapping:
+    """The parsed mapping table. Falsy means "no file — use the fallback"."""
 
-    routes: tuple[Route, ...] = ()
+    pairings: tuple[Pairing, ...] = ()
     source: Path | None = None
 
     def __bool__(self) -> bool:
-        """Whether a table was *read*, not whether it routed anything.
+        """Whether a table was *read*, not whether it mapped anything.
 
         The distinction decides what the runner does. A table listing no pairs
         — every symbol disabled for the weekend, say — means trade nothing, and
@@ -81,63 +81,63 @@ class SymbolRouting:
     # ── Queries ───────────────────────────────────────────────────────
 
     def symbols_for(self, strategy: str) -> list[str]:
-        """Every symbol *strategy* is routed to, in file order."""
-        return [route.symbol for route in self.routes if route.strategy == strategy]
+        """Every symbol *strategy* is mapped to, in file order."""
+        return [pairing.symbol for pairing in self.pairings if pairing.strategy == strategy]
 
     def strategies_for(self, symbol: str) -> list[str]:
-        """Every strategy routed to *symbol*, in file order."""
+        """Every strategy mapped to *symbol*, in file order."""
         upper = symbol.upper()
-        return [route.strategy for route in self.routes if route.symbol == upper]
+        return [pairing.strategy for pairing in self.pairings if pairing.symbol == upper]
 
     def params_for(self, symbol: str, strategy: str) -> dict[str, Any]:
-        """Parameter overrides for one pair; empty when the pair is not routed."""
+        """Parameter overrides for one pair; empty when the pair is not mapped."""
         upper = symbol.upper()
-        for route in self.routes:
-            if route.symbol == upper and route.strategy == strategy:
-                return dict(route.params)
+        for pairing in self.pairings:
+            if pairing.symbol == upper and pairing.strategy == strategy:
+                return dict(pairing.params)
         return {}
 
     @property
     def symbols(self) -> list[str]:
         """Every symbol mentioned, deduplicated, in file order."""
-        return list(dict.fromkeys(route.symbol for route in self.routes))
+        return list(dict.fromkeys(pairing.symbol for pairing in self.pairings))
 
     @property
     def strategies(self) -> list[str]:
         """Every strategy mentioned, deduplicated, in file order."""
-        return list(dict.fromkeys(route.strategy for route in self.routes))
+        return list(dict.fromkeys(pairing.strategy for pairing in self.pairings))
 
     # ── Loading ───────────────────────────────────────────────────────
 
     @classmethod
-    def load(cls, path: Path | str) -> SymbolRouting:
+    def load(cls, path: Path | str) -> SymbolMapping:
         """Parse *path*, or return an empty table when it does not exist.
 
         A missing file is not an error: the fallback — a strategy's own
         ``symbols`` attribute — is the behaviour that existed before this file
-        did, and a fresh clone has no routing table because the real one never
+        did, and a fresh clone has no mapping table because the real one never
         reaches git. A *malformed* file is an error, and loudly, because
         "trades nothing" and "trades everything it used to" look identical in
         a log until the P&L arrives.
         """
         path = Path(path)
         if not path.is_file():
-            log.info("No routing table at %s — strategies keep their own symbols", path)
+            log.info("No mapping table at %s — strategies keep their own symbols", path)
             return cls()
 
         with path.open("rb") as handle:
             document = tomllib.load(handle)
-        return cls(routes=tuple(_parse(document, path)), source=path)
+        return cls(pairings=tuple(_parse(document, path)), source=path)
 
 
-def _parse(document: dict[str, Any], path: Path) -> list[Route]:
+def _parse(document: dict[str, Any], path: Path) -> list[Pairing]:
     """Turn the parsed TOML into a flat list of pairs, validating as it goes."""
     defaults = _strategy_names(document.get(DEFAULTS_TABLE, {}), path, DEFAULTS_TABLE)
     symbols = document.get(SYMBOLS_TABLE, {})
     if not isinstance(symbols, dict):
         raise ValueError(f"{path}: [{SYMBOLS_TABLE}] must be a table of symbols")
 
-    routes: list[Route] = []
+    pairings: list[Pairing] = []
     seen: set[tuple[str, str]] = set()
     for raw_symbol, entry in symbols.items():
         symbol = str(raw_symbol).upper()
@@ -148,7 +148,7 @@ def _parse(document: dict[str, Any], path: Path) -> list[Route]:
         # being commented out, so turning it back on is a one-word edit and the
         # diff says what happened.
         if entry.get("enabled", True) is False:
-            log.info("Routing: %s is disabled in %s", symbol, path)
+            log.info("Mapping: %s is disabled in %s", symbol, path)
             continue
 
         names = _strategy_names(entry, path, where) or defaults
@@ -166,8 +166,8 @@ def _parse(document: dict[str, Any], path: Path) -> list[Route]:
             params = overrides.get(name, {})
             if not isinstance(params, dict):
                 raise ValueError(f"{path}: [{where}.params.{name}] must be a table")
-            routes.append(Route(symbol=symbol, strategy=name, params=dict(params)))
-    return routes
+            pairings.append(Pairing(symbol=symbol, strategy=name, params=dict(params)))
+    return pairings
 
 
 def _strategy_names(entry: dict[str, Any], path: Path, where: str) -> list[str]:

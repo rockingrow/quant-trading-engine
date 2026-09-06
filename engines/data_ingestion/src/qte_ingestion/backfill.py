@@ -41,6 +41,7 @@ from qte_shared.interfaces.market_data import (
     UnsupportedCapability,
 )
 from qte_shared.logging_setup import get_logger
+from qte_shared.market_data_plan import SymbolFeed
 from qte_shared.models import Candle
 from qte_shared.providers import create_provider
 from qte_shared.symbols import SymbolSpec
@@ -63,13 +64,15 @@ class HistoryBackfiller:
     def __init__(
         self,
         state,
-        specs: list[SymbolSpec],
-        timeframes: list[str],
+        subscriptions: list[SymbolFeed],
         cache: HistoryCache | None = None,
     ) -> None:
         self.state = state
-        self.specs = specs
-        self.timeframes = timeframes
+        # One list of (symbol, market, timeframes) rather than a symbol list
+        # crossed with a timeframe list: warming a pair nothing resamples costs
+        # a vendor request against a rate-limited plan and fills Redis with a
+        # window no strategy reads.
+        self.subscriptions = subscriptions
         self.target = settings.redis.candle_history
         # Injectable so a test can point the parquet cache at a temporary
         # directory instead of the repository's own data/.
@@ -78,7 +81,7 @@ class HistoryBackfiller:
     async def run(self) -> None:
         """Warm every symbol and timeframe. Never raises."""
         if not ingestion_settings.backfill_history:
-            log.info("History backfill disabled (QTE_INGESTION__BACKFILL_HISTORY=false)")
+            log.info("History backfill disabled ([provider].backfill_history = false)")
             return
 
         source = self._history_source()
@@ -86,16 +89,16 @@ class HistoryBackfiller:
             return
 
         cache = self.cache or HistoryCache(settings.market_data.provider)
-        for spec in self.specs:
-            for timeframe in self.timeframes:
+        for feed in self.subscriptions:
+            for timeframe in feed.timeframes:
                 try:
-                    await self._backfill_one(source, cache, spec, timeframe)
+                    await self._backfill_one(source, cache, feed.spec, timeframe)
                 except Exception:
                     # One bad symbol must not cost the others their warm-up,
                     # and none of them may cost the service its start.
                     log.exception(
                         "History backfill failed for %s %s — starting on what Redis has",
-                        spec.symbol,
+                        feed.symbol,
                         timeframe,
                     )
 

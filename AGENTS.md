@@ -54,6 +54,7 @@ make check          # Ruff + pytest — what CI runs; the gate before any commit
 make test           # uv run pytest -q   (one file: uv run pytest tests/test_replay.py -q)
 make lint / format  # ruff check / ruff format + --fix
 make audit          # validate __strategies__/ against the signal contract
+make tiingo         # write config/tiingo.toml — what the vendor is asked to feed
 make db-check       # fail if the models drifted from the migrations
 make db-upgrade     # Alembic; there is no init script
 make infra          # redis + postgres + nats only
@@ -77,13 +78,14 @@ package; never scan from the repository root.
 | Task or concept | Primary location |
 | --- | --- |
 | Wire models, enums, candles, ticks, `SignalIntent` | `engines/shared/src/qte_shared/models.py` |
-| Strategy contract and its seven methods | `engines/shared/src/qte_shared/strategy_base.py` |
-| Strategy discovery and manifests | `engines/shared/src/qte_shared/plugin_loader.py` |
-| Intent to broker payload | `engines/shared/src/qte_shared/signal_factory.py` |
-| Position sizing and account risk | `engines/shared/src/qte_shared/sizing.py` |
+| Strategy contract and its seven methods | `engines/shared/src/qte_shared/strategies/strategy_base.py` |
+| Strategy discovery and manifests | `engines/shared/src/qte_shared/strategies/plugin_loader.py` |
+| Intent to broker payload | `engines/shared/src/qte_shared/strategies/signal_factory.py` |
+| Position sizing and account risk | `engines/shared/src/qte_shared/strategies/sizing.py` |
 | Indicators (pure, arrays in and out) | `engines/shared/src/qte_shared/indicators.py` |
 | Timeframes, candle buckets, symbol markets | `engines/shared/src/qte_shared/{timeframes,symbols}.py` |
-| Symbol to strategy routing | `engines/shared/src/qte_shared/routing.py`, `config/strategies_mapping.example.toml` |
+| Symbol to strategy mapping | `engines/shared/src/qte_shared/strategies/mapping.py`, `config/strategies_mapping.example.toml` |
+| What the vendor feeds: symbols, markets, timeframes, vendor knobs | `engines/shared/src/qte_shared/market_data_plan.py`, `config/tiingo.example.toml` |
 | Settings and `QTE_*` environment variables | `engines/shared/src/qte_shared/config.py`, each service's `settings.py`, `.env.example` |
 | NATS subjects and publishing | `engines/shared/src/qte_shared/bus/{subjects,nats_bus}.py` |
 | Redis state and the candle outbox | `engines/shared/src/qte_shared/cache/redis_state.py` |
@@ -121,8 +123,8 @@ the plugin shape.
   `qte_strategy_engine.runner`, and both must keep going through
   `signal_factory` — otherwise a backtest stops predicting live behaviour.
 - The plugin contract is **structural, not nominal**: a strategy repo restates
-  the interface on its own side. Changing `strategy_base.py` or `models.py` is a
-  contract change — check
+  the interface on its own side. Changing `strategies/strategy_base.py` or
+  `models.py` is a contract change — check
   `engines/strategy_audit/src/qte_strategy_audit/contract.py` and run
   `make audit`.
 - Schema changes go through the single Alembic chain under `migrations/`

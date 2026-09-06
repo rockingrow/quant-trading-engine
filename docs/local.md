@@ -60,16 +60,11 @@ QTE_ENV=dev
 QTE_LOG_LEVEL=INFO
 
 # ── Market data: the dev simulator, not a vendor ──────────────────────
+# The simulator needs no key and no plan file. What a *vendor* is asked to feed
+# — symbols, markets, timeframes, its own knobs — lives in
+# config/<provider>.toml instead of here; see section 8.
 QTE_MARKET_DATA__PROVIDER=simulator
-QTE_TIINGO__API_KEY=
-QTE_ENGINE__SYMBOLS=["XAUUSD"]
-QTE_ENGINE__TIMEFRAMES=["M15"]
-QTE_ENGINE__SIGNAL_TIMEFRAME=M15
-QTE_INGESTION__MARKET_OVERRIDES={}
-# The simulator serves no history, so start-up backfill is a no-op here.
-# Warm the window by hand instead: `make warmup` or `make warmup-cache`.
-QTE_INGESTION__BACKFILL_HISTORY=false
-QTE_TIINGO__MAX_ROWS_PER_REQUEST=5000
+QTE_DATA_PROVIDER_API_KEY=
 
 # ── Simulator (refuses to run unless QTE_ENV=dev) ─────────────────────
 # Host-side URL; compose swaps it for ws://market-simulator:8901/stream
@@ -79,6 +74,9 @@ QTE_SIMULATOR__HOST=0.0.0.0
 QTE_SIMULATOR__PORT=8901
 QTE_SIMULATOR__CONTROL_URL=ws://127.0.0.1:8901/control
 QTE_SIMULATOR__LOG_TICKS=false
+# What `make warmup-cache` replays, and how much of it.
+QTE_SIMULATOR_PARQUET_FILE=data/parquet/tiingo/XAUUSD_M15.parquet
+#QTE_SIMULATOR__CACHE_BARS=6000
 
 # ── Host ports (the container side never changes) ─────────────────────
 QTE_REDIS_PORT=6379
@@ -153,7 +151,7 @@ make audit              # validate it against the signal contract before it runs
 `make strategy-mapping` never overwrites an existing file. The example publishes
 `QTE_EXAMPLE_EMA_ATR`, while the template pairs `XAUUSD` with different names —
 so either edit `config/strategies_mapping.toml` to list `QTE_EXAMPLE_EMA_ATR`
-under `[symbols.XAUUSD]`, or delete the file entirely. With no routing table
+under `[symbols.XAUUSD]`, or delete the file entirely. With no mapping table
 each strategy simply keeps the symbols it declares.
 
 With your own private repo instead:
@@ -249,8 +247,13 @@ Prefer prices that actually printed? If you have vendor history in
 `data/parquet/tiingo/`, replay that instead:
 
 ```bash
-make warmup-cache CACHE_BARS=6000     # fills the whole Redis retention window
+make warmup-cache                     # fills the whole Redis retention window
 ```
+
+It takes its file from `QTE_SIMULATOR_PARQUET_FILE` and its length from
+`QTE_SIMULATOR__CACHE_BARS` (default: the Redis retention), and it re-anchors
+the bars onto the buckets ending at the current one — so Redis holds what the
+runner would have read had it been up all along.
 
 Watching, from a second terminal:
 
@@ -279,8 +282,8 @@ make backtest STRATEGY=QTE_EXAMPLE_EMA_ATR SYMBOL=XAUUSD TF=M15
 make chart REPORT=data/reports/<file>.json       # interactive HTML dashboard
 ```
 
-`make download` needs a real vendor key (`QTE_TIINGO__API_KEY`); the simulator
-serves no history. Without one, import an MT5 CSV export instead:
+`make download` needs a real vendor key (`QTE_DATA_PROVIDER_API_KEY`) and a
+plan naming what to fetch (`make tiingo`); the simulator serves no history. Without one, import an MT5 CSV export instead:
 
 ```bash
 make csv-import CSV=data/csv/XAUUSD_M15.csv TZ=EET
@@ -318,7 +321,7 @@ and Redis state included. Only when you want a genuinely empty stack.
 | `market-simulator` exits at boot | `QTE_ENV` is not `dev`. Both the server and the provider call `require_dev_env()`, and there is no override flag. |
 | Ingestion logs no ticks | `QTE_MARKET_DATA__PROVIDER` is not `simulator`, or `QTE_SIMULATOR__URL` points somewhere else. Inside compose it has to be the service name — that is the override's job, so check nothing has pinned it elsewhere. |
 | A bar is sent, no candle closes | Bars close on the clock, not on the next tick, and `--verify` waits for the real close. If it still times out: `make sim-reset` clears Redis, resets the cursor and restarts ingestion. |
-| Candles close, no signal | The strategy has too little history — warm it with `make warmup` first — or routing is not pairing it with the symbol. `make strategies` lists what actually loaded. |
+| Candles close, no signal | The strategy has too little history — warm it with `make warmup` first — or the mapping table is not pairing it with the symbol. `make strategies` lists what actually loaded. |
 | `db-migrate` exits non-zero | Read `docker compose logs db-migrate`. Nothing downstream starts until it exits 0, so app containers stuck in `Created` are the symptom, not the fault. |
 | Port already allocated | Something else owns `5432`/`4222` — typically `algo-trading-broker`. Shift the `QTE_*_PORT` values; the container side is unaffected. |
 | A strategy fails on import | Its dependencies are not in the image. Run `make strategy-requirements`, then `make up` to rebuild. |
@@ -327,13 +330,34 @@ and Redis state included. Only when you want a genuinely empty stack.
 
 ## 8. Swapping in a real vendor feed
 
-Two variables, once you have a key:
+Two things: the key in `.env`, and a plan saying what to feed.
 
 ```bash
+# .env — one key name whichever vendor is on
 QTE_MARKET_DATA__PROVIDER=tiingo
-QTE_TIINGO__API_KEY=<your key>
-QTE_INGESTION__BACKFILL_HISTORY=true    # warm Redis from vendor history at start-up
+QTE_DATA_PROVIDER_API_KEY=<your key>
 ```
+
+```bash
+make tiingo        # writes config/tiingo.toml from the tracked template
+```
+
+That file is the market-data plan: one table per symbol, stating the market it
+trades on and the bars it is resampled to, plus a `[provider]` table for the
+vendor's own knobs (`backfill_history`, `max_rows_per_request`). It is
+git-ignored, like the mapping table and for the same reason.
+
+```toml
+[symbols.XAUUSD]
+market = "fx"
+timeframes = ["M15"]
+```
+
+`make start` refuses to bring the stack up while the provider is a vendor and
+its plan is missing — without one the engine would fall back to the
+`QTE_ENGINE__*` defaults and subscribe to symbols nobody chose. Those variables
+still work and still win when set, which is what makes
+`QTE_ENGINE__SYMBOLS='["EURUSD"]' make backtest` a one-run override.
 
 Then stop the simulator explicitly — leaving it running alongside a real vendor
 puts two feeds on one symbol, racing the same resampler:

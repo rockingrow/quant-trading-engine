@@ -154,8 +154,8 @@ class PositionBlock(BaseModel):
     both, which :meth:`BrokerSignal.validate_shape` enforces before we publish.
 
     ``quantity`` is the engine's number, not the strategy's: it is risk-sized
-    against the configured account by :class:`~qte_shared.sizing.PositionSizer`
-    on the way through :class:`~qte_shared.signal_factory.SignalFactory`.
+    against the configured account by :class:`~qte_shared.strategies.sizing.PositionSizer`
+    on the way through :class:`~qte_shared.strategies.signal_factory.SignalFactory`.
     """
 
     model_config = ConfigDict(allow_inf_nan=False)
@@ -171,7 +171,7 @@ class PositionBlock(BaseModel):
     move_sl_to_be: bool | None = None
     #: Mirrors ``inputs.use_equity_sizing`` so the broker sees the pair's
     #: configured sizing mode. It is reported, not obeyed: QTE sizes off the
-    #: fixed ``QTE_ACCOUNT__CAPITAL`` either way — see :mod:`qte_shared.sizing`.
+    #: fixed ``QTE_ACCOUNT__CAPITAL`` either way — see :mod:`qte_shared.strategies.sizing`.
     use_equity_sizing: bool | None = None
     is_running: bool | None = None
     is_scale_position: bool | None = None

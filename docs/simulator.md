@@ -38,7 +38,7 @@ qte-simulator watch / --verify         ← and you check the far end from here
 | Redis, Postgres, NATS | `make infra` (Postgres can be skipped — see below) |
 | The schema | `make db-upgrade`, or set `QTE_POSTGRES__ENABLED=false` |
 | A strategy | `cp examples/__strategies__/ema_atr_breakout.py __strategies__/` |
-| A routing table | optional — without one the strategy keeps the symbols it declares |
+| A mapping table | optional — without one the strategy keeps the symbols it declares |
 
 Postgres is only the audit trail, and nothing on the tick path waits for it. If
 you want the shortest possible loop, `QTE_POSTGRES__ENABLED=false` and skip
@@ -53,10 +53,14 @@ In `.env`:
 ```bash
 QTE_ENV=dev
 QTE_MARKET_DATA__PROVIDER=simulator     # ← the whole switch
-QTE_ENGINE__SYMBOLS=["XAUUSD"]
-QTE_ENGINE__TIMEFRAMES=["M15"]
-QTE_ENGINE__SIGNAL_TIMEFRAME=M15
 QTE_BROKER__SHADOW_MODE=true            # build and audit signals, send nothing
+
+# The simulator is the one provider with no market-data plan: with no
+# config/simulator.toml these defaults apply, and they are what the rest of
+# this walkthrough assumes. Set them to rehearse on something else.
+#QTE_ENGINE__SYMBOLS=["XAUUSD"]
+#QTE_ENGINE__TIMEFRAMES=["M15"]
+#QTE_ENGINE__SIGNAL_TIMEFRAME=M15
 
 # Where the feed is. 127.0.0.1 when ingestion runs on the host,
 # ws://market-simulator:8901/stream inside compose.
@@ -203,6 +207,44 @@ qte-simulator replay --symbol XAUUSD --file data/parquet/XAUUSD_M15.parquet --li
 qte-simulator replay --symbol XAUUSD --file scenario.jsonl        # {"open":…,"high":…,…}
 ```
 
+Where they land differs, though, and deliberately: a file is anchored **past**
+and generated bars **next** (see [Where bars are
+placed](#where-bars-are-placed-on-the-clock-and-why-it-matters)). Prices that
+printed belong in buckets that have happened, so a warm-up from real history
+ends on the last completed bucket and runs backwards from there — Redis then
+holds what the runner would have read had it been up all along, rather than a
+window stamped days ahead of the clock. Pass `--anchor next` to override.
+
+### Warming up from the cached vendor history
+
+The whole of that is one argument-free command, because the arguments live in
+`.env`:
+
+```bash
+make warmup-cache          # = uv run qte-simulator replay
+```
+
+| Setting | What it gives the replay |
+| --- | --- |
+| `QTE_SIMULATOR_PARQUET_FILE` | the file, when neither `--file` nor `--generate` is given |
+| `QTE_SIMULATOR__CACHE_BARS` | how many of its trailing bars (default: `QTE_REDIS__CANDLE_HISTORY`) |
+| `QTE_SIMULATOR__GENERATE_BARS` | bars a bare `--generate` synthesises (default: `QTE_ENGINE__WARMUP_CANDLES`) |
+| `QTE_ENGINE__SYMBOLS` | the symbol, when `--symbol` is left out — the first entry |
+| `QTE_ENGINE__SIGNAL_TIMEFRAME` | the timeframe, when `--timeframe` is left out |
+
+A run that size is more bars than the server accepts in one command, so the CLI
+sends it in batches: the first is placed on the clock, the rest continue the
+series it left, and only the last one seals. That is invisible in the output —
+one line, one bucket range — and it is why the warm-up window can be as large
+as the retention.
+
+`make warmup-cache` deliberately does **not** pass `--verify`. Every bucket a
+past-anchored run fills is already over, so ingestion's wall-clock flush can
+close a bar between two of its own ticks: about one bar per
+`QTE_INGESTION__FLUSH_INTERVAL` the replay lasts. In a few thousand warm-up
+bars that is noise; against a bar-by-bar check it is a guaranteed red. `make
+warmup`, which is forward-anchored, verifies every bar.
+
 ---
 
 ## 6. Making a signal happen
@@ -228,7 +270,7 @@ turning it off sends invented signals to real workers.
 
 `--expect-signal` exits non-zero when nothing fires, which is what makes this a
 test rather than a demo. When it does not fire, the message says what to look
-at: the strategy may still be warming, it may not be routed to this symbol in
+at: the strategy may still be warming, it may not be mapped to this symbol in
 `config/strategies_mapping.toml`, or the bar may simply not have met its rule.
 All three are answers; "nothing happened" is not.
 
@@ -313,17 +355,21 @@ touches them: each bar is closed by the arrival of the next, and the last by an
 explicit sealing tick. A loose `tick` counts as having touched a bucket, which
 is why the bar in step 4 landed at `15:00` and not on top of the `14:45` tick.
 
-`--anchor past` is the other placement, and it is worth knowing about because
-it exercises a different path: the run ends on the last **completed** bucket,
-so the wall-clock flush is what closes its final bar.
+`--anchor past` is the other placement: the run ends on the last **completed**
+bucket, so the wall-clock flush is what closes its final bar. It is the default
+for a replay read from a file, because history whose timestamps sit in the
+future is not what a strategy reads on a live feed — and it accepts the flush
+race that comes with it, at about one torn bar per flush interval the run
+lasts. `--anchor auto`, the replay default, is exactly this choice: `past` for a
+file, `next` for generated bars.
 
 | | `next` (default) | `past` |
 | --- | --- | --- |
 | Where | the first untouched bucket, marching forward | ends on the last completed bucket |
 | What closes the last bar | an explicit sealing tick, immediately | the wall-clock flush, within `QTE_INGESTION__FLUSH_INTERVAL` |
 | Can the flush split a bar | no — no bucket's end has passed | in the ~1 ms its four ticks take to arrive; the risk grows with every bar in the run |
-| Good for | anything, at any length | testing the flush path itself, one bar at a time |
-| Cost | candle timestamps run ahead of the clock | not usable for a long replay |
+| Good for | generated bars, at any length | real history, and testing the flush path itself |
+| Cost | candle timestamps run ahead of the clock | roughly one torn bar per flush interval the run lasts |
 
 The cost of `next` is real: after a few hundred bars the series is days ahead of
 the wall clock, and candles carry those timestamps. That is fine in a dev
@@ -362,7 +408,7 @@ Work down this list; each step tells you which hop lost it.
 | `qte-simulator status` shows no feed client | Same, from the other end |
 | Ingestion logs `Dropping late tick` | The resampler holds a bar ahead of what you sent — see above |
 | Ingestion logs `Candle closed` but `watch` sees nothing | The two are on different NATS clusters — compare `QTE_NATS__URL` |
-| Candle arrives, no signal | The strategy: warm-up, routing, or the rule genuinely not met |
+| Candle arrives, no signal | The strategy: warm-up, mapping, or the rule genuinely not met |
 | `refused: … is a development-only component` | `QTE_ENV` is not `dev` |
 | Candle arrives with the wrong OHLC | A real finding. `QTE_SIMULATOR__LOG_TICKS=true` shows what was sent |
 
@@ -378,7 +424,7 @@ qte-simulator tick    --symbol [--bid] [--ask] [--last] [--volume] [--ts]
 qte-simulator bar     --symbol --open --high --low --close [--volume]
                       [--timeframe] [--anchor next|past|<iso>] [--spread]
                       [--no-seal] [--verify] [--expect-signal] [--timeout]
-qte-simulator replay  --symbol (--file F | --generate N) [--limit N]
+qte-simulator replay  [--symbol] [--file F | --generate [N]] [--limit N]
                       [--timeframe] [--anchor] [--rate] [--seed]
                       [--start-price] [--volatility] [--drift]
                       [--spread] [--no-seal] [--verify] [--expect-signal]
@@ -392,6 +438,11 @@ qte-simulator watch   --symbol [--timeframe] [--seconds]
 
 Global: `--url` (control endpoint, default `QTE_SIMULATOR__CONTROL_URL`) and
 `--json` (print the raw acknowledgement).
+
+`--symbol` defaults to the first of `QTE_ENGINE__SYMBOLS` and `--timeframe` to
+`QTE_ENGINE__SIGNAL_TIMEFRAME`, so a rehearsal cannot land on a symbol
+ingestion never subscribed to by leaving the flag out. A `replay` with no
+source reads `QTE_SIMULATOR_PARQUET_FILE`.
 
 `make sim`, `make sim-up`, `make sim-status`, `make sim-replay`, `make sim-bar`,
 `make sim-walk`, `make sim-stop` and `make sim-watch` wrap the common ones.

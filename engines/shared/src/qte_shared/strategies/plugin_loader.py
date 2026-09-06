@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from qte_shared.logging_setup import get_logger
-from qte_shared.strategy_base import (
+from qte_shared.strategies.strategy_base import (
     StrategyLike,
     implements_strategy_contract,
     looks_like_a_strategy,
@@ -93,7 +93,7 @@ class Candidate:
 
     ``via`` says how it was found. A ``"manifest"`` candidate was named by the
     repo and is therefore certainly meant as a strategy; a ``"scan"`` candidate
-    is a guess — see :func:`~qte_shared.strategy_base.looks_like_a_strategy`.
+    is a guess — see :func:`~qte_shared.strategies.strategy_base.looks_like_a_strategy`.
     """
 
     name: str
@@ -128,7 +128,7 @@ class LoadedStrategy:
     """One discovered strategy class and where it came from.
 
     ``cls`` is a class the engine can drive, which is not the same as a
-    :class:`~qte_shared.strategy_base.StrategyBase` subclass — see that
+    :class:`~qte_shared.strategies.strategy_base.StrategyBase` subclass — see that
     module's docstring.
     """
 

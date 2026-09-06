@@ -1,11 +1,11 @@
-"""Walk ``__strategies__/``, judge everything in it, cross-check the routing.
+"""Walk ``__strategies__/``, judge everything in it, cross-check the mapping.
 
 The loader already knows how to find things — manifests at a repo root, loose
 files below it, repo furniture skipped — so this reuses
-:meth:`~qte_shared.plugin_loader.StrategyLoader.collect` rather than growing a
+:meth:`~qte_shared.strategies.plugin_loader.StrategyLoader.collect` rather than growing a
 second, subtly different walker. What the auditor adds is that it keeps what
 the loader discards, and that it looks at the directory as a whole: duplicate
-names, repos that never declared a manifest, and a routing table pointing at
+names, repos that never declared a manifest, and a mapping table pointing at
 strategies nobody publishes.
 """
 
@@ -17,13 +17,13 @@ from pathlib import Path
 
 from qte_shared.config import settings
 from qte_shared.logging_setup import get_logger
-from qte_shared.plugin_loader import (
+from qte_shared.strategies.mapping import SymbolMapping
+from qte_shared.strategies.plugin_loader import (
     MANIFEST_FILENAMES,
     Candidate,
     LoadFailure,
     StrategyLoader,
 )
-from qte_shared.routing import SymbolRouting
 
 from qte_strategy_audit.contract import Finding, Severity, StrategyAudit, check_strategy
 from qte_strategy_audit.report import AuditReport
@@ -33,10 +33,10 @@ log = get_logger(__name__)
 
 @dataclass(slots=True)
 class StrategyAuditor:
-    """Audits one strategies directory against one routing table."""
+    """Audits one strategies directory against one mapping table."""
 
     directory: Path
-    routing_file: Path | None = None
+    mapping_file: Path | None = None
 
     def run(self) -> AuditReport:
         directory = Path(self.directory)
@@ -85,43 +85,43 @@ class StrategyAuditor:
         findings.extend(_duplicate_names(audits))
         findings.extend(_repos_without_a_manifest(directory, candidates))
 
-        routing = self._load_routing(findings)
-        findings.extend(_routing_findings(routing, audits))
+        mapping = self._load_mapping(findings)
+        findings.extend(_mapping_findings(mapping, audits))
 
         return AuditReport(
-            directory=directory, strategies=audits, findings=findings, routing=routing
+            directory=directory, strategies=audits, findings=findings, mapping=mapping
         )
 
-    def _load_routing(self, findings: list[Finding]) -> SymbolRouting:
-        """Parse the routing table, turning a malformed one into a finding.
+    def _load_mapping(self, findings: list[Finding]) -> SymbolMapping:
+        """Parse the mapping table, turning a malformed one into a finding.
 
         A table that will not parse takes the runner down at boot. Reporting it
         here — with the same message the runner would have raised — is the
         difference between finding out in CI and finding out at the open.
         """
-        if self.routing_file is None:
-            return SymbolRouting()
+        if self.mapping_file is None:
+            return SymbolMapping()
         try:
-            return SymbolRouting.load(self.routing_file)
+            return SymbolMapping.load(self.mapping_file)
         except (ValueError, OSError) as error:
             findings.append(
                 Finding(
-                    code="routing-unreadable",
+                    code="mapping-unreadable",
                     severity=Severity.ERROR,
-                    subject=str(self.routing_file),
-                    message=f"the routing table could not be read: {error}",
+                    subject=str(self.mapping_file),
+                    message=f"the mapping table could not be read: {error}",
                     fix="compare it against config/strategies_mapping.example.toml",
-                    source=Path(self.routing_file),
+                    source=Path(self.mapping_file),
                 )
             )
-            return SymbolRouting()
+            return SymbolMapping()
 
 
-def audit(directory: Path | str | None = None, routing: Path | str | None = None) -> AuditReport:
-    """Audit the configured directory and routing table, or the ones given."""
+def audit(directory: Path | str | None = None, mapping: Path | str | None = None) -> AuditReport:
+    """Audit the configured directory and mapping table, or the ones given."""
     return StrategyAuditor(
         directory=Path(directory or settings.engine.strategies_dir),
-        routing_file=Path(routing) if routing is not None else settings.engine.routing_file,
+        mapping_file=Path(mapping) if mapping is not None else settings.engine.mapping_file,
     ).run()
 
 
@@ -220,44 +220,44 @@ def _repos_without_a_manifest(directory: Path, candidates: list[Candidate]) -> l
     return findings
 
 
-def _routing_findings(routing: SymbolRouting, audits: list[StrategyAudit]) -> list[Finding]:
+def _mapping_findings(mapping: SymbolMapping, audits: list[StrategyAudit]) -> list[Finding]:
     """Does the table name things that exist, and does everything found get used?
 
     Both directions matter and they fail differently. A name in the table that
     nobody publishes means a symbol trades nothing, and reads in a log exactly
-    like a strategy that found no setups. A strategy nobody routed means code
+    like a strategy that found no setups. A strategy nothing maps to means code
     was deployed and never called — harmless, but almost always the half of a
     rename that was forgotten.
     """
-    if not routing:
+    if not mapping:
         return []
 
     published = {entry.name for entry in audits}
     findings = [
         Finding(
-            code="routed-to-nothing",
+            code="mapped-to-nothing",
             severity=Severity.ERROR,
             subject=name,
             message=(
-                f"the routing table sends {', '.join(routing.symbols_for(name))} to {name!r}, "
+                f"the mapping table sends {', '.join(mapping.symbols_for(name))} to {name!r}, "
                 "which no repo publishes"
             ),
             fix="check the spelling against `make strategies`, or the manifest alias it renamed",
-            source=routing.source,
+            source=mapping.source,
         )
-        for name in routing.strategies
+        for name in mapping.strategies
         if name not in published
     ]
     findings += [
         Finding(
-            code="unrouted-strategy",
+            code="unmapped-strategy",
             severity=Severity.WARNING,
             subject=entry.name,
-            message="loaded but routed to no symbol, so it will never see a candle",
-            fix=f"add it to a [symbols.<SYMBOL>].strategies list in {routing.source}",
+            message="loaded but mapped to no symbol, so it will never see a candle",
+            fix=f"add it to a [symbols.<SYMBOL>].strategies list in {mapping.source}",
             source=entry.source,
         )
         for entry in audits
-        if not routing.symbols_for(entry.name)
+        if not mapping.symbols_for(entry.name)
     ]
     return findings

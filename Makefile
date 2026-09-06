@@ -1,8 +1,15 @@
 .DEFAULT_GOAL := help
 SHELL := /bin/bash
 
-help: ## Show this help
-	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
+help: ## Show this help, grouped by section
+	@awk 'BEGIN {FS = ":.*?## "} \
+		/^##@ / {printf "\n\033[1m%s\033[0m\n", substr($$0, 5); next} \
+		/^[a-zA-Z0-9_-]+([ ]+[a-zA-Z0-9_-]+)*:.*?## / \
+		{split($$1, names, " "); printf "  \033[36m%-20s\033[0m %s\n", names[1], $$2}' \
+		$(MAKEFILE_LIST)
+	@echo
+
+##@ Workspace
 
 install: ## Sync the uv workspace (runtime deps only)
 	uv sync --no-dev
@@ -12,6 +19,8 @@ install-dev: ## Sync the workspace with dev tooling
 
 lock: ## Refresh uv.lock
 	uv lock
+
+##@ Quality
 
 test: ## Run the test suite
 	uv run pytest -q
@@ -24,6 +33,8 @@ format: ## Ruff format + import sort
 	uv run ruff check --fix .
 
 check: lint test ## Lint and test — what CI runs
+
+##@ Strategies
 
 # ── Strategy plugins ────────────────────────────────────────────────────
 #
@@ -58,7 +69,7 @@ strategy-audit: ## Audit one mounted strategy repo; prints true or false to stdo
 		echo false; \
 		exit 0; \
 	fi; \
-	if uv run qte-strategy-audit --dir "$$repo" --no-routing 1>&2; then \
+	if uv run qte-strategy-audit --dir "$$repo" --no-mapping 1>&2; then \
 		echo true; \
 	else \
 		echo false; \
@@ -141,7 +152,7 @@ strategy-test: ## Run one mounted strategy repo's own suite (STRATEGY=<name> req
 	fi
 	$(MAKE) -C $(STRATEGIES_DIR)/$(STRATEGY) check
 
-audit: ## Validate __strategies__/ against the QTE signal contract + routing table
+audit: ## Validate __strategies__/ against the QTE signal contract + mapping table
 	uv run qte-strategy-audit
 
 audit-strict: ## Same, but warnings fail too — what CI should run
@@ -160,13 +171,54 @@ strategies: ## List what the mounted strategy repo publishes
 		from qte_shared.plugin_loader import load_strategies; \
 		[print(e.name, 'from', e.source) for e in load_strategies(settings.engine.strategies_dir)]"
 
+##@ Market data
+
+# What a provider is asked to feed — symbols, their markets and timeframes, and
+# the vendor's own knobs — lives in config/<provider>.toml, not in .env: it is a
+# per-symbol matrix and the flat form could not express one. The real file is
+# git-ignored like the mapping table; the template beside it is tracked.
+# The key is the exception and stays in .env as QTE_DATA_PROVIDER_API_KEY.
+
+tiingo: ## Copy the Tiingo market-data plan into place (never overwrites)
+	@if [ -f config/tiingo.toml ]; then \
+		echo "config/tiingo.toml exists - leaving it alone"; \
+	else \
+		cp config/tiingo.example.toml config/tiingo.toml; \
+		echo "Wrote config/tiingo.toml (git-ignored) - list the symbols you want fed in it"; \
+	fi
+
+# Guards `up` and `start`. A missing plan does not fail at runtime: the engine
+# falls back to the QTE_ENGINE__* defaults and quietly subscribes to something
+# nobody asked for, which on a live vendor is the wrong kind of surprise. The
+# simulator is exempt — it is the one provider with no plan and no key.
+market-plan: ## Fail unless the configured provider has its plan file
+	@provider=$$(sed -n 's/^QTE_MARKET_DATA__PROVIDER=//p' .env 2>/dev/null | tail -n1 | tr -d '"' | tr -d "\r' "); \
+	plan=$$(sed -n 's/^QTE_MARKET_DATA__CONFIG_FILE=//p' .env 2>/dev/null | tail -n1 | tr -d '"' | tr -d "\r' "); \
+	[ -n "$$provider" ] || provider=tiingo; \
+	[ -n "$$plan" ] || plan="config/$$provider.toml"; \
+	if [ "$$provider" = "simulator" ]; then exit 0; fi; \
+	if [ ! -f "$$plan" ]; then \
+		echo "QTE_MARKET_DATA__PROVIDER=$$provider, but $$plan does not exist." >&2; \
+		echo "Without it the engine falls back to the QTE_ENGINE__* defaults and" >&2; \
+		echo "subscribes to symbols nobody chose." >&2; \
+		if [ -f "config/$$provider.example.toml" ]; then \
+			echo "Write one:  make $$provider" >&2; \
+		else \
+			echo "There is no config/$$provider.example.toml to copy - write $$plan by hand." >&2; \
+		fi; \
+		exit 1; \
+	fi; \
+	echo "Market-data plan: $$plan"
+
+##@ Stack
+
 infra: ## Start redis, postgres and nats only
 	docker compose up -d redis-cache postgres-audit nats
 
-up: strategy-requirements ## Start the whole stack
+up: market-plan strategy-requirements ## Start the whole stack
 	docker compose up -d --build
 
-start: strategy-requirements ## `up` + wait for db-migrate to finish; the local dev entry point
+start: market-plan strategy-requirements ## `up` + wait for db-migrate to finish; the local dev entry point
 	docker compose up -d --build
 	@echo "Stack is up. Data-ingestion / strategy-runner block until db-migrate exits 0."
 	@echo "Drive the simulator with: make bar O=2400 H=2412.5 L=2396.25 C=2408.75"
@@ -186,6 +238,8 @@ logs: ## Tail every service
 nuke: ## Stop the stack and DELETE its volumes (audit trail included)
 	docker compose down -v
 
+##@ Database
+
 db-upgrade: ## Apply every pending migration
 	uv run alembic upgrade head
 
@@ -204,10 +258,12 @@ db-history: ## The migration history
 db-check: ## Fail if the models have drifted from the migrations
 	uv run alembic check
 
+##@ History and backtests
+
 csv-import: ## Convert an MT5 CSV export to parquet: make csv-import CSV=data/csv/x.csv [TZ=EET] [ARGS=--overwrite]
 	uv run python scripts/mt5_csv_to_parquet.py $(CSV) --tz $(or $(TZ),UTC) $(ARGS)
 
-download: ## Fetch provider history for QTE_ENGINE__SYMBOLS into parquet
+download: ## Fetch provider history for every symbol in the market-data plan
 	uv run qte-backtest download
 
 history: ## List the parquet history on disk
@@ -223,11 +279,15 @@ chart: ## Draw a report as an interactive HTML dashboard: make chart REPORT=data
 reports: ## List the backtest reports written so far
 	@ls -lht data/reports 2>/dev/null | head -20 || echo "No reports yet — run make backtest"
 
+##@ Run a service locally
+
 ingestion: ## Run the ingestion service locally
 	uv run qte-ingestion
 
 runner: ## Run the strategy runner locally
 	uv run qte-strategy-runner
+
+##@ Simulator
 
 # ── Dev market data simulator ───────────────────────────────────────────
 #
@@ -235,16 +295,19 @@ runner: ## Run the strategy runner locally
 # without a market being open. Refuses to run unless QTE_ENV=dev. The full
 # walkthrough is docs/simulator.md.
 
-SIM_SYMBOL ?= XAUUSD
-SIM_TF     ?= M15
-SIM_BARS   ?= 300
-# Where a successful vendor fetch parks its bars. `warmup-cache` replays these
-# into the simulator, so a dev stack rehearses on prices that really printed
-# without spending a request against a rate-limited plan.
-HISTORY_CACHE ?= data/parquet/tiingo
-# Bars replayed by `warmup-cache`. Defaults to the Redis retention so one run
-# fills the window the runner will actually read.
-CACHE_BARS ?= 6000
+# These targets carry no parameters of their own. The symbol, the timeframe,
+# the bar counts and the cached history file all come from .env — the same file
+# ingestion and the runner read — so a rehearsal cannot aim at a symbol the
+# engine is not watching or a window the runner will not keep:
+#
+#   QTE_ENGINE__SYMBOLS            the symbol, first entry
+#   QTE_ENGINE__SIGNAL_TIMEFRAME   the timeframe
+#   QTE_SIMULATOR__GENERATE_BARS   synthetic bars for `make warmup`
+#   QTE_SIMULATOR_PARQUET_FILE     the vendor parquet `make warmup-cache` plays
+#   QTE_SIMULATOR__CACHE_BARS      how many of its trailing bars
+#
+# For a one-off, pass the flag instead of editing .env:
+#   uv run qte-simulator replay --generate 500 --seed 7
 
 sim: ## Run the dev websocket market data simulator (QTE_ENV=dev only)
 	uv run qte-simulator serve
@@ -255,29 +318,27 @@ sim-up: ## (Re)build and start just the market-simulator container
 sim-status: ## What the simulator is doing, and who is attached to it
 	uv run qte-simulator status
 
-warmup-cache: ## Warm the engine from real cached bars: make warmup-cache [CACHE_BARS=6000]
-	uv run qte-simulator replay --symbol $(SIM_SYMBOL) --timeframe $(SIM_TF) \
-		--file $(HISTORY_CACHE)/$(SIM_SYMBOL)_$(SIM_TF).parquet \
-		--limit $(CACHE_BARS) --verify
+# No --verify here, unlike the synthetic warm-up: real history is anchored in
+# the past, where ingestion's wall-clock flush can close a bar between two of
+# its own ticks. That costs about one bar per flush interval the replay lasts —
+# fine for a warm-up window, and a guaranteed red for a bar-by-bar check.
+warmup-cache: ## Warm the engine from the cached vendor parquet (QTE_SIMULATOR_PARQUET_FILE)
+	uv run qte-simulator replay
 
-sim-replay warmup: ## Warm the engine with synthetic bars: make warmup [SIM_BARS=300]
-	uv run qte-simulator replay --symbol $(SIM_SYMBOL) --timeframe $(SIM_TF) \
-		--generate $(SIM_BARS) --seed 7 --verify
+warmup sim-replay: ## Warm the engine with synthetic bars (QTE_SIMULATOR__GENERATE_BARS)
+	uv run qte-simulator replay --generate --seed 7 --verify
 
-sim-bar bar: ## One bar, round-tripped: make bar O=2400 H=2412.5 L=2396.25 C=2408.75 [V=150]
-	uv run qte-simulator bar --symbol $(SIM_SYMBOL) --timeframe $(SIM_TF) \
-		--open $(O) --high $(H) --low $(L) --close $(C) \
+bar sim-bar: ## One bar, round-tripped: make bar O=2400 H=2412.5 L=2396.25 C=2408.75 [V=150]
+	uv run qte-simulator bar --open $(O) --high $(H) --low $(L) --close $(C) \
 		$(if $(V),--volume $(V),) --verify
 
 signal: ## Warmup + drift replay expected to fire a signal (fails if none does)
-	uv run qte-simulator replay --symbol $(SIM_SYMBOL) --timeframe $(SIM_TF) \
-		--generate $(SIM_BARS) --seed 7 --verify
-	uv run qte-simulator replay --symbol $(SIM_SYMBOL) --timeframe $(SIM_TF) \
-		--generate 60 --seed 3 --drift 0.004 --volatility 0.0015 \
-		--verify --expect-signal
+	uv run qte-simulator replay --generate --seed 7 --verify
+	uv run qte-simulator replay --generate 60 --seed 3 --drift 0.004 \
+		--volatility 0.0015 --verify --expect-signal
 
 sim-walk: ## Stream a live-ish random walk until stopped
-	uv run qte-simulator walk --symbol $(SIM_SYMBOL) --rate 5
+	uv run qte-simulator walk --rate 5
 
 sim-stop: ## Stop every background generator
 	uv run qte-simulator stop
@@ -289,7 +350,9 @@ sim-reset: ## Clear Redis + reset the simulator cursor + restart ingestion (fixe
 	docker compose restart data-ingestion strategy-runner
 
 sim-watch: ## Tail closed candles and emitted signals on NATS
-	uv run qte-simulator watch --symbol $(SIM_SYMBOL) --timeframe $(SIM_TF)
+	uv run qte-simulator watch
+
+##@ Live control
 
 shadow-status: ## Show whether signals are reaching the broker
 	uv run qte-control shadow status
@@ -303,7 +366,8 @@ shadow-off: ## Resume delivery to the broker (GOES LIVE — prompts to confirm)
 ping: ## Ask the running runners to identify themselves
 	uv run qte-control ping
 
-.PHONY: help install install-dev lock test lint format check infra up start stop down restart logs nuke \
+.PHONY: help install install-dev lock test lint format check tiingo market-plan \
+	infra up start stop down restart logs nuke \
 	strategy-mount strategy-audit strategy-requirements strategy-test strategies audit audit-strict strategy-mapping \
 	db-upgrade db-downgrade db-revision db-current db-history db-check \
 	download history backtest chart reports ingestion runner csv-import \

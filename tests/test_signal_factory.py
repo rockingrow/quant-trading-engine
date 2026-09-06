@@ -2,9 +2,9 @@ from datetime import UTC, datetime
 
 import pytest
 from qte_shared.models import SignalAction, is_valid_uxid
-from qte_shared.signal_factory import BracketPolicy, SignalFactory
-from qte_shared.sizing import PositionSizer
-from qte_shared.strategy_base import SignalIntent
+from qte_shared.strategies.signal_factory import BracketPolicy, SignalFactory
+from qte_shared.strategies.sizing import PositionSizer
+from qte_shared.strategies.strategy_base import SignalIntent
 
 NOW = datetime(2026, 5, 1, 10, 0, tzinfo=UTC)
 
