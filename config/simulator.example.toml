@@ -1,0 +1,55 @@
+# What the dev simulator is asked to feed: which symbols, and at which bars.
+#
+#   make simulator     # writes config/simulator.toml from this template
+#
+# The engine reads `config/<QTE_MARKET_DATA__PROVIDER>.toml`, so this file is
+# the plan for the `simulator` provider, exactly as `config/tiingo.toml` is the
+# plan for `tiingo`. `make start` refuses to bring the stack up without it: a
+# missing plan does not fail loudly at runtime, it quietly falls back to the
+# built-in `QTE_ENGINE__*` defaults, and "subscribed to what it used to be"
+# looks identical to "subscribed to what I asked for" in a log.
+#
+# This template is tracked; `config/simulator.toml` is git-ignored, for the
+# same reason as `config/tiingo.toml` and the routing table: what a desk
+# subscribes to is position information and this repository is public.
+#
+# **No API key.** The simulator invents its own prices; there is nothing to
+# authenticate against. `QTE_DATA_PROVIDER_API_KEY` is left empty for it.
+#
+# Everything below still has an environment variable, and the environment still
+# wins: `QTE_ENGINE__SYMBOLS='["EURUSD"]' make backtest` is a one-run override
+# that does not touch the plan. The file is where the standing answer lives.
+
+
+# ── The provider's own knobs ────────────────────────────────────────────
+#
+# The table is generic — read by whichever provider is on, so a plan always
+# has the same three-section shape. The simulator has no knobs of its own: it
+# serves LIVE ticks only (a boot-time backfill finds nothing and skips itself),
+# and its client URL and reconnect policy live in .env under QTE_SIMULATOR__*
+# because Compose overrides them per environment. So the table is left empty.
+
+[provider]
+
+
+# ── One table per symbol ────────────────────────────────────────────────
+#
+# The symbol name is the broker spelling — what ends up in the signal a worker
+# executes. The simulator speaks QTE's own symbols, so there is no vendor
+# ticker to translate into.
+
+[symbols.XAUUSD]
+# Which socket the feed opens for it. Inferred when omitted; worth stating for
+# anything ambiguous (BTCUSD is a crypto pair on an exchange and an FX CFD on a
+# broker's book).
+market = "fx"
+# Bars resampled from the simulated tick stream (QTE_ENGINE__TIMEFRAMES). Every
+# entry costs a Redis list per symbol, so ask for the ones strategies read.
+timeframes = ["M15"]
+
+# `enabled = false` parks a symbol without deleting its settings, so turning it
+# back on is a one-word edit and the diff says what happened.
+[symbols.BTCUSDT]
+enabled = false
+market = "crypto"
+timeframes = ["M15"]

@@ -35,8 +35,9 @@ from qte_shared.logging_setup import get_logger
 
 log = get_logger(__name__)
 
-#: Key the mapping table and ``QTE_RUNNER__STRATEGY_PARAMS`` use to state a
-#: pair's risk. Read off a strategy's params, which is where both land.
+#: Key the mapping table uses to state a pair's risk — in a
+#: ``[strategies.<name>]`` default or a ``[symbols.<symbol>.params.<name>]``
+#: override. Read off a strategy's params, which is where both land.
 RISK_PERCENT_KEY = "risk_percent"
 
 #: Params key mirrored onto the payload's ``position.use_equity_sizing``.
@@ -68,7 +69,8 @@ class PositionSizer:
         """Build one from ``QTE_ACCOUNT__*`` and a pair's strategy params.
 
         *params* is what ``config/strategies_mapping.toml`` mapped to this pair
-        (merged over ``QTE_RUNNER__STRATEGY_PARAMS``), so a ``risk_percent``
+        (its ``[strategies.<name>]`` defaults merged under the pair's
+        ``[symbols.<symbol>.params.<name>]`` overrides), so a ``risk_percent``
         stated there wins over the account default. An explicit *risk_percent*
         argument wins over both — that is the caller saying it already resolved
         the question.

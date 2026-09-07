@@ -132,12 +132,12 @@ def test_each_pair_gets_its_own_instance(runner, monkeypatch, tmp_path):
 
 def test_per_pair_params_beat_the_per_strategy_default(runner, monkeypatch, tmp_path):
     """One strategy running tighter on gold than on bitcoin is the point."""
-    from qte_strategy_engine.settings import runner_settings
-
-    monkeypatch.setitem(runner_settings.strategy_params, "GOLD_M15", {"risk_percent": 2.0})
     mapping = table(
         tmp_path,
         """
+        [strategies.GOLD_M15]
+        risk_percent = 2.0
+
         [symbols.XAUUSD]
         strategies = ["GOLD_M15"]
 
@@ -163,6 +163,27 @@ def test_a_name_nobody_publishes_is_logged_as_an_error(runner, monkeypatch, tmp_
 
     assert "TYPOD_NAME" in caplog.text
     assert not runner.slots
+
+
+def test_strategy_defaults_for_an_unknown_name_are_warned_about(
+    runner, monkeypatch, tmp_path, caplog
+):
+    """A typo in a [strategies.<name>] key means an override silently never applies."""
+    mapping = table(
+        tmp_path,
+        """
+        [strategies.TYPOD_NAME]
+        risk_percent = 2.0
+
+        [symbols.XAUUSD]
+        strategies = ["GOLD_M15"]
+        """,
+    )
+    with caplog.at_level("WARNING"):
+        pairs = build(runner, monkeypatch, mapping)
+
+    assert "TYPOD_NAME" in caplog.text
+    assert pairs == {("GOLD_M15", "XAUUSD")}, "the typo'd default does not stop the real pairing"
 
 
 def test_a_table_that_maps_nothing_trades_nothing(runner, monkeypatch, tmp_path):

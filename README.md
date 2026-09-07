@@ -335,10 +335,14 @@ Which strategies trade which symbols lives in
 [symbols.XAUUSD]
 strategies = ["MT5_GOLD_M5_SCALP"]
 
-# Per-pair overrides. They beat QTE_RUNNER__STRATEGY_PARAMS, so one strategy
+# Per-strategy defaults, applied wherever this strategy runs.
+[strategies.MT5_GOLD_M5_SCALP]
+risk_percent = 1.0
+
+# Per-pair overrides beat the [strategies.*] defaults above, so one strategy
 # can run tighter on gold than it does on everything else.
 [symbols.XAUUSD.params.MT5_GOLD_M5_SCALP]
-risk_percent = 1.0
+risk_percent = 0.5
 
 # Parks a symbol without deleting its configuration.
 [symbols.EURUSD]

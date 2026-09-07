@@ -1,5 +1,23 @@
 .DEFAULT_GOAL := help
+
+# Every recipe here is POSIX shell. Inside Git Bash, WSL or Linux, /bin/bash
+# resolves and there is nothing to do. A native Windows make started from
+# PowerShell or cmd resolves no POSIX path at all, so point it at the bash Git
+# for Windows ships. It has to be the 8.3 form: a space in SHELL defeats make's
+# "is this a Unix shell" check and it falls back to running recipes through cmd.
 SHELL := /bin/bash
+WINDOWS_BASH ?= C:/PROGRA~1/Git/bin/bash.exe
+ifeq ($(OS),Windows_NT)
+ifndef MSYSTEM
+ifeq ($(wildcard $(WINDOWS_BASH)),)
+$(error No shell at $(WINDOWS_BASH). Run make from Git Bash, or pass WINDOWS_BASH=<path to bash.exe, no spaces>)
+endif
+SHELL := $(WINDOWS_BASH)
+# Simple recipe lines are launched directly, without the shell, so the coreutils
+# Git ships (awk, sed, cp) have to be findable on PATH as well.
+export PATH := $(dir $(WINDOWS_BASH))../usr/bin;$(PATH)
+endif
+endif
 
 help: ## Show this help, grouped by section
 	@awk 'BEGIN {FS = ":.*?## "} \
@@ -121,6 +139,7 @@ strategy-mount: ## Install one (STRATEGY=<name>) or every mounted strategy repo'
 
 strategy-requirements: ## Freeze deps for one (STRATEGY=<name>) or every mounted repo (from STRATEGIES_MANIFEST) into deploy/
 	@set -e; \
+	mkdir -p deploy; \
 	if [ -n "$(STRATEGY)" ]; then \
 		names="$(STRATEGY)"; \
 	else \
@@ -165,13 +184,13 @@ strategy-mapping: ## Copy the strategies-mapping template into place (never over
 	@if [ -f config/strategies_mapping.toml ]; then \
 		echo "config/strategies_mapping.toml exists - leaving it alone"; \
 	else \
-		cp config/strategies_mapping.example.toml config/strategies_mapping.toml; \
-		echo "Wrote config/strategies_mapping.toml (git-ignored) - pair your symbols with strategies in it"; \
+		sed -e '/^[ \t]*#/d' config/strategies_mapping.example.toml | cat -s | sed -e '/./,$$!d' > config/strategies_mapping.toml; \
+		echo "Wrote config/strategies_mapping.toml (git-ignored, comments stripped) - pair your symbols with strategies in it"; \
 	fi
 
 strategies: ## List what the mounted strategy repo publishes
 	uv run python -c "from qte_shared.config import settings; \
-		from qte_shared.plugin_loader import load_strategies; \
+		from qte_shared.strategies.plugin_loader import load_strategies; \
 		[print(e.name, 'from', e.source) for e in load_strategies(settings.engine.strategies_dir)]"
 
 ##@ Market data
@@ -186,20 +205,28 @@ tiingo: ## Copy the Tiingo market-data plan into place (never overwrites)
 	@if [ -f config/tiingo.toml ]; then \
 		echo "config/tiingo.toml exists - leaving it alone"; \
 	else \
-		cp config/tiingo.example.toml config/tiingo.toml; \
-		echo "Wrote config/tiingo.toml (git-ignored) - list the symbols you want fed in it"; \
+		sed -e '/^[ \t]*#/d' config/tiingo.example.toml | cat -s | sed -e '/./,$$!d' > config/tiingo.toml; \
+		echo "Wrote config/tiingo.toml (git-ignored, comments stripped) - list the symbols you want fed in it"; \
+	fi
+
+simulator: ## Copy the simulator market-data plan into place (never overwrites)
+	@if [ -f config/simulator.toml ]; then \
+		echo "config/simulator.toml exists - leaving it alone"; \
+	else \
+		sed -e '/^[ \t]*#/d' config/simulator.example.toml | cat -s | sed -e '/./,$$!d' > config/simulator.toml; \
+		echo "Wrote config/simulator.toml (git-ignored, comments stripped) - list the symbols you want fed in it"; \
 	fi
 
 # Guards `up` and `start`. A missing plan does not fail at runtime: the engine
 # falls back to the QTE_ENGINE__* defaults and quietly subscribes to something
 # nobody asked for, which on a live vendor is the wrong kind of surprise. The
-# simulator is exempt — it is the one provider with no plan and no key.
+# simulator answers the same "what to feed" question and is held to it too — it
+# has no key, but it still needs a plan (`make simulator`).
 market-plan: ## Fail unless the configured provider has its plan file
 	@provider=$$(sed -n 's/^QTE_MARKET_DATA__PROVIDER=//p' .env 2>/dev/null | tail -n1 | tr -d '"' | tr -d "\r' "); \
 	plan=$$(sed -n 's/^QTE_MARKET_DATA__CONFIG_FILE=//p' .env 2>/dev/null | tail -n1 | tr -d '"' | tr -d "\r' "); \
 	[ -n "$$provider" ] || provider=tiingo; \
 	[ -n "$$plan" ] || plan="config/$$provider.toml"; \
-	if [ "$$provider" = "simulator" ]; then exit 0; fi; \
 	if [ ! -f "$$plan" ]; then \
 		echo "QTE_MARKET_DATA__PROVIDER=$$provider, but $$plan does not exist." >&2; \
 		echo "Without it the engine falls back to the QTE_ENGINE__* defaults and" >&2; \
@@ -229,8 +256,8 @@ stop: ## Stop the stack (volumes survive) — alias of `down`
 down: ## Stop the stack (volumes survive)
 	docker compose down
 
-restart: ## Recreate every app container (keeps volumes and infra)
-	docker compose up -d --build --force-recreate data-ingestion strategy-runner market-simulator
+restart: market-plan strategy-requirements ## Recreate ingestion and runner, preserving the simulator clock
+	docker compose up -d --build --no-deps --force-recreate data-ingestion strategy-runner
 
 # ── Live-editing dev loop ──────────────────────────────────────────────
 #
@@ -244,11 +271,14 @@ DEV_COMPOSE := -f docker-compose.yml -f docker-compose.dev.yml
 dev: market-plan strategy-requirements ## `start` with src/ bind-mounted for live editing
 	docker compose $(DEV_COMPOSE) up -d --build
 
-dev-restart: ## Reload code after an edit — restart the app processes, no rebuild
-	docker compose $(DEV_COMPOSE) restart data-ingestion strategy-runner market-simulator
+dev-restart: ## Reload ingestion and runner code, preserving the simulator clock
+	docker compose $(DEV_COMPOSE) restart data-ingestion strategy-runner
 
-logs: ## Tail every service
-	docker compose logs -f --tail=100
+# Streams until interrupted. SERVICE narrows it to one container — the way to
+# watch a single process now that the services only run in compose:
+#   make logs SERVICE=data-ingestion   (or strategy-runner, market-simulator)
+logs: ## Tail every service, or one: make logs SERVICE=strategy-runner
+	docker compose logs -f --tail=100 $(SERVICE)
 
 nuke: ## Stop the stack and DELETE its volumes (audit trail included)
 	docker compose down -v
@@ -294,14 +324,6 @@ chart: ## Draw a report as an interactive HTML dashboard: make chart REPORT=data
 reports: ## List the backtest reports written so far
 	@ls -lht data/reports 2>/dev/null | head -20 || echo "No reports yet — run make backtest"
 
-##@ Run a service locally
-
-ingestion: ## Run the ingestion service locally
-	uv run qte-ingestion
-
-runner: ## Run the strategy runner locally
-	uv run qte-strategy-runner
-
 ##@ Simulator
 
 # ── Dev market data simulator ───────────────────────────────────────────
@@ -330,12 +352,10 @@ sim: ## Run the dev websocket market data simulator (QTE_ENV=dev only)
 sim-status: ## What the simulator is doing, and who is attached to it
 	uv run qte-simulator status
 
-# No --verify here, unlike the synthetic warm-up: real history is anchored in
-# the past, where ingestion's wall-clock flush can close a bar between two of
-# its own ticks. That costs about one bar per flush interval the replay lasts —
-# fine for a warm-up window, and a guaranteed red for a bar-by-bar check.
+# File prices continue the forward series too, so the wall-clock flush cannot
+# split historical bars. Verify the full warm-up, including runs sent in batches.
 warmup-cache: ## Warm the engine from the cached vendor parquet (QTE_SIMULATOR_PARQUET_FILE)
-	uv run qte-simulator replay
+	uv run qte-simulator replay --verify --timeout 120
 
 warmup sim-replay: ## Warm the engine with synthetic bars (QTE_SIMULATOR__GENERATE_BARS)
 	uv run qte-simulator replay --generate --seed 7 --verify
@@ -378,10 +398,10 @@ shadow-off: ## Resume delivery to the broker (GOES LIVE — prompts to confirm)
 ping: ## Ask the running runners to identify themselves
 	uv run qte-control ping
 
-.PHONY: help install install-dev lock test lint format check tiingo market-plan \
+.PHONY: help install install-dev lock test lint format check tiingo simulator market-plan \
 	up start stop down restart dev dev-restart logs nuke \
 	strategy-mount strategy-audit strategy-requirements strategy-test strategies audit audit-strict strategy-mapping \
 	db-upgrade db-downgrade db-revision db-current db-history db-check \
-	download history backtest chart reports ingestion runner csv-import \
+	download history backtest chart reports csv-import \
 	sim sim-status sim-replay warmup warmup-cache sim-bar bar signal sim-walk sim-stop sim-reset sim-watch \
 	shadow-status shadow-on shadow-off ping

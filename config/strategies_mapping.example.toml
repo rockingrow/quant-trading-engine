@@ -27,14 +27,27 @@
 strategies = []
 
 
+# ── Per-strategy default parameters ────────────────────────────────────
+# One table per strategy, keyed by strategy name. Every value here applies to
+# that strategy on every symbol it runs on. A pair that needs a different
+# number restates just that key under [symbols.<symbol>.params.<strategy>]
+# below, which wins. Omit the table and the strategy keeps whatever defaults
+# its own code sets.
+
+[strategies.EXAMPLE_GOLD_M15_V1]
+risk_percent = 3.0
+tp1_qty_percent = 50
+use_equity_sizing = false
+
+
 # ── One table per symbol ────────────────────────────────────────────────
 
 [symbols.XAUUSD]
 strategies = ["EXAMPLE_GOLD_M15_V1", "EXAMPLE_GOLD_M5_SCALP"]
 
-# Per-pair parameter overrides, keyed by strategy name. They win over
-# QTE_RUNNER__STRATEGY_PARAMS, which is the per-strategy default — so one
-# strategy can run tighter on gold than it does on everything else.
+# Per-pair parameter overrides, keyed by strategy name. They win over the
+# [strategies.EXAMPLE_GOLD_M15_V1] defaults above — so one strategy can run
+# tighter on gold than it does on everything else.
 [symbols.XAUUSD.params.EXAMPLE_GOLD_M15_V1]
 risk_percent = 1.0
 atr_sl_mult = 1.5

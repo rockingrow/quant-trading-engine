@@ -72,6 +72,44 @@ def test_an_unknown_strategy_maps_to_nothing_rather_than_raising(mapping):
     assert mapping.symbols_for("NOT_DEPLOYED") == []
 
 
+# ── Per-strategy default parameters ─────────────────────────────────────
+
+
+def test_strategy_defaults_apply_wherever_the_strategy_runs(tmp_path):
+    mapping = SymbolMapping.load(
+        write(
+            tmp_path,
+            """
+            [strategies.GOLD_M15]
+            risk_percent = 1.5
+            atr_sl_mult = 2.0
+
+            [symbols.XAUUSD]
+            strategies = ["GOLD_M15"]
+
+            [symbols.BTCUSDT]
+            strategies = ["GOLD_M15"]
+            """,
+        )
+    )
+    assert mapping.defaults_for("GOLD_M15") == {"risk_percent": 1.5, "atr_sl_mult": 2.0}
+    assert mapping.defaults_for("GOLD_SCALP") == {}, "no entry means no defaults"
+
+
+def test_strategy_defaults_are_empty_without_the_table(mapping):
+    assert mapping.defaults_for("GOLD_M15") == {}
+
+
+def test_strategy_defaults_are_empty_on_a_mapping_that_was_never_read():
+    assert SymbolMapping().defaults_for("GOLD_M15") == {}
+
+
+def test_a_strategies_entry_that_is_not_a_table_is_refused(tmp_path):
+    """``[strategies.GOLD_M15]`` has to hold parameters, not a bare scalar."""
+    with pytest.raises(ValueError, match=r"strategies\.GOLD_M15"):
+        SymbolMapping.load(write(tmp_path, "[strategies]\nGOLD_M15 = 1\n"))
+
+
 # ── Absence, and switching things off ────────────────────────────────────
 
 
@@ -174,6 +212,9 @@ def test_the_committed_template_parses():
     assert mapping, "the template should demonstrate at least one pairing"
     assert "XAUUSD" in mapping.symbols
     assert "EURUSD" not in mapping.symbols, "the template's disabled symbol stays disabled"
+    assert mapping.defaults_for("EXAMPLE_GOLD_M15_V1"), (
+        "the template should demonstrate a [strategies.<name>] default"
+    )
 
 
 def test_the_real_table_is_not_committed():

@@ -140,16 +140,22 @@ async def run_backtest(
 
 
 def _mapped_params(request: BacktestRequest) -> dict[str, Any]:
-    """This pair's overrides from ``config/strategies_mapping.toml``, if any.
+    """This pair's parameters from ``config/strategies_mapping.toml``, if any.
 
-    A missing table is normal — a fresh clone has none — and an unmapped pair
-    is normal too: backtesting a symbol before deciding to trade it is the
-    usual order of events. Both mean "no overrides", not an error.
+    The strategy's ``[strategies.<name>]`` defaults, with this pair's
+    ``[symbols.<symbol>.params.<name>]`` overrides merged on top — the same two
+    layers the runner applies, so a backtest measures the book that is actually
+    configured. A missing table is normal — a fresh clone has none — and an
+    unmapped pair is normal too: backtesting a symbol before deciding to trade
+    it is the usual order of events. Both mean "no overrides", not an error.
     """
     mapping = SymbolMapping.load(settings.engine.mapping_file)
     if not mapping:
         return {}
-    mapped = mapping.params_for(request.symbol, request.strategy)
+    mapped = {
+        **mapping.defaults_for(request.strategy),
+        **mapping.params_for(request.symbol, request.strategy),
+    }
     if mapped:
         log.info(
             "Applying %s overrides from %s for %s/%s",

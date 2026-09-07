@@ -65,6 +65,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Per-strategy parameters move from `QTE_RUNNER__STRATEGY_PARAMS` into the
+  mapping table.** `config/strategies_mapping.toml` gains a `[strategies.<name>]`
+  table — one sub-table of default parameters per strategy, applied wherever
+  that strategy is mapped, with the per-pair `[symbols.<symbol>.params.<name>]`
+  overrides merged on top. The environment variable is gone: a strategy × pair
+  × parameter matrix belongs in the reviewable file next to the routing it
+  tunes, not flattened into JSON in `.env`. The backtest reads the same two
+  layers now, so a run measures the book the runner would trade.
+  `make strategy-mapping` now strips the template's comments as it copies, the
+  way `make tiingo` and `make simulator` already do.
+
 - **A `TP1` that closes the entry's whole quantity ends the trade cycle.**
   Previously only `TP2`/`SL`/`R_SL`/`FLAT` did, so a strategy taking "50%" of a
   position sized at one unit left the runner holding a cycle the broker had

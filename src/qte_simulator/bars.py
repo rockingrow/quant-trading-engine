@@ -219,7 +219,8 @@ def anchor_open_times(
         last = floor_to_bucket(moment, timeframe) - duration
         first = last - duration * (count - 1)
     elif mode == "next":
-        first = cursor + duration if cursor is not None else floor_to_bucket(moment, timeframe)
+        current_bucket = floor_to_bucket(moment, timeframe)
+        first = max(cursor + duration, current_bucket) if cursor is not None else current_bucket
     else:
         raise BarError(f"Unknown anchor {mode!r}; use 'past' or 'next'")
 

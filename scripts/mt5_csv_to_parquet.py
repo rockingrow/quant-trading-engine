@@ -98,9 +98,10 @@ def read_mt5_csv(path: Path, tz: str) -> pd.DataFrame:
     # <VOL> is real volume and is 0 for most FX/CFD feeds; <TICKVOL> counts
     # ticks and is the only volume MT5 actually has there. Prefer the real one
     # when the broker reports it, so a volume-aware strategy is not fed ticks.
-    real = pd.to_numeric(frame.get("vol", 0), errors="coerce").fillna(0.0)
-    ticks = pd.to_numeric(frame.get("tickvol", 0), errors="coerce").fillna(0.0)
-    frame["volume"] = real if float(real.sum()) > 0 else ticks
+    empty_volume = pd.Series(0.0, index=frame.index)
+    real_volume = pd.to_numeric(frame.get("vol", empty_volume), errors="coerce").fillna(0.0)
+    tick_volume = pd.to_numeric(frame.get("tickvol", empty_volume), errors="coerce").fillna(0.0)
+    frame["volume"] = real_volume if float(real_volume.sum()) > 0 else tick_volume
 
     frame = frame.set_index("open_time")[OHLCV].astype(float).sort_index()
     return frame[~frame.index.duplicated(keep="last")]

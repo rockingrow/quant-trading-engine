@@ -1,9 +1,7 @@
 # QTE local/VPS stack.
 #
-# The schema is NOT created by this file. Run `make db-upgrade` after the first
-# `up` — Alembic owns the schema, and an init-hook script would only ever run on
-# an empty volume, which is precisely the case a migration tool exists to
-# outgrow.
+# The db-migrate one-shot applies the Alembic chain before the app services
+# start. No separate schema command or database init-hook is needed.
 #
 # `nats` here is for standalone development. In production you normally point
 # QTE_BROKER__NATS_URL at the *broker's* NATS, because that is where the
@@ -15,7 +13,7 @@
 name: qte
 
 # Container-side network URLs. .env carries the host-side ones (127.0.0.1) so
-# `make ingestion` / alembic / qte-simulator on the host work out of the box;
+# alembic / qte-simulator / qte-backtest on the host work out of the box;
 # these overrides swap them for the compose service names once the process is
 # inside the network. `environment:` wins over `env_file:` in compose, so the
 # same .env drives both worlds.
@@ -134,10 +132,8 @@ services:
   #
   # Started by every `docker compose up` — the in-process guard
   # (`qte_shared.dev_only`) refuses to run outside dev, so leaving it out of
-  # a profile is safe. Two feeds on one symbol still race the resampler; when
-  # you want a real vendor instead, set QTE_MARKET_DATA__PROVIDER=tiingo (or
-  # equivalent), write its plan (`make tiingo`) and stop this service
-  # explicitly.
+  # a profile is safe. Ingestion selects one provider; an idle simulator does
+  # not inject ticks into a vendor feed. Stop it when it is not needed.
   #
   # It depends on nothing: no Redis, no Postgres, no NATS. It owns a socket and
   # the ticks it is told to send, and everything downstream of that is the real
