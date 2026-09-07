@@ -164,9 +164,7 @@ class StrategyRunner:
         happened before the table existed — see :mod:`qte_shared.strategies.mapping`.
         """
         mapping = SymbolMapping.load(settings.engine.mapping_file)
-        discovered = load_strategies(
-            settings.engine.strategies_dir, runner_settings.enabled_strategies or None
-        )
+        discovered = load_strategies(settings.engine.strategies_dir)
         if mapping:
             loaded_names = [entry.name for entry in discovered]
             self._warn_on_unmapped(mapping, loaded_names)

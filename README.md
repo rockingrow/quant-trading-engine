@@ -315,10 +315,23 @@ make strategies                              # list what the engine can see
 make audit                                   # check that what it sees is fit to trade
 ```
 
-`strategy-mount` records each repo's audit result in
-`__strategies__/strategies.toml` — auto-generated, never hand-edited. `make up`
-and `make dev` read it to freeze only the audit-passing repos into the image,
-and refuse to start without it.
+`strategy-mount` records the audit result of every strategy each repo publishes
+in `__strategies__/strategies.toml` — auto-generated, never hand-edited, one
+table per repo and one line per strategy:
+
+```toml
+[strategies.my-strategies]
+MT5_GOLD_M15_V1 = true
+MT5_GOLD_M5_V1 = false
+```
+
+`make up` and `make dev` read it to freeze only the repos that still have a
+passing strategy into the image, and refuse to start without it. So does the
+runner: a strategy marked `false` is not loaded, because its dependencies were
+never frozen into the image it would have to run in, and a repo with nothing
+passing is not even imported. Fix what the audit found and mount it again.
+`make strategies` lists what the engine can see; `uv run qte-strategy-mount
+--show` lists what the mount recorded.
 
 > Why a manifest, why the contract is structural rather than nominal, and why
 > the interface is seven methods rather than one:

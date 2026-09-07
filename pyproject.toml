@@ -1,7 +1,7 @@
 [project]
 name = "quant-trading-engine"
 version = "0.1.0"
-description = "Event-driven quant trading engine: ingestion, backtest, live strategy runner, signal broker bridge."
+description = "Data-driven quant trading engine for backtesting and executing proprietary strategies via integrated data providers (Tiingo first), featuring full trade lifecycle management and external signal routing."
 readme = "README.md"
 # Pinned to 3.13, and the reason is not this repo's own dependencies — they are
 # happy on anything from 3.11 up. The strategy runner imports the plugins in
@@ -59,6 +59,7 @@ qte-ingestion = "qte_ingestion.main:run"
 qte-strategy-runner = "qte_strategy_engine.main:run"
 qte-control = "qte_strategy_engine.control:main"
 qte-strategy-audit = "qte_strategy_audit.main:run"
+qte-strategy-mount = "qte_strategy_audit.mount:run"
 qte-simulator = "qte_simulator.cli:main"
 
 [dependency-groups]

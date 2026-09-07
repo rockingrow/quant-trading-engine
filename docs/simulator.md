@@ -87,7 +87,6 @@ QTE_POSTGRES__ENABLED=true
 
 # ── Strategy runner ───────────────────────────────────────────────────
 QTE_RUNNER__AUDIT_ON_START=warn
-QTE_RUNNER__ENABLED_STRATEGIES=[]
 QTE_RUNNER__DEFAULT_QUANTITY=0.01
 
 # ── Market data: the dev simulator, not a vendor ──────────────────────
@@ -181,10 +180,14 @@ unrelated placeholders on several symbols. Editing only XAUUSD still leaves
 invalid mappings elsewhere.
 
 For your own repo, clone under `__strategies__/<name>`, run
-`make strategy-mount STRATEGY=<name>`, and update the mapping and
-`QTE_RUNNER__ENABLED_STRATEGIES`. `make strategy-requirements` freezes audited
-mounts' dependencies into `deploy/` for the images, creating that directory
-when needed. `make start` runs this step for you.
+`make strategy-mount STRATEGY=<name>`, and add it to the mapping table. The
+mount records an audit verdict per published strategy in
+`__strategies__/strategies.toml`, which is what decides whether the runner
+loads each of them — a `false` entry is skipped, so re-run
+`make strategy-mount STRATEGY=<name>` once you have fixed what the audit
+found. `make strategy-requirements` freezes audited mounts'
+dependencies into `deploy/` for the images, creating that directory when
+needed. `make start` runs this step for you.
 
 ## 3. Bring up and check the stack
 

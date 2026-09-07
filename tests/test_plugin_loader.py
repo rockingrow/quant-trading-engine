@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from qte_shared.strategies.mount_manifest import MOUNT_MANIFEST_FILENAME, MountManifest
 from qte_shared.strategies.plugin_loader import StrategyLoader, load_strategies
 
 STRATEGY_SOURCE = textwrap.dedent(
@@ -71,12 +72,12 @@ def test_load_one_reports_what_is_available_when_it_misses(plugin_dir):
         StrategyLoader(plugin_dir).load_one("NOPE")
 
 
-def test_the_allow_list_filters_discovery(plugin_dir):
+def test_every_strategy_in_the_directory_is_loaded(plugin_dir):
+    """No allow-list on this side: what runs is the mapping table's answer."""
     (plugin_dir / "other.py").write_text(
         STRATEGY_SOURCE.replace("MyEdge", "Other").replace("MY_EDGE", "OTHER")
     )
-    assert len(load_strategies(plugin_dir)) == 2
-    assert [entry.name for entry in load_strategies(plugin_dir, ["OTHER"])] == ["OTHER"]
+    assert sorted(entry.name for entry in load_strategies(plugin_dir)) == ["MY_EDGE", "OTHER"]
 
 
 def test_a_missing_directory_is_empty_not_an_error(tmp_path):
@@ -362,3 +363,155 @@ def test_a_repo_declaring_two_manifests_is_refused(manifest_repo):
 
     with pytest.raises(RuntimeError, match="more than one strategy manifest"):
         StrategyLoader(manifest_repo).discover()
+
+
+# ── The mount manifest: what `make strategy-mount` recorded ──────────────
+
+
+def record_mount(directory: Path, repositories: dict[str, dict[str, bool]]) -> Path:
+    """Stand in for `make strategy-mount`, which normally writes this file."""
+    return MountManifest(repositories=repositories).write(directory)
+
+
+def test_a_strategy_that_failed_its_mount_audit_is_not_loaded(manifest_repo):
+    """Its dependencies were never frozen into the image it would run in."""
+    record_mount(manifest_repo, {"my-strategies": {"GOLD_EDGE_V1": False}})
+
+    assert load_strategies(manifest_repo) == []
+
+
+def test_a_strategy_that_passed_its_mount_audit_is_loaded(manifest_repo):
+    record_mount(manifest_repo, {"my-strategies": {"GOLD_EDGE_V1": True}})
+
+    assert [entry.name for entry in load_strategies(manifest_repo)] == ["GOLD_EDGE_V1"]
+
+
+def test_a_failing_strategy_does_not_take_its_passing_sibling_down(manifest_repo):
+    """The verdict is per strategy, so half a repo can still trade.
+
+    This is the whole reason the manifest records strategies rather than
+    repositories: one edge failing its audit must not stop the other four in
+    the same checkout.
+    """
+    repo = manifest_repo / "my-strategies"
+    (repo / "strategies.py").write_text(
+        textwrap.dedent(
+            """
+            import sys
+            from pathlib import Path
+
+            sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+
+            from edges.gold import GoldEdge
+
+
+            def load_all():
+                return {"GOLD_EDGE_V1": GoldEdge, "GOLD_EDGE_V2": GoldEdge}
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    record_mount(
+        manifest_repo,
+        {"my-strategies": {"GOLD_EDGE_V1": True, "GOLD_EDGE_V2": False}},
+    )
+
+    assert [entry.name for entry in load_strategies(manifest_repo)] == ["GOLD_EDGE_V1"]
+
+
+def test_a_repo_with_nothing_passing_is_never_imported_at_all(manifest_repo):
+    """Skipping its strategies after the import would already be too late.
+
+    A manifest prepends its own ``src/`` to ``sys.path``, so importing a repo
+    with nothing left to run can shadow a package the repos we *are* running
+    import. The observable proof is that a module which explodes on import
+    leaves no failure behind: nothing read it.
+    """
+    repo = manifest_repo / "my-strategies"
+    (repo / "strategies.py").write_text("raise RuntimeError('boom')", encoding="utf-8")
+    record_mount(manifest_repo, {"my-strategies": {"GOLD_EDGE_V1": False}})
+
+    loader = StrategyLoader(manifest_repo, honor_mount_manifest=True)
+
+    assert loader.discover() == []
+    assert loader.failures == []
+
+
+def test_a_repo_with_one_passing_strategy_is_still_imported(manifest_repo):
+    """It has to be: the passing sibling lives in the same module tree."""
+    record_mount(
+        manifest_repo,
+        {"my-strategies": {"GOLD_EDGE_V1": True, "GOLD_EDGE_GONE": False}},
+    )
+
+    assert [entry.name for entry in load_strategies(manifest_repo)] == ["GOLD_EDGE_V1"]
+
+
+def test_a_loose_strategy_file_is_gated_by_name_like_any_other(tmp_path):
+    """The gate is the strategy, not the manifest — a scanned file is one too."""
+    repo = tmp_path / "my-strategies"
+    repo.mkdir()
+    (repo / "my_edge.py").write_text(STRATEGY_SOURCE, encoding="utf-8")
+    record_mount(tmp_path, {"my-strategies": {"MY_EDGE": False}})
+
+    assert load_strategies(tmp_path) == []
+
+
+def test_the_audit_still_sees_a_strategy_the_engine_refuses_to_load(manifest_repo):
+    """Gating the audit on the last audit is how a failure never recovers."""
+    record_mount(manifest_repo, {"my-strategies": {"GOLD_EDGE_V1": False}})
+
+    found = StrategyLoader(manifest_repo).discover()
+
+    assert [entry.name for entry in found] == ["GOLD_EDGE_V1"]
+
+
+def test_a_strategy_the_manifest_never_heard_of_is_loaded(manifest_repo):
+    """A repo that grew a strategy since its last mount is stale, not hostile.
+
+    The pre-flight audit still has its say on what trades, and refusing an
+    unlisted name here would mean every new strategy looked broken until
+    someone remembered to remount.
+    """
+    record_mount(manifest_repo, {"my-strategies": {}})
+
+    assert [entry.name for entry in load_strategies(manifest_repo)] == ["GOLD_EDGE_V1"]
+
+
+def test_no_mount_manifest_disables_nothing(manifest_repo):
+    """A checkout that never ran `make strategy-mount` behaves as it always did."""
+    assert [entry.name for entry in load_strategies(manifest_repo)] == ["GOLD_EDGE_V1"]
+
+
+def test_an_unreadable_mount_manifest_disables_nothing(manifest_repo, caplog):
+    """Fail open, loudly: a generated artefact must not take the runner down."""
+    (manifest_repo / MOUNT_MANIFEST_FILENAME).write_text("[strategies", encoding="utf-8")
+
+    with caplog.at_level("ERROR"):
+        found = load_strategies(manifest_repo)
+
+    assert [entry.name for entry in found] == ["GOLD_EDGE_V1"]
+    assert MOUNT_MANIFEST_FILENAME in caplog.text
+
+
+def test_the_flat_shape_this_format_replaced_is_refused(manifest_repo, caplog):
+    """`<repo> = true` said nothing about which strategy passed."""
+    (manifest_repo / MOUNT_MANIFEST_FILENAME).write_text(
+        "[strategies]\nmy-strategies = false\n", encoding="utf-8"
+    )
+
+    with caplog.at_level("ERROR"):
+        found = load_strategies(manifest_repo)
+
+    assert [entry.name for entry in found] == ["GOLD_EDGE_V1"]
+    assert "make strategy-mount" in caplog.text
+
+
+def test_an_entry_for_a_repo_that_is_gone_is_harmless(manifest_repo):
+    """A stale manifest names repos nobody mounted any more."""
+    record_mount(
+        manifest_repo,
+        {"my-strategies": {"GOLD_EDGE_V1": True}, "removed-repo": {"GONE_V1": False}},
+    )
+
+    assert [entry.name for entry in load_strategies(manifest_repo)] == ["GOLD_EDGE_V1"]

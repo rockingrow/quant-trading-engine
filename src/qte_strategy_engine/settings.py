@@ -16,8 +16,6 @@ class RunnerSettings(BaseSettings):
     #: — "warn" is the default because it changes nothing about which
     #: strategies run, it only makes the loader's skipping legible.
     audit_on_start: Literal["off", "warn", "error", "strict"] = "warn"
-    #: Only run these strategies; empty means every one discovered.
-    enabled_strategies: list[str] = Field(default_factory=list)
     #: Default size attached to an entry whose strategy did not set one.
     default_quantity: float = 0.01
     #: NATS queue group. Two runner replicas in the same group split candles
