@@ -226,6 +226,15 @@ market-plan: ## Fail unless the configured provider has its plan file
 
 ##@ Stack
 
+# `up`, `start`, `restart` and `dev` build before they boot; these two only
+# build. `build-prod` names its services because compose has no "all but one"
+# flag — the list is every buildable service except the dev-only simulator.
+build: strategy-requirements ## Rebuild every service image
+	docker compose build
+
+build-prod: strategy-requirements ## Rebuild every service image except the dev simulator
+	docker compose build db-migrate data-ingestion strategy-runner
+
 up: market-plan strategy-requirements ## Start the whole stack
 	docker compose up -d --build
 
@@ -292,15 +301,14 @@ db-check: ## Fail if the models have drifted from the migrations
 csv-import: ## Convert an MT5 CSV export to parquet: make csv-import CSV=data/csv/x.csv [TZ=EET] [ARGS=--overwrite]
 	uv run python scripts/mt5_csv_to_parquet.py $(CSV) --tz $(or $(TZ),UTC) $(ARGS)
 
-download: ## Fetch provider history for every symbol in the market-data plan
-	uv run qte-backtest download
+# Writes data/parquet/<provider>/<SYMBOL>_<TF>.parquet - one file per source,
+# so `make backtest` has to name the one it replays.
+download: ## Fetch provider history for the market-data plan [ARGS="--symbol X --timeframe M15 --market fx"]
+	uv run qte-backtest download $(ARGS)
 
-history: ## List the parquet history on disk
-	uv run qte-backtest list
-
-backtest: ## Replay one strategy: make backtest STRATEGY=... SYMBOL=XAUUSD [TF=M15]
+backtest: ## Replay one strategy: make backtest STRATEGY=... SYMBOL=XAUUSD TF=M15 FILE=data/parquet/tiingo/XAUUSD_M15.parquet
 	uv run qte-backtest run --strategy $(STRATEGY) --symbol $(SYMBOL) \
-		--timeframe $(or $(TF),M15) --report
+		--timeframe $(TF) --file $(FILE) --report
 
 chart: ## Draw a report as an interactive HTML dashboard: make chart REPORT=data/reports/x.json
 	uv run qte-backtest chart $(REPORT)
@@ -349,8 +357,12 @@ warmup-cache: ## Warm the engine from the cached vendor parquet (QTE_SIMULATOR_P
 warmup sim-replay: ## Warm the engine with synthetic bars (needs START=<price> on a cold simulator)
 	uv run qte-simulator replay --generate --seed 7 $(if $(START),--start-price $(START),) --verify
 
-bar sim-bar: ## One bar, round-tripped: make bar O=2400 H=2412.5 L=2396.25 C=2408.75 [V=150]
-	uv run qte-simulator bar --open $(O) --high $(H) --low $(L) --close $(C) \
+# SYMBOL and TF are overrides, not defaults: left unset the CLI takes the first
+# of QTE_ENGINE__SYMBOLS and the engine signal timeframe, which is what
+# ingestion subscribed to. Naming anything else sends a bar the engine ignores.
+bar sim-bar: ## One bar, round-tripped: make bar O=2400 H=2412.5 L=2396.25 C=2408.75 [V=150] [SYMBOL=] [TF=]
+	uv run qte-simulator bar $(if $(SYMBOL),--symbol $(SYMBOL),) $(if $(TF),--timeframe $(TF),) \
+		--open $(O) --high $(H) --low $(L) --close $(C) \
 		$(if $(V),--volume $(V),) --verify
 
 signal: ## Warmup + drift replay expected to fire a signal (needs START=<price> on a cold simulator)
@@ -388,9 +400,9 @@ ping: ## Ask the running runners to identify themselves
 	uv run qte-control ping
 
 .PHONY: help install install-dev lock test lint format check tiingo simulator market-plan \
-	up start stop down restart dev dev-restart logs nuke \
+	build build-prod up start stop down restart dev dev-restart logs nuke \
 	strategy-mount strategy-audit strategy-requirements strategy-test strategies audit audit-strict strategy-mapping \
 	db-upgrade db-downgrade db-revision db-current db-history db-check \
-	download history backtest chart reports csv-import \
+	download backtest chart reports csv-import \
 	sim sim-status sim-replay warmup warmup-cache sim-bar bar signal sim-walk sim-stop sim-reset sim-watch \
 	shadow-status shadow-on shadow-off ping

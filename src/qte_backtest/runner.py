@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from qte_backtest.data_store import ParquetStore
+from qte_backtest.data_store import load_history
 from qte_backtest.db import BacktestRepository
 from qte_backtest.execution import CostModel
 from qte_backtest.replay import BacktestEngine
@@ -26,7 +26,10 @@ log = get_logger(__name__)
 class BacktestRequest:
     strategy: str
     symbol: str
-    timeframe: str = "M15"
+    timeframe: str
+    #: The parquet to replay, named outright. See
+    #: :func:`qte_backtest.data_store.load_history` for why it is not derived.
+    history_file: Path
     start: datetime | None = None
     end: datetime | None = None
     params: dict[str, Any] = field(default_factory=dict)
@@ -57,7 +60,6 @@ async def run_backtest(
     request: BacktestRequest,
     *,
     strategies_dir: Path | None = None,
-    parquet_dir: Path | None = None,
 ) -> BacktestReport:
     """Load the strategy and its history, replay it, and diagnose the outcome.
 
@@ -74,14 +76,20 @@ async def run_backtest(
     params = {**_mapped_params(request), **request.params}
     strategy = loader.load_one(request.strategy, params)
 
-    store = ParquetStore(parquet_dir)
-    frame = store.load(request.symbol, request.timeframe, request.start, request.end)
+    frame = load_history(
+        request.history_file,
+        request.symbol,
+        request.timeframe,
+        request.start,
+        request.end,
+    )
     log.info(
-        "Replaying %s on %s %s — %d bars",
+        "Replaying %s on %s %s — %d bars from %s",
         strategy.name,
         request.symbol,
         request.timeframe,
         len(frame),
+        request.history_file,
     )
 
     engine = BacktestEngine(

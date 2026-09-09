@@ -109,7 +109,7 @@ flowchart TD
         REDIS[("Redis<br/>hot state, signal_uxid, shadow flag")]
         NATS{{"NATS / JetStream"}}
         PG[("PostgreSQL<br/>signal audit, JSONB")]
-        PARQUET[("data/parquet<br/>history")]
+        PARQUET[("data/parquet/&lt;source&gt;<br/>history")]
     end
 
     subgraph broker["🤝 algo-trading-broker (separate repo)"]
@@ -484,17 +484,24 @@ worse than none, the wrong one when four strategies trading beats zero.
 ## Backtesting
 
 ```bash
-make download                                        # provider history → data/parquet/
-make backtest STRATEGY=MY_EDGE SYMBOL=XAUUSD TF=M15
+make download                                        # → data/parquet/<provider>/
+make backtest STRATEGY=MY_EDGE SYMBOL=XAUUSD TF=M15 \
+    FILE=data/parquet/tiingo/XAUUSD_M15.parquet
 ```
 
 or the CLI directly, for the full set of knobs:
 
 ```bash
-uv run qte-backtest download --symbol XAUUSD --timeframe M15 --start 2023-01-01
-uv run qte-backtest list
-uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --spread 0.30 --persist
+uv run qte-backtest download --symbol XAUUSD --timeframe M15 --market fx --start 2023-01-01
+uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --timeframe M15 \
+    --file data/parquet/tiingo/XAUUSD_M15.parquet --spread 0.30 --persist
 ```
+
+Every history file lives under the source that produced it —
+`data/parquet/tiingo/`, `data/parquet/mt5/` for a broker CSV import — and a
+replay names the file it reads. The same pair from two sources disagrees about
+session times, weekend gaps and volume, and choosing between them by convention
+is how a run measures a book nobody meant to test.
 
 A run starts from `QTE_ACCOUNT__CAPITAL` (default **$1,000**) and prices its
 fills with `QTE_ACCOUNT__COMMISSION_PER_UNIT`, so P&L, max drawdown and profit
@@ -529,7 +536,8 @@ strategy, not flatter one:
 companion for a human — same object, two renderings:
 
 ```bash
-uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --report
+uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --timeframe M15 \
+    --file data/parquet/tiingo/XAUUSD_M15.parquet --report
 # → data/reports/MY_EDGE_XAUUSD_M15_20260823T150404Z.{json,md}
 ```
 
@@ -562,7 +570,8 @@ reads:
 
 ```bash
 make chart REPORT=data/reports/MY_EDGE_XAUUSD_M15_20260823T150404Z.json
-uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --report --chart
+uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --timeframe M15 \
+    --file data/parquet/tiingo/XAUUSD_M15.parquet --report --chart
 ```
 
 The equity curve against buy-and-hold, the price window with every trade marked

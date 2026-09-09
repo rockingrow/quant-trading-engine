@@ -255,7 +255,10 @@ async def test_the_downloader_writes_whatever_provider_it_is_given(tmp_path, fak
     downloader = HistoryDownloader(provider=FakeProvider(), parquet_dir=tmp_path)
     path = await downloader.download(DownloadRequest(symbol="xauusd", market="fx", timeframe="M15"))
 
-    assert path == tmp_path / "XAUUSD_M15.parquet"
+    # Under the provider's own directory, and nowhere else: a second copy in
+    # data/parquet/ would leave a replay guessing which of the two it read.
+    assert path == tmp_path / "fake" / "XAUUSD_M15.parquet"
+    assert list(tmp_path.glob("*.parquet")) == []
     frame = pd.read_parquet(path)
     assert list(frame.columns) == list(OHLCV_COLUMNS)
 

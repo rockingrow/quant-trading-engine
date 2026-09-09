@@ -9,9 +9,10 @@ two columns::
 
 The rest of QTE only knows one shape — a UTC ``open_time`` index over
 ``open/high/low/close/volume`` — so this converts into exactly what
-:class:`~qte_backtest.downloader.HistoryDownloader` writes, and drops the file
-where :class:`~qte_backtest.data_store.ParquetStore` looks for it. A file
-converted here and one downloaded through a market data provider are interchangeable to a replay.
+:class:`~qte_backtest.downloader.HistoryDownloader` writes. It lands in
+``data/parquet/mt5/`` because a downloader writes ``data/parquet/<provider>/``:
+every history file names the source it came from, and a replay says which one
+it reads rather than picking by convention.
 
 Two things the CSV does not carry and the caller must get right:
 
@@ -42,6 +43,10 @@ from qte_shared.config import settings
 from qte_shared.timeframes import normalize_timeframe
 
 OHLCV = ["open", "high", "low", "close", "volume"]
+
+#: Broker imports get their own directory beside each provider's, so a file's
+#: path always says where its bars came from.
+MT5_PARQUET_DIR = settings.engine.parquet_dir / "mt5"
 
 #: ``<SYMBOL>_<TF>_<from>_<to>.csv`` — how MT5 names its exports.
 _EXPORT_NAME = re.compile(r"^(?P<symbol>[A-Za-z0-9.#_-]+?)_(?P<timeframe>[A-Za-z]\d+)_\d+_\d+$")
@@ -169,8 +174,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--out-dir",
         type=Path,
-        default=settings.engine.parquet_dir,
-        help=f"Where to write. Default: {settings.engine.parquet_dir}",
+        default=MT5_PARQUET_DIR,
+        help=f"Where to write. Default: {MT5_PARQUET_DIR}",
     )
     parser.add_argument("--overwrite", action="store_true", help="Replace an existing parquet")
     args = parser.parse_args(argv)

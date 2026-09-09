@@ -58,7 +58,7 @@ make audit          # validate __strategies__/ against the signal contract
 make tiingo         # write config/tiingo.toml — what the vendor is asked to feed
 make db-check       # fail if the models drifted from the migrations
 make db-upgrade     # Alembic; there is no init script
-make backtest STRATEGY=QTE_EXAMPLE_EMA_ATR SYMBOL=XAUUSD [TF=M15]
+make backtest STRATEGY=QTE_EXAMPLE_EMA_ATR SYMBOL=XAUUSD TF=M15 FILE=data/parquet/tiingo/XAUUSD_M15.parquet
 make chart REPORT=data/reports/<file>.json
 make help           # every target, one line each
 ```
@@ -95,7 +95,7 @@ package; never scan from the repository root.
 | Live feed, resampling, Redis and NATS | `src/qte_ingestion/{service,resampler}.py` |
 | Live loop, broker delivery, control CLI | `src/qte_strategy_engine/{runner,broker_sink,preflight,control}.py` |
 | Backtest replay, fills, metrics, reports | `src/qte_backtest/{replay,execution,metrics,report,diagnostics}.py` |
-| Parquet history: download, read, list | `src/qte_backtest/{downloader,data_store}.py` |
+| Parquet history: download to `data/parquet/<source>/`, read one file | `src/qte_backtest/{downloader,data_store}.py` |
 | Backtest HTML dashboard | `src/qte_backtest/visualize/` |
 | Strategy deploy audit | `src/qte_strategy_audit/{auditor,contract,mount}.py` |
 | Dev-only WebSocket simulator | `src/qte_simulator/` (refuses to run unless `QTE_ENV=dev`) |

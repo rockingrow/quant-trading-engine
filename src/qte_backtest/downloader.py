@@ -14,6 +14,12 @@ mid-range comes back ``200 OK`` and simply stops early, so every write is
 checked against the range that was asked for and the shortfall logged. And the
 file is merged rather than overwritten, because the alternative is that one
 short answer quietly replaces a good history under the same name.
+
+There is exactly one file per symbol and timeframe, and it lives under the
+provider's own directory -- ``data/parquet/tiingo/XAUUSD_M15.parquet``. Writing
+a second, vendor-neutral copy alongside it used to make ingestion's warm-up and
+a backtest read different files that only looked like the same history; now the
+path names its source, and a replay is told which one to read.
 """
 
 from __future__ import annotations
@@ -24,23 +30,19 @@ from pathlib import Path
 
 import pandas as pd
 
-from qte_shared.config import settings
 from qte_shared.history_cache import (
     COVERAGE_TOLERANCE_DAYS,
     HistoryCache,
     fetch_history,
-    merge_frames,
 )
 from qte_shared.interfaces.market_data import (
     Capability,
     HistoryRequest,
     MarketDataProvider,
-    empty_ohlcv_frame,
 )
 from qte_shared.logging_setup import get_logger
 from qte_shared.providers import create_provider
 from qte_shared.symbols import Market
-from qte_shared.timeframes import normalize_timeframe
 
 log = get_logger(__name__)
 
@@ -70,7 +72,7 @@ class DownloadRequest:
 
 
 class HistoryDownloader:
-    """Pulls history and writes ``<parquet_dir>/<SYMBOL>_<TF>.parquet``."""
+    """Pulls history into ``<parquet_dir>/<provider>/<SYMBOL>_<TF>.parquet``."""
 
     def __init__(
         self,
@@ -79,14 +81,16 @@ class HistoryDownloader:
     ) -> None:
         self.provider = provider or create_provider(capability=Capability.HISTORY)
         self._source = self.provider.history_source()
-        self._dir = Path(parquet_dir or settings.engine.parquet_dir)
-        self._dir.mkdir(parents=True, exist_ok=True)
-        #: Vendor-side copy, shared with ingestion's warm-up. Writing it here is
-        #: what lets a dev stack replay real bars without spending a request.
-        self._cache = HistoryCache(self.provider.name, self._dir)
+        #: The one file this command writes, and the same one ingestion's
+        #: warm-up reads on a dev stack -- there is no second copy to drift.
+        self._cache = HistoryCache(self.provider.name, parquet_dir)
+
+    @property
+    def directory(self) -> Path:
+        return self._cache.directory
 
     def path_for(self, symbol: str, timeframe: str) -> Path:
-        return self._dir / f"{symbol.upper()}_{normalize_timeframe(timeframe)}.parquet"
+        return self._cache.path_for(symbol, timeframe)
 
     async def download(self, request: DownloadRequest, *, replace: bool = False) -> Path:
         """Fetch one symbol/timeframe and write it to parquet. Returns the path.
@@ -98,20 +102,17 @@ class HistoryDownloader:
         overwrite deliberately, which is the way to discard bars that are wrong
         rather than merely absent.
         """
+        if not self._cache.available:
+            raise RuntimeError(
+                "Writing parquet history needs pyarrow, which ships in the optional "
+                "`history-cache` extra. Install it with `uv sync --extra history-cache`."
+            )
         history = request.to_history_request()
         # Never read the cache here. This command exists to fetch, and a cache
         # hit would make `make download` a no-op that quietly returns bars up
-        # to COVERAGE_TOLERANCE_DAYS old. It still *writes* the cache, which
-        # is what ingestion's warm-up reads.
-        # On a replace the cache is written once, below, with the frame alone;
-        # letting fetch_history merge into it first would read and rewrite the
-        # whole file only to have it immediately overwritten.
-        frame = await fetch_history(
-            self._source,
-            history,
-            cache=None if replace else self._cache,
-            use_cache=False,
-        )
+        # to COVERAGE_TOLERANCE_DAYS old. The write below is the only one, so
+        # the merge-or-replace decision is made in a single place.
+        frame = await fetch_history(self._source, history, cache=None, use_cache=False)
         if frame.empty:
             raise RuntimeError(
                 f"{self.provider.name} returned no rows for {history.symbol} "
@@ -120,16 +121,17 @@ class HistoryDownloader:
             )
         _warn_if_short(frame, history, self.provider.name)
 
-        path = self.path_for(history.symbol, history.timeframe)
-        if replace:
-            # The vendor copy is merged on write, so replacing only the canonical
-            # file would leave the two disagreeing about the same symbol.
-            self._cache.replace(frame, history.symbol, history.timeframe)
-        written = frame if replace else merge_frames(self._read_existing(path), frame)
-        written.to_parquet(path, engine="pyarrow", compression="snappy")
+        write = self._cache.replace if replace else self._cache.store
+        path = write(frame, history.symbol, history.timeframe)
+        if path is None:
+            raise RuntimeError(
+                f"Could not write {self.path_for(history.symbol, history.timeframe)} — "
+                "see the logged error above"
+            )
+        written = self._cache.load(history.symbol, history.timeframe)
         log.info(
             "Saved %s rows=%d span=%s..%s source=%s mode=%s",
-            path.name,
+            path,
             len(written),
             written.index[0].isoformat(),
             written.index[-1].isoformat(),
@@ -142,16 +144,6 @@ class HistoryDownloader:
         self, requests: list[DownloadRequest], *, replace: bool = False
     ) -> list[Path]:
         return [await self.download(request, replace=replace) for request in requests]
-
-    @staticmethod
-    def _read_existing(path: Path) -> pd.DataFrame:
-        if not path.is_file():
-            return empty_ohlcv_frame()
-        try:
-            return pd.read_parquet(path, engine="pyarrow")
-        except Exception:
-            log.exception("Could not read %s to merge into — writing the new frame alone", path)
-            return empty_ohlcv_frame()
 
 
 def _warn_if_short(frame: pd.DataFrame, history: HistoryRequest, provider_name: str) -> None:

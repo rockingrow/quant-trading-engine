@@ -253,28 +253,55 @@ an existing series.
 Run 4.1–4.3 in order on a fresh rehearsal. Stop background walks before
 deterministic bar commands: concurrent producers can change a candle's OHLCV.
 
-### 4.1 One tick and one bar
+### 4.1 One bar and one tick
+
+#### 4.1.1 One bar
 
 ```bash
-uv run qte-simulator tick --symbol XAUUSD --bid 2400.0 --ask 2400.4
-docker compose exec -T redis-cache redis-cli get qte:tick:XAUUSD
 make bar O=2400 H=2412.5 L=2396.25 C=2408.75 V=150
 ```
 
-The tick's midpoint is 2400.2 (`last` takes precedence when supplied).
 Expect `1 feed client(s)`, `Verify 1/1`, exact supplied OHLCV and `ticks=4`.
-The bar wrapper expands to:
+With this walkthrough's default symbol and timeframe, the wrapper resolves to:
 
 ```bash
 uv run qte-simulator bar --symbol XAUUSD --timeframe M15 \
   --open 2400 --high 2412.5 --low 2396.25 --close 2408.75 --volume 150 --verify
 ```
 
+It reaches `XAUUSD M15` without naming either: `--symbol` falls back to the
+first of `QTE_ENGINE__SYMBOLS` and `--timeframe` to the engine signal
+timeframe, and the symbol list is read from `config/simulator.toml` — the same
+plan ingestion subscribed to. `make bar SYMBOL=EURUSD TF=M5` overrides both,
+but a symbol outside the plan is accepted by the simulator and then ignored
+downstream, because ingestion subscribed to that list and nothing else.
+
 Four ticks form the bar; an extra tick in the following bucket seals it.
 `--verify` subscribes to NATS before sending and compares ingestion's actual
-output. The earlier loose tick and sealing ticks can also produce separate
-one-tick candles. Verification checks requested bars, not the absence of
-additional candles.
+output. The sealing tick can also leave a separate one-tick candle behind:
+verification checks requested bars, not the absence of additional candles.
+
+`bar` states its own `--open`, so it needs no earlier price and runs first on a
+cold simulator — unlike `--generate` and `walk`, which continue from a last
+price unless given one. It leaves that last price at the close, `2408.75`,
+which 4.2 continues from.
+
+#### 4.1.2 One tick
+
+```bash
+uv run qte-simulator tick --symbol XAUUSD --bid 2408.55 --ask 2408.95
+docker compose exec -T redis-cache redis-cli get qte:tick:XAUUSD
+```
+
+A tick is a quote, not one price: the engine reads the midpoint, here 2408.75
+(`last` takes precedence when supplied). Redis must show that tick under
+`qte:tick:XAUUSD`. The bar above drives the same tick handler but only reports
+the candle it produced; this sends a tick you choose and reads back the state it
+left.
+
+Quote it at the bar's close so the series continues undisturbed. A tick at any
+other price becomes the last price 4.2 continues from, which changes every
+figure quoted downstream.
 
 ### 4.2 Synthetic warm-up
 
@@ -300,11 +327,16 @@ emit signals during the remaining replay.
 ### 4.3 Trigger a signal and check the audit
 
 ```bash
-uv run qte-simulator replay --symbol XAUUSD --generate 60 --seed 3 \
-  --drift 0.004 --volatility 0.0015 --verify --expect-signal
+uv run qte-simulator replay --symbol XAUUSD --generate 60 --seed 3 --drift 0.004 --volatility 0.0015 --verify --expect-signal
 docker compose exec -T postgres-audit psql -U qte -d qte_audit \
   -c "SELECT strategy, symbol, action, price, quantity, delivery_status, shadow FROM signals ORDER BY created_at DESC LIMIT 5;"
 ```
+
+This step builds on 4.2: `--generate` continues from the price the warm-up
+left (as 4.2 continued from 4.1), and the strategy has cleared its 220-candle
+warm-up only because 4.2 ran first. Run 4.1–4.3 in order. Jumping straight to
+this command on a cold simulator fails asking for `--start-price`; the fix is
+to run 4.2, not to pass a start price here.
 
 Expect `Verify 60/60` and an example LONG marked `[shadow]`. With the preceding
 price path, the entry is approximately 2528.181922 and stop 2513.63404.
@@ -331,7 +363,7 @@ set `QTE_SIMULATOR_PARQUET_FILE` to an existing parquet before running:
 ```bash
 make warmup-cache
 # Or choose a source explicitly:
-uv run qte-simulator replay --file data/parquet/XAUUSD_M15.parquet --limit 400 --verify
+uv run qte-simulator replay --file data/parquet/tiingo/XAUUSD_M15.parquet --limit 400 --verify
 uv run qte-simulator replay --file scenario.jsonl --verify
 ```
 
@@ -345,10 +377,11 @@ replay continues the same series after synthetic warm-up without late ticks.
 Runs over 5,000 bars use consecutive batches and one final sealing tick.
 The wrapper fails if ingestion's output differs or does not arrive in time.
 
-The default importer/backtest path is `data/parquet/XAUUSD_M15.parquet`.
-A subfolder such as `data/parquet/tiingo/` must be selected explicitly if that
-is where your file lives. The simulator's file setting is independent of the
-backtest history directory.
+Every history file sits under the source that wrote it: `data/parquet/tiingo/`
+for a provider download, `data/parquet/mt5/` for a CSV import. Nothing has a
+default path any more — the simulator reads `QTE_SIMULATOR_PARQUET_FILE` or
+`--file`, and a backtest reads its own `--file`, so the two never share a file
+by accident.
 
 ### 4.5 Watch and stream
 
@@ -402,13 +435,14 @@ They do not pass through WebSocket/ingestion/NATS.
 
 ```bash
 make csv-import CSV=data/csv/XAUUSD_M15.csv TZ=EET ARGS="--symbol XAUUSD --timeframe M15"
-make backtest STRATEGY=QTE_EXAMPLE_EMA_ATR SYMBOL=XAUUSD TF=M15
+make backtest STRATEGY=QTE_EXAMPLE_EMA_ATR SYMBOL=XAUUSD TF=M15 FILE=data/parquet/mt5/XAUUSD_M15.parquet
 make chart REPORT=data/reports/<actual-report-name>.json
 ```
 
 Use the MT5 server's timezone; `EET` is only an example. Short filenames need
 explicit symbol/timeframe arguments; standard MT5 filenames containing date
-ranges can be inferred. The importer writes `data/parquet/` by default.
+ranges can be inferred. The importer writes `data/parquet/mt5/` by default, and
+`make backtest` needs `FILE=` naming the parquet to replay.
 Use the JSON path printed by the backtest for `make chart`, then open the
 generated HTML in a browser. Reports stay local under `data/reports/`.
 Synthetic fixtures can smoke-test the tooling but do not measure performance.
@@ -420,7 +454,14 @@ Tiingo key, use this Bash override for the host job only:
 ```bash
 make tiingo
 QTE_MARKET_DATA__PROVIDER=tiingo make download
+# One symbol and timeframe only:
+QTE_MARKET_DATA__PROVIDER=tiingo make download \
+    ARGS="--symbol XAUUSD --timeframe M15 --market fx"
 ```
+
+It writes `data/parquet/tiingo/XAUUSD_M15.parquet` — the same file
+`QTE_SIMULATOR_PARQUET_FILE` points at, and the one to pass to
+`make backtest FILE=`.
 
 This does not switch the running ingestion container.
 
@@ -507,6 +548,9 @@ uv run qte-simulator watch   [--symbol] [--timeframe] [--seconds]
 
 Global `--url` and `--json` go before the subcommand. Symbol defaults to the
 first engine symbol; timeframe defaults to the engine signal timeframe.
+The simulator never guesses a price from the symbol: the first `--generate`
+for a symbol needs `--start-price`, and `walk` needs `--price`, until a tick,
+bar or replay has set a last price for it to continue from.
 Both endpoints accept JSON over WebSocket: subscribe on `/stream` with
 `{"op":"subscribe","symbols":["XAUUSD"]}`, or send to `/control` with
 `{"op":"tick","symbol":"XAUUSD","last":2401.5}`.

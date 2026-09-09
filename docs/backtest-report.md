@@ -7,10 +7,12 @@ detail view of different numbers: the Markdown is the JSON laid out for reading,
 and the HTML is the JSON drawn.
 
 ```bash
-uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --report
+uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --timeframe M15 \
+    --file data/parquet/tiingo/XAUUSD_M15.parquet --report
 # → data/reports/MY_EDGE_XAUUSD_M15_20260823T150404Z.{json,md}
 
-uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --report --chart
+uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --timeframe M15 \
+    --file data/parquet/tiingo/XAUUSD_M15.parquet --report --chart
 # → …{json,md,html}
 ```
 

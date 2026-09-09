@@ -219,6 +219,9 @@ class EngineSettings(BaseSettings):
     #: it; see :mod:`qte_shared.strategies.mapping`. Absent means every
     #: strategy keeps the symbols it declares on itself.
     mapping_file: Path = REPO_ROOT / "config" / "strategies_mapping.toml"
+    #: Root of the history tree. Nothing is written here directly: each
+    #: source owns a subdirectory (``tiingo/`` for a provider download,
+    #: ``mt5/`` for a CSV import) so a file's path names its origin.
     parquet_dir: Path = REPO_ROOT / "data" / "parquet"
     reports_dir: Path = REPO_ROOT / "data" / "reports"
 
