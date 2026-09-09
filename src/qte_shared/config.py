@@ -12,10 +12,11 @@ from pathlib import Path
 from typing import Literal
 
 from dotenv import load_dotenv
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from qte_shared.market_data_plan import MarketDataPlan
+from qte_shared.timeframes import normalize_timeframe
 
 
 def _find_repo_root() -> Path:
@@ -193,30 +194,57 @@ def market_data_plan() -> MarketDataPlan:
 class EngineSettings(BaseSettings):
     """What the running engine trades and how much history it keeps warm.
 
-    The first three fields are the market-data plan's, not this block's:
+    ``symbols`` and ``timeframes`` are the market-data plan's, not this block's:
     ``config/<provider>.toml`` states them per symbol, and these read whatever
     it says. The environment variables still exist and still win — a
     ``default_factory`` only runs when the variable is unset — so a one-off
     ``QTE_ENGINE__SYMBOLS='["EURUSD"]' make backtest`` overrides the file
     without editing it. With no plan on disk the defaults below apply, which is
     what a simulator dev stack runs on.
+
+    ``signal_timeframe`` is *not* in the plan — it is one value for the whole
+    engine, not a per-symbol one. It has to be a bar some symbol is resampled
+    to, or the runner subscribes to a candle subject that never fires; the
+    validator below refuses that outright rather than let it start quiet.
     """
 
     model_config = SettingsConfigDict(env_prefix="QTE_ENGINE__", extra="ignore")
 
     symbols: list[str] = Field(default_factory=lambda: market_data_plan().symbols or ["XAUUSD"])
     timeframes: list[str] = Field(default_factory=lambda: market_data_plan().timeframes or ["M15"])
-    signal_timeframe: str = Field(
-        default_factory=lambda: market_data_plan().signal_timeframe or "M15"
-    )
+    signal_timeframe: str = "M15"
     warmup_candles: int = 300
     strategies_dir: Path = REPO_ROOT / "__strategies__"
     #: Symbol → strategies table. Git-ignored, with a tracked template beside
     #: it; see :mod:`qte_shared.strategies.mapping`. Absent means every
     #: strategy keeps the symbols it declares on itself.
     mapping_file: Path = REPO_ROOT / "config" / "strategies_mapping.toml"
+    #: Root of the history tree. Nothing is written here directly: each
+    #: source owns a subdirectory (``tiingo/`` for a provider download,
+    #: ``mt5/`` for a CSV import) so a file's path names its origin.
     parquet_dir: Path = REPO_ROOT / "data" / "parquet"
     reports_dir: Path = REPO_ROOT / "data" / "reports"
+
+    @model_validator(mode="after")
+    def _signal_timeframe_is_resampled(self) -> EngineSettings:
+        """The signal bar must be one the feed actually produces.
+
+        ``QTE_ENGINE__SIGNAL_TIMEFRAME`` naming a bar no symbol is resampled to
+        is not a runtime error anywhere — the runner just subscribes to
+        ``QTE.candle.closed.<symbol>.<bar>`` and waits forever. Catch it here,
+        where both values are resolved, instead.
+        """
+        try:
+            signal = normalize_timeframe(self.signal_timeframe)
+            resampled = {normalize_timeframe(label) for label in self.timeframes}
+        except ValueError as exc:
+            raise ValueError(f"QTE_ENGINE__ timeframe is not a valid label: {exc}") from exc
+        if signal not in resampled:
+            raise ValueError(
+                f"QTE_ENGINE__SIGNAL_TIMEFRAME={self.signal_timeframe!r} is not one of the "
+                f"resampled timeframes {sorted(resampled)} — nothing would ever close for it"
+            )
+        return self
 
 
 class Settings(BaseSettings):

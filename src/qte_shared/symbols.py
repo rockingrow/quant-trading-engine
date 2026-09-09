@@ -6,6 +6,11 @@ that translation belongs to the vendor: see
 :meth:`~qte_shared.interfaces.market_data.MarketDataProvider.ticker_for`. What
 stays here is the vendor-independent part — which market a symbol belongs to,
 because that decides *which* feed or endpoint the provider reaches for.
+
+The market is always stated, never guessed: ``BTCUSD`` is a crypto pair on an
+exchange and an FX CFD on a broker's book, and only the operator knows which.
+It comes from ``market`` beside the symbol in ``config/<provider>.toml``, or
+from ``QTE_INGESTION__MARKET_OVERRIDES`` on the no-plan fallback path.
 """
 
 from __future__ import annotations
@@ -14,11 +19,6 @@ from dataclasses import dataclass
 from typing import Literal
 
 Market = Literal["fx", "crypto"]
-
-#: Quote currencies that only ever appear on a crypto pair. ``USD`` is absent on
-#: purpose — ``XAUUSD`` and ``BTCUSD`` both end in it, so it decides nothing.
-_CRYPTO_QUOTES = ("USDT", "USDC", "BUSD", "DAI", "TUSD")
-_CRYPTO_BASES = ("BTC", "ETH", "SOL", "XRP", "BNB", "ADA", "DOGE", "AVAX", "LTC", "LINK")
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,27 +29,24 @@ class SymbolSpec:
     market: Market
 
 
-def infer_market(symbol: str) -> Market:
-    """Best-effort market guess, overridable in configuration.
-
-    ``BTCUSD`` is genuinely ambiguous (a CFD desk quotes it on FX, an exchange
-    on crypto), so the base-asset check runs before any USD reasoning and
-    ``QTE_INGESTION__MARKET_OVERRIDES`` exists for whatever is left.
-    """
-    upper = symbol.upper()
-    if upper.endswith(_CRYPTO_QUOTES):
-        return "crypto"
-    if upper.startswith(_CRYPTO_BASES):
-        return "crypto"
-    return "fx"
-
-
 def build_specs(symbols: list[str], overrides: dict[str, str] | None = None) -> list[SymbolSpec]:
+    """Pair each symbol with its market, which must be stated in *overrides*.
+
+    This is the no-plan fallback path only: a market-data plan carries
+    ``market`` beside every symbol. A symbol missing from *overrides* is an
+    error rather than a guess, because ``BTCUSD`` alone cannot say whether it
+    is the exchange pair or the FX CFD.
+    """
     resolved = {key.upper(): value for key, value in (overrides or {}).items()}
     specs = []
     for symbol in symbols:
         upper = symbol.upper()
-        market = resolved.get(upper) or infer_market(upper)
+        market = resolved.get(upper)
+        if market is None:
+            raise ValueError(
+                f"No market for {symbol!r}: name it in QTE_INGESTION__MARKET_OVERRIDES, "
+                "or move the symbol into config/<provider>.toml where it sits beside one"
+            )
         if market not in ("fx", "crypto"):
             raise ValueError(f"Unknown market {market!r} for symbol {symbol!r}")
         specs.append(SymbolSpec(symbol=upper, market=market))  # type: ignore[arg-type]

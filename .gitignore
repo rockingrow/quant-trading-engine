@@ -246,9 +246,12 @@ __marimo__/
 
 # The market-data plan: which symbols are actually subscribed, at what size of
 # window. Same rule as the routing table — the template is tracked, the real
-# file is not. `make tiingo` writes it.
+# file is not. `make tiingo` and `make simulator` write them.
 /config/tiingo.toml
+/config/simulator.toml
 !/config/tiingo.example.toml
+!/config/simulator.example.toml
+!/config/simulator.example.toml
 
 # Downloaded market history — regenerate with `make download`, never commit.
 /data/parquet/*

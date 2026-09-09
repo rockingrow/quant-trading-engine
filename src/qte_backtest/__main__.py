@@ -1,4 +1,4 @@
-"""``qte-backtest`` CLI — download history, list it, replay a strategy, draw one."""
+"""``qte-backtest`` CLI — download history, replay a strategy over it, draw the report."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ import sys
 from datetime import UTC, date, datetime
 from pathlib import Path
 
-from qte_backtest.data_store import ParquetStore
 from qte_backtest.downloader import DownloadRequest, HistoryDownloader
 from qte_backtest.runner import BacktestRequest, run_backtest
 from qte_backtest.visualize import render_html
@@ -39,7 +38,10 @@ def build_parser() -> argparse.ArgumentParser:
     download.add_argument("--start", type=_as_date, default=None, help="YYYY-MM-DD")
     download.add_argument("--end", type=_as_date, default=None, help="YYYY-MM-DD")
     download.add_argument(
-        "--market", choices=["fx", "crypto"], default=None, help="Override the inferred market"
+        "--market",
+        choices=["fx", "crypto"],
+        default=None,
+        help="Required for --symbol targets that are not in the market-data plan",
     )
     download.add_argument(
         "--replace",
@@ -47,12 +49,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Overwrite the parquet instead of merging into it (discards bars outside the range)",
     )
 
-    subparsers.add_parser("list", help="Show the history already on disk")
-
     run = subparsers.add_parser("run", help="Replay a strategy over stored history")
     run.add_argument("--strategy", required=True)
     run.add_argument("--symbol", required=True)
-    run.add_argument("--timeframe", default="M15")
+    run.add_argument("--timeframe", required=True)
+    run.add_argument(
+        "--file",
+        dest="history_file",
+        required=True,
+        type=Path,
+        help="The parquet to replay, e.g. data/parquet/tiingo/XAUUSD_M15.parquet",
+    )
     run.add_argument("--start", type=_as_datetime, default=None)
     run.add_argument("--end", type=_as_datetime, default=None)
     run.add_argument(
@@ -147,7 +154,7 @@ async def _download(args: argparse.Namespace) -> None:
         )
 
 
-def _download_targets(args: argparse.Namespace) -> list[tuple[str, str, str | None]]:
+def _download_targets(args: argparse.Namespace) -> list[tuple[str, str, str]]:
     """Which (symbol, timeframe, market) triples to fetch.
 
     With no flags this is the market-data plan itself, pair for pair: fetching
@@ -155,6 +162,9 @@ def _download_targets(args: argparse.Namespace) -> list[tuple[str, str, str | No
     for bars nothing subscribes to, and on a rate-limited plan those requests
     come out of the ones that matter. A flag drops back to the cross product,
     because then the operator has said exactly what they want.
+
+    The plan carries each symbol's market; a target off the plan has none, so
+    ``--market`` is required rather than guessed.
     """
     plan = market_data_plan()
     if not args.symbol and not args.timeframe and plan.feeds:
@@ -163,6 +173,11 @@ def _download_targets(args: argparse.Namespace) -> list[tuple[str, str, str | No
             for feed in plan.feeds
             for timeframe in feed.timeframes
         ]
+    if args.market is None:
+        raise SystemExit(
+            "qte-backtest download: --market fx|crypto is required for --symbol targets "
+            "that are not in the market-data plan"
+        )
     return [
         (symbol, timeframe, args.market)
         for symbol in (args.symbol or settings.engine.symbols)
@@ -180,6 +195,7 @@ async def _run(args: argparse.Namespace) -> None:
             strategy=args.strategy,
             symbol=args.symbol,
             timeframe=args.timeframe,
+            history_file=args.history_file,
             start=args.start,
             end=args.end,
             params=_parse_params(args.param),
@@ -251,18 +267,6 @@ def _print_findings(report) -> None:
     print()
 
 
-def _list() -> None:
-    store = ParquetStore()
-    pairs = store.available()
-    if not pairs:
-        print(f"No parquet history in {store.directory}. Run `qte-backtest download` first.")
-        return
-    print(f"History in {store.directory}:")
-    for symbol, timeframe in pairs:
-        path = store.path_for(symbol, timeframe)
-        print(f"  {symbol:<12} {timeframe:<5} {path.stat().st_size / 1_048_576:>8.2f} MB")
-
-
 def _parse_params(pairs: list[str]) -> dict[str, object]:
     """Parse ``--param key=value`` with light type coercion."""
     params: dict[str, object] = {}
@@ -320,10 +324,8 @@ def main() -> None:
         asyncio.run(_download(args))
     elif args.command == "run":
         asyncio.run(_run(args))
-    elif args.command == "chart":
-        _chart(args)
     else:
-        _list()
+        _chart(args)
 
 
 if __name__ == "__main__":

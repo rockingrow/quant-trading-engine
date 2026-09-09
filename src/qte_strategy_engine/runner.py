@@ -164,14 +164,14 @@ class StrategyRunner:
         happened before the table existed — see :mod:`qte_shared.strategies.mapping`.
         """
         mapping = SymbolMapping.load(settings.engine.mapping_file)
-        discovered = load_strategies(
-            settings.engine.strategies_dir, runner_settings.enabled_strategies or None
-        )
+        discovered = load_strategies(settings.engine.strategies_dir)
         if mapping:
-            self._warn_on_unmapped(mapping, [entry.name for entry in discovered])
+            loaded_names = [entry.name for entry in discovered]
+            self._warn_on_unmapped(mapping, loaded_names)
+            self._warn_on_unused_strategy_defaults(mapping, loaded_names)
 
         for entry in discovered:
-            defaults = runner_settings.strategy_params.get(entry.name, {})
+            defaults = mapping.defaults_for(entry.name)
             if mapping:
                 symbols = mapping.symbols_for(entry.name)
                 if not symbols:
@@ -189,6 +189,8 @@ class StrategyRunner:
                 # One instance per pair: a strategy carries per-symbol state
                 # between bars, and sharing it across symbols would let gold's
                 # last bar decide what happens on bitcoin's next one.
+                # Params layer: the strategy's [strategies.<name>] defaults,
+                # then this pair's [symbols.<symbol>.params.<name>] on top.
                 params = {**defaults, **mapping.params_for(symbol, entry.name)}
                 strategy = entry.instantiate(params)
                 # Size against the account, at the risk this pair is mapped at.
@@ -233,6 +235,24 @@ class StrategyRunner:
                 ", ".join(sorted(unknown)),
                 settings.engine.strategies_dir,
                 ", ".join(sorted(loaded)) or "none",
+            )
+
+    @staticmethod
+    def _warn_on_unused_strategy_defaults(mapping: SymbolMapping, loaded: list[str]) -> None:
+        """Say so when ``[strategies.<name>]`` names a strategy nobody publishes.
+
+        Unlike an unmapped pairing this trades nothing wrong — the defaults are
+        simply never read — but a typo here means an intended ``risk_percent``
+        override silently does not apply, so it is worth a line.
+        """
+        unknown = [name for name in mapping.strategy_defaults if name not in set(loaded)]
+        if unknown:
+            log.warning(
+                "Mapping table %s has [strategies.*] defaults for %s, which %s did not "
+                "publish — those defaults will not apply anywhere.",
+                mapping.source,
+                ", ".join(sorted(unknown)),
+                settings.engine.strategies_dir,
             )
 
     @staticmethod

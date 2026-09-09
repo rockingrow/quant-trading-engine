@@ -109,7 +109,7 @@ flowchart TD
         REDIS[("Redis<br/>hot state, signal_uxid, shadow flag")]
         NATS{{"NATS / JetStream"}}
         PG[("PostgreSQL<br/>signal audit, JSONB")]
-        PARQUET[("data/parquet<br/>history")]
+        PARQUET[("data/parquet/&lt;source&gt;<br/>history")]
     end
 
     subgraph broker["🤝 algo-trading-broker (separate repo)"]
@@ -315,10 +315,23 @@ make strategies                              # list what the engine can see
 make audit                                   # check that what it sees is fit to trade
 ```
 
-`strategy-mount` records each repo's audit result in
-`__strategies__/strategies.toml` — auto-generated, never hand-edited. `make up`
-and `make dev` read it to freeze only the audit-passing repos into the image,
-and refuse to start without it.
+`strategy-mount` records the audit result of every strategy each repo publishes
+in `__strategies__/strategies.toml` — auto-generated, never hand-edited, one
+table per repo and one line per strategy:
+
+```toml
+[strategies.my-strategies]
+MT5_GOLD_M15_V1 = true
+MT5_GOLD_M5_V1 = false
+```
+
+`make up` and `make dev` read it to freeze only the repos that still have a
+passing strategy into the image, and refuse to start without it. So does the
+runner: a strategy marked `false` is not loaded, because its dependencies were
+never frozen into the image it would have to run in, and a repo with nothing
+passing is not even imported. Fix what the audit found and mount it again.
+`make strategies` lists what the engine can see; `uv run qte-strategy-mount
+--show` lists what the mount recorded.
 
 > Why a manifest, why the contract is structural rather than nominal, and why
 > the interface is seven methods rather than one:
@@ -335,10 +348,14 @@ Which strategies trade which symbols lives in
 [symbols.XAUUSD]
 strategies = ["MT5_GOLD_M5_SCALP"]
 
-# Per-pair overrides. They beat QTE_RUNNER__STRATEGY_PARAMS, so one strategy
+# Per-strategy defaults, applied wherever this strategy runs.
+[strategies.MT5_GOLD_M5_SCALP]
+risk_percent = 1.0
+
+# Per-pair overrides beat the [strategies.*] defaults above, so one strategy
 # can run tighter on gold than it does on everything else.
 [symbols.XAUUSD.params.MT5_GOLD_M5_SCALP]
-risk_percent = 1.0
+risk_percent = 0.5
 
 # Parks a symbol without deleting its configuration.
 [symbols.EURUSD]
@@ -467,17 +484,24 @@ worse than none, the wrong one when four strategies trading beats zero.
 ## Backtesting
 
 ```bash
-make download                                        # provider history → data/parquet/
-make backtest STRATEGY=MY_EDGE SYMBOL=XAUUSD TF=M15
+make download                                        # → data/parquet/<provider>/
+make backtest STRATEGY=MY_EDGE SYMBOL=XAUUSD TF=M15 \
+    FILE=data/parquet/tiingo/XAUUSD_M15.parquet
 ```
 
 or the CLI directly, for the full set of knobs:
 
 ```bash
-uv run qte-backtest download --symbol XAUUSD --timeframe M15 --start 2023-01-01
-uv run qte-backtest list
-uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --spread 0.30 --persist
+uv run qte-backtest download --symbol XAUUSD --timeframe M15 --market fx --start 2023-01-01
+uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --timeframe M15 \
+    --file data/parquet/tiingo/XAUUSD_M15.parquet --spread 0.30 --persist
 ```
+
+Every history file lives under the source that produced it —
+`data/parquet/tiingo/`, `data/parquet/mt5/` for a broker CSV import — and a
+replay names the file it reads. The same pair from two sources disagrees about
+session times, weekend gaps and volume, and choosing between them by convention
+is how a run measures a book nobody meant to test.
 
 A run starts from `QTE_ACCOUNT__CAPITAL` (default **$1,000**) and prices its
 fills with `QTE_ACCOUNT__COMMISSION_PER_UNIT`, so P&L, max drawdown and profit
@@ -512,7 +536,8 @@ strategy, not flatter one:
 companion for a human — same object, two renderings:
 
 ```bash
-uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --report
+uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --timeframe M15 \
+    --file data/parquet/tiingo/XAUUSD_M15.parquet --report
 # → data/reports/MY_EDGE_XAUUSD_M15_20260823T150404Z.{json,md}
 ```
 
@@ -545,7 +570,8 @@ reads:
 
 ```bash
 make chart REPORT=data/reports/MY_EDGE_XAUUSD_M15_20260823T150404Z.json
-uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --report --chart
+uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --timeframe M15 \
+    --file data/parquet/tiingo/XAUUSD_M15.parquet --report --chart
 ```
 
 The equity curve against buy-and-hold, the price window with every trade marked

@@ -1,14 +1,10 @@
 """What the engine trades and how the vendor is asked for it, read from TOML.
 
 One provider, one file: ``config/<provider>.toml``, named after
-``QTE_MARKET_DATA__PROVIDER``. It answers three questions that used to be four
-environment variables and a JSON blob:
+``QTE_MARKET_DATA__PROVIDER``. It answers what used to be two environment
+variables and a JSON blob:
 
 .. code-block:: toml
-
-    [feed]
-    timeframes = ["M15"]
-    signal_timeframe = "M15"
 
     [provider]
     backfill_history = true
@@ -24,6 +20,11 @@ symbols, ``QTE_ENGINE__TIMEFRAMES`` said which bars — for all of them at once 
 and ``QTE_INGESTION__MARKET_OVERRIDES={"BTCUSD":"fx"}`` bolted the third column
 back on as JSON inside a shell variable. Written as tables, the symbol and its
 settings sit together and a reviewer can see what will actually be subscribed.
+
+The bar a strategy *decides* on is not here: it is one value for the whole
+engine, not a per-symbol one, so it stays in the environment as
+``QTE_ENGINE__SIGNAL_TIMEFRAME`` (default ``M15``). ``EngineSettings`` refuses
+to start when it names a bar no symbol is resampled to.
 
 **The real file is git-ignored; the template beside it is not**, for the same
 reason as :mod:`qte_shared.strategies.mapping`: what a desk trades is position
@@ -49,7 +50,7 @@ from pathlib import Path
 from typing import Any
 
 from qte_shared.logging_setup import get_logger
-from qte_shared.symbols import Market, SymbolSpec, infer_market
+from qte_shared.symbols import Market, SymbolSpec
 from qte_shared.timeframes import normalize_timeframe
 
 log = get_logger(__name__)
@@ -57,15 +58,21 @@ log = get_logger(__name__)
 #: Table holding the per-symbol entries.
 SYMBOLS_TABLE = "symbols"
 
-#: Table of settings shared by every symbol that names none of its own.
-FEED_TABLE = "feed"
-
 #: Table of the vendor's own knobs, read by that provider's settings block.
 PROVIDER_TABLE = "provider"
+
+#: What a symbol is resampled to when it names no ``timeframes`` of its own.
+DEFAULT_TIMEFRAMES = ("M15",)
 
 #: Never taken from the file, however it got written there — a key in a config
 #: file is a key in a diff. It is read from ``QTE_DATA_PROVIDER_API_KEY``.
 _SECRET_OPTIONS = ("api_key", "token", "password", "secret")
+
+#: Keys an earlier layout put at the top of the plan. ``[feed]`` carried a
+#: default timeframe list and ``signal_timeframe``; both moved — timeframes to
+#: each ``[symbols.*]``, the signal bar to ``QTE_ENGINE__SIGNAL_TIMEFRAME``.
+#: Kept here only so a stale plan is warned about rather than silently obeyed.
+_RETIRED_KEYS = ("feed", "signal_timeframe")
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,7 +94,6 @@ class MarketDataPlan:
     """The parsed plan. Falsy means "no file — use the environment defaults"."""
 
     feeds: tuple[SymbolFeed, ...] = ()
-    signal_timeframe: str = ""
     options: dict[str, Any] = field(default_factory=dict)
     source: Path | None = None
 
@@ -152,12 +158,7 @@ class MarketDataPlan:
 
 def _parse(document: dict[str, Any], path: Path) -> MarketDataPlan:
     """Turn the parsed TOML into a plan, validating as it goes."""
-    feed_table = _table(document, FEED_TABLE, path)
-    default_timeframes = _timeframes(feed_table, path, FEED_TABLE) or ["M15"]
-    signal_timeframe = feed_table.get("signal_timeframe", default_timeframes[0])
-    if not isinstance(signal_timeframe, str):
-        raise ValueError(f"{path}: [{FEED_TABLE}].signal_timeframe must be a timeframe label")
-    signal_timeframe = normalize_timeframe(signal_timeframe)
+    _warn_on_retired_keys(document, path)
 
     options = _table(document, PROVIDER_TABLE, path)
     for name in _SECRET_OPTIONS:
@@ -187,11 +188,11 @@ def _parse(document: dict[str, Any], path: Path) -> MarketDataPlan:
         if any(feed.symbol == symbol for feed in feeds):
             raise ValueError(f"{path}: {symbol} has two entries; one symbol is one subscription")
 
-        timeframes = _timeframes(entry, path, where) or default_timeframes
+        timeframes = _timeframes(entry, path, where) or list(DEFAULT_TIMEFRAMES)
         feeds.append(
             SymbolFeed(
                 symbol=symbol,
-                market=_market(entry, symbol, path, where),
+                market=_market(entry, path, where),
                 timeframes=tuple(timeframes),
             )
         )
@@ -200,12 +201,28 @@ def _parse(document: dict[str, Any], path: Path) -> MarketDataPlan:
         log.warning(
             "Market-data plan %s lists no enabled symbol — ingestion will subscribe to none", path
         )
-    return MarketDataPlan(
-        feeds=tuple(feeds),
-        signal_timeframe=signal_timeframe,
-        options=options,
-        source=path,
-    )
+    return MarketDataPlan(feeds=tuple(feeds), options=options, source=path)
+
+
+def _warn_on_retired_keys(document: dict[str, Any], path: Path) -> None:
+    """``[feed]`` and a top-level ``signal_timeframe`` are no longer read.
+
+    ``[feed]`` carried a default timeframe list and the signal bar. Timeframes
+    are stated under each ``[symbols.*]`` now, and the bar a strategy decides on
+    is ``QTE_ENGINE__SIGNAL_TIMEFRAME`` — one value for the whole engine, not a
+    per-plan one. Obeying half of a stale plan silently is exactly the "looks
+    like it still says that" failure this module exists to avoid, so a leftover
+    key is called out rather than dropped without a word.
+    """
+    for key in _RETIRED_KEYS:
+        if key in document:
+            where = "[feed]" if key == "feed" else f"top-level {key!r}"
+            log.warning(
+                "%s in %s is no longer read — put timeframes under each [symbols.*] "
+                "and set QTE_ENGINE__SIGNAL_TIMEFRAME in .env",
+                where,
+                path,
+            )
 
 
 def _table(document: dict[str, Any], name: str, path: Path) -> dict[str, Any]:
@@ -230,16 +247,16 @@ def _timeframes(entry: dict[str, Any], path: Path, where: str) -> list[str]:
         raise ValueError(f"{path}: [{where}].timeframes — {exc}") from exc
 
 
-def _market(entry: dict[str, Any], symbol: str, path: Path, where: str) -> Market:
-    """The symbol's market, stated or inferred.
+def _market(entry: dict[str, Any], path: Path, where: str) -> Market:
+    """The symbol's market, which the entry must state.
 
     Stating it is the point of writing the symbol down: ``BTCUSD`` is a crypto
-    pair on an exchange and an FX CFD on a broker's book, and the guess decides
-    which socket the provider opens.
+    pair on an exchange and an FX CFD on a broker's book, and only the operator
+    knows which socket the provider should open.
     """
     market = entry.get("market")
     if market is None:
-        return infer_market(symbol)
+        raise ValueError(f'{path}: [{where}] must set market = "fx" or "crypto"')
     if market not in ("fx", "crypto"):
         raise ValueError(f'{path}: [{where}].market must be "fx" or "crypto", got {market!r}')
     return market

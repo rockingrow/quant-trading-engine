@@ -274,10 +274,13 @@ which is the same split `__strategies__/` makes for the code.
 
 Three details earn their complexity:
 
-- **Per-pair parameters, not per-strategy.** One strategy running tighter on
-  gold than on bitcoin is the ordinary case, and the runner builds one instance
-  per pair so a strategy carrying state between bars never has gold's last bar
-  deciding bitcoin's next one.
+- **Parameters layer: per-strategy default, per-pair override.** A
+  `[strategies.<name>]` table sets what a strategy runs at everywhere it is
+  mapped; a `[symbols.<symbol>.params.<name>]` table restates only the keys
+  that differ for one pair. One strategy running tighter on gold than on
+  bitcoin is the ordinary case, and the runner builds one instance per pair so
+  a strategy carrying state between bars never has gold's last bar deciding
+  bitcoin's next one.
 - **An absent file is not an empty one.** No file means fall back to what each
   strategy declares — the behaviour from before the table existed. A file that
   maps nothing means trade nothing. Those differ by a deploy, so the table's

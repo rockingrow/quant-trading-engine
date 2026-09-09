@@ -179,7 +179,9 @@ def test_rows_without_a_timestamp_column_are_refused():
 
 def test_tiingo_splits_the_symbols_across_its_two_sockets():
     provider = TiingoProvider(TiingoSettings(api_key="k"))
-    feeds = provider.live_feeds(build_specs(["XAUUSD", "BTCUSDT"]), _noop)
+    feeds = provider.live_feeds(
+        build_specs(["XAUUSD", "BTCUSDT"], {"XAUUSD": "fx", "BTCUSDT": "crypto"}), _noop
+    )
     assert [feed.name for feed in feeds] == ["tiingo-fx", "tiingo-crypto"]
     assert feeds[0].symbols == ("XAUUSD",)
     assert feeds[1].symbols == ("BTCUSDT",)
@@ -187,7 +189,7 @@ def test_tiingo_splits_the_symbols_across_its_two_sockets():
 
 def test_tiingo_makes_no_socket_for_a_market_with_no_symbols():
     provider = TiingoProvider(TiingoSettings(api_key="k"))
-    feeds = provider.live_feeds(build_specs(["EURUSD"]), _noop)
+    feeds = provider.live_feeds(build_specs(["EURUSD"], {"EURUSD": "fx"}), _noop)
     assert [feed.name for feed in feeds] == ["tiingo-fx"]
 
 
@@ -251,9 +253,12 @@ async def test_the_downloader_writes_whatever_provider_it_is_given(tmp_path, fak
     from qte_backtest.downloader import DownloadRequest, HistoryDownloader
 
     downloader = HistoryDownloader(provider=FakeProvider(), parquet_dir=tmp_path)
-    path = await downloader.download(DownloadRequest(symbol="xauusd", timeframe="M15"))
+    path = await downloader.download(DownloadRequest(symbol="xauusd", market="fx", timeframe="M15"))
 
-    assert path == tmp_path / "XAUUSD_M15.parquet"
+    # Under the provider's own directory, and nowhere else: a second copy in
+    # data/parquet/ would leave a replay guessing which of the two it read.
+    assert path == tmp_path / "fake" / "XAUUSD_M15.parquet"
+    assert list(tmp_path.glob("*.parquet")) == []
     frame = pd.read_parquet(path)
     assert list(frame.columns) == list(OHLCV_COLUMNS)
 

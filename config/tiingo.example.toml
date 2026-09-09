@@ -28,20 +28,6 @@
 # that does not touch the plan. The file is where the standing answer lives.
 
 
-# ── The feed as a whole ─────────────────────────────────────────────────
-#
-# Applied to any symbol that names none of its own.
-
-[feed]
-# Bars resampled from the tick stream (QTE_ENGINE__TIMEFRAMES). Every entry
-# here costs a Redis list per symbol and a backfill request per symbol at boot,
-# so ask for the ones strategies actually read.
-timeframes = ["M15"]
-# The bar a strategy decides on (QTE_ENGINE__SIGNAL_TIMEFRAME). It has to be
-# one of the timeframes above, or nothing ever closes for it.
-signal_timeframe = "M15"
-
-
 # ── The vendor's own knobs ──────────────────────────────────────────────
 #
 # Read by whichever provider is on — the table is generic, the keys are that
@@ -77,12 +63,13 @@ max_rows_per_request = 5000
 # job (`MarketDataProvider.ticker_for`), not this file's.
 
 [symbols.XAUUSD]
-# Which socket the provider opens for it. Inferred when omitted, and worth
-# stating for anything ambiguous: BTCUSD is a crypto pair on an exchange and
-# an FX CFD on a broker's book (this replaces QTE_INGESTION__MARKET_OVERRIDES).
+# Required: which socket the provider opens for it — "fx" or "crypto". BTCUSD
+# is a crypto pair on an exchange and an FX CFD on a broker's book, so the
+# operator states it (this replaces QTE_INGESTION__MARKET_OVERRIDES).
 market = "fx"
-# Overrides [feed].timeframes for this symbol alone. Ingestion resamples
-# exactly this list, and the boot backfill warms exactly these windows.
+# Bars resampled from the tick stream (QTE_ENGINE__TIMEFRAMES). Every entry
+# costs a Redis list per symbol and a backfill request per symbol at boot, so
+# ask for the ones strategies actually read.
 timeframes = ["M15"]
 
 [symbols.BTCUSDT]

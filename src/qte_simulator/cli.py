@@ -15,7 +15,7 @@
 stack the two warm-ups are argument-free: ``replay --generate`` synthesises
 ``QTE_SIMULATOR__GENERATE_BARS`` bars, and a bare ``replay`` plays the last
 ``QTE_SIMULATOR__CACHE_BARS`` of ``QTE_SIMULATOR_PARQUET_FILE`` — real vendor
-history, re-anchored onto the buckets that end at the current one.
+history, re-anchored onto the same forward series as generated bars.
 
 ``--verify`` is the part worth knowing about: it subscribes to QTE's own NATS
 subjects before sending anything, then reports, bar by bar, whether the candle
@@ -33,14 +33,15 @@ import argparse
 import asyncio
 import json
 import sys
+from datetime import timedelta
 from typing import Any
 
 from qte_shared.config import settings
 from qte_shared.dev_only import DevOnlyError
 from qte_shared.logging_setup import configure_logging, get_logger
 from qte_shared.models import Candle
-from qte_shared.timeframes import normalize_timeframe
-from qte_simulator.bars import anchor_open_times, generate_bars, reference_price
+from qte_shared.timeframes import normalize_timeframe, timeframe_seconds
+from qte_simulator.bars import anchor_open_times, generate_bars
 from qte_simulator.client import ControlClient, ControlError, SimulatorUnreachable
 from qte_simulator.control import MAX_BARS
 from qte_simulator.settings import simulator_settings
@@ -120,7 +121,12 @@ def build_parser() -> argparse.ArgumentParser:
             f"({simulator_settings.cache_bars})"
         ),
     )
-    replay.add_argument("--start-price", type=float, default=None)
+    replay.add_argument(
+        "--start-price",
+        type=float,
+        default=None,
+        help="Required for the first --generate of a symbol the simulator has not seen",
+    )
     replay.add_argument("--volatility", type=float, default=0.002)
     replay.add_argument("--drift", type=float, default=0.0)
     replay.add_argument("--seed", type=int, default=None, help="Makes --generate reproducible")
@@ -169,8 +175,8 @@ def _add_placement_arguments(parser: argparse.ArgumentParser, *, default_anchor:
         help=(
             "next = the first bucket nothing has been sent into yet, marching forward "
             "(nothing the wall-clock flush can race); past = end on the last completed "
-            "bucket instead, letting that flush close it; auto = past for a file and "
-            "next for generated bars; or an ISO-8601 open time for the first bar. "
+            "bucket instead (the wall-clock flush can split historical bars); "
+            "auto = next for every source; or an ISO-8601 open time for the first bar. "
             f"Default: {default_anchor}"
         ),
     )
@@ -237,7 +243,7 @@ async def _bar(args: argparse.Namespace) -> int:
 async def _replay(args: argparse.Namespace) -> int:
     timeframe = _timeframe(args)
     source_file = _source_file(args)
-    args.anchor = _resolve_anchor(args, from_file=source_file is not None)
+    args.anchor = _resolve_anchor(args)
     if source_file is not None:
         try:
             rows = load_bars(source_file, limit=args.limit)
@@ -257,6 +263,13 @@ async def _replay(args: argparse.Namespace) -> int:
             print("error: --generate needs a positive number of bars", file=sys.stderr)
             return 2
         start = args.start_price or await _continue_from(args)
+        if start is None:
+            print(
+                f"error: no last price for {args.symbol} yet — pass --start-price for "
+                "the first --generate of a symbol",
+                file=sys.stderr,
+            )
+            return 2
         # Generated locally and sent as plain OHLCV: placement is the server's
         # job (it owns the cursor), so the open times here are placeholders the
         # server replaces. Keeping generation on this side is what makes --seed
@@ -298,38 +311,31 @@ def _source_file(args: argparse.Namespace) -> str | None:
     return simulator_settings.parquet_file or None
 
 
-def _resolve_anchor(args: argparse.Namespace, *, from_file: bool) -> str:
-    """``auto``: real history goes in the past, synthetic bars in the future.
+def _resolve_anchor(args: argparse.Namespace) -> str:
+    """Continue the forward series for every source unless placement is explicit.
 
-    A file carries prices that printed. Re-anchoring them onto buckets that
-    have not happened yet leaves Redis holding a warm-up stamped days ahead of
-    the clock — legible to a strategy, but nothing like what it reads on a live
-    feed. So a file replay ends on the last completed bucket and runs backwards
-    from there: ``--limit`` bars of history landing where history belongs.
-
-    The cost is the one :func:`~qte_simulator.bars.anchor_open_times` warns
-    about. Every bucket the run fills is already over, so ingestion's
-    wall-clock flush can land between two ticks of the same bar and publish
-    half of it — once per ``QTE_INGESTION__FLUSH_INTERVAL`` for as long as the
-    replay takes. A warm-up survives losing a bar in a few hundred; use
-    ``--anchor next`` when it must not.
+    File timestamps are discarded anyway. Anchoring file prices in the past
+    both races wall-clock closing and loses the whole replay after a generated
+    warm-up has advanced ingestion. Preserve OHLCV by default; ``past`` remains
+    an explicit diagnostic for late ticks and wall-clock closing.
     """
     if args.anchor != "auto":
         return args.anchor
-    return "past" if from_file else "next"
+    return "next"
 
 
-async def _continue_from(args: argparse.Namespace) -> float:
-    """Where a generated run starts: wherever this symbol last was.
+async def _continue_from(args: argparse.Namespace) -> float | None:
+    """Where a generated run continues from: wherever this symbol last was.
 
-    Falling back to a reference price on every command would put a gap between
-    two consecutive replays — and a gap is the one thing a resampled feed
-    cannot produce, so it would be an artefact of the fixture appearing in the
-    chart the strategy reads.
+    Picking a starting level here would put a gap between two consecutive
+    replays — and a gap is the one thing a resampled feed cannot produce, so it
+    would be an artefact of the fixture appearing in the chart the strategy
+    reads. So the first ``--generate`` of a symbol the simulator has not seen
+    returns ``None``, and the caller asks for ``--start-price``.
     """
     async with ControlClient(args.url) as client:
         status = await client.send("status")
-    return status.get("last_prices", {}).get(args.symbol.upper()) or reference_price(args.symbol)
+    return status.get("last_prices", {}).get(args.symbol.upper())
 
 
 def _placeholder_times(count: int, timeframe: str) -> list:
@@ -391,8 +397,8 @@ async def _send_bars(
     The server caps a single command at :data:`~qte_simulator.control.MAX_BARS`
     bars, and a cache warm-up sized to the Redis retention is routinely larger
     than that, so a long run goes over in batches. Only the first batch is
-    placed on the clock; the rest continue the series it left, which is exactly
-    what ``anchor=next`` means. Sealing is left to the last batch — a seal
+    placed on the clock; the rest start immediately after the preceding batch,
+    even for an explicit historical anchor. Sealing is left to the last batch — a seal
     between two batches opens a one-tick bucket in the middle of the run, and
     the batch after it would start one bucket late.
     """
@@ -409,12 +415,16 @@ async def _send_bars(
                     symbol=args.symbol,
                     timeframe=timeframe,
                     bars=batch,
-                    anchor=anchor if position == 0 else "next",
+                    anchor=anchor,
                     spread=args.spread,
                     seal=args.seal and position == len(batches) - 1,
                     rate=getattr(args, "rate", 0.0),
                 )
             )
+            last_candle = Candle.model_validate(results[-1]["expected"][-1])
+            anchor = (
+                last_candle.open_time + timedelta(seconds=timeframe_seconds(timeframe))
+            ).isoformat()
     return _merge_acknowledgements(results)
 
 

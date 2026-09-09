@@ -139,8 +139,8 @@ class MyEdge(SignalStrategy):
         introduce.
         """
         # Every tunable reads through `param`, so config/strategies_mapping.toml
-        # (and QTE_RUNNER__STRATEGY_PARAMS) can retune this strategy per pair
-        # without editing the file that produced the backtest.
+        # can retune this strategy per pair without editing the file that
+        # produced the backtest.
         fast_length = self.param("fast", 21)
         slow_length = self.param("slow", 55)
         atr_length = self.param("atr_len", 14)

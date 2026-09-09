@@ -58,7 +58,7 @@ make audit          # validate __strategies__/ against the signal contract
 make tiingo         # write config/tiingo.toml — what the vendor is asked to feed
 make db-check       # fail if the models drifted from the migrations
 make db-upgrade     # Alembic; there is no init script
-make backtest STRATEGY=QTE_EXAMPLE_EMA_ATR SYMBOL=XAUUSD [TF=M15]
+make backtest STRATEGY=QTE_EXAMPLE_EMA_ATR SYMBOL=XAUUSD TF=M15 FILE=data/parquet/tiingo/XAUUSD_M15.parquet
 make chart REPORT=data/reports/<file>.json
 make help           # every target, one line each
 ```
@@ -80,6 +80,7 @@ package; never scan from the repository root.
 | Wire models, enums, candles, ticks, `SignalIntent` | `src/qte_shared/models.py` |
 | Strategy contract and its seven methods | `src/qte_shared/strategies/strategy_base.py` |
 | Strategy discovery and manifests | `src/qte_shared/strategies/plugin_loader.py` |
+| What `make strategy-mount` recorded, per strategy | `src/qte_shared/strategies/mount_manifest.py`, `__strategies__/strategies.toml` |
 | Intent to broker payload | `src/qte_shared/strategies/signal_factory.py` |
 | Position sizing and account risk | `src/qte_shared/strategies/sizing.py` |
 | Indicators (pure, arrays in and out) | `src/qte_shared/indicators.py` |
@@ -94,9 +95,9 @@ package; never scan from the repository root.
 | Live feed, resampling, Redis and NATS | `src/qte_ingestion/{service,resampler}.py` |
 | Live loop, broker delivery, control CLI | `src/qte_strategy_engine/{runner,broker_sink,preflight,control}.py` |
 | Backtest replay, fills, metrics, reports | `src/qte_backtest/{replay,execution,metrics,report,diagnostics}.py` |
-| Parquet history: download, read, list | `src/qte_backtest/{downloader,data_store}.py` |
+| Parquet history: download to `data/parquet/<source>/`, read one file | `src/qte_backtest/{downloader,data_store}.py` |
 | Backtest HTML dashboard | `src/qte_backtest/visualize/` |
-| Strategy deploy audit | `src/qte_strategy_audit/{auditor,contract}.py` |
+| Strategy deploy audit | `src/qte_strategy_audit/{auditor,contract,mount}.py` |
 | Dev-only WebSocket simulator | `src/qte_simulator/` (refuses to run unless `QTE_ENV=dev`) |
 | **Why** something is built this way | `docs/architecture.md` — 20 "Why X" sections; run `rg -n '^## ' docs/architecture.md`, then read only the one you need |
 | Broker payload contract | `docs/broker-contract.md` |
@@ -104,7 +105,7 @@ package; never scan from the repository root.
 | Simulator walkthrough, and running the whole stack locally with no vendor | `docs/simulator.md` |
 
 CLI entry points: `qte-backtest`, `qte-ingestion`, `qte-strategy-runner`,
-`qte-control`, `qte-strategy-audit`, `qte-simulator`.
+`qte-control`, `qte-strategy-audit`, `qte-strategy-mount`, `qte-simulator`.
 
 `README.md` is ~46KB — never read it whole. Run `rg -n '^#{1,3} ' README.md` for
 the section index, then read only that range.

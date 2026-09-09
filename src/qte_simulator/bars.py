@@ -219,7 +219,8 @@ def anchor_open_times(
         last = floor_to_bucket(moment, timeframe) - duration
         first = last - duration * (count - 1)
     elif mode == "next":
-        first = cursor + duration if cursor is not None else floor_to_bucket(moment, timeframe)
+        current_bucket = floor_to_bucket(moment, timeframe)
+        first = max(cursor + duration, current_bucket) if cursor is not None else current_bucket
     else:
         raise BarError(f"Unknown anchor {mode!r}; use 'past' or 'next'")
 
@@ -275,25 +276,6 @@ def generate_bars(
     return bars
 
 
-#: Somewhere plausible to start a walk when nobody says. A dev fixture, not a
-#: quote — the numbers only have to be the right order of magnitude for a stop
-#: distance in ATR multiples to look sane in a log.
-REFERENCE_PRICES: dict[str, float] = {
-    "XAUUSD": 2400.0,
-    "XAGUSD": 30.0,
-    "EURUSD": 1.08,
-    "GBPUSD": 1.27,
-    "USDJPY": 156.0,
-    "BTCUSDT": 60000.0,
-    "BTCUSD": 60000.0,
-    "ETHUSDT": 3000.0,
-}
-
-
-def reference_price(symbol: str) -> float:
-    return REFERENCE_PRICES.get(symbol.upper(), 100.0)
-
-
 __all__ = [
     "TICKS_PER_BAR",
     "BarError",
@@ -302,6 +284,5 @@ __all__ = [
     "bar_ticks",
     "expected_candle",
     "generate_bars",
-    "reference_price",
     "seal_tick",
 ]
