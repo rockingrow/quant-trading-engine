@@ -50,7 +50,7 @@ from pathlib import Path
 from typing import Any
 
 from qte_shared.logging_setup import get_logger
-from qte_shared.symbols import Market, SymbolSpec, infer_market
+from qte_shared.symbols import Market, SymbolSpec
 from qte_shared.timeframes import normalize_timeframe
 
 log = get_logger(__name__)
@@ -192,7 +192,7 @@ def _parse(document: dict[str, Any], path: Path) -> MarketDataPlan:
         feeds.append(
             SymbolFeed(
                 symbol=symbol,
-                market=_market(entry, symbol, path, where),
+                market=_market(entry, path, where),
                 timeframes=tuple(timeframes),
             )
         )
@@ -247,16 +247,16 @@ def _timeframes(entry: dict[str, Any], path: Path, where: str) -> list[str]:
         raise ValueError(f"{path}: [{where}].timeframes — {exc}") from exc
 
 
-def _market(entry: dict[str, Any], symbol: str, path: Path, where: str) -> Market:
-    """The symbol's market, stated or inferred.
+def _market(entry: dict[str, Any], path: Path, where: str) -> Market:
+    """The symbol's market, which the entry must state.
 
     Stating it is the point of writing the symbol down: ``BTCUSD`` is a crypto
-    pair on an exchange and an FX CFD on a broker's book, and the guess decides
-    which socket the provider opens.
+    pair on an exchange and an FX CFD on a broker's book, and only the operator
+    knows which socket the provider should open.
     """
     market = entry.get("market")
     if market is None:
-        return infer_market(symbol)
+        raise ValueError(f'{path}: [{where}] must set market = "fx" or "crypto"')
     if market not in ("fx", "crypto"):
         raise ValueError(f'{path}: [{where}].market must be "fx" or "crypto", got {market!r}')
     return market

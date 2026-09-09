@@ -288,11 +288,14 @@ Expect `Verify 300/300`. The example needs 220 candles before its decision
 hook runs. Redis restore progress is logged at startup; ongoing warm-up
 progress is at DEBUG.
 
-Commands continue the last price automatically. Seed, start price and
-generator parameters determine the price path; use an explicit
-`--start-price 2408.75` when reproducing it independently. Warm-up over the
-feed is ordinary candle traffic: after the minimum window is reached, a
-strategy can emit signals during the remaining replay.
+Commands continue from the last price the simulator saw — here the `2408.75`
+close from 4.1. A synthetic run on a simulator that has seen nothing yet has
+no price to continue, so pass one: `make warmup START=2408.75`, or
+`uv run qte-simulator replay --generate --seed 7 --start-price 2408.75`. Seed,
+start price and generator parameters determine the price path; use the same
+`--start-price` to reproduce a run independently. Warm-up over the feed is
+ordinary candle traffic: after the minimum window is reached, a strategy can
+emit signals during the remaining replay.
 
 ### 4.3 Trigger a signal and check the audit
 
@@ -314,7 +317,8 @@ a specific strategy/action; inspect the printed name and use the one-strategy
 mapping above.
 
 `make signal` combines warm-up and drift. Use it **instead of 4.2–4.3**, once
-on a fresh series. Repeating it may emit nothing because the runner retains
+on a fresh series (after 4.1 has set a price, or with `make signal
+START=2408.75`). Repeating it may emit nothing because the runner retains
 open cycles. The example delegates exits to broker brackets; shadow mode
 does not simulate fills or broker close feedback. This proves signal
 production, not a complete entry/fill/exit cycle.
@@ -367,9 +371,11 @@ make sim-stop
 
 At 120x speed, an M15 bucket advances in about 7.5 seconds. Without `--ticks`,
 a walk continues until stopped. `make sim-walk` starts one at 5 ticks/s and
-normal speed. On a fresh series at speed 1, ingestion's flush timer closes
-quiet bars on the clock. After accelerated replay, the walk continues the
-future series; it does not immediately return to wall-clock timestamps.
+normal speed; on a simulator that has seen no price for the symbol yet, pass
+`make sim-walk PRICE=2400` or `walk --price 2400`. On a fresh series at speed
+1, ingestion's flush timer closes quiet bars on the clock. After accelerated
+replay, the walk continues the future series; it does not immediately return
+to wall-clock timestamps.
 
 ### 4.6 Verify warm-up after runner restart
 

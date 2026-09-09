@@ -327,8 +327,13 @@ reports: ## List the backtest reports written so far
 #   QTE_SIMULATOR_PARQUET_FILE     the vendor parquet `make warmup-cache` plays
 #   QTE_SIMULATOR__CACHE_BARS      how many of its trailing bars
 #
+# The one exception: a synthetic run needs a starting price, and the simulator
+# only knows one once a tick, a bar or an earlier replay has set it. On a cold
+# simulator pass it — `make warmup START=2400`, `make sim-walk PRICE=2400` — or
+# run `make bar ...` first. It is never guessed from the symbol name.
+#
 # For a one-off, pass the flag instead of editing .env:
-#   uv run qte-simulator replay --generate 500 --seed 7
+#   uv run qte-simulator replay --generate 500 --seed 7 --start-price 2400
 
 sim: ## Run the dev websocket market data simulator (QTE_ENV=dev only)
 	uv run qte-simulator serve
@@ -341,20 +346,20 @@ sim-status: ## What the simulator is doing, and who is attached to it
 warmup-cache: ## Warm the engine from the cached vendor parquet (QTE_SIMULATOR_PARQUET_FILE)
 	uv run qte-simulator replay --verify --timeout 120
 
-warmup sim-replay: ## Warm the engine with synthetic bars (QTE_SIMULATOR__GENERATE_BARS)
-	uv run qte-simulator replay --generate --seed 7 --verify
+warmup sim-replay: ## Warm the engine with synthetic bars (needs START=<price> on a cold simulator)
+	uv run qte-simulator replay --generate --seed 7 $(if $(START),--start-price $(START),) --verify
 
 bar sim-bar: ## One bar, round-tripped: make bar O=2400 H=2412.5 L=2396.25 C=2408.75 [V=150]
 	uv run qte-simulator bar --open $(O) --high $(H) --low $(L) --close $(C) \
 		$(if $(V),--volume $(V),) --verify
 
-signal: ## Warmup + drift replay expected to fire a signal (fails if none does)
-	uv run qte-simulator replay --generate --seed 7 --verify
+signal: ## Warmup + drift replay expected to fire a signal (needs START=<price> on a cold simulator)
+	uv run qte-simulator replay --generate --seed 7 $(if $(START),--start-price $(START),) --verify
 	uv run qte-simulator replay --generate 60 --seed 3 --drift 0.004 \
 		--volatility 0.0015 --verify --expect-signal
 
-sim-walk: ## Stream a live-ish random walk until stopped
-	uv run qte-simulator walk --rate 5
+sim-walk: ## Stream a live-ish random walk until stopped (needs PRICE=<price> on a cold simulator)
+	uv run qte-simulator walk --rate 5 $(if $(PRICE),--price $(PRICE),)
 
 sim-stop: ## Stop every background generator
 	uv run qte-simulator stop

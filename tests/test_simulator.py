@@ -114,7 +114,9 @@ def test_it_serves_live_and_deliberately_not_history():
 
 def test_one_socket_carries_every_symbol():
     provider = create_provider("simulator")
-    feeds = provider.live_feeds(build_specs(["XAUUSD", "BTCUSDT"]), _noop)
+    feeds = provider.live_feeds(
+        build_specs(["XAUUSD", "BTCUSDT"], {"XAUUSD": "fx", "BTCUSDT": "crypto"}), _noop
+    )
     assert len(feeds) == 1
     assert feeds[0].symbols == ("BTCUSDT", "XAUUSD")
 
@@ -316,6 +318,13 @@ async def test_a_walk_is_refused_rather_than_run_at_a_nonsense_rate():
             await dispatch(SimulatorHub(), {"op": "walk", "symbol": "XAUUSD", **bad})
 
 
+async def test_a_first_walk_without_a_price_is_refused():
+    """A walk continues a series; the first one for a symbol has none to continue,
+    and the level is never guessed from the symbol name."""
+    with pytest.raises(CommandError, match="no last price"):
+        await dispatch(SimulatorHub(), {"op": "walk", "symbol": "XAUUSD", "rate": 5})
+
+
 async def _drained(hub: SimulatorHub) -> None:
     while hub.generators:
         await asyncio.sleep(0.01)
@@ -441,6 +450,15 @@ def test_replay_without_bars_or_a_cached_file_says_so(monkeypatch, capsys):
     arguments = cli.build_parser().parse_args(["replay", "--symbol", "XAUUSD"])
     assert asyncio.run(cli._replay(arguments)) == 2
     assert "QTE_SIMULATOR_PARQUET_FILE" in capsys.readouterr().err
+
+
+def test_a_first_generate_without_a_start_price_says_so(monkeypatch, capsys):
+    """The synthetic feed is a random walk; a cold simulator has no level to start it,
+    and it is never guessed from the symbol name."""
+    monkeypatch.setattr(cli, "ControlClient", lambda url=None: _loopback(SimulatorHub()))
+    arguments = cli.build_parser().parse_args(["replay", "--symbol", "XAUUSD", "--generate", "5"])
+    assert asyncio.run(cli._replay(arguments)) == 2
+    assert "--start-price" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("source", [[], ["--file", "history.parquet"], ["--generate"]])
@@ -600,7 +618,7 @@ async def test_the_provider_feed_reconnects_and_delivers_into_the_tick_handler()
     async with _running_server() as server:
         config = SimulatorSettings(url=f"ws://127.0.0.1:{server.bound_port}/stream")
         feed = create_provider("simulator", config=config).live_feeds(
-            build_specs(["XAUUSD"]), on_tick
+            build_specs(["XAUUSD"], {"XAUUSD": "fx"}), on_tick
         )[0]
         feed.start()
         await _until(lambda: bool(server.hub.subscribers))

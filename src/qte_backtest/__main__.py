@@ -39,7 +39,10 @@ def build_parser() -> argparse.ArgumentParser:
     download.add_argument("--start", type=_as_date, default=None, help="YYYY-MM-DD")
     download.add_argument("--end", type=_as_date, default=None, help="YYYY-MM-DD")
     download.add_argument(
-        "--market", choices=["fx", "crypto"], default=None, help="Override the inferred market"
+        "--market",
+        choices=["fx", "crypto"],
+        default=None,
+        help="Required for --symbol targets that are not in the market-data plan",
     )
     download.add_argument(
         "--replace",
@@ -147,7 +150,7 @@ async def _download(args: argparse.Namespace) -> None:
         )
 
 
-def _download_targets(args: argparse.Namespace) -> list[tuple[str, str, str | None]]:
+def _download_targets(args: argparse.Namespace) -> list[tuple[str, str, str]]:
     """Which (symbol, timeframe, market) triples to fetch.
 
     With no flags this is the market-data plan itself, pair for pair: fetching
@@ -155,6 +158,9 @@ def _download_targets(args: argparse.Namespace) -> list[tuple[str, str, str | No
     for bars nothing subscribes to, and on a rate-limited plan those requests
     come out of the ones that matter. A flag drops back to the cross product,
     because then the operator has said exactly what they want.
+
+    The plan carries each symbol's market; a target off the plan has none, so
+    ``--market`` is required rather than guessed.
     """
     plan = market_data_plan()
     if not args.symbol and not args.timeframe and plan.feeds:
@@ -163,6 +169,11 @@ def _download_targets(args: argparse.Namespace) -> list[tuple[str, str, str | No
             for feed in plan.feeds
             for timeframe in feed.timeframes
         ]
+    if args.market is None:
+        raise SystemExit(
+            "qte-backtest download: --market fx|crypto is required for --symbol targets "
+            "that are not in the market-data plan"
+        )
     return [
         (symbol, timeframe, args.market)
         for symbol in (args.symbol or settings.engine.symbols)

@@ -63,9 +63,9 @@ max_rows_per_request = 5000
 # job (`MarketDataProvider.ticker_for`), not this file's.
 
 [symbols.XAUUSD]
-# Which socket the provider opens for it. Inferred when omitted, and worth
-# stating for anything ambiguous: BTCUSD is a crypto pair on an exchange and
-# an FX CFD on a broker's book (this replaces QTE_INGESTION__MARKET_OVERRIDES).
+# Required: which socket the provider opens for it — "fx" or "crypto". BTCUSD
+# is a crypto pair on an exchange and an FX CFD on a broker's book, so the
+# operator states it (this replaces QTE_INGESTION__MARKET_OVERRIDES).
 market = "fx"
 # Bars resampled from the tick stream (QTE_ENGINE__TIMEFRAMES). Every entry
 # costs a Redis list per symbol and a backfill request per symbol at boot, so

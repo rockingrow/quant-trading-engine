@@ -11,10 +11,11 @@ from qte_shared.config import market_data_plan
 class IngestionSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="QTE_INGESTION__", extra="ignore")
 
-    #: Force a symbol onto a market when inference gets it wrong, e.g.
-    #: ``{"BTCUSD": "fx"}`` for a CFD desk quoting bitcoin on the FX socket.
-    #: Only consulted when there is no market-data plan: a plan states
-    #: ``market`` beside the symbol it belongs to, where it can be read.
+    #: The market for each symbol on the no-plan fallback path, e.g.
+    #: ``{"XAUUSD": "fx", "BTCUSD": "crypto"}``. Only consulted when there is no
+    #: market-data plan: a plan states ``market`` beside the symbol it belongs
+    #: to. Without a plan every symbol in ``QTE_ENGINE__SYMBOLS`` must appear
+    #: here — the market is never guessed from the symbol name.
     market_overrides: dict[str, str] = Field(default_factory=dict)
     #: How often the wall-clock flush runs. Must stay well under the shortest
     #: timeframe, or bars close late in a quiet market.

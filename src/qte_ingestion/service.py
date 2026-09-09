@@ -53,9 +53,9 @@ def resolve_subscriptions() -> list[SymbolFeed]:
     symbols, each one's market and the timeframes it is resampled to, which is
     the only form that can differ per symbol. With no plan on disk the engine
     falls back to what it read before the file existed —
-    ``QTE_ENGINE__SYMBOLS`` × ``QTE_ENGINE__TIMEFRAMES``, with markets from
-    ``QTE_INGESTION__MARKET_OVERRIDES`` — which is what a simulator dev stack
-    runs on.
+    ``QTE_ENGINE__SYMBOLS`` × ``QTE_ENGINE__TIMEFRAMES``, with every symbol's
+    market from ``QTE_INGESTION__MARKET_OVERRIDES`` — which is what a simulator
+    dev stack runs on.
     """
     plan = market_data_plan()
     if plan.feeds:

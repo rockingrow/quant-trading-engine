@@ -65,6 +65,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A symbol's market is stated, never guessed.** `qte_shared.symbols` had two
+  hardcoded lists — crypto base assets and stablecoin quotes — that
+  `infer_market()` matched a symbol name against to pick `fx` or `crypto`. A
+  coin outside the list resolved to `fx` silently, which is the wrong socket
+  and no error. `market` is now required: beside each symbol in
+  `config/<provider>.toml`, in `QTE_INGESTION__MARKET_OVERRIDES` for every
+  symbol on the no-plan fallback path, on `DownloadRequest`, and as
+  `qte-backtest download --market` for a target that is not in the plan. A plan
+  entry with no `market` is refused rather than half-read.
+
+- **The dev simulator asks for a starting price instead of inventing one.**
+  `qte_simulator.bars` carried a `REFERENCE_PRICES` table (XAUUSD 2400, BTCUSDT
+  60000, …) that seeded a synthetic walk when nothing else set the level. It
+  only ever applied to the first `replay --generate` or `walk` of a symbol on a
+  cold simulator; after the first bar the series continues itself. That first
+  call now needs `--start-price` / `price` (or a prior `tick`/`bar`/`replay` to
+  set the level) — `make warmup START=<price>`, `make sim-walk PRICE=<price>`.
+
 - **Per-strategy parameters move from `QTE_RUNNER__STRATEGY_PARAMS` into the
   mapping table.** `config/strategies_mapping.toml` gains a `[strategies.<name>]`
   table — one sub-table of default parameters per strategy, applied wherever

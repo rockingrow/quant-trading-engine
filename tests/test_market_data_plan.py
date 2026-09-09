@@ -53,20 +53,9 @@ def test_each_symbol_carries_its_own_market_and_timeframes(tmp_path):
     assert [spec.market for spec in plan.specs] == ["fx", "crypto"]
 
 
-def test_a_stated_market_beats_the_guess(tmp_path):
-    """BTCUSD is a crypto pair on an exchange and an FX CFD on a broker's book."""
-    plan = MarketDataPlan.load(
-        write_plan(tmp_path, '[symbols.BTCUSD]\nmarket = "fx"\n[symbols.ETHUSDT]\n')
-    )
-    assert [(feed.symbol, feed.market) for feed in plan.feeds] == [
-        ("BTCUSD", "fx"),
-        ("ETHUSDT", "crypto"),
-    ]
-
-
 def test_a_disabled_symbol_is_kept_in_the_file_and_out_of_the_feed(tmp_path):
     plan = MarketDataPlan.load(
-        write_plan(tmp_path, "[symbols.XAUUSD]\n[symbols.EURUSD]\nenabled = false\n")
+        write_plan(tmp_path, '[symbols.XAUUSD]\nmarket = "fx"\n[symbols.EURUSD]\nenabled = false\n')
     )
     assert plan.symbols == ["XAUUSD"]
 
@@ -83,7 +72,7 @@ def test_no_file_is_not_an_error_but_is_distinguishable(tmp_path):
 
 
 def test_timeframe_labels_are_normalised(tmp_path):
-    body = '[symbols.XAUUSD]\ntimeframes = ["15m", "1h"]\n'
+    body = '[symbols.XAUUSD]\nmarket = "fx"\ntimeframes = ["15m", "1h"]\n'
     plan = MarketDataPlan.load(write_plan(tmp_path, body))
     assert plan.timeframes_for("XAUUSD") == ["M15", "H1"]
 
@@ -97,6 +86,8 @@ def test_timeframe_labels_are_normalised(tmp_path):
         '[symbols.XAUUSD]\ntimeframes = "M15"\n',  # a string, not a list
         '[symbols.XAUUSD]\ntimeframes = ["M7"]\n',  # not a timeframe
         '[symbols.XAUUSD]\nmarket = "equities"\n',  # not a market QTE quotes
+        '[symbols.XAUUSD]\ntimeframes = ["M15"]\n',  # no market, and it is never guessed:
+        # BTCUSD is a crypto pair on an exchange and an FX CFD on a broker's book.
         "symbols = 1\n",  # not a table
     ],
 )
@@ -143,7 +134,8 @@ def test_a_retired_feed_key_is_warned_about_not_obeyed(tmp_path, caplog):
         plan = MarketDataPlan.load(
             write_plan(
                 tmp_path,
-                '[feed]\ntimeframes = ["H1"]\nsignal_timeframe = "H1"\n[symbols.XAUUSD]\n',
+                '[feed]\ntimeframes = ["H1"]\nsignal_timeframe = "H1"\n'
+                '[symbols.XAUUSD]\nmarket = "fx"\n',
             )
         )
     # The stray table is ignored: XAUUSD still falls back to the module default.
@@ -167,10 +159,13 @@ def test_ingestion_subscribes_to_the_plan_when_there_is_one(monkeypatch, tmp_pat
     ]
 
     # And falls back to the environment when no plan is on disk, which is what
-    # a one-off `QTE_ENGINE__SYMBOLS=... make backtest` override rides on.
+    # a one-off `QTE_ENGINE__SYMBOLS=... make backtest` override rides on. The
+    # market is not guessed there either: every symbol names one in
+    # QTE_INGESTION__MARKET_OVERRIDES.
     monkeypatch.setattr(service, "market_data_plan", MarketDataPlan)
     monkeypatch.setattr(service.settings.engine, "symbols", ["XAUUSD"])
     monkeypatch.setattr(service.settings.engine, "timeframes", ["M15"])
+    monkeypatch.setattr(service.ingestion_settings, "market_overrides", {"XAUUSD": "fx"})
     assert service.resolve_subscriptions() == [
         SymbolFeed(symbol="XAUUSD", market="fx", timeframes=("M15",))
     ]

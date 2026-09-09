@@ -380,7 +380,7 @@ async def test_an_explicit_download_always_reaches_the_vendor(tmp_path, monkeypa
     covering = bars(5000, start=datetime(2020, 1, 1, tzinfo=UTC))
     downloader._cache.store(covering, "XAUUSD", "M15")
 
-    await downloader.download(DownloadRequest(symbol="XAUUSD", timeframe="M15"))
+    await downloader.download(DownloadRequest(symbol="XAUUSD", market="fx", timeframe="M15"))
 
     assert len(source.calls) == 1, "an explicit download must not be served from the cache"
 

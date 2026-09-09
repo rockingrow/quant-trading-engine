@@ -39,7 +39,7 @@ from qte_shared.interfaces.market_data import (
 )
 from qte_shared.logging_setup import get_logger
 from qte_shared.providers import create_provider
-from qte_shared.symbols import Market, infer_market
+from qte_shared.symbols import Market
 from qte_shared.timeframes import normalize_timeframe
 
 log = get_logger(__name__)
@@ -51,13 +51,10 @@ DEFAULT_HISTORY_DAYS = 365 * 3
 @dataclass(slots=True)
 class DownloadRequest:
     symbol: str
+    market: Market
     timeframe: str = "M15"
     start: date | None = None
     end: date | None = None
-    market: str | None = None
-
-    def resolved_market(self) -> Market:
-        return self.market or infer_market(self.symbol)  # type: ignore[return-value]
 
     def to_history_request(self) -> HistoryRequest:
         """Fill in the open ends and hand the provider a fully specified window."""
@@ -68,7 +65,7 @@ class DownloadRequest:
             timeframe=self.timeframe,
             start=start,
             end=end,
-            market=self.resolved_market(),
+            market=self.market,
         ).normalized()
 
 

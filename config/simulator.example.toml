@@ -39,9 +39,9 @@
 # ticker to translate into.
 
 [symbols.XAUUSD]
-# Which socket the feed opens for it. Inferred when omitted; worth stating for
-# anything ambiguous (BTCUSD is a crypto pair on an exchange and an FX CFD on a
-# broker's book).
+# Required: which socket the feed opens for it — "fx" or "crypto". BTCUSD is a
+# crypto pair on an exchange and an FX CFD on a broker's book, so the operator
+# states it.
 market = "fx"
 # Bars resampled from the simulated tick stream (QTE_ENGINE__TIMEFRAMES). Every
 # entry costs a Redis list per symbol, so ask for the ones strategies read.

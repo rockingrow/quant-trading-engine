@@ -41,7 +41,7 @@ from qte_shared.dev_only import DevOnlyError
 from qte_shared.logging_setup import configure_logging, get_logger
 from qte_shared.models import Candle
 from qte_shared.timeframes import normalize_timeframe, timeframe_seconds
-from qte_simulator.bars import anchor_open_times, generate_bars, reference_price
+from qte_simulator.bars import anchor_open_times, generate_bars
 from qte_simulator.client import ControlClient, ControlError, SimulatorUnreachable
 from qte_simulator.control import MAX_BARS
 from qte_simulator.settings import simulator_settings
@@ -121,7 +121,12 @@ def build_parser() -> argparse.ArgumentParser:
             f"({simulator_settings.cache_bars})"
         ),
     )
-    replay.add_argument("--start-price", type=float, default=None)
+    replay.add_argument(
+        "--start-price",
+        type=float,
+        default=None,
+        help="Required for the first --generate of a symbol the simulator has not seen",
+    )
     replay.add_argument("--volatility", type=float, default=0.002)
     replay.add_argument("--drift", type=float, default=0.0)
     replay.add_argument("--seed", type=int, default=None, help="Makes --generate reproducible")
@@ -258,6 +263,13 @@ async def _replay(args: argparse.Namespace) -> int:
             print("error: --generate needs a positive number of bars", file=sys.stderr)
             return 2
         start = args.start_price or await _continue_from(args)
+        if start is None:
+            print(
+                f"error: no last price for {args.symbol} yet — pass --start-price for "
+                "the first --generate of a symbol",
+                file=sys.stderr,
+            )
+            return 2
         # Generated locally and sent as plain OHLCV: placement is the server's
         # job (it owns the cursor), so the open times here are placeholders the
         # server replaces. Keeping generation on this side is what makes --seed
@@ -312,17 +324,18 @@ def _resolve_anchor(args: argparse.Namespace) -> str:
     return "next"
 
 
-async def _continue_from(args: argparse.Namespace) -> float:
-    """Where a generated run starts: wherever this symbol last was.
+async def _continue_from(args: argparse.Namespace) -> float | None:
+    """Where a generated run continues from: wherever this symbol last was.
 
-    Falling back to a reference price on every command would put a gap between
-    two consecutive replays — and a gap is the one thing a resampled feed
-    cannot produce, so it would be an artefact of the fixture appearing in the
-    chart the strategy reads.
+    Picking a starting level here would put a gap between two consecutive
+    replays — and a gap is the one thing a resampled feed cannot produce, so it
+    would be an artefact of the fixture appearing in the chart the strategy
+    reads. So the first ``--generate`` of a symbol the simulator has not seen
+    returns ``None``, and the caller asks for ``--start-price``.
     """
     async with ControlClient(args.url) as client:
         status = await client.send("status")
-    return status.get("last_prices", {}).get(args.symbol.upper()) or reference_price(args.symbol)
+    return status.get("last_prices", {}).get(args.symbol.upper())
 
 
 def _placeholder_times(count: int, timeframe: str) -> list:
