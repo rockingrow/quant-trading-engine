@@ -16,17 +16,23 @@ it reads rather than picking by convention.
 
 Two things the CSV does not carry and the caller must get right:
 
-* **The clock.** MT5 timestamps are *broker server time*, not UTC. Most MT5
-  brokers run EET (UTC+2/+3 with DST); pass ``--tz`` with the server's zone so
-  the bars land on the same UTC instants as downloaded history. The default is
-  UTC — correct only if the terminal itself is UTC.
+* **The clock.** MT5 timestamps are *broker server time*, not UTC. Many MT5
+  brokers run EET (UTC+2/+3 with DST), but not all of them: Exness (the
+  ``XAUUSDm`` suffix) runs its servers on UTC+0, and converting its export as
+  EET lands every bar two hours early in winter and three in summer, which
+  silently moves every session window a strategy gates on. Pass ``--tz`` with
+  the server's zone so the bars land on the same UTC instants as downloaded
+  history. The default is UTC. Check the result rather than the broker's
+  marketing: gold's daily break is 17:00-18:00 New York, so XAUUSD bars resume
+  at 23:00 UTC in winter and 22:00 UTC in summer.
 * **The symbol.** Brokers suffix their tickers (``XAUUSDm``, ``XAUUSD.pro``).
   The suffix is stripped by default so the parquet matches the symbol the
   engine trades; ``--symbol`` overrides the guess outright.
 
 Usage::
 
-    uv run python scripts/mt5_csv_to_parquet.py data/csv/XAUUSDm_M5_*.csv --tz EET
+    uv run python scripts/mt5_csv_to_parquet.py data/csv/XAUUSDm_M5_*.csv --tz UTC
+    uv run python scripts/mt5_csv_to_parquet.py data/csv/XAUUSD_M5_*.csv --tz EET
 """
 
 from __future__ import annotations
