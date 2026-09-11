@@ -34,6 +34,9 @@ class SimulatorProvider(MarketDataProvider):
     capabilities: ClassVar[frozenset[Capability]] = frozenset({Capability.LIVE})
     #: Every market, because the simulator quotes whatever you tell it to.
     markets: ClassVar[tuple[Market, ...]] = ("fx", "crypto")
+    #: It invents prices, and a forward-anchored replay stamps them ahead of the
+    #: clock on purpose (``qte_simulator.bars.anchor_open_times``).
+    synthetic: ClassVar[bool] = True
 
     def __init__(self, config: SimulatorSettings | None = None) -> None:
         # Before anything else: constructing this object is the moment a

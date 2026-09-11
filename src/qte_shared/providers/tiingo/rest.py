@@ -18,11 +18,19 @@ walks the range in windows sized to stay under
 short as a truncation to resume from rather than as the end of the data.
 Duplicate bars across a page boundary are collapsed by
 :func:`~qte_shared.interfaces.market_data.normalize_ohlcv`.
+
+**The bucket still forming is dropped.** Asked for a range that ends today, the
+endpoint also returns the bar still being built, with nothing to mark it. The
+interface promises completed bars, and a snapshot stored as closed would shadow
+the real close of that bucket downstream, so
+:func:`~qte_shared.interfaces.market_data.drop_unfinished_bars` removes it before
+the frame leaves this module.
 """
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from collections.abc import Callable
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -33,6 +41,7 @@ from qte_shared.interfaces.market_data import (
     HistorySource,
     ProviderError,
     ProviderNotConfigured,
+    drop_unfinished_bars,
     empty_ohlcv_frame,
     normalize_ohlcv,
 )
@@ -60,12 +69,19 @@ _SECONDS_PER_DAY = 86_400
 class TiingoHistorySource(HistorySource):
     """Fetches completed bars over Tiingo's REST API, paging a wide range."""
 
-    def __init__(self, config: TiingoSettings) -> None:
+    def __init__(
+        self,
+        config: TiingoSettings,
+        utc_clock: Callable[[], datetime] | None = None,
+    ) -> None:
         if not config.api_key:
             raise ProviderNotConfigured(
                 "QTE_DATA_PROVIDER_API_KEY is not set; Tiingo cannot serve historical bars"
             )
         self._config = config
+        #: What "now" is when deciding which bucket is still forming. Injectable
+        #: so a test can pin it.
+        self._utc_clock = utc_clock or (lambda: datetime.now(UTC))
 
     def supports_timeframe(self, timeframe: str) -> bool:
         return timeframe in FREQUENCY
@@ -109,7 +125,9 @@ class TiingoHistorySource(HistorySource):
                     request.end,
                 )
 
-        return self._combine(pages, request)
+        return drop_unfinished_bars(
+            self._combine(pages, request), request.timeframe, self._utc_clock()
+        )
 
     # -- Paging ------------------------------------------------------------
 

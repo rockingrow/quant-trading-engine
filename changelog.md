@@ -124,6 +124,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   alongside it so the benchmark is sized the way the strategy was. Additive:
   a consumer of 1.0 reads a 1.1 report unchanged.
 
+### Fixed
+
+- **Backfill no longer stores the bucket still forming as a closed bar.**
+  Tiingo's intraday history for today includes the bar being built, and it was
+  written to Redis as closed: the runner then rejected the real close of that
+  bucket as a duplicate and kept the snapshot in its window. History sources
+  drop unfinished buckets (`drop_unfinished_bars`), and a fresh fetch replaces a
+  held vendor bar instead of deferring to it.
+
+- **A bar built from part of its bucket is completed before it is published.**
+  The first bucket after ingestion starts, and a bar restored from Redis after a
+  restart, used to go out as though whole. Each is now merged with the vendor's
+  bar for the same bucket — its open, the extremes of both, and the engine's own
+  close while the engine was still listening when the bucket ended — or
+  published as built with a log line when that bar is unavailable or takes
+  longer than five seconds. A restored bar whose bucket ended during the
+  downtime takes the vendor's close too, and is closed before backfill runs so
+  the top-up does not duplicate it.
+
+- **Backfill notices a stale cache, not only a short one.** A full Redis list
+  whose newest bar predates the last completed bucket is topped up from that
+  bar, so an outage no longer leaves a hole the bar count cannot see.
+
+- **The runner decides on closes it missed while starting.** It records the
+  newest bar each pair was fed (`qte:decided:*`) and, once subscribed, feeds
+  every newer bar Redis holds: it decides on those that closed within
+  `QTE_RUNNER__CATCH_UP_MAX_AGE` (120 s) and keeps older ones as history only.
+  Restored history is de-duplicated by open time.
+
+- **Ingestion discards candle state another provider wrote.** The writing
+  provider is recorded (`qte:history:provider`). A switch, state with no
+  recorded writer — everything written before this release, discarded once on
+  the first start after upgrading — or bars dated after now from a provider that
+  is not synthetic discards the candle lists, open bars and candle outbox before
+  anything reads them, so simulator bars left in Redis no longer make a Tiingo
+  feed drop every tick. Open positions are not touched.
+
 ## [0.1.0] - 2026-08-24
 
 First release of **Quant Trading Engine** — an event-driven framework for

@@ -73,6 +73,17 @@ def next_bucket(moment: datetime, timeframe: str) -> datetime:
     return floor_to_bucket(moment, timeframe) + timedelta(seconds=timeframe_seconds(timeframe))
 
 
+def bucket_close(open_time: datetime, timeframe: str) -> datetime:
+    """When the bucket that opens at *open_time* ends — the moment its bar closes."""
+    return open_time + timedelta(seconds=timeframe_seconds(timeframe))
+
+
+#: Slack for the gap between this host's clock and a feed's own timestamps, so a
+#: bar that a quote closed a moment early is not taken for one dated in the
+#: future. Ingestion and the runner both judge "future" bars by it.
+CLOCK_TOLERANCE = timedelta(seconds=5)
+
+
 def _as_utc(moment: datetime) -> datetime:
     """Treat a naive datetime as UTC; convert an aware one into UTC."""
     if moment.tzinfo is None:

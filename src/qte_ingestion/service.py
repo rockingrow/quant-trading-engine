@@ -18,6 +18,15 @@ Start-up also *seeds* that cache from vendor history when the provider serves
 it -- see :mod:`qte_ingestion.backfill`. Without it a cold Redis means the
 runner has no indicator window until enough bars have printed live, which on
 M15 is days.
+
+Start-up guards that cache in a fixed order. Candle state another provider
+wrote, or dated after now, is discarded before anything reads it back
+(:mod:`qte_ingestion.state_guard`). A bar restored from before a restart whose
+bucket ended during the downtime is closed and completed from vendor history
+before backfill runs, so the top-up merges around it instead of landing beside
+it. And the moment ticks start arriving is recorded on every resampler, so the
+bar of the bucket already under way is completed when it closes rather than
+published half-built (:mod:`qte_ingestion.repair`).
 """
 
 from __future__ import annotations
@@ -26,14 +35,21 @@ import asyncio
 import contextlib
 from datetime import UTC, datetime
 
-from qte_ingestion.backfill import HistoryBackfiller
+from qte_ingestion.backfill import HistoryBackfiller, open_history_source
+from qte_ingestion.repair import PartialBarRepairer
 from qte_ingestion.resampler import Resampler
 from qte_ingestion.settings import ingestion_settings
+from qte_ingestion.state_guard import discard_foreign_candle_state
 from qte_shared.bus import NatsBus, Subjects
 from qte_shared.cache import RedisState
 from qte_shared.config import market_data_plan, settings
 from qte_shared.db import EventRepository
-from qte_shared.interfaces.market_data import Capability, LiveFeed
+from qte_shared.interfaces.market_data import (
+    Capability,
+    LiveFeed,
+    ProviderError,
+    UnsupportedCapability,
+)
 from qte_shared.logging_setup import get_logger
 from qte_shared.market_data_plan import SymbolFeed
 from qte_shared.models import Candle, CandleClosedEvent, Tick, TickEvent
@@ -90,6 +106,8 @@ class IngestionService:
             for feed in self.subscriptions
         }
         self._feeds: list[LiveFeed] = []
+        #: Completes partial bars from vendor history; built in :meth:`start`.
+        self._repairer: PartialBarRepairer | None = None
         self._flush_task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
         self._outbox_lock = asyncio.Lock()
@@ -102,13 +120,35 @@ class IngestionService:
         try:
             await self.bus.connect()
             await self.state.connect()
+            # Before anything reads the cache back: bars another provider wrote,
+            # or dated after now, are not this market's history.
+            await discard_foreign_candle_state(
+                self.state,
+                self.subscriptions,
+                provider_name=self.provider.name,
+                synthetic=self.provider.synthetic,
+            )
             # Drain before accepting fresh ticks so a candle delayed by a restart
             # cannot arrive after a newer close for the same strategy window.
             await self._drain_candle_outbox()
+            self._repairer = self._build_repairer()
             await self._restore_open_candles()
+            # A restored bar whose bucket ended while this process was down closes
+            # now, completed from vendor history — its close included, since this
+            # process heard its last tick before the outage — before backfill reads
+            # the list. Closed any later, it would land behind the bars the backfill
+            # tops up with, beside the vendor's copy of its own bucket.
+            await self._emit_candles(
+                self._close_ended_bars(datetime.now(UTC)), close_is_current=False
+            )
             # Before the first live tick: a bar backfilled from the vendor must
             # not land behind one this process just resampled.
             await HistoryBackfiller(self.state, self.subscriptions).run()
+
+            # Whatever bucket is under way now was not listened to from its open.
+            joined_at = datetime.now(UTC)
+            for resampler in self._resamplers.values():
+                resampler.mark_joined(joined_at)
 
             started = 0
             for feed in self.provider.live_feeds(self.specs, self._handle_tick):
@@ -143,6 +183,18 @@ class IngestionService:
         except BaseException:
             await self._close_resources(record_event=False)
             raise
+
+    def _build_repairer(self) -> PartialBarRepairer:
+        """A repairer over the provider's history, or one that publishes as built."""
+        markets = {symbol_feed.symbol: symbol_feed.market for symbol_feed in self.subscriptions}
+        try:
+            source = open_history_source()
+        except UnsupportedCapability:
+            source = None
+        except ProviderError as failure:
+            log.warning("Partial bars will be published as built: %s", failure)
+            source = None
+        return PartialBarRepairer(source, markets)
 
     def request_stop(self) -> None:
         """Ask :meth:`run_forever` to unwind. Safe to call from a signal handler."""
@@ -247,24 +299,52 @@ class IngestionService:
             await asyncio.sleep(ingestion_settings.flush_interval)
             try:
                 await self._drain_candle_outbox()
-                now = datetime.now(UTC)
-                closed: list[Candle] = []
-                for resampler in self._resamplers.values():
-                    closed.extend(resampler.flush(now))
-                await self._emit_candles(closed)
+                await self._emit_candles(self._close_ended_bars(datetime.now(UTC)))
             except asyncio.CancelledError:
                 raise
             except Exception:
                 log.exception("Flush cycle failed — retrying at the next interval")
 
+    def _close_ended_bars(self, moment: datetime) -> list[Candle]:
+        """Every open bar, across all symbols, whose bucket has ended by *moment*."""
+        closed_bars: list[Candle] = []
+        for resampler in self._resamplers.values():
+            closed_bars.extend(resampler.flush(moment))
+        return closed_bars
+
     async def _emit_candle(self, candle: Candle) -> None:
         await self._emit_candles([candle])
 
-    async def _emit_candles(self, candles: list[Candle]) -> None:
-        """Stage every retired bucket before attempting any network publish."""
+    async def _emit_candles(self, candles: list[Candle], *, close_is_current: bool = True) -> None:
+        """Stage every retired bucket before attempting any network publish.
+
+        A bar the resampler built from only part of its bucket is completed from
+        vendor history first, so what reaches Redis and the runner is the whole
+        bar. Whole bars are staged and published before any repair starts, so
+        one symbol's vendor request never holds back another symbol's close. A
+        batch never holds two bars of one symbol and timeframe — a tick or a
+        flush retires at most one per timeframe — so no series is reordered.
+
+        *close_is_current* is false only for the bars closed at start-up after an
+        outage that outlasted their bucket: this process's last tick for them
+        predates the outage, so their close comes from the vendor as well.
+        """
+        partial_bars: list[Candle] = []
         for candle in candles:
-            await self.state.stage_closed_candle(candle)
+            resampler = self._resamplers.get(candle.symbol)
+            if resampler is not None and resampler.take_partial(candle):
+                partial_bars.append(candle)
+            else:
+                await self.state.stage_closed_candle(candle)
         await self._drain_candle_outbox()
+        for candle in partial_bars:
+            if self._repairer is None:
+                repaired = candle
+            else:
+                repaired = await self._repairer.repair(candle, close_is_current=close_is_current)
+            await self.state.stage_closed_candle(repaired)
+        if partial_bars:
+            await self._drain_candle_outbox()
 
     async def _drain_candle_outbox(self) -> None:
         """Publish staged closes oldest-first, acknowledging only on success.

@@ -12,6 +12,7 @@ Postgres stays the audit trail; nothing here is a system of record.
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from typing import Any
 
 import redis.asyncio as redis
@@ -156,6 +157,54 @@ class RedisState:
     async def get_open_candle(self, symbol: str, timeframe: str) -> Candle | None:
         raw = await self.client.get(self.key("open_candle", symbol, timeframe))
         return Candle.model_validate_json(raw) if raw else None
+
+    async def pending_candles(self) -> list[Candle]:
+        """Every staged close still waiting in the outbox, oldest first."""
+        staged = await self.client.lrange(self.key("outbox", "candles"), 0, -1)
+        return [Candle.model_validate_json(staged_json) for staged_json in staged]
+
+    # ── Candle state provenance ───────────────────────────────────────
+    #
+    # Redis outlives a change of market-data provider, and bars one provider
+    # wrote are not market history for another. See
+    # :mod:`qte_ingestion.state_guard`.
+
+    async def get_history_provider(self) -> str | None:
+        """The provider whose feed last wrote the candle state, if recorded."""
+        return await self.client.get(self.key("history", "provider"))
+
+    async def set_history_provider(self, provider_name: str) -> None:
+        await self.client.set(self.key("history", "provider"), provider_name)
+
+    async def discard_candle_state(self, symbol: str, timeframe: str) -> None:
+        """Forget one pair's closed history and its open bar. Positions stay."""
+        await self.client.delete(
+            self.key("candles", symbol, timeframe),
+            self.key("open_candle", symbol, timeframe),
+        )
+
+    async def discard_candle_outbox(self) -> None:
+        """Drop every staged close that has not been published yet."""
+        await self.client.delete(self.key("outbox", "candles"))
+
+    # ── Decision watermark ────────────────────────────────────────────
+    #
+    # The open time of the newest bar each (strategy, symbol, timeframe) was fed.
+    # Closes published while a runner was down or still starting are the bars
+    # newer than this; see ``StrategyRunner._catch_up``.
+
+    async def get_decided_open_time(
+        self, strategy: str, symbol: str, timeframe: str
+    ) -> datetime | None:
+        stored = await self.client.get(self.key("decided", strategy, symbol, timeframe))
+        return datetime.fromisoformat(stored) if stored else None
+
+    async def set_decided_open_time(
+        self, strategy: str, symbol: str, timeframe: str, open_time: datetime
+    ) -> None:
+        await self.client.set(
+            self.key("decided", strategy, symbol, timeframe), open_time.isoformat()
+        )
 
     # ── Strategy cycle state ──────────────────────────────────────────
     #

@@ -23,6 +23,7 @@ from qte_shared.interfaces.market_data import (
     TickHandler,
     UnknownProvider,
     UnsupportedCapability,
+    drop_unfinished_bars,
     empty_ohlcv_frame,
     normalize_ohlcv,
 )
@@ -40,6 +41,7 @@ __all__ = [
     "TickHandler",
     "UnknownProvider",
     "UnsupportedCapability",
+    "drop_unfinished_bars",
     "empty_ohlcv_frame",
     "normalize_ohlcv",
 ]

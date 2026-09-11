@@ -84,13 +84,14 @@ class FakeSource(HistorySource):
         return self.frame
 
 
-def backfiller(state, target: int = 100, cache=None) -> HistoryBackfiller:
+def backfiller(state, target: int = 100, cache=None, utc_clock=None) -> HistoryBackfiller:
     # The cache is always injected: a default one would write parquet into the
     # repository's own data/ directory as a side effect of running the suite.
     instance = HistoryBackfiller(
         state,
         [SymbolFeed(symbol="XAUUSD", market="fx", timeframes=("M15",))],
         cache=cache or NullCache(),
+        utc_clock=utc_clock,
     )
     instance.target = target
     return instance
@@ -128,12 +129,60 @@ def install_source(monkeypatch, source: FakeSource | None, *, unsupported: bool 
 async def test_full_cache_is_left_alone(monkeypatch):
     source = FakeSource()
     install_source(monkeypatch, source)
-    state = FakeState([candle_at(index) for index in range(100)])
+    fake_state = FakeState([candle_at(index) for index in range(100)])
+    # The newest held bar (offset 99) is the last completed bucket four minutes
+    # into the one after it.
+    clock_reading = START + timedelta(minutes=15 * 100 + 4)
 
-    await backfiller(state, target=100).run()
+    await backfiller(fake_state, target=100, utc_clock=lambda: clock_reading).run()
 
-    assert source.calls == [], "a warm cache must not cost a vendor request"
-    assert state.written == []
+    assert source.calls == [], "a warm, current cache must not cost a vendor request"
+    assert fake_state.written == []
+
+
+async def test_a_full_but_stale_cache_is_topped_up_from_its_newest_bar(monkeypatch):
+    """The audit's restart: every bar held, the newest from before an outage."""
+    held_bars = [candle_at(index) for index in range(100)]
+    newest_open = held_bars[-1].open_time
+    source = FakeSource(bars(3, start=newest_open + timedelta(minutes=15)))
+    install_source(monkeypatch, source)
+    fake_state = FakeState(held_bars)
+    clock_reading = newest_open + timedelta(minutes=15 * 4 + 2)
+
+    await backfiller(fake_state, target=100, utc_clock=lambda: clock_reading).run()
+
+    request = source.calls[0]
+    assert (request.start, request.end) == (newest_open.date(), clock_reading.date())
+    assert [candle.open_time for candle in fake_state.written[-3:]] == [
+        newest_open + timedelta(minutes=15 * bar_step) for bar_step in (1, 2, 3)
+    ]
+    assert len(fake_state.written) == 100, "the list is trimmed back to its target"
+
+
+async def test_a_top_up_that_finds_nothing_new_rewrites_nothing(monkeypatch):
+    """A weekend: the newest bar is Friday's and the vendor has nothing after it."""
+    held_bars = [candle_at(index) for index in range(100)]
+    source = FakeSource(bars(0))
+    install_source(monkeypatch, source)
+    fake_state = FakeState(held_bars)
+    clock_reading = held_bars[-1].open_time + timedelta(days=2)
+
+    await backfiller(fake_state, target=100, utc_clock=lambda: clock_reading).run()
+
+    assert len(source.calls) == 1
+    assert fake_state.written == []
+
+
+async def test_the_bar_still_forming_is_never_stored(monkeypatch):
+    source = FakeSource(bars(10))
+    install_source(monkeypatch, source)
+    fake_state = FakeState()
+    # Four minutes into the tenth bucket: offsets 0-8 are over, offset 9 is not.
+    clock_reading = START + timedelta(minutes=15 * 9 + 4)
+
+    await backfiller(fake_state, utc_clock=lambda: clock_reading).run()
+
+    assert fake_state.written[-1].open_time == START + timedelta(minutes=15 * 8)
 
 
 async def test_short_cache_is_filled(monkeypatch):

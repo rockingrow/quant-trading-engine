@@ -8,7 +8,7 @@ The runner is the only component that knows this is *live*. Strategies see the
 same frame and the same context object the backtest hands them, which is what
 makes a backtested edge and a traded edge the same code path.
 
-Two ordering rules matter here:
+Three ordering rules matter here:
 
 * **Stage, publish, then commit.** A durable outbox row is written before the
   broker call. Its UUID is the stable delivery id, so an ambiguous timeout can
@@ -16,6 +16,12 @@ Two ordering rules matter here:
 * **Warm from Redis, not from the feed.** On boot the runner pulls its
   indicator window out of Redis rather than waiting hours for live candles to
   accumulate, so a restart resumes trading on the next close.
+* **Catch up before listening.** Core NATS does not replay, so a close
+  published while the runner was down or still starting never arrives. Each
+  pair records the newest bar it was fed, and on boot every newer bar in Redis
+  is fed as a close — decided on while at most ``QTE_RUNNER__CATCH_UP_MAX_AGE``
+  old, kept as history otherwise — with every slot held, so a live close cannot
+  overtake it.
 
 Position state is written twice on purpose. The cycle a pair is holding goes to
 Redis (hot, read on every bar) *and* to Postgres (durable), and boot prefers
@@ -30,7 +36,7 @@ import asyncio
 import contextlib
 import json
 from collections import defaultdict, deque
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from nats.aio.msg import Msg
@@ -39,8 +45,10 @@ from qte_shared.bus import NatsBus, Subjects
 from qte_shared.cache import RedisState
 from qte_shared.config import settings
 from qte_shared.db import EventRepository
+from qte_shared.interfaces.market_data import ProviderError
 from qte_shared.logging_setup import get_logger
 from qte_shared.models import BrokerSignal, Candle, CandleClosedEvent, OpenPosition, TickEvent
+from qte_shared.providers import get_provider_class
 from qte_shared.strategies.mapping import SymbolMapping
 from qte_shared.strategies.plugin_loader import load_strategies
 from qte_shared.strategies.signal_factory import BracketPolicy, SignalFactory
@@ -53,7 +61,12 @@ from qte_shared.strategies.strategy_base import (
     candles_to_frame,
     overrides_on_tick,
 )
-from qte_shared.timeframes import normalize_timeframe
+from qte_shared.timeframes import (
+    CLOCK_TOLERANCE,
+    bucket_close,
+    normalize_timeframe,
+    timeframe_seconds,
+)
 from qte_strategy_engine.broker_sink import BrokerSink, DeliveryResult
 from qte_strategy_engine.db import OpenPositionRepository, SignalRepository
 from qte_strategy_engine.preflight import run_preflight_audit
@@ -132,7 +145,15 @@ class StrategyRunner:
 
             await self._restore_state()
             await self._recover_pending_deliveries()
-            await self._subscribe()
+            # Every slot is held while the subscriptions go live and the missed
+            # closes are replayed. A close that arrives meanwhile waits for the
+            # replay, then finds its bar already fed and is ignored, so no bar is
+            # decided on twice or behind a newer one.
+            async with contextlib.AsyncExitStack() as held_slots:
+                for strategy_slot in self.slots:
+                    await held_slots.enter_async_context(strategy_slot.lock)
+                await self._subscribe()
+                await self._catch_up()
             self._tasks.append(
                 asyncio.create_task(self._delivery_retry_loop(), name="signal-outbox-retry")
             )
@@ -286,21 +307,151 @@ class StrategyRunner:
             )
 
     async def _restore_state(self) -> None:
-        """Refill candle buffers and the open cycle each slot was holding."""
-        for slot in self.slots:
-            candles = await self.state.get_candles(
-                slot.symbol, slot.timeframe, slot.buffer.maxlen or 0
-            )
-            slot.buffer.extend(candles)
-            await self._restore_position(slot)
+        """Refill candle buffers and the open cycle each slot was holding.
+
+        A slot that has been fed before takes only the bars up to the newest one
+        it was fed. Anything Redis holds beyond that closed while this runner was
+        not listening, and :meth:`_catch_up` feeds it as a close rather than
+        leaving it in the window as history nobody decided on.
+        """
+        allow_future = self._provider_is_synthetic()
+        for strategy_slot in self.slots:
+            candles = await self._stored_history(strategy_slot, allow_future=allow_future)
+            decided = await self._decided_open_time(strategy_slot, allow_future=allow_future)
+            if decided is not None:
+                candles = [candle for candle in candles if candle.open_time <= decided]
+            strategy_slot.buffer.extend(candles)
+            await self._restore_position(strategy_slot)
             log.info(
                 "Warm-up %s/%s %s: %d/%d candles from Redis",
-                slot.strategy.name,
-                slot.symbol,
-                slot.timeframe,
-                len(slot.buffer),
-                slot.strategy.warmup,
+                strategy_slot.strategy.name,
+                strategy_slot.symbol,
+                strategy_slot.timeframe,
+                len(strategy_slot.buffer),
+                strategy_slot.strategy.warmup,
             )
+
+    async def _stored_history(
+        self, strategy_slot: StrategySlot, *, allow_future: bool
+    ) -> list[Candle]:
+        """The slot's window as Redis holds it, cleaned of what cannot be history."""
+        stored = await self.state.get_candles(
+            strategy_slot.symbol, strategy_slot.timeframe, strategy_slot.buffer.maxlen or 0
+        )
+        return _clean_history(stored, strategy_slot, allow_future=allow_future)
+
+    async def _decided_open_time(
+        self, strategy_slot: StrategySlot, *, allow_future: bool
+    ) -> datetime | None:
+        """The newest bar this slot was fed, or where to draw that line instead.
+
+        A mark dated after now was written while a synthetic feed ran ahead of
+        the clock, and because every live feed rewrites it, it also means no bar
+        of the current feed has been fed since. Taken at face value it would file
+        every close this runner missed as already decided. So the line is drawn
+        at ``QTE_RUNNER__CATCH_UP_MAX_AGE`` instead: older bars warm the window,
+        newer ones are caught up.
+        """
+        decided = await self.state.get_decided_open_time(
+            strategy_slot.strategy.name, strategy_slot.symbol, strategy_slot.timeframe
+        )
+        moment = datetime.now(UTC)
+        if decided is None or allow_future or decided <= moment + CLOCK_TOLERANCE:
+            return decided
+        oldest_catch_up_close = moment - timedelta(seconds=runner_settings.catch_up_max_age)
+        log.warning(
+            "Ignoring the decided-bar mark %s of %s/%s %s: it is dated after now, so a feed "
+            "running ahead of the clock wrote it. Bars that closed before %s warm the window "
+            "and later ones are caught up.",
+            decided.isoformat(),
+            strategy_slot.strategy.name,
+            strategy_slot.symbol,
+            strategy_slot.timeframe,
+            oldest_catch_up_close.isoformat(),
+        )
+        return oldest_catch_up_close - timedelta(seconds=timeframe_seconds(strategy_slot.timeframe))
+
+    async def _catch_up(self) -> None:
+        """Feed every close Redis holds that this runner was not listening for.
+
+        Called with every slot lock held and the subscriptions already live. A
+        bar that closed within ``QTE_RUNNER__CATCH_UP_MAX_AGE`` is fed like a
+        live close, strategy decision included. An older one joins the window as
+        history only: deciding on it now would send an entry at a price the
+        strategy never saw, which is not the trade a backtest would record.
+        """
+        max_age = timedelta(seconds=runner_settings.catch_up_max_age)
+        allow_future = self._provider_is_synthetic()
+        for strategy_slot in self.slots:
+            buffer = strategy_slot.buffer
+            newest_fed = buffer[-1].open_time if buffer else None
+            missed = [
+                candle
+                for candle in await self._stored_history(strategy_slot, allow_future=allow_future)
+                if newest_fed is None or candle.open_time > newest_fed
+            ]
+            skipped: list[Candle] = []
+            for candle in missed:
+                closed_at = bucket_close(candle.open_time, strategy_slot.timeframe)
+                closed_ago = datetime.now(UTC) - closed_at
+                if closed_ago <= max_age:
+                    log.info(
+                        "Catching up %s/%s %s on the close of %s, %.0fs after it closed",
+                        strategy_slot.strategy.name,
+                        strategy_slot.symbol,
+                        strategy_slot.timeframe,
+                        candle.open_time.isoformat(),
+                        closed_ago.total_seconds(),
+                    )
+                    await self._feed_candle_serialized(strategy_slot, candle)
+                else:
+                    buffer.append(candle)
+                    await self._record_decided(strategy_slot, candle)
+                    skipped.append(candle)
+            if skipped:
+                log.warning(
+                    "Skipped the decision on %d missed close(s) of %s/%s %s (%s..%s): they "
+                    "closed more than QTE_RUNNER__CATCH_UP_MAX_AGE=%.0fs ago and only join "
+                    "the window as history",
+                    len(skipped),
+                    strategy_slot.strategy.name,
+                    strategy_slot.symbol,
+                    strategy_slot.timeframe,
+                    skipped[0].open_time.isoformat(),
+                    skipped[-1].open_time.isoformat(),
+                    runner_settings.catch_up_max_age,
+                )
+
+    async def _record_decided(self, strategy_slot: StrategySlot, candle: Candle) -> None:
+        """Remember *candle* as the newest bar this slot was fed. Never raises.
+
+        A lost write can let a restart within ``QTE_RUNNER__CATCH_UP_MAX_AGE``
+        feed the same bar again. That is the lesser failure next to letting a
+        Redis error cost the strategy the decision it is about to make.
+        """
+        try:
+            await self.state.set_decided_open_time(
+                strategy_slot.strategy.name,
+                strategy_slot.symbol,
+                strategy_slot.timeframe,
+                candle.open_time,
+            )
+        except Exception:
+            log.exception(
+                "Could not record the decided bar %s for %s/%s %s",
+                candle.open_time.isoformat(),
+                strategy_slot.strategy.name,
+                strategy_slot.symbol,
+                strategy_slot.timeframe,
+            )
+
+    @staticmethod
+    def _provider_is_synthetic() -> bool:
+        """Whether the configured feed invents its prices, as the dev simulator does."""
+        try:
+            return get_provider_class(settings.market_data.provider).synthetic
+        except (ProviderError, ImportError):
+            return False
 
     async def _restore_position(self, slot: StrategySlot) -> None:
         """Reload the cycle this slot holds — Redis first, Postgres behind it.
@@ -373,6 +524,10 @@ class StrategyRunner:
             )
             return
         slot.buffer.append(candle)
+        # Recorded before the strategy runs, not after it: a crash in between
+        # costs this one decision, where recording afterwards would let the next
+        # start's catch-up decide the same bar a second time.
+        await self._record_decided(slot, candle)
 
         if not slot.is_warm:
             log.debug(
@@ -724,6 +879,51 @@ class StrategyRunner:
                 log.exception("Resource cleanup failed during runner shutdown")
         self._cleaned = not cleanup_failed
         log.info("Runner stopped")
+
+
+def _clean_history(
+    candles: list[Candle], strategy_slot: StrategySlot, *, allow_future: bool
+) -> list[Candle]:
+    """Redis history as a window: one bar per open time, and none from the future.
+
+    A duplicate open time is what an earlier backfill left behind when it stored
+    a bucket still forming and ingestion later closed the same bucket. The later
+    entry is the live close, so it wins. A bar whose bucket has not ended cannot
+    be market history either -- unless the configured feed is the simulator,
+    which anchors its bars ahead of the clock on purpose.
+    """
+    by_open_time: dict[datetime, Candle] = {}
+    for candle in candles:
+        by_open_time[candle.open_time] = candle
+    ordered = [by_open_time[open_time] for open_time in sorted(by_open_time)]
+    duplicate_count = len(candles) - len(ordered)
+    if duplicate_count:
+        log.warning(
+            "Dropped %d duplicate bar(s) from the %s/%s %s history in Redis",
+            duplicate_count,
+            strategy_slot.strategy.name,
+            strategy_slot.symbol,
+            strategy_slot.timeframe,
+        )
+    if allow_future:
+        return ordered
+    horizon = datetime.now(UTC) + CLOCK_TOLERANCE
+    finished = [
+        candle
+        for candle in ordered
+        if bucket_close(candle.open_time, strategy_slot.timeframe) <= horizon
+    ]
+    if len(finished) < len(ordered):
+        log.error(
+            "Ignored %d bar(s) dated after now in the %s/%s %s history, newest %s. "
+            "Ingestion discards such state on its next start.",
+            len(ordered) - len(finished),
+            strategy_slot.strategy.name,
+            strategy_slot.symbol,
+            strategy_slot.timeframe,
+            ordered[-1].open_time.isoformat(),
+        )
+    return finished
 
 
 def _encode(payload: dict[str, Any]) -> bytes:
