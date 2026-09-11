@@ -11,6 +11,14 @@ loop calls it on a timer regardless of feed activity.
 A bucket with no ticks produces no candle. Forward-filling a flat synthetic bar
 would feed strategies a body that never traded, which quietly corrupts any
 indicator with a range in it (ATR most of all).
+
+A bar can also be **partial**: built from only part of its bucket because this
+process was not listening when the bucket opened. That is the first bucket after
+a start — :meth:`Resampler.mark_joined` records when listening began — and any
+bar restored from Redis after a restart, whose ticks from the downtime never
+arrived. Such a bar still closes on the clock, but :meth:`Resampler.take_partial`
+tells the caller, so it can complete the bar from vendor history before anyone
+decides on it (:mod:`qte_ingestion.repair`).
 """
 
 from __future__ import annotations
@@ -37,9 +45,18 @@ class _BarBuilder:
         "close",
         "volume",
         "tick_count",
+        "partial",
     )
 
-    def __init__(self, symbol: str, timeframe: str, open_time: datetime, price: float) -> None:
+    def __init__(
+        self,
+        symbol: str,
+        timeframe: str,
+        open_time: datetime,
+        price: float,
+        *,
+        partial: bool = False,
+    ) -> None:
         self.symbol = symbol
         self.timeframe = timeframe
         self.open_time = open_time
@@ -49,6 +66,8 @@ class _BarBuilder:
         self.close = price
         self.volume = 0.0
         self.tick_count = 0
+        #: Whether ticks from before this process started listening are missing.
+        self.partial = partial
 
     def update(self, price: float, volume: float) -> None:
         self.high = max(self.high, price)
@@ -85,8 +104,22 @@ class Resampler:
         #: bucket would open a *second* builder there and publish the bucket
         #: again — the exact repaint the late-tick branch below exists to stop.
         self._last_closed: dict[str, datetime] = {}
+        #: When this process began receiving ticks; ``None`` until
+        #: :meth:`mark_joined`, and then a bucket opened before it is partial.
+        self._joined_at: datetime | None = None
+        #: (timeframe, open time) of every closed bar that was partial, until
+        #: the caller collects it with :meth:`take_partial`.
+        self._partial_closes: set[tuple[str, datetime]] = set()
 
     # ── Feeding ───────────────────────────────────────────────────────
+
+    def mark_joined(self, moment: datetime) -> None:
+        """Record when ticks start arriving; buckets opened before it are partial.
+
+        Never called, nothing is ever partial — which is what a caller replaying
+        whole bars (the simulator's tests, a backfill) wants.
+        """
+        self._joined_at = moment
 
     def add_tick(self, tick: Tick) -> list[Candle]:
         """Fold *tick* into every timeframe; return any bars it closed.
@@ -108,11 +141,10 @@ class Resampler:
 
             builder = self._builders.get(timeframe)
             if builder is None:
-                self._builders[timeframe] = _BarBuilder(self.symbol, timeframe, bucket, price)
+                self._builders[timeframe] = self._open_builder(timeframe, bucket, price)
             elif bucket > builder.open_time:
-                closed.append(builder.snapshot(is_closed=True))
-                self._last_closed[timeframe] = builder.open_time
-                self._builders[timeframe] = _BarBuilder(self.symbol, timeframe, bucket, price)
+                closed.append(self._retire(timeframe, builder))
+                self._builders[timeframe] = self._open_builder(timeframe, bucket, price)
             elif bucket < builder.open_time:
                 # Out-of-order tick from a reconnect replay. Its bucket was
                 # never opened — the feed skipped it — but opening it now would
@@ -121,6 +153,18 @@ class Resampler:
                 continue
             self._builders[timeframe].update(price, tick.volume)
         return closed
+
+    def _open_builder(self, timeframe: str, bucket: datetime, first_price: float) -> _BarBuilder:
+        """A builder for *bucket*, partial when the bucket opened before we joined."""
+        joined_late = self._joined_at is not None and bucket < self._joined_at
+        return _BarBuilder(self.symbol, timeframe, bucket, first_price, partial=joined_late)
+
+    def _retire(self, timeframe: str, builder: _BarBuilder) -> Candle:
+        """Close *builder*'s bar, remembering the bucket as spent."""
+        self._last_closed[timeframe] = builder.open_time
+        if builder.partial:
+            self._partial_closes.add((timeframe, builder.open_time))
+        return builder.snapshot(is_closed=True)
 
     def _log_late(
         self, timeframe: str, bucket: datetime, boundary: datetime, *, reason: str
@@ -144,12 +188,19 @@ class Resampler:
         for timeframe, builder in list(self._builders.items()):
             bucket_end = builder.open_time + timedelta(seconds=timeframe_seconds(timeframe))
             if now >= bucket_end:
-                closed.append(builder.snapshot(is_closed=True))
-                self._last_closed[timeframe] = builder.open_time
+                closed.append(self._retire(timeframe, builder))
                 del self._builders[timeframe]
         return closed
 
     # ── Inspection ────────────────────────────────────────────────────
+
+    def take_partial(self, candle: Candle) -> bool:
+        """Whether *candle* closed partial. Answers ``True`` once per bar."""
+        marker = (normalize_timeframe(candle.timeframe), candle.open_time)
+        if marker in self._partial_closes:
+            self._partial_closes.remove(marker)
+            return True
+        return False
 
     def open_candle(self, timeframe: str) -> Candle | None:
         """The in-progress bar, for state persistence and dashboards."""
@@ -160,7 +211,11 @@ class Resampler:
         return [builder.snapshot(is_closed=False) for builder in self._builders.values()]
 
     def restore(self, candle: Candle) -> None:
-        """Resume a partially-built bar recovered from Redis after a restart."""
+        """Resume a partially-built bar recovered from Redis after a restart.
+
+        The resumed bar is always partial: whatever ticks arrived while this
+        process was down are not in it.
+        """
         timeframe = normalize_timeframe(candle.timeframe)
         if timeframe not in self.timeframes:
             return
@@ -170,7 +225,7 @@ class Resampler:
             # republish a bucket that has already gone out.
             self._log_late(timeframe, candle.open_time, last_closed, reason="already closed")
             return
-        builder = _BarBuilder(self.symbol, timeframe, candle.open_time, candle.open)
+        builder = _BarBuilder(self.symbol, timeframe, candle.open_time, candle.open, partial=True)
         builder.high = candle.high
         builder.low = candle.low
         builder.close = candle.close

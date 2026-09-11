@@ -560,8 +560,11 @@ Frames are defined in `qte_shared.providers.simulator.protocol`.
 
 This is outside the no-vendor rehearsal. Configure a key, set
 `QTE_MARKET_DATA__PROVIDER=tiingo`, and create the plan with `make tiingo`.
-Keep shadow mode on. Use clean rehearsal state so future simulator bars
-cannot cause real ticks to be discarded as late.
+Keep shadow mode on. On its first start against the vendor, ingestion discards
+the candle state the simulator left in Redis — candle lists, open bars and the
+candle outbox — and backfills from Tiingo, so future simulator bars cannot cause
+real ticks to be discarded as late. Open positions from a rehearsal are not
+touched: clear those deliberately before reading a vendor run's audit trail.
 
 An idle simulator cannot race Tiingo: ingestion selects one provider.
 To start only the vendor app services and their dependencies:

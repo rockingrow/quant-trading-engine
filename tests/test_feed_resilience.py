@@ -208,6 +208,8 @@ async def test_a_failed_candle_publish_remains_in_the_durable_outbox():
     service = object.__new__(IngestionService)
     service.state = CandleOutbox()
     service.bus = FlakyCandleBus()
+    service._resamplers = {}
+    service._repairer = None
     subject = staticmethod(lambda symbol, timeframe: f"{symbol}.{timeframe}")
     service.subjects = type("Subjects", (), {"candle_closed": subject})()
     candle = Resampler("XAUUSD", ["M1"])
@@ -255,3 +257,40 @@ async def test_concurrent_feeds_cannot_ack_a_candle_another_feed_has_not_publish
         "XAUUSD",
         "BTCUSDT",
     ]
+
+
+class RecordingRepairer:
+    """Stands in for vendor history: records what it completed, and what had gone out."""
+
+    def __init__(self, bus) -> None:
+        self.bus = bus
+        self.repaired: list[object] = []
+        self.published_before_repair: list[int] = []
+
+    async def repair(self, candle, **repair_options):
+        self.repaired.append(candle)
+        self.published_before_repair.append(len(self.bus.published))
+        return candle.model_copy(update={"open": 1111.0})
+
+
+async def test_a_partial_bar_is_repaired_after_whole_bars_have_gone_out():
+    service = object.__new__(IngestionService)
+    service.state = CandleOutbox()
+    service.bus = YieldingCandleBus()
+    subject = staticmethod(lambda symbol, timeframe: f"{symbol}.{timeframe}")
+    service.subjects = type("Subjects", (), {"candle_closed": subject})()
+    joined_late = Resampler("XAUUSD", ["M1"])
+    joined_late.mark_joined(MOMENT + timedelta(seconds=20))
+    listening = Resampler("BTCUSDT", ["M1"])
+    service._resamplers = {"XAUUSD": joined_late, "BTCUSDT": listening}
+    service._repairer = RecordingRepairer(service.bus)
+
+    joined_late.add_tick(Tick(symbol="XAUUSD", ts=MOMENT + timedelta(seconds=30), last=2400.0))
+    listening.add_tick(Tick(symbol="BTCUSDT", ts=MOMENT + timedelta(seconds=5), last=60000.0))
+    bucket_end = MOMENT + timedelta(minutes=1)
+    closes = joined_late.flush(bucket_end) + listening.flush(bucket_end)
+    await service._emit_candles(closes)
+
+    assert [candle.symbol for candle in service.state.staged] == ["BTCUSDT", "XAUUSD"]
+    assert service.state.staged[1].open == 1111.0, "the partial bar went out repaired"
+    assert service._repairer.published_before_repair == [1], "the whole bar did not wait"

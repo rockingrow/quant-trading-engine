@@ -36,8 +36,9 @@
 [provider]
 # Fill Redis from vendor history at boot, so the runner warms its indicator
 # window on the first close rather than days later
-# (QTE_INGESTION__BACKFILL_HISTORY). Providers that serve no history — the dev
-# simulator — skip it whatever this says.
+# (QTE_INGESTION__BACKFILL_HISTORY). A full cache whose newest bar is stale —
+# ingestion was down across a close — is topped up from that bar. Providers
+# that serve no history — the dev simulator — skip it whatever this says.
 backfill_history = true
 # Bars asked for in one REST call (QTE_TIINGO__MAX_ROWS_PER_REQUEST). Tiingo
 # signals truncation with a *200 and fewer bars*, not an error, so a range

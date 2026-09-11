@@ -23,7 +23,7 @@ import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 from enum import Enum
 from typing import Any, ClassVar
 
@@ -188,6 +188,10 @@ class HistorySource(ABC):
         :data:`~qte_shared.indicators.OHLCV_COLUMNS`. Build it with
         :func:`normalize_ohlcv` rather than by hand, and return an empty frame
         -- not ``None`` -- when the vendor has nothing for that range.
+
+        Only bars whose bucket has ended belong in it. A vendor that also
+        answers with the bucket still forming must pass the frame through
+        :func:`drop_unfinished_bars` first.
         """
 
     def supports_timeframe(self, timeframe: str) -> bool:
@@ -245,6 +249,10 @@ class MarketDataProvider(ABC):  # noqa: B024
     capabilities: ClassVar[frozenset[Capability]] = frozenset()
     #: Markets the vendor quotes; symbols on any other market are dropped.
     markets: ClassVar[tuple[Market, ...]] = ("fx", "crypto")
+    #: Whether the prices are invented rather than quoted. A synthetic feed may
+    #: stamp bars ahead of the wall clock on purpose, so the checks that treat a
+    #: future-dated bar as corrupt state do not apply to it.
+    synthetic: ClassVar[bool] = False
 
     def supports(self, capability: Capability) -> bool:
         return capability in self.capabilities
@@ -309,3 +317,25 @@ def normalize_ohlcv(rows: list[dict[str, Any]], timeframe: str) -> pd.DataFrame:
     frame.attrs["timeframe"] = normalize_timeframe(timeframe)
     frame.attrs["timeframe_seconds"] = timeframe_seconds(timeframe)
     return frame
+
+
+def drop_unfinished_bars(
+    history: pd.DataFrame, timeframe: str, moment: datetime | None = None
+) -> pd.DataFrame:
+    """Only the bars whose bucket had ended by *moment* (default: now).
+
+    An intraday endpoint asked for "up to today" answers with the bucket that is
+    still forming, and nothing in the row says so. Stored as closed, that
+    snapshot becomes the newest bar a strategy decides on, and the live close
+    for the same bucket is then rejected as a duplicate of it. Bars are keyed by
+    open time, so one is finished once its open time plus a timeframe has passed.
+    """
+    if history.empty:
+        return history
+    cutoff = pd.Timestamp(moment or datetime.now(UTC))
+    if cutoff.tzinfo is None:
+        cutoff = cutoff.tz_localize("UTC")
+    duration = pd.Timedelta(seconds=timeframe_seconds(timeframe))
+    finished = history[history.index + duration <= cutoff]
+    finished.attrs.update(history.attrs)
+    return finished

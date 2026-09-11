@@ -37,6 +37,14 @@ bucket the clock has passed, regardless of feed activity. A bucket with no ticks
 produces no candle: forward-filling a flat synthetic bar would feed strategies a
 body that never traded, which corrupts any indicator with a range in it.
 
+The clock also decides whether a bar is *whole*. A process that starts, or
+restarts, after a bucket opened builds that bar from the ticks it received and
+misses the open and whatever printed before. The resampler marks such a bar
+partial, and ingestion completes it from the vendor's bar for the same bucket
+before staging it (`qte_ingestion.repair`). History fetched for "today" is the
+mirror image: the vendor includes the bucket still forming, so every bar whose
+bucket has not ended is dropped rather than stored as closed.
+
 ## Why each engine owns its own tables
 
 `signals` is written only by the strategy runner; the backtest tables only by
@@ -80,6 +88,16 @@ open on each (strategy, symbol). It runs with AOF on, so a restart loses at most
 the last write. The runner rebuilds its indicator window from Redis on boot
 instead of waiting hours for live candles, which is what makes a restart resume
 trading on the next close.
+
+Two keys make that rebuild trustworthy. `qte:decided:<strategy>:<symbol>:<tf>`
+holds the newest bar each pair was fed. Closes published while the runner was
+down or still starting are the bars newer than it, and the runner replays them
+once subscribed — deciding only on those that closed within
+`QTE_RUNNER__CATCH_UP_MAX_AGE`, because a late entry trades a price the backtest
+never saw. `qte:history:provider` names the feed that wrote the candle state:
+before anything reads it back, ingestion discards candle lists, open bars and
+staged closes that another provider wrote, that no provider was recorded for,
+or that are dated after now. Positions are never part of that discard.
 
 Postgres is the audit trail — written *after* the signal has gone out, and its
 failures are logged rather than raised. A logging outage must not become a
