@@ -45,6 +45,7 @@ from qte_backtest.execution import SimulatedPosition
 from qte_backtest.replay import BacktestResult
 from qte_backtest.visualize import render_html
 from qte_shared.logging_setup import get_logger
+from qte_shared.strategies.signal_serialization import signal_record
 
 log = get_logger(__name__)
 
@@ -165,13 +166,10 @@ class BacktestReport:
                 _trade_to_dict(index, position)
                 for index, position in enumerate(_closed(result.positions), start=1)
             ],
-            # The exact broker payloads this run would have published. Keeping
-            # them here is what makes a backtest report comparable against the
-            # live audit trail row by row.
+            # Trading fields match the live audit trail; broker authentication
+            # is never part of a downloadable report.
             "signals": (
-                [signal.model_dump(mode="json") for signal in result.signals]
-                if include_signals
-                else []
+                [signal_record(signal) for signal in result.signals] if include_signals else []
             ),
         }
 

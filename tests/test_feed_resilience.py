@@ -294,3 +294,122 @@ async def test_a_partial_bar_is_repaired_after_whole_bars_have_gone_out():
     assert [candle.symbol for candle in service.state.staged] == ["BTCUSDT", "XAUUSD"]
     assert service.state.staged[1].open == 1111.0, "the partial bar went out repaired"
     assert service._repairer.published_before_repair == [1], "the whole bar did not wait"
+
+
+class FlakyStaging(CandleOutbox):
+    """Fail at a chosen batch item without changing the accepted history."""
+
+    def __init__(self, failure_index):
+        super().__init__()
+        self.failure_index = failure_index
+        self.attempts = 0
+        self.available = True
+
+    async def stage_closed_candle(self, candle):
+        self.attempts += 1
+        if not self.available or self.attempts == self.failure_index:
+            raise ConnectionError("Redis staging unavailable")
+        await super().stage_closed_candle(candle)
+
+
+def staging_service(failure_index):
+    service = object.__new__(IngestionService)
+    service.state = FlakyStaging(failure_index)
+    service.bus = YieldingCandleBus()
+    service._resamplers = {"XAUUSD": Resampler("XAUUSD", ["M1", "M5", "M15"])}
+    service._repairer = None
+    from qte_shared.bus import Subjects
+
+    service.subjects = Subjects()
+    return service
+
+
+@pytest.mark.parametrize("failure_index", [1, 2, 3])
+async def test_a_failed_stage_retains_every_unwritten_bar_in_the_batch(failure_index):
+    service = staging_service(failure_index)
+    resampler = service._resamplers["XAUUSD"]
+    resampler.add_tick(Tick(symbol="XAUUSD", ts=MOMENT, last=2400))
+    retired = resampler.flush(MOMENT + timedelta(minutes=15))
+    with pytest.raises(ConnectionError, match="staging unavailable"):
+        await service._emit_candles(retired)
+    assert resampler.flush(MOMENT + timedelta(minutes=15)) == []
+    assert len(service._retired_candles) == 4 - failure_index
+    await service._emit_candles([])
+    assert service.state.staged == retired
+    assert service._retired_candles == {}
+    assert len(service.bus.published) == 3
+
+
+async def test_a_partial_flag_survives_failure_on_an_earlier_whole_bar():
+    service = staging_service(1)
+    partial = Resampler("EURUSD", ["M15"])
+    partial.mark_joined(MOMENT + timedelta(seconds=20))
+    partial.add_tick(Tick(symbol="EURUSD", ts=MOMENT + timedelta(seconds=30), last=1.2))
+    whole_resampler = service._resamplers["XAUUSD"]
+    whole_resampler.add_tick(Tick(symbol="XAUUSD", ts=MOMENT, last=2400))
+    service._resamplers["EURUSD"] = partial
+    service._repairer = RecordingRepairer(service.bus)
+    closes = whole_resampler.flush(MOMENT + timedelta(minutes=15)) + partial.flush(
+        MOMENT + timedelta(minutes=15)
+    )
+    with pytest.raises(ConnectionError):
+        await service._emit_candles(closes, close_is_current=False)
+    assert len(service._retired_candles) == 4
+    await service._emit_candles([])
+    assert len(service._repairer.repaired) == 1
+    assert service.state.staged[-1].symbol == "EURUSD"
+    assert service.state.staged[-1].open == 1111
+    assert len(service.bus.published) == 4
+
+
+async def test_a_repaired_bar_is_retained_without_repeating_vendor_repair():
+    service = staging_service(1)
+    resampler = service._resamplers["XAUUSD"]
+    resampler.mark_joined(MOMENT + timedelta(seconds=20))
+    resampler.add_tick(Tick(symbol="XAUUSD", ts=MOMENT + timedelta(seconds=30), last=2400))
+    service._repairer = RecordingRepairer(service.bus)
+    closes = resampler.flush(MOMENT + timedelta(minutes=1))
+    with pytest.raises(ConnectionError):
+        await service._emit_candles(closes)
+    await service._emit_candles([])
+    assert len(service._repairer.repaired) == 1
+    assert service.state.staged[0].open == 1111
+    assert service._retired_candles == {}
+
+
+async def test_staging_backlog_prevents_unbounded_retirement_on_new_ticks():
+    service = staging_service(1)
+    resampler = service._resamplers["XAUUSD"]
+    resampler.add_tick(Tick(symbol="XAUUSD", ts=MOMENT, last=2400))
+    retired = resampler.flush(MOMENT + timedelta(minutes=15))
+    with pytest.raises(ConnectionError):
+        await service._emit_candles(retired)
+    service.state.available = False
+    for offset in range(20):
+        with pytest.raises(ConnectionError):
+            await service._handle_tick(
+                Tick(symbol="XAUUSD", ts=MOMENT + timedelta(minutes=30 + offset), last=2401)
+            )
+        assert len(service._retired_candles) == 3
+        assert resampler.open_candles() == []
+    service.state.available = True
+    await service._emit_candles([])
+    assert service.state.staged == retired
+
+
+async def test_wall_clock_loop_retries_retired_bars_without_another_tick(monkeypatch):
+    service = staging_service(1)
+    service._stopping = asyncio.Event()
+    service._resamplers["XAUUSD"].add_tick(Tick(symbol="XAUUSD", ts=MOMENT, last=2400))
+    monkeypatch.setattr("qte_ingestion.service.ingestion_settings.flush_interval", 0.001)
+    original_publish = service.bus.publish
+
+    async def stop_after_publish(subject, payload):
+        await original_publish(subject, payload)
+        if len(service.bus.published) == 3:
+            service._stopping.set()
+
+    service.bus.publish = stop_after_publish
+    await asyncio.wait_for(service._flush_loop(), timeout=1)
+    assert len(service.state.staged) == 3
+    assert service._retired_candles == {}

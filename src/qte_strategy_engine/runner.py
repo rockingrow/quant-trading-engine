@@ -38,6 +38,7 @@ import json
 from collections import defaultdict, deque
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from uuid import uuid4
 
 from nats.aio.msg import Msg
 
@@ -52,6 +53,7 @@ from qte_shared.providers import get_provider_class
 from qte_shared.strategies.mapping import SymbolMapping
 from qte_shared.strategies.plugin_loader import load_strategies
 from qte_shared.strategies.signal_factory import BracketPolicy, SignalFactory
+from qte_shared.strategies.signal_serialization import signal_record
 from qte_shared.strategies.sizing import PositionSizer
 from qte_shared.strategies.strategy_base import (
     SignalIntent,
@@ -114,11 +116,17 @@ class StrategyRunner:
         self.signals = SignalRepository()
         self.positions = OpenPositionRepository()
         self.sink = sink or BrokerSink()
+        self._configured_shadow_mode = self.sink.shadow_mode
+        self._history_started_at = datetime.now(UTC)
+        self._owner_id = str(uuid4())
+        self._ownership_acquired = False
         self.slots: list[StrategySlot] = []
         self._by_subject: dict[tuple[str, str], list[StrategySlot]] = defaultdict(list)
         self._stopping = asyncio.Event()
         self._tasks: list[asyncio.Task[Any]] = []
         self._uncertain_pairs: set[tuple[str, str]] = set()
+        self._unconfirmed_staging: set[tuple[str, str]] = set()
+        self._pending_results: dict[str, DeliveryResult] = {}
         self._cleaned = False
 
     # ── Startup ───────────────────────────────────────────────────────
@@ -130,10 +138,19 @@ class StrategyRunner:
         # we are about to reject. Off by configuration is the same call.
         run_preflight_audit()
         self._cleaned = False
+        self._history_started_at = datetime.now(UTC)
 
         try:
             await self.bus.connect()
             await self.state.connect()
+            if not await self.state.claim_runner(self._owner_id):
+                raise RuntimeError(
+                    "Runner ownership is already held in this Redis namespace. Stop the "
+                    "other runner; after an unclean exit verify it is gone before clearing "
+                    "the runner:owner key. Automatic failover is disabled."
+                )
+            self._ownership_acquired = True
+            await self._refresh_shadow_mode()
             await self.sink.start()
 
             self._build_slots()
@@ -157,6 +174,9 @@ class StrategyRunner:
             self._tasks.append(
                 asyncio.create_task(self._delivery_retry_loop(), name="signal-outbox-retry")
             )
+            self._tasks.append(
+                asyncio.create_task(self._history_sync_loop(), name="runner-history-sync")
+            )
 
             await self.events.record_event(
                 service=SERVICE_NAME,
@@ -175,6 +195,36 @@ class StrategyRunner:
             )
         except BaseException:
             await self._close_resources(record_event=False)
+            raise
+
+    async def _refresh_shadow_mode(self) -> None:
+        """Read the durable control before recovery and every new delivery.
+
+        Missing state uses the configured default. Invalid/unreadable state
+        fails closed, including when a control broadcast never reached us.
+        """
+        try:
+            stored_mode = await self.state.get_flag("shadow_mode", None)
+            if stored_mode is not None and not isinstance(stored_mode, bool):
+                raise ValueError("Persisted shadow_mode must be a boolean")
+        except Exception:
+            self.sink.set_shadow_mode(True)
+            raise
+        effective_mode = settings.broker.force_shadow_mode or (
+            self._configured_shadow_mode if stored_mode is None else stored_mode
+        )
+        if self.sink.shadow_mode != effective_mode:
+            self.sink.set_shadow_mode(effective_mode)
+
+    async def _check_ownership(self) -> None:
+        """Refuse all decisions and effects after shutdown or ownership loss."""
+        try:
+            owns_state = self._ownership_acquired and await self.state.owns_runner(self._owner_id)
+            if self._stopping.is_set() or not owns_state:
+                raise RuntimeError("Runner no longer owns the trading state")
+        except Exception:
+            self.sink.set_shadow_mode(True)
+            self.request_stop()
             raise
 
     def _build_slots(self) -> None:
@@ -380,47 +430,79 @@ class StrategyRunner:
         history only: deciding on it now would send an entry at a price the
         strategy never saw, which is not the trade a backtest would record.
         """
-        max_age = timedelta(seconds=runner_settings.catch_up_max_age)
-        allow_future = self._provider_is_synthetic()
         for strategy_slot in self.slots:
-            buffer = strategy_slot.buffer
-            newest_fed = buffer[-1].open_time if buffer else None
-            missed = [
-                candle
-                for candle in await self._stored_history(strategy_slot, allow_future=allow_future)
-                if newest_fed is None or candle.open_time > newest_fed
-            ]
-            skipped: list[Candle] = []
-            for candle in missed:
-                closed_at = bucket_close(candle.open_time, strategy_slot.timeframe)
-                closed_ago = datetime.now(UTC) - closed_at
-                if closed_ago <= max_age:
-                    log.info(
-                        "Catching up %s/%s %s on the close of %s, %.0fs after it closed",
-                        strategy_slot.strategy.name,
-                        strategy_slot.symbol,
-                        strategy_slot.timeframe,
-                        candle.open_time.isoformat(),
-                        closed_ago.total_seconds(),
-                    )
-                    await self._feed_candle_serialized(strategy_slot, candle)
-                else:
-                    buffer.append(candle)
-                    await self._record_decided(strategy_slot, candle)
-                    skipped.append(candle)
-            if skipped:
-                log.warning(
-                    "Skipped the decision on %d missed close(s) of %s/%s %s (%s..%s): they "
-                    "closed more than QTE_RUNNER__CATCH_UP_MAX_AGE=%.0fs ago and only join "
-                    "the window as history",
-                    len(skipped),
-                    strategy_slot.strategy.name,
-                    strategy_slot.symbol,
-                    strategy_slot.timeframe,
-                    skipped[0].open_time.isoformat(),
-                    skipped[-1].open_time.isoformat(),
-                    runner_settings.catch_up_max_age,
-                )
+            await self._sync_history(strategy_slot)
+
+    async def _sync_history(
+        self, strategy_slot: StrategySlot, *, before_open: datetime | None = None
+    ) -> None:
+        """Merge cached history and replay unseen closes with the slot lock held.
+
+        Redis is authoritative about which buckets traded. We never invent
+        candles across a session break. A live event bounds the read so no
+        later cached bar can overtake it or leak into its indicator window.
+        """
+        await self._check_ownership()
+        allow_future = self._provider_is_synthetic()
+        stored = await self._stored_history(strategy_slot, allow_future=allow_future)
+        if before_open is not None:
+            stored = [candle for candle in stored if candle.open_time < before_open]
+        newest_fed = strategy_slot.buffer[-1].open_time if strategy_slot.buffer else None
+        if newest_fed is None:
+            newest_fed = await self._decided_open_time(strategy_slot, allow_future=allow_future)
+            if newest_fed is None:
+                # Initial history may arrive after start() returned. Warm it
+                # without manufacturing past decisions. A close produced after
+                # this process started is still a live event even when its
+                # first NATS notification was lost.
+                for candle in stored:
+                    if (
+                        bucket_close(candle.open_time, strategy_slot.timeframe)
+                        <= self._history_started_at
+                    ):
+                        strategy_slot.buffer.append(candle)
+                    else:
+                        await self._feed_if_current(strategy_slot, candle)
+                return
+        historical = {candle.open_time: candle for candle in strategy_slot.buffer}
+        historical.update(
+            (candle.open_time, candle) for candle in stored if candle.open_time <= newest_fed
+        )
+        strategy_slot.buffer.clear()
+        strategy_slot.buffer.extend(historical[moment] for moment in sorted(historical))
+        for candle in stored:
+            if candle.open_time > newest_fed:
+                await self._feed_if_current(strategy_slot, candle)
+
+    async def _feed_if_current(self, strategy_slot: StrategySlot, candle: Candle) -> None:
+        closed_ago = datetime.now(UTC) - bucket_close(candle.open_time, strategy_slot.timeframe)
+        if closed_ago <= timedelta(seconds=runner_settings.catch_up_max_age):
+            await self._feed_candle_serialized(strategy_slot, candle)
+        else:
+            await self._check_ownership()
+            strategy_slot.buffer.append(candle)
+            await self._record_decided(strategy_slot, candle)
+            log.warning(
+                "Skipped the decision on missed close of %s/%s at %s: older than "
+                "QTE_RUNNER__CATCH_UP_MAX_AGE; retained as history",
+                strategy_slot.strategy.name,
+                strategy_slot.symbol,
+                candle.open_time,
+            )
+
+    async def _history_sync_loop(self) -> None:
+        """Repair lost messages and late backfills without waiting for another tick."""
+        while not self._stopping.is_set():
+            await asyncio.sleep(runner_settings.history_sync_interval)
+            try:
+                await self._refresh_shadow_mode()
+                for strategy_slot in self.slots:
+                    async with strategy_slot.lock:
+                        await self._sync_history(strategy_slot)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("History synchronization failed; retrying at the next interval")
 
     async def _record_decided(self, strategy_slot: StrategySlot, candle: Candle) -> None:
         """Remember *candle* as the newest bar this slot was fed. Never raises.
@@ -510,9 +592,13 @@ class StrategyRunner:
 
     async def _feed_candle(self, slot: StrategySlot, candle: Candle) -> None:
         async with slot.lock:
-            await self._feed_candle_serialized(slot, candle)
+            if slot.buffer and candle.open_time <= slot.buffer[-1].open_time:
+                return
+            await self._sync_history(slot, before_open=candle.open_time)
+            await self._feed_if_current(slot, candle)
 
     async def _feed_candle_serialized(self, slot: StrategySlot, candle: Candle) -> None:
+        await self._check_ownership()
         if slot.buffer and candle.open_time <= slot.buffer[-1].open_time:
             # A redelivery or a duplicate close. Acting on it twice would open a
             # second position on a signal the strategy already made once.
@@ -537,6 +623,9 @@ class StrategyRunner:
                 len(slot.buffer),
                 slot.strategy.warmup,
             )
+            return
+
+        if slot.key in self._uncertain_pairs:
             return
 
         context = StrategyContext(
@@ -575,9 +664,10 @@ class StrategyRunner:
         event = TickEvent.model_validate_json(msg.data)
         price = event.tick.price
         for slot in self.slots:
-            if slot.symbol != event.symbol or not slot.started:
+            if slot.symbol != event.symbol or not slot.started or slot.key in self._uncertain_pairs:
                 continue
             async with slot.lock:
+                await self._check_ownership()
                 context = StrategyContext(
                     symbol=slot.symbol,
                     timeframe=slot.timeframe,
@@ -606,14 +696,14 @@ class StrategyRunner:
 
         action = command.get("action")
         if action == "set_shadow_mode":
-            enabled = bool(command.get("enabled", True))
-            self.sink.set_shadow_mode(enabled)
-            await self.state.set_flag("shadow_mode", enabled)
+            # The CLI already persisted the command. Re-read it instead of
+            # allowing an older, delayed broadcast to overwrite a newer mode.
+            await self._refresh_shadow_mode()
             await self.events.record_event(
                 service=SERVICE_NAME,
                 event="shadow_mode_changed",
                 level="WARNING",
-                payload={"enabled": enabled},
+                payload={"enabled": self.sink.shadow_mode},
             )
         elif action == "ping":
             if msg.reply:
@@ -624,6 +714,8 @@ class StrategyRunner:
                             "service": SERVICE_NAME,
                             "slots": len(self.slots),
                             "shadow_mode": self.sink.shadow_mode,
+                            "ready": all(slot.is_warm for slot in self.slots)
+                            and not self._uncertain_pairs,
                         }
                     ),
                 )
@@ -635,6 +727,8 @@ class StrategyRunner:
     async def _emit(
         self, slot: StrategySlot, intent: SignalIntent, fallback_price: float, moment: datetime
     ) -> None:
+        await self._check_ownership()
+        await self._refresh_shadow_mode()
         if slot.key in self._uncertain_pairs:
             log.error(
                 "Dropped intent for uncertain delivery strategy=%s symbol=%s; "
@@ -660,13 +754,19 @@ class StrategyRunner:
             log.warning("Dropped intent from %s: %s", slot.strategy.name, exc)
             return
 
+        original_shadow = self.sink.shadow_mode
         delivery_id = await self.signals.stage_signal(
             signal,
             transport=self.sink.transport,
-            shadow=self.sink.shadow_mode,
+            shadow=original_shadow,
             recovery_context=slot.factory.pending_delivery_context(slot.symbol),
         )
         if delivery_id is None:
+            # The insert may have committed before its connection failed.
+            # Do not create a second command until a successful outbox scan
+            # proves whether this pair has an unfinished row.
+            self._uncertain_pairs.add(slot.key)
+            self._unconfirmed_staging.add(slot.key)
             slot.factory.discard_pending_delivery_context(slot.symbol)
             log.error(
                 "Signal not sent because its outbox row could not be persisted "
@@ -677,45 +777,17 @@ class StrategyRunner:
             )
             return
 
-        result = await self.sink.send(signal, delivery_id=delivery_id)
-
-        # Only after a successful send (or a shadow run) does the cycle become
-        # "the position we hold". Both the in-process factory and Redis are
-        # committed here; build() deliberately left them unchanged.
-        if result.status in {"sent", "shadow"}:
-            slot.factory.commit(signal, delivery_id=delivery_id)
-            try:
-                persisted = await self._track_cycle(slot)
-            except Exception:
-                # The broker already accepted the signal and the outbox row is
-                # still pending. Keep the pair blocked so startup recovery can
-                # reconcile it before another decision changes the cycle.
-                log.exception(
-                    "Failed to persist cycle strategy=%s symbol=%s uxid=%s",
-                    slot.strategy.name,
-                    slot.symbol,
-                    signal.signal_uxid,
-                )
-                persisted = False
-            if persisted:
-                await self.signals.mark_delivery(delivery_id, status=result.status)
-            else:
-                self._uncertain_pairs.add(slot.key)
-        else:
-            await self.signals.mark_delivery(
-                delivery_id,
-                status=result.status,
-                error=result.detail,
-            )
-            if result.status == "unknown":
-                self._uncertain_pairs.add(slot.key)
-            else:
-                slot.factory.discard_pending_delivery_context(slot.symbol)
+        self._uncertain_pairs.add(slot.key)
+        result = await self._send_staged_signal(signal, delivery_id, shadow=original_shadow)
+        if result is None:
+            return
+        if await self._finish_delivery(slot, signal, delivery_id, result):
+            self._uncertain_pairs.discard(slot.key)
 
         await self.bus.publish(
             self.subjects.signal_emitted(),
             {
-                "signal": signal.model_dump(mode="json"),
+                "signal": signal_record(signal),
                 "delivery": {
                     "id": delivery_id,
                     "status": result.status,
@@ -726,91 +798,161 @@ class StrategyRunner:
             },
         )
 
-    async def _recover_pending_deliveries(self, *, unknown_only: bool = False) -> None:
-        """Replay durable outbox rows with their original de-duplication ids."""
-        slots = {slot.key: slot for slot in self.slots}
-        rows = (
-            await self.signals.pending_deliveries(statuses=("unknown",))
-            if unknown_only
-            else await self.signals.pending_deliveries()
-        )
-        for row in rows:
-            signal = BrokerSignal.model_validate(row.payload["payload"])
-            key = (signal.strategy, signal.symbol.upper())
-            slot = slots.get(key)
-            if slot is None:
-                self._uncertain_pairs.add(key)
-                log.error(
-                    "Cannot recover signal delivery id=%s: no active slot for %s/%s",
-                    row.id,
-                    *key,
-                )
-                continue
+    async def _send_staged_signal(
+        self, signal: BrokerSignal, delivery_id: str, *, shadow: bool
+    ) -> DeliveryResult | None:
+        """Record uncertainty before crossing the broker boundary."""
+        await self._check_ownership()
+        await self._refresh_shadow_mode()
+        if shadow:
+            return DeliveryResult(status="shadow", transport=self.sink.transport)
+        if self.sink.shadow_mode:
+            log.error(
+                "Cannot recover live delivery id=%s while shadow mode is enabled", delivery_id
+            )
+            return None
+        if not await self.signals.mark_delivery(delivery_id, status="unknown"):
+            return None
+        await self._check_ownership()
+        await self._refresh_shadow_mode()
+        if self.sink.shadow_mode:
+            return None
+        try:
+            return await self.sink.send(signal, delivery_id=delivery_id)
+        except Exception:
+            log.exception("Broker call raised after staging delivery id=%s", delivery_id)
+            return DeliveryResult(status="unknown", transport=self.sink.transport)
 
-            async with slot.lock:
-                delivery_id = str(row.id)
-                slot.factory.restore_pending_delivery_context(
-                    slot.symbol, self.signals.recovery_context(row)
+    async def _finish_delivery(
+        self,
+        strategy_slot: StrategySlot,
+        signal: BrokerSignal,
+        delivery_id: str,
+        outcome: DeliveryResult,
+    ) -> bool:
+        """Checkpoint broker acceptance separately from local state persistence.
+
+        A known result stays in memory if its checkpoint fails. After a crash,
+        the pre-send unknown marker prevents blind resends outside a configured
+        deduplication horizon. Accepted checkpoints only retry local writes.
+        """
+        if outcome.status != "unknown":
+            self._pending_results[delivery_id] = outcome
+        try:
+            if outcome.status in {"sent", "shadow"}:
+                if not await self.signals.mark_delivery(
+                    delivery_id, status=f"{outcome.status}_pending"
+                ):
+                    return False
+                strategy_slot.factory.commit(signal, delivery_id=delivery_id)
+                if not await self._track_cycle(strategy_slot):
+                    return False
+            finalized = await self.signals.mark_delivery(
+                delivery_id, status=outcome.status, error=outcome.detail or None
+            )
+            if not finalized or outcome.status == "unknown":
+                return False
+        except Exception:
+            log.exception("Could not reconcile delivery id=%s; pair remains blocked", delivery_id)
+            return False
+        self._pending_results.pop(delivery_id, None)
+        strategy_slot.factory.discard_pending_delivery_context(strategy_slot.symbol)
+        return True
+
+    async def _recover_pending_deliveries(self) -> None:
+        """Reconcile every unfinished phase without starving rows beyond page one."""
+        await self._check_ownership()
+        await self._refresh_shadow_mode()
+        active_slots = {strategy_slot.key: strategy_slot for strategy_slot in self.slots}
+        blocked_pairs: set[tuple[str, str]] = set()
+        resolved_pairs: set[tuple[str, str]] = set()
+        after_cursor = None
+        while True:
+            pending_rows = await self.signals.pending_deliveries(
+                after_cursor=after_cursor, include_ids=tuple(self._pending_results)
+            )
+            if not pending_rows:
+                break
+            after_cursor = (pending_rows[-1].created_at, pending_rows[-1].id)
+            for pending_row in pending_rows:
+                pairing = (pending_row.strategy, pending_row.symbol.upper())
+                self._uncertain_pairs.add(pairing)
+                strategy_slot = active_slots.get(pairing)
+                if strategy_slot is None or pairing in blocked_pairs:
+                    blocked_pairs.add(pairing)
+                    continue
+                try:
+                    async with strategy_slot.lock:
+                        resolved = await self._recover_delivery(strategy_slot, pending_row)
+                except Exception:
+                    log.exception("Could not recover delivery id=%s", pending_row.id)
+                    resolved = False
+                if resolved:
+                    resolved_pairs.add(pairing)
+                else:
+                    blocked_pairs.add(pairing)
+        # Do not unblock between rows: an older unresolved row blocks every
+        # later row of its pair, including those on another page.
+        self._uncertain_pairs.difference_update(
+            (resolved_pairs | self._unconfirmed_staging) - blocked_pairs
+        )
+        self._unconfirmed_staging.clear()
+
+    async def _recover_delivery(self, strategy_slot: StrategySlot, pending_row: Any) -> bool:
+        await self._check_ownership()
+        delivery_id = str(pending_row.id)
+        # A scan may see a prepared row while its original sender still holds
+        # this lock. Never resend that stale snapshot after the sender finishes.
+        pending_row = await self.signals.get_delivery(delivery_id)
+        if pending_row is None:
+            raise ValueError("Outbox row disappeared during recovery")
+        if pending_row.delivery_status in {"sent", "shadow", "failed"}:
+            if delivery_id not in self._pending_results:
+                return True
+        signal = BrokerSignal.model_validate(pending_row.payload["payload"])
+        if (signal.strategy, signal.symbol.upper()) != strategy_slot.key:
+            raise ValueError("Outbox payload does not match its stored strategy and symbol")
+        strategy_slot.factory.restore_pending_delivery_context(
+            strategy_slot.symbol, self.signals.recovery_context(pending_row)
+        )
+        outcome = self._pending_results.get(delivery_id)
+        if outcome is None and pending_row.delivery_status in {"sent_pending", "shadow_pending"}:
+            outcome = DeliveryResult(
+                status=pending_row.delivery_status.removesuffix("_pending"),
+                transport=pending_row.transport,
+            )
+        if outcome is None:
+            if pending_row.transport != self.sink.transport:
+                log.error("Transport changed for unfinished delivery id=%s", delivery_id)
+                return False
+            if not pending_row.shadow and pending_row.delivery_status != "prepared":
+                elapsed = (datetime.now(UTC) - pending_row.created_at).total_seconds()
+                retry_horizon = runner_settings.delivery_retry_max_age
+                if retry_horizon <= 0 or not 0 <= elapsed < retry_horizon:
+                    log.error(
+                        "Delivery id=%s requires broker reconciliation: outside the configured "
+                        "deduplication horizon; no automatic resend",
+                        delivery_id,
+                    )
+                    return False
+            was_ambiguous = pending_row.delivery_status in {"pending", "unknown"}
+            outcome = await self._send_staged_signal(signal, delivery_id, shadow=pending_row.shadow)
+            if outcome is not None and outcome.status == "failed" and was_ambiguous:
+                # Rejecting a retry does not disprove acceptance of the first
+                # ambiguous attempt. Keep the pair blocked for reconciliation.
+                outcome = DeliveryResult(
+                    status="unknown", transport=outcome.transport, detail=outcome.detail
                 )
-                original_transport = getattr(row, "transport", self.sink.transport)
-                original_shadow = getattr(row, "shadow", self.sink.shadow_mode)
-                if original_transport != self.sink.transport:
-                    self._uncertain_pairs.add(key)
-                    log.error(
-                        "Cannot recover delivery id=%s over %s: it was staged for %s",
-                        delivery_id,
-                        self.sink.transport,
-                        original_transport,
-                    )
-                    continue
-                if original_shadow:
-                    # A staged paper trade must never become live because the
-                    # operator changed configuration before recovery.
-                    result = DeliveryResult(status="shadow", transport=original_transport)
-                elif self.sink.shadow_mode:
-                    # The inverse transition is unsafe too: calling send would
-                    # label a previously-live command as shadow without ever
-                    # reconciling it with the broker.
-                    self._uncertain_pairs.add(key)
-                    log.error(
-                        "Cannot recover live delivery id=%s while shadow mode is enabled",
-                        delivery_id,
-                    )
-                    continue
-                else:
-                    result = await self.sink.send(signal, delivery_id=delivery_id)
-                if result.status in {"sent", "shadow"}:
-                    slot.factory.commit(signal, delivery_id=delivery_id)
-                    try:
-                        persisted = await self._track_cycle(slot)
-                    except Exception:
-                        log.exception(
-                            "Failed to persist recovered cycle delivery_id=%s", delivery_id
-                        )
-                        persisted = False
-                    if persisted:
-                        await self.signals.mark_delivery(delivery_id, status=result.status)
-                        self._uncertain_pairs.discard(key)
-                    else:
-                        self._uncertain_pairs.add(key)
-                else:
-                    await self.signals.mark_delivery(
-                        delivery_id,
-                        status=result.status,
-                        error=result.detail,
-                    )
-                    if result.status == "unknown":
-                        self._uncertain_pairs.add(key)
-                    else:
-                        self._uncertain_pairs.discard(key)
-                        slot.factory.discard_pending_delivery_context(slot.symbol)
+        if outcome is None:
+            return False
+        return await self._finish_delivery(strategy_slot, signal, delivery_id, outcome)
 
     async def _delivery_retry_loop(self) -> None:
         """Continuously reconcile ambiguous sends without requiring a restart."""
         while not self._stopping.is_set():
             await asyncio.sleep(runner_settings.delivery_retry_interval)
             try:
-                await self._recover_pending_deliveries(unknown_only=True)
+                await self._recover_pending_deliveries()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -871,12 +1013,26 @@ class StrategyRunner:
         if record_event:
             with contextlib.suppress(Exception):
                 await self.events.record_event(service=SERVICE_NAME, event="stopped")
-        for close in (self.sink.stop, self.state.close, self.bus.close):
+        # Drain callbacks before releasing ownership: a queued close must not
+        # run alongside the next owner. Uncertain cleanup retains the claim.
+        for close in (self.bus.close, self.sink.stop):
             try:
                 await close()
             except Exception:
                 cleanup_failed = True
                 log.exception("Resource cleanup failed during runner shutdown")
+        if self._ownership_acquired and not cleanup_failed:
+            try:
+                await self.state.release_runner(self._owner_id)
+                self._ownership_acquired = False
+            except Exception:
+                cleanup_failed = True
+                log.exception("Could not release runner ownership")
+        try:
+            await self.state.close()
+        except Exception:
+            cleanup_failed = True
+            log.exception("Redis cleanup failed during runner shutdown")
         self._cleaned = not cleanup_failed
         log.info("Runner stopped")
 

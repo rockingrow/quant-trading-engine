@@ -105,7 +105,7 @@ async def test_redis_is_written_even_when_nats_is_down(monkeypatch, capsys):
     output = capsys.readouterr().out
     # Silence here would read as "applied everywhere", which is the one thing
     # it is not.
-    assert "WARNING" in output and "keep their old mode" in output
+    assert "WARNING" in output and "refresh the stored flag" in output
     assert audit.events[0]["payload"]["broadcast"] is False
 
 

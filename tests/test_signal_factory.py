@@ -218,9 +218,7 @@ def test_the_strategys_own_size_is_replaced_not_honoured():
     assert signal.position.quantity == pytest.approx(6.0)
 
 
-def test_an_entry_that_cannot_be_sized_falls_back_to_the_configured_default():
-    # No stop reaches the sizer only when the bracket cannot supply one either,
-    # which is why the fallback exists at all.
+def test_a_zero_stop_distance_cannot_select_the_configured_fallback():
     factory = SignalFactory(
         "S",
         timeframe="M5",
@@ -229,8 +227,9 @@ def test_an_entry_that_cannot_be_sized_falls_back_to_the_configured_default():
         default_quantity=0.01,
     )
     intent = SignalIntent(action=SignalAction.LONG, price=2334.50, sl=2334.50)
-    signal = factory.build(intent, symbol="XAUUSD", moment=NOW)
-    assert signal.position.quantity == pytest.approx(0.01)
+    with pytest.raises(ValueError, match="stop distance"):
+        factory.build(intent, symbol="XAUUSD", moment=NOW)
+    assert factory.open_position("XAUUSD") is None
 
 
 def test_a_strategy_declining_the_trade_with_a_zero_size_is_not_sized_into_one():

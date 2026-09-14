@@ -99,9 +99,42 @@ before anything reads it back, ingestion discards candle lists, open bars and
 staged closes that another provider wrote, that no provider was recorded for,
 or that are dated after now. Positions are never part of that discard.
 
-Postgres is the audit trail — written *after* the signal has gone out, and its
-failures are logged rather than raised. A logging outage must not become a
-runner that stops trading.
+Postgres stages each signal as `prepared` before it can go out. The runner
+records `unknown` before calling the broker, then `sent_pending` or
+`shadow_pending` before persisting the resulting position to both stores.
+Only after those writes succeed does the row become `sent` or `shadow`.
+Every unfinished phase is revisited with keyset pagination, and its pair
+cannot decide again until all older rows are reconciled. Accepted rows only
+retry local persistence; they never resend to the broker.
+
+An ambiguous live result, including legacy `pending` rows, requires operator
+reconciliation by default. `QTE_RUNNER__DELIVERY_RETRY_MAX_AGE` can opt into
+retries only inside a verified broker deduplication horizon. It must leave room
+for the publish timeout and network latency; the engine does not infer a
+guarantee from an HTTP header or assume NATS retains message ids forever.
+
+The runner also reconciles Redis before processing a new live close and every
+`QTE_RUNNER__HISTORY_SYNC_INTERVAL` seconds. Missing cached bars are replayed in
+order with the same decision-age limit. Cold windows incorporate backfill that
+finishes after startup; initial history warms without inventing past decisions.
+Only actual cached bars fill gaps, so closed market sessions create no fake bars.
+
+**One active runner per Redis namespace.** A non-expiring `runner:owner` claim
+is acquired before restoration or subscriptions and checked before decisions
+and delivery. Graceful shutdown drains callbacks before releasing it. A second
+process refuses to start; queue groups do not provide shared strategy state.
+There is deliberately no lease timeout or automatic takeover without broker
+fencing. After a crash, stop and verify the previous runner is gone, reconcile
+outstanding broker outcomes, then explicitly remove only that namespace's stale
+ownership key before restarting. Never clear it while an owner may still run.
+Redis persistence and retention of this key are required; do not flush or evict
+the trading namespace while runners are active.
+
+Ingestion keeps each retired candle, including its partial-bar repair state,
+until Redis acknowledges staging. It retries that batch before retiring more
+bars, bounding the backlog by configured series. Redis stages history and the
+candle outbox with an atomic per-series watermark, so a lost response can be
+retried without duplicate history/events or deletion of a newer open candle.
 
 **The open position is the exception, and is written to both.** It is the one
 piece of hot state whose loss is not merely slow to recover from: a runner that
@@ -126,9 +159,14 @@ Four things a strategy is not allowed to own, all in `SignalFactory`:
    that sized itself would be sizing against a number it invented.
 4. **Timeframe spelling** — QTE says `M15`, the broker's contract says `"15"`.
 
-Because both drivers go through the factory, a signal in a backtest report is
-byte-identical to the one a worker would have executed. Reconciliation compares
-two rows, not two implementations.
+Both drivers reject an intent naming a symbol other than its slot before
+building or committing it. Risk sizing rounds down; an invalid budget or a
+quantity below the supported step rejects the trade rather than choosing a
+fallback. The ceiling also applies to fallback quantities.
+
+Because both drivers go through the factory, the trading fields in a backtest
+report match those sent live. The sink injects the current broker credential
+only at delivery; reports, audit payloads and internal mirrors omit it.
 
 ## Why the plugin loader imports by path
 
@@ -334,6 +372,12 @@ The exception is shadow mode, which genuinely has to reach a *process that is
 already running* — flipping live/paper must not require a restart mid-position.
 That is one message on `QTE.control`, so `qte-control` publishes it straight to
 NATS and no service is needed to carry it.
+
+The runner reads the durable Redis flag before recovery and again before each
+delivery, including when a broadcast was lost. A delayed message cannot
+overwrite a newer flag. Missing state uses `QTE_BROKER__SHADOW_MODE`; malformed
+or unreadable state fails closed. `QTE_BROKER__FORCE_SHADOW_MODE=true` overrides
+both the persisted flag and runtime controls and never permits live delivery.
 
 Relatedly, `NatsBus.connect` bounds the *initial* connect even though reconnects
 are unlimited: nats-py applies `max_reconnect_attempts` to both, so `-1` (what a

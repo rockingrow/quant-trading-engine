@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from qte_ingestion.backfill import HistoryBackfiller, open_history_source
@@ -60,6 +61,15 @@ from qte_shared.timeframes import normalize_timeframe
 log = get_logger(__name__)
 
 SERVICE_NAME = "data-ingestion"
+
+
+@dataclass
+class RetiredCandle:
+    """A retired bucket retained until Redis acknowledges durable staging."""
+
+    candle: Candle
+    partial: bool
+    close_is_current: bool
 
 
 def resolve_subscriptions() -> list[SymbolFeed]:
@@ -111,6 +121,8 @@ class IngestionService:
         self._flush_task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
         self._outbox_lock = asyncio.Lock()
+        self._processing_lock = asyncio.Lock()
+        self._retired_candles: dict[tuple[str, str, datetime], RetiredCandle] = {}
         self._cleaned = False
 
     # ── Lifecycle ─────────────────────────────────────────────────────
@@ -266,6 +278,19 @@ class IngestionService:
     # ── Tick path ─────────────────────────────────────────────────────
 
     async def _handle_tick(self, tick: Tick) -> None:
+        async with self._processing_guard():
+            # Do not retire another batch while Redis cannot retain the first.
+            # This bounds memory by the configured series, rather than ticks.
+            if getattr(self, "_retired_candles", None):
+                await self._emit_candles([])
+            await self._handle_tick_serialized(tick)
+
+    def _processing_guard(self) -> asyncio.Lock:
+        if not hasattr(self, "_processing_lock"):
+            self._processing_lock = asyncio.Lock()
+        return self._processing_lock
+
+    async def _handle_tick_serialized(self, tick: Tick) -> None:
         await self.state.set_last_tick(tick)
         if ingestion_settings.publish_ticks:
             await self.bus.publish(
@@ -298,8 +323,10 @@ class IngestionService:
         while not self._stopping.is_set():
             await asyncio.sleep(ingestion_settings.flush_interval)
             try:
-                await self._drain_candle_outbox()
-                await self._emit_candles(self._close_ended_bars(datetime.now(UTC)))
+                async with self._processing_guard():
+                    if getattr(self, "_retired_candles", None):
+                        await self._emit_candles([])
+                    await self._emit_candles(self._close_ended_bars(datetime.now(UTC)))
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -329,21 +356,34 @@ class IngestionService:
         outage that outlasted their bucket: this process's last tick for them
         predates the outage, so their close comes from the vendor as well.
         """
-        partial_bars: list[Candle] = []
+        if not hasattr(self, "_retired_candles"):
+            self._retired_candles = {}
+        # Retain the entire batch and its partial flags before the first await.
+        # A failure on any item must leave that item and all later ones intact.
         for candle in candles:
             resampler = self._resamplers.get(candle.symbol)
-            if resampler is not None and resampler.take_partial(candle):
-                partial_bars.append(candle)
-            else:
-                await self.state.stage_closed_candle(candle)
+            marker = (candle.symbol, candle.timeframe, candle.open_time)
+            if marker not in self._retired_candles:
+                self._retired_candles[marker] = RetiredCandle(
+                    candle=candle,
+                    partial=resampler is not None and resampler.take_partial(candle),
+                    close_is_current=close_is_current,
+                )
+        for marker, retired in list(self._retired_candles.items()):
+            if not retired.partial:
+                await self.state.stage_closed_candle(retired.candle)
+                del self._retired_candles[marker]
         await self._drain_candle_outbox()
-        for candle in partial_bars:
-            if self._repairer is None:
-                repaired = candle
-            else:
-                repaired = await self._repairer.repair(candle, close_is_current=close_is_current)
-            await self.state.stage_closed_candle(repaired)
-        if partial_bars:
+        had_partial_bars = bool(self._retired_candles)
+        for marker, retired in list(self._retired_candles.items()):
+            if self._repairer is not None:
+                retired.candle = await self._repairer.repair(
+                    retired.candle, close_is_current=retired.close_is_current
+                )
+            retired.partial = False
+            await self.state.stage_closed_candle(retired.candle)
+            del self._retired_candles[marker]
+        if had_partial_bars:
             await self._drain_candle_outbox()
 
     async def _drain_candle_outbox(self) -> None:

@@ -1,9 +1,8 @@
 """The runner's own tables — it is the only writer of both.
 
-``signals`` is the append-only audit trail: ``payload`` holds the exact broker
-envelope that was sent (or would have been, in shadow mode), so reconciliation
-against ``algo-trading-broker``'s own ``signals`` table compares bytes rather
-than a reconstruction.
+``signals`` is the audit/outbox trail: ``payload`` holds the broker envelope's
+trading fields, without authentication. Delivery status records preparation,
+broker acceptance and completion of local position persistence separately.
 
 ``open_positions`` is the opposite kind of table — one mutable row per
 (strategy, symbol), holding the trade cycle currently live on that pair. Redis
@@ -53,7 +52,9 @@ class SignalAudit(Base):
     inputs: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
 
     transport: Mapped[str] = mapped_column(String(16), default="nats")
-    #: ``pending`` | ``unknown`` | ``sent`` | ``shadow`` | ``failed``.
+    #: ``prepared`` (unsent), legacy ``pending``/``unknown`` (ambiguous),
+    #: ``sent_pending``/``shadow_pending`` (local reconciliation), then
+    #: terminal ``sent``/``shadow``/``failed``. No schema change is needed.
     delivery_status: Mapped[str] = mapped_column(String(16), default="shadow")
     delivery_error: Mapped[str | None] = mapped_column(Text)
     shadow: Mapped[bool] = mapped_column(Boolean, default=True)

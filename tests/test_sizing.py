@@ -49,7 +49,8 @@ def test_an_entry_with_no_stop_cannot_be_sized():
 
 def test_a_stop_sitting_on_the_entry_cannot_be_sized():
     sizer = PositionSizer(capital=1000.0, risk_percent=3.0)
-    assert sizer.size(price=2334.50, sl=2334.50) is None
+    with pytest.raises(ValueError, match="stop distance"):
+        sizer.size(price=2334.50, sl=2334.50)
 
 
 def test_the_cap_is_a_ceiling_not_a_target():
@@ -61,7 +62,8 @@ def test_the_cap_is_a_ceiling_not_a_target():
 def test_a_size_that_rounds_away_is_refused_rather_than_sent_as_zero():
     # The broker rejects a zero-quantity entry; catching it here says why.
     sizer = PositionSizer(capital=10.0, risk_percent=0.001, precision=4)
-    assert sizer.size(price=2334.50, sl=2329.50) is None
+    with pytest.raises(ValueError, match="quantity step"):
+        sizer.size(price=2334.50, sl=2329.50)
 
 
 def test_precision_is_where_the_size_is_rounded():

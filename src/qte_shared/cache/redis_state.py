@@ -23,6 +23,34 @@ from qte_shared.models import Candle, OpenPosition, Tick
 
 log = get_logger(__name__)
 
+STAGE_CLOSED_CANDLE = """
+local previous = redis.call('GET', KEYS[4])
+if previous and tonumber(previous) >= tonumber(ARGV[2]) then return 0 end
+local history_type = redis.call('TYPE', KEYS[1]).ok
+local outbox_type = redis.call('TYPE', KEYS[2]).ok
+if (history_type ~= 'none' and history_type ~= 'list') or
+   (outbox_type ~= 'none' and outbox_type ~= 'list') then
+    return redis.error_reply('Candle history and outbox must be lists')
+end
+local opened = redis.call('GET', KEYS[3])
+local remove_open = false
+if opened then
+    local decoded, stored = pcall(cjson.decode, opened)
+    if not decoded or type(stored) ~= 'table' then
+        return redis.error_reply('Open candle must contain valid JSON')
+    end
+    local candle = cjson.decode(ARGV[1])
+    remove_open = stored.open_time == candle.open_time
+end
+redis.call('RPUSH', KEYS[1], ARGV[1])
+redis.call('LTRIM', KEYS[1], -tonumber(ARGV[3]), -1)
+if tonumber(ARGV[4]) > 0 then redis.call('EXPIRE', KEYS[1], ARGV[4]) end
+redis.call('RPUSH', KEYS[2], ARGV[1])
+redis.call('SET', KEYS[4], ARGV[2])
+if remove_open then redis.call('DEL', KEYS[3]) end
+return 1
+"""
+
 
 class RedisState:
     """Namespaced async Redis accessor. One instance per service."""
@@ -53,6 +81,32 @@ class RedisState:
     def key(self, *parts: str) -> str:
         return ":".join((self._prefix, *parts))
 
+    # ── Runner ownership ──────────────────────────────────────────────
+
+    async def claim_runner(self, owner_id: str) -> bool:
+        """Allow one runner per state namespace, without automatic lease expiry.
+
+        A paused process must not outlive a lease and resume alongside a new
+        writer. After an unclean exit an operator must first stop that process
+        and explicitly remove the stale ownership key before restarting.
+        """
+        return bool(await self.client.set(self.key("runner", "owner"), owner_id, nx=True))
+
+    async def owns_runner(self, owner_id: str) -> bool:
+        return await self.client.get(self.key("runner", "owner")) == owner_id
+
+    async def release_runner(self, owner_id: str) -> bool:
+        """Release only our own claim, never a replacement runner's claim."""
+        return bool(
+            await self.client.eval(
+                "if redis.call('GET', KEYS[1]) == ARGV[1] then "
+                "return redis.call('DEL', KEYS[1]) else return 0 end",
+                1,
+                self.key("runner", "owner"),
+                owner_id,
+            )
+        )
+
     # ── Ticks ─────────────────────────────────────────────────────────
 
     async def set_last_tick(self, tick: Tick) -> None:
@@ -80,7 +134,7 @@ class RedisState:
         await pipe.execute()
 
     async def stage_closed_candle(self, candle: Candle, max_len: int | None = None) -> None:
-        """Persist a closed candle and enqueue its event in one Redis transaction.
+        """Persist and enqueue a close atomically, once per series/open time.
 
         The resampler has already retired the bucket by the time this is
         called.  If NATS is unavailable, the queue is therefore the only place
@@ -88,20 +142,18 @@ class RedisState:
         queue append in one transaction also prevents a restart from seeing a
         candle in one representation but not the other.
         """
-        limit = max_len or settings.redis.candle_history
-        history = self.key("candles", candle.symbol, candle.timeframe)
-        outbox = self.key("outbox", "candles")
-        pipe = self.client.pipeline(transaction=True)
-        pipe.rpush(history, candle.model_dump_json())
-        pipe.ltrim(history, -limit, -1)
-        if settings.redis.ttl_seconds:
-            pipe.expire(history, settings.redis.ttl_seconds)
-        pipe.rpush(outbox, candle.model_dump_json())
-        # A quiet-market flush may close the only builder without a following
-        # tick to overwrite this key.  Leaving it behind would resurrect an
-        # already-closed bar after a restart.
-        pipe.delete(self.key("open_candle", candle.symbol, candle.timeframe))
-        await pipe.execute()
+        await self.client.eval(
+            STAGE_CLOSED_CANDLE,
+            4,
+            self.key("candles", candle.symbol, candle.timeframe),
+            self.key("outbox", "candles"),
+            self.key("open_candle", candle.symbol, candle.timeframe),
+            self.key("staged", candle.symbol, candle.timeframe),
+            candle.model_dump_json(),
+            candle.open_time.timestamp(),
+            max_len or settings.redis.candle_history,
+            settings.redis.ttl_seconds,
+        )
 
     async def peek_pending_candle(self) -> Candle | None:
         """Oldest closed candle whose NATS event has not been acknowledged."""
@@ -181,6 +233,7 @@ class RedisState:
         await self.client.delete(
             self.key("candles", symbol, timeframe),
             self.key("open_candle", symbol, timeframe),
+            self.key("staged", symbol, timeframe),
         )
 
     async def discard_candle_outbox(self) -> None:

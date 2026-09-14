@@ -56,6 +56,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 async def _set_shadow_mode(enabled: bool) -> None:
+    if not enabled and settings.broker.force_shadow_mode:
+        raise SystemExit("QTE_BROKER__FORCE_SHADOW_MODE forbids disabling shadow mode")
     state = RedisState()
     try:
         await state.connect()
@@ -99,8 +101,8 @@ async def _set_shadow_mode(enabled: bool) -> None:
         print("Shadow mode OFF — signals are going LIVE to the broker.")
     if not broadcast:
         print(
-            "WARNING: NATS was unreachable, so runners already running keep their old mode. "
-            "Restart them, or re-run this once NATS is back."
+            "WARNING: NATS was unreachable. Runners refresh the stored flag before their "
+            "next delivery and on periodic synchronization; use ping to check the running mode."
         )
 
 
@@ -114,7 +116,11 @@ async def _show_shadow_mode() -> None:
     finally:
         await state.close()
 
-    if stored is None:
+    if stored is not None and not isinstance(stored, bool):
+        raise SystemExit("Persisted shadow_mode is invalid; runners refuse delivery")
+    if settings.broker.force_shadow_mode:
+        print("Shadow mode is ON (paper), forced by QTE_BROKER__FORCE_SHADOW_MODE.")
+    elif stored is None:
         print(
             f"No stored flag; runners fall back to QTE_BROKER__SHADOW_MODE="
             f"{settings.broker.shadow_mode}."

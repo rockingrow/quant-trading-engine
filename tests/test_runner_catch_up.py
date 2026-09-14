@@ -9,15 +9,18 @@ back out of Redis — and decides on it only while it is still fresh.
 
 from __future__ import annotations
 
+import asyncio
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+
+from test_runner_delivery import FakeState
 
 from qte_shared.config import settings
 from qte_shared.models import Candle, CandleClosedEvent
 from qte_shared.strategies.signal_factory import SignalFactory
 from qte_shared.strategies.strategy_base import StrategyBase
-from qte_shared.timeframes import floor_to_bucket
+from qte_shared.timeframes import bucket_close, floor_to_bucket
 from qte_strategy_engine.runner import StrategyRunner, StrategySlot
 
 BAR_LENGTH = timedelta(minutes=15)
@@ -62,10 +65,11 @@ def completed_bars(bar_count: int) -> list[Candle]:
     ]
 
 
-class CandleStore:
+class CandleStore(FakeState):
     """The Redis surface the runner reads for history, cycles and the watermark."""
 
     def __init__(self, candles: list[Candle], decided: datetime | None = None) -> None:
+        super().__init__()
         self.candles = list(candles)
         self.decided = decided
         self.recorded: list[datetime] = []
@@ -111,6 +115,9 @@ class QuietSink:
     shadow_mode = True
     transport = "nats"
 
+    def set_shadow_mode(self, enabled):
+        self.shadow_mode = enabled
+
     async def start(self) -> None:
         return None
 
@@ -124,7 +131,7 @@ class NoPositions:
 
 
 class NoPendingSignals:
-    async def pending_deliveries(self, *, statuses=("pending", "unknown")):
+    async def pending_deliveries(self, **query_options):
         return []
 
 
@@ -284,5 +291,127 @@ async def test_the_live_path_records_the_bar_it_fed(monkeypatch):
         await deliver_live(runner, history[2])
         assert strategy.decided_on == [history[2].open_time]
         assert candle_store.recorded == [history[2].open_time]
+    finally:
+        await runner.stop()
+
+
+async def test_a_missing_middle_close_is_replayed_before_the_next_live_decision(monkeypatch):
+    allow_catch_up_within(monkeypatch, 86_400)
+    history = completed_bars(3)
+    candle_store = CandleStore(history[:1])
+    runner, strategy_slot, strategy = build_runner(monkeypatch, candle_store)
+    await runner.start()
+    try:
+        candle_store.candles = history
+        await deliver_live(runner, history[2])
+        assert list(strategy_slot.buffer) == history
+        assert strategy.decided_on == [history[1].open_time, history[2].open_time]
+        await deliver_live(runner, history[1])
+        await deliver_live(runner, history[2])
+        assert len(strategy.decided_on) == 2
+    finally:
+        await runner.stop()
+
+
+async def test_periodic_sync_repairs_a_lost_final_message_without_another_tick(monkeypatch):
+    allow_catch_up_within(monkeypatch, 86_400)
+    monkeypatch.setattr("qte_strategy_engine.runner.runner_settings.history_sync_interval", 0.01)
+    history = completed_bars(3)
+    candle_store = CandleStore(history[:1])
+    runner, strategy_slot, strategy = build_runner(monkeypatch, candle_store)
+    await runner.start()
+    try:
+        candle_store.candles = history
+
+        async def wait_for_sync():
+            while len(strategy_slot.buffer) < len(history):
+                await asyncio.sleep(0.001)
+
+        await asyncio.wait_for(wait_for_sync(), timeout=1)
+        assert strategy.decided_on == [history[1].open_time, history[2].open_time]
+    finally:
+        await runner.stop()
+
+
+async def test_late_backfill_warms_a_cold_runner_before_its_first_live_decision(monkeypatch):
+    allow_catch_up_within(monkeypatch, 86_400)
+    history = completed_bars(6)
+    candle_store = CandleStore([])
+    runner, strategy_slot, strategy = build_runner(monkeypatch, candle_store)
+    strategy.warmup = 5
+    await runner.start()
+    try:
+        assert not strategy_slot.is_warm
+        candle_store.candles = history
+        await deliver_live(runner, history[-1])
+        assert list(strategy_slot.buffer) == history
+        assert strategy.decided_on == [history[-1].open_time]
+        assert strategy_slot.is_warm
+    finally:
+        await runner.stop()
+
+
+async def test_late_backfill_also_fills_history_before_an_existing_short_buffer(monkeypatch):
+    allow_catch_up_within(monkeypatch, 86_400)
+    history = completed_bars(6)
+    candle_store = CandleStore(history[3:5])
+    runner, strategy_slot, strategy = build_runner(monkeypatch, candle_store)
+    strategy.warmup = 5
+    await runner.start()
+    try:
+        candle_store.candles = history
+        await deliver_live(runner, history[-1])
+        assert list(strategy_slot.buffer) == history
+        assert strategy.decided_on == [history[-1].open_time]
+    finally:
+        await runner.stop()
+
+
+async def test_live_reconciliation_excludes_later_cached_bars(monkeypatch):
+    allow_catch_up_within(monkeypatch, 86_400)
+    history = completed_bars(4)
+    candle_store = CandleStore(history[:1])
+    runner, strategy_slot, strategy = build_runner(monkeypatch, candle_store)
+    await runner.start()
+    try:
+        candle_store.candles = history
+        await deliver_live(runner, history[2])
+        assert list(strategy_slot.buffer) == history[:3]
+        assert history[3].open_time not in strategy.decided_on
+    finally:
+        await runner.stop()
+
+
+async def test_live_reconciliation_does_not_invent_session_break_bars(monkeypatch):
+    allow_catch_up_within(monkeypatch, 86_400)
+    history = completed_bars(6)
+    candle_store = CandleStore(history[:1])
+    runner, strategy_slot, _ = build_runner(monkeypatch, candle_store)
+    await runner.start()
+    try:
+        candle_store.candles = [history[0], history[4], history[5]]
+        await deliver_live(runner, history[5])
+        assert list(strategy_slot.buffer) == candle_store.candles
+    finally:
+        await runner.stop()
+
+
+async def test_cold_periodic_sync_does_not_swallow_the_first_post_start_close(monkeypatch):
+    allow_catch_up_within(monkeypatch, 86_400)
+    history = completed_bars(2)
+    candle_store = CandleStore([])
+    runner, strategy_slot, strategy = build_runner(monkeypatch, candle_store)
+    await runner.start()
+    try:
+        runner._history_started_at = bucket_close(history[1].open_time, "M15") - timedelta(
+            seconds=1
+        )
+        candle_store.candles = history
+        async with strategy_slot.lock:
+            await runner._sync_history(strategy_slot)
+        assert list(strategy_slot.buffer) == history
+        assert strategy.decided_on == [history[1].open_time]
+        await deliver_live(runner, history[1])
+        assert len(strategy.decided_on) == 1
     finally:
         await runner.stop()

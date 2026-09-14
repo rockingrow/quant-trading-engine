@@ -179,6 +179,7 @@ async def test_discarding_removes_candles_open_bar_and_outbox_but_no_cycle(monke
     assert fake_client.deleted == [
         redis_state.key("candles", "XAUUSD", "M15"),
         redis_state.key("open_candle", "XAUUSD", "M15"),
+        redis_state.key("staged", "XAUUSD", "M15"),
         redis_state.key("outbox", "candles"),
     ]
     assert not [deleted_key for deleted_key in fake_client.deleted if ":cycle:" in deleted_key]

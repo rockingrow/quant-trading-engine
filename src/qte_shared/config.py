@@ -92,6 +92,8 @@ class BrokerSettings(BaseSettings):
     # it would do live — build the signal, log it, audit it — but stops short of
     # handing it to the broker.
     shadow_mode: bool = True
+    #: Deployment safety override; persisted or broadcast controls cannot disable it.
+    force_shadow_mode: bool = False
 
 
 class AccountSettings(BaseSettings):

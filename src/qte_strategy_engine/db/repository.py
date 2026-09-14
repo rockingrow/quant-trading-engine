@@ -6,12 +6,13 @@ import uuid
 from collections.abc import Sequence
 from datetime import datetime
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, or_, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert
 
 from qte_shared.db.session import Database, get_database
 from qte_shared.logging_setup import get_logger
 from qte_shared.models import BrokerSignal, OpenPosition
+from qte_shared.strategies.signal_serialization import signal_record
 from qte_strategy_engine.db.models import OpenPositionRow, SignalAudit
 
 log = get_logger(__name__)
@@ -44,7 +45,7 @@ class SignalRepository:
             signal,
             row_id=delivery_id,
             transport=transport,
-            delivery_status="pending",
+            delivery_status="prepared",
             shadow=shadow,
             recovery_context=recovery_context,
         )
@@ -74,12 +75,12 @@ class SignalRepository:
         try:
             row_id = uuid.UUID(delivery_id)
             async with self._db.session() as session:
-                await session.execute(
+                execution = await session.execute(
                     update(SignalAudit)
                     .where(SignalAudit.id == row_id)
                     .values(delivery_status=status, delivery_error=error)
                 )
-            return True
+            return execution.rowcount == 1
         except Exception as exc:
             log.error("Could not mark signal delivery %s as %s: %s", delivery_id, status, exc)
             return False
@@ -88,17 +89,39 @@ class SignalRepository:
         self,
         limit: int = 100,
         *,
-        statuses: tuple[str, ...] = ("pending", "unknown"),
+        statuses: tuple[str, ...] = (
+            "prepared",
+            "pending",
+            "unknown",
+            "sent_pending",
+            "shadow_pending",
+        ),
+        after_cursor: tuple[datetime, uuid.UUID] | None = None,
+        include_ids: Sequence[str] = (),
     ) -> Sequence[SignalAudit]:
         """Outbox rows whose final broker outcome is not known yet."""
         statement = (
             select(SignalAudit)
-            .where(SignalAudit.delivery_status.in_(statuses))
-            .order_by(SignalAudit.created_at.asc())
+            .where(
+                or_(
+                    SignalAudit.delivery_status.in_(statuses),
+                    SignalAudit.id.in_([uuid.UUID(identifier) for identifier in include_ids]),
+                )
+            )
+            .order_by(SignalAudit.created_at.asc(), SignalAudit.id.asc())
             .limit(limit)
         )
+        if after_cursor is not None:
+            statement = statement.where(
+                tuple_(SignalAudit.created_at, SignalAudit.id) > after_cursor
+            )
         async with self._db.session() as session:
             return (await session.execute(statement)).scalars().all()
+
+    async def get_delivery(self, delivery_id: str) -> SignalAudit | None:
+        """Refresh a scanned row after acquiring its pair lock."""
+        async with self._db.session() as session:
+            return await session.get(SignalAudit, uuid.UUID(delivery_id))
 
     async def record_signal(
         self,
@@ -186,7 +209,7 @@ def _signal_row(
         sl=signal.position.sl,
         tp1=signal.position.tp1,
         tp2=signal.position.tp2,
-        payload=signal.to_envelope(),
+        payload={"payload": signal_record(signal)},
         indicators=signal.indicators,
         inputs=audit_inputs,
         transport=transport,

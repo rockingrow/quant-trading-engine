@@ -29,7 +29,7 @@ uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --timeframe M15 \
 | `diagnostics` | Findings, most severe first, each with its threshold, its evidence and one concrete change. |
 | `activity` | Trades taken, entries rejected, signals emitted. |
 | `trades` | Every trade — entry, exit, bars held, initial risk, R-multiple, MAE/MFE, and each partial leg. |
-| `signals` | The exact broker payloads the run would have published. |
+| `signals` | Broker trading fields the run would have published; authentication token omitted. |
 
 Two design choices to know about:
 
