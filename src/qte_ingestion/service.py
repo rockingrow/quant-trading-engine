@@ -55,8 +55,6 @@ from qte_shared.logging_setup import get_logger
 from qte_shared.market_data_plan import SymbolFeed
 from qte_shared.models import Candle, CandleClosedEvent, Tick, TickEvent
 from qte_shared.providers import create_provider
-from qte_shared.symbols import build_specs
-from qte_shared.timeframes import normalize_timeframe
 
 log = get_logger(__name__)
 
@@ -73,25 +71,10 @@ class RetiredCandle:
 
 
 def resolve_subscriptions() -> list[SymbolFeed]:
-    """What this process subscribes to, and where that was decided.
-
-    ``config/<provider>.toml`` is the answer when it exists: it states the
-    symbols, each one's market and the timeframes it is resampled to, which is
-    the only form that can differ per symbol. With no plan on disk the engine
-    falls back to what it read before the file existed —
-    ``QTE_ENGINE__SYMBOLS`` × ``QTE_ENGINE__TIMEFRAMES``, with every symbol's
-    market from ``QTE_INGESTION__MARKET_OVERRIDES`` — which is what a simulator
-    dev stack runs on.
-    """
-    plan = market_data_plan()
-    if plan.feeds:
-        return list(plan.feeds)
-
-    timeframes = tuple(normalize_timeframe(label) for label in settings.engine.timeframes)
-    return [
-        SymbolFeed(symbol=spec.symbol, market=spec.market, timeframes=timeframes)
-        for spec in build_specs(settings.engine.symbols, ingestion_settings.market_overrides)
-    ]
+    """Use the shared precedence rules, preserving an intentionally empty plan."""
+    return settings.engine.resolve_subscriptions(
+        market_data_plan(), ingestion_settings.market_overrides
+    )
 
 
 class IngestionService:
@@ -99,6 +82,11 @@ class IngestionService:
 
     def __init__(self) -> None:
         self.subscriptions = resolve_subscriptions()
+        if not self.subscriptions:
+            raise ValueError(
+                "Market-data configuration enables no subscriptions. Enable a planned symbol "
+                "or configure QTE_ENGINE__SYMBOLS and timeframes before starting ingestion."
+            )
         self.specs = [feed.spec for feed in self.subscriptions]
         #: Every timeframe anything is resampled to — for the log, the start
         #: event and the outbox drain. What a given symbol gets is its own

@@ -18,20 +18,28 @@ name: qte
 
 services:
   data-ingestion:
+    environment:
+      QTE_ENV: dev
     volumes:
       - ./src:/app/src
 
   strategy-runner:
+    environment:
+      QTE_ENV: dev
     volumes:
       - ./src:/app/src
 
   market-simulator:
+    environment:
+      QTE_ENV: dev
     volumes:
       - ./src:/app/src
 
   # The one-shot migrator reads the migrations tree and alembic.ini too, so a
   # migration can be iterated without rebuilding its image.
   db-migrate:
+    environment:
+      QTE_ENV: dev
     volumes:
       - ./src:/app/src
       - ./migrations:/app/migrations

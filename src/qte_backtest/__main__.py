@@ -167,10 +167,13 @@ def _download_targets(args: argparse.Namespace) -> list[tuple[str, str, str]]:
     ``--market`` is required rather than guessed.
     """
     plan = market_data_plan()
-    if not args.symbol and not args.timeframe and plan.feeds:
+    if not args.symbol and not args.timeframe and plan:
+        subscriptions = settings.engine.resolve_subscriptions(
+            plan, settings.market_stream.market_overrides
+        )
         return [
             (feed.symbol, timeframe, args.market or feed.market)
-            for feed in plan.feeds
+            for feed in subscriptions
             for timeframe in feed.timeframes
         ]
     if args.market is None:

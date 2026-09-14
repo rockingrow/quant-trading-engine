@@ -62,7 +62,7 @@ without the file it writes.
 **Production — the whole stack in Docker.**
 
 ```bash
-make up        # build and start; a one-shot db-migrate container creates the schema first
+make start-prod  # production images and QTE_ENV=prod; migrate before apps start
 make logs
 ```
 
@@ -75,8 +75,9 @@ turn shadow mode off — see
 
 **Development — no vendor key, no market open.**
 
-`make dev` is the same stack with `src/` bind-mounted for live editing, and
-`QTE_MARKET_DATA__PROVIDER=simulator` swaps the vendor for a WebSocket feed you
+`make dev` enables the simulator profile, sets `QTE_ENV=dev` and bind-mounts
+`src/` for live editing. Plain `make up` / `make start` exclude the simulator.
+Set `QTE_MARKET_DATA__PROVIDER=simulator` to swap the vendor for a WebSocket feed you
 drive by hand, so the real pipeline runs on invented prices.
 
 👉 [`docs/simulator.md`](docs/simulator.md) is the step-by-step walkthrough.
@@ -732,10 +733,10 @@ make tiingo                          # config/tiingo.toml — symbols, timeframe
 make strategy-mapping                # config/strategies_mapping.toml, git-ignored — edit it
 make audit-strict                    # fails on anything the runner would skip
 
-# 5. Up. `make up` freezes the plugin repos' requirements into deploy/ first,
+# 5. `make start-prod` freezes plugin requirements into deploy/ first,
 #    and a one-shot db-migrate container creates the schema before the services
 #    start.
-make up
+make start-prod
 make logs
 ```
 

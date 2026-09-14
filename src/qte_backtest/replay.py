@@ -56,7 +56,7 @@ class MarketWindow:
     close), so the shape is the market's, only coarser.
 
     ``benchmark_close`` is the close of the first bar the strategy could act on
-    — the bar after warm-up — which is what a buy-and-hold comparison has to be
+    — the bar completing warm-up — which is what a buy-and-hold comparison has to be
     anchored to. Anchoring it at the first bar of the file would credit or
     charge the benchmark for a stretch the strategy was never allowed to trade.
     """
@@ -180,7 +180,7 @@ class BacktestEngine:
             raise ValueError(f"No history to replay for {self.symbol} {self.timeframe}")
 
         warmup = max(self.strategy.warmup, 1)
-        if len(frame) <= warmup:
+        if len(frame) < warmup:
             raise ValueError(
                 f"{len(frame)} bars is not enough for a strategy needing {warmup} of warm-up"
             )
@@ -193,13 +193,13 @@ class BacktestEngine:
         context = StrategyContext(
             symbol=self.symbol,
             timeframe=self.timeframe,
-            now=_as_datetime(frame.index[warmup]),
+            now=_as_datetime(frame.index[warmup - 1]),
             mode="backtest",
             params=self.strategy.params,
         )
         self.strategy.on_start(context)
 
-        for position in range(warmup, len(frame)):
+        for position in range(warmup - 1, len(frame)):
             bar_time = _as_datetime(frame.index[position])
             bar = frame.iloc[position]
 
@@ -361,7 +361,7 @@ def sample_market(frame: pd.DataFrame, warmup: int, rows: int = MARKET_ROWS) -> 
             ]
         )
 
-    anchor = min(warmup, len(frame) - 1)
+    anchor = min(max(warmup - 1, 0), len(frame) - 1)
     return MarketWindow(
         bucket_bars=bucket,
         rows=ohlc,

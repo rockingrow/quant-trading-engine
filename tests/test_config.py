@@ -9,7 +9,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from qte_shared.config import REPO_ROOT, _find_repo_root, settings
+import pytest
+from sqlalchemy.engine import make_url
+
+from qte_shared.config import REPO_ROOT, PostgresSettings, _find_repo_root, settings
 
 MARKER = '[project]\nname = "x"\n\n[tool.qte]\nrepo-root = true\n'
 
@@ -73,3 +76,35 @@ def test_no_stray_path_assumptions_survive_outside_the_root():
     # REPO_ROOT must be an ancestor of the package, never a sibling or below it.
     package = Path(__file__).resolve().parents[1] / "src" / "qte_shared"
     assert package.is_relative_to(REPO_ROOT)
+
+
+@pytest.mark.parametrize("credential", ['literal@:/?#%$&" value', "", "ordinary"])
+def test_postgres_components_round_trip_reserved_password_characters(credential):
+    database_config = PostgresSettings(
+        dsn="",
+        username="reader@desk",
+        password=credential,
+        hostname="postgres-audit",
+        database="custom_audit",
+        port_number=6432,
+    )
+    database_url = make_url(database_config.dsn)
+    assert database_url.username == "reader@desk"
+    assert database_url.password == credential
+    assert database_url.host == "postgres-audit"
+    assert database_url.port == 6432
+    assert database_url.database == "custom_audit"
+
+
+def test_explicit_postgres_url_wins_over_component_defaults():
+    explicit_dsn = "postgresql+asyncpg://reader:synthetic%40value@database.example/audit"
+    database_config = PostgresSettings(dsn=explicit_dsn, hostname="ignored")
+    assert database_config.dsn == explicit_dsn
+
+
+def test_test_process_does_not_inherit_operator_credentials_or_deployment_mode():
+    assert settings.env == "dev"
+    assert settings.broker.token == settings.broker.nats_token == settings.nats.token == ""
+    assert settings.broker.shadow_mode is True
+    assert settings.account.capital == 1000
+    assert not settings.market_data.plan_file.exists()

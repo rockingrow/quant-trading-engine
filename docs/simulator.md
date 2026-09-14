@@ -92,7 +92,7 @@ QTE_RUNNER__DEFAULT_QUANTITY=0.01
 # ── Market data: the dev simulator, not a vendor ──────────────────────
 # The simulator needs no key and no plan file. Point this at `tiingo` and the
 # symbols, timeframes and vendor knobs come from config/tiingo.toml
-# (`make tiingo`) — `make start` checks it is there.
+# (`make tiingo`) — `make dev` checks it is there.
 QTE_MARKET_DATA__PROVIDER=simulator
 QTE_DATA_PROVIDER_API_KEY=
 
@@ -144,7 +144,7 @@ make simulator
 
 That copies `config/simulator.example.toml` to the git-ignored
 `config/simulator.toml` (comments stripped), pinning one symbol: `XAUUSD` at
-`M15`. `make start` refuses to come up without it. To test another pair, edit
+`M15`. `make dev` refuses to come up without it. To test another pair, edit
 `config/simulator.toml`, the strategy and the mapping together.
 
 ## 2. Install and map the example strategy
@@ -187,12 +187,12 @@ loads each of them — a `false` entry is skipped, so re-run
 `make strategy-mount STRATEGY=<name>` once you have fixed what the audit
 found. `make strategy-requirements` freezes audited mounts'
 dependencies into `deploy/` for the images, creating that directory when
-needed. `make start` runs this step for you.
+needed. `make dev` runs this step for you.
 
 ## 3. Bring up and check the stack
 
 ```bash
-make start
+make dev
 docker compose ps -a
 docker compose logs --tail=50 db-migrate data-ingestion strategy-runner
 make sim-status
@@ -200,6 +200,11 @@ make sim-status
 
 `db-migrate` runs `alembic upgrade head`; ingestion and runner wait for its
 successful exit. No separate `make db-upgrade` is needed.
+
+`make dev` enables the simulator profile, sets `QTE_ENV=dev` for the app
+processes and mounts `src/` for local editing. Plain `make up` and `make start`
+leave the simulator out. To run the dev images without source mounts, use
+`docker compose --profile dev up -d --build` with `QTE_ENV=dev` in `.env`.
 
 | Service | Expected state |
 | --- | --- |
@@ -244,7 +249,7 @@ make dev-restart
 `make dev` bind-mounts `src/`; Python processes pick up edits after restart.
 `dev-restart` restarts ingestion and runner, preserving the simulator clock.
 `make restart` rebuilds/recreates those same two services. Dependency or
-migration changes need `make dev` or `make start` again. Changes to simulator
+migration changes need `make dev` again. Changes to simulator
 code require restarting that service itself; read section 6 before continuing
 an existing series.
 
@@ -499,7 +504,7 @@ simulator, or `down` followed by `start`, can leave it behind the restored
 future bar. Restarting both processes does not remove persisted state.
 
 For independent scenarios, stop the old project and select a new
-`COMPOSE_PROJECT_NAME` in this rehearsal's `.env` before `make start`.
+`COMPOSE_PROJECT_NAME` in this rehearsal's `.env` before `make dev`.
 That retains previous results and gives the new scenario empty volumes.
 
 `make sim-reset` is destructive: it clears the selected Redis database using
@@ -523,7 +528,7 @@ neither command is required for this walkthrough.
 | No final candle | Check `--no-seal`, timeframe, timeout and ingestion logs. |
 | Watcher misses logged candles | Compare NATS endpoints and subject prefix. |
 | Host CLI cannot connect after port change | Update URLs as well as published ports. |
-| Container strategy import fails | Re-run `make strategy-mount` and `make start` to install dependencies. |
+| Container strategy import fails | Re-run `make strategy-mount` and `make dev` to install dependencies. |
 
 ## Command reference
 
@@ -570,13 +575,11 @@ An idle simulator cannot race Tiingo: ingestion selects one provider.
 To start only the vendor app services and their dependencies:
 
 ```bash
-make market-plan
-make strategy-requirements
-docker compose up -d --build data-ingestion strategy-runner
+make start-prod
 docker compose stop market-simulator
 ```
 
-Plain `make start` also starts the simulator. Broker delivery is a separate
+Plain `make start` excludes the simulator. Broker delivery is a separate
 setup described in [README.md](../README.md).
 
 ## Related reading

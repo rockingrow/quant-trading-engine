@@ -160,6 +160,7 @@ class StrategyRunner:
                     "private strategy repo into __strategies__/ (see README, phase 6)."
                 )
 
+            self._validate_tick_publication()
             await self._restore_state()
             await self._recover_pending_deliveries()
             # Every slot is held while the subscriptions go live and the missed
@@ -566,6 +567,19 @@ class StrategyRunner:
             position.remaining,
         )
 
+    def _wants_ticks(self) -> bool:
+        return runner_settings.subscribe_ticks or any(
+            overrides_on_tick(strategy_slot.strategy) for strategy_slot in self.slots
+        )
+
+    def _validate_tick_publication(self) -> None:
+        """Reject a book whose tick callbacks would never receive market data."""
+        if self._wants_ticks() and not settings.market_stream.publish_ticks:
+            raise RuntimeError(
+                "Runner requires ticks, but QTE_INGESTION__PUBLISH_TICKS is false. "
+                "Set it to true for both ingestion and runner before starting this book."
+            )
+
     async def _subscribe(self) -> None:
         for symbol, timeframe in sorted(self._by_subject):
             await self.bus.subscribe(
@@ -575,12 +589,9 @@ class StrategyRunner:
             )
         await self.bus.subscribe(self.subjects.engine_control(), self._on_control_message)
 
-        wants_ticks = runner_settings.subscribe_ticks or any(
-            overrides_on_tick(slot.strategy) for slot in self.slots
-        )
-        if wants_ticks:
+        if self._wants_ticks():
             await self.bus.subscribe(self.subjects.tick_wildcard(), self._on_tick_message)
-            log.info("Tick subscription active — a strategy overrides on_tick")
+            log.info("Tick subscription active — tick publication is required")
 
     # ── Message handlers ──────────────────────────────────────────────
 

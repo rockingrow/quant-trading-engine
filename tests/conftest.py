@@ -3,10 +3,36 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import numpy as np
 import pandas as pd
 import pytest
+from pydantic_settings import DotEnvSettingsSource
+
+
+def pytest_configure(config):
+    """Choose test configuration before collection imports application globals.
+
+    Deployment secrets, mode and private plans must never become test inputs.
+    Individual tests can still set environment variables or patch settings to
+    exercise production refusals and configuration precedence explicitly.
+    """
+    import os
+
+    isolated = pytest.MonkeyPatch()
+    config.add_cleanup(isolated.undo)
+    directory = TemporaryDirectory(prefix="qte-test-config-")
+    config.add_cleanup(directory.cleanup)
+    for variable in tuple(os.environ):
+        if variable.startswith("QTE_"):
+            isolated.delenv(variable)
+    isolated.setenv("QTE_ENV", "dev")
+    isolated.setenv("QTE_MARKET_DATA__CONFIG_FILE", str(Path(directory.name) / "missing.toml"))
+    isolated.setenv("QTE_ENGINE__MAPPING_FILE", str(Path(directory.name) / "mapping.toml"))
+    isolated.setattr("dotenv.load_dotenv", lambda *arguments, **keywords: False)
+    isolated.setattr(DotEnvSettingsSource, "_read_env_files", lambda self: {})
 
 
 @pytest.fixture

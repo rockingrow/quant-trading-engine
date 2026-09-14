@@ -1,0 +1,12 @@
+# Production images with an explicit mode; broker shadow controls remain in .env.
+# `make start-prod` selects only the applications, migrator and dependencies.
+services:
+  data-ingestion:
+    environment:
+      QTE_ENV: prod
+  strategy-runner:
+    environment:
+      QTE_ENV: prod
+  db-migrate:
+    environment:
+      QTE_ENV: prod

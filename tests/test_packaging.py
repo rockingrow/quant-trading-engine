@@ -311,10 +311,11 @@ def test_the_numpy_ceiling_the_plugins_need_is_declared() -> None:
 
 
 def test_the_simulator_still_refuses_outside_dev():
-    """``docker compose up`` starts the simulator, so the in-process guard is
-    what stands between an invented feed and a non-dev environment. Both
-    server and provider call ``require_dev_env()``; if either loses that call
-    a compose ``up`` would happily fabricate prices in staging or prod."""
+    """An explicitly selected simulator must still refuse a non-dev environment.
+
+    Profiles control startup selection; both server and provider retain the
+    independent ``require_dev_env()`` check against synthetic production data.
+    """
     server = (SRC / "qte_simulator" / "server.py").read_text(encoding="utf-8")
     provider = (SRC / "qte_shared" / "providers" / "simulator" / "provider.py").read_text(
         encoding="utf-8"

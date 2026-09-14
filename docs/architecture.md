@@ -412,6 +412,11 @@ a plugin would win.
 
 ## Why the strategy sees a bounded window
 
+Both drivers first decide when the closed history contains `warmup` bars,
+including the bar just closed. Replay starts at index `warmup - 1`, and its
+buy-and-hold benchmark starts at that same close. Exactly `warmup` input bars
+are enough for one decision; a shorter history is rejected.
+
 `StrategyBase.history_window()` is read by *both* drivers, and that is the whole
 point of it existing. Before it did, the live runner kept a deque of
 `max(warmup * 2, 400)` candles while the backtest passed `frame.iloc[:i+1]` —
@@ -430,6 +435,22 @@ runner will. Making it faster means incremental indicators that carry state
 between bars, which is a real design change rather than a tuning exercise.
 
 ## Why each service builds its own image
+
+Default Compose startup includes the vendor applications and infrastructure.
+The simulator is behind the `dev` profile; `make dev` opts in and explicitly
+sets development mode. `make start-prod` uses the production overlay and an
+explicit application service list with `QTE_ENV=prod`. Redis, Postgres and
+NATS use `restart: unless-stopped`, matching the applications; the migration
+job remains one-shot. A stale runner ownership claim still needs the manual
+reconciliation described above after an unclean runner exit.
+
+Container Postgres URLs are built from the same `POSTGRES_USER`,
+`POSTGRES_PASSWORD` and `POSTGRES_DB` that initialize Postgres, using
+SQLAlchemy's URL builder to encode credentials. `QTE_POSTGRES__DSN` remains
+the host-tool URL; `QTE_CONTAINER_POSTGRES_DSN` explicitly overrides the URL
+inside containers. All applications and the migrator share that resolution.
+Changing initialization variables does not rename users or databases in an
+existing Postgres volume.
 
 This used to be a uv workspace of six distributions, and `uv sync --package`
 cut the images along that seam. It no longer is, because the seam was in the
@@ -455,6 +476,22 @@ dependency was only ever a proxy for the import — but it is a check somebody
 has to keep running, where the resolver enforced it for free.
 
 ## Why the market data vendor sits behind an interface
+
+Explicit `QTE_ENGINE__SYMBOLS` and `QTE_ENGINE__TIMEFRAMES` override the plan.
+A symbol override selects the exact symbol list; without a timeframe override,
+existing symbols keep their individual planned timeframes and new symbols use
+the engine's timeframe list. A timeframe override applies to every selected
+symbol. Planned markets stay authoritative; a new symbol requires a market in
+`QTE_INGESTION__MARKET_OVERRIDES`. Ingestion and unqualified history downloads
+use the same resolver. A present plan with no enabled symbols stays empty;
+only a missing plan uses default symbols and timeframes.
+
+`QTE_INGESTION__PUBLISH_TICKS` is shared deployment configuration, read by both
+ingestion and runner. When a strategy overrides `on_tick`, or the runner's
+explicit tick subscription is enabled, startup refuses a false publication
+setting before restoring positions or recovering deliveries. Set the variable
+consistently in both processes; Compose uses the shared `.env` for this. This
+checks configuration compatibility, not whether the upstream feed is healthy.
 
 Tiingo used to be spelled out in three places: a WebSocket client inside
 `data_ingestion`, a REST downloader inside `backtest_engine`, a `tiingo_ticker`
