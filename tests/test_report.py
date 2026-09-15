@@ -90,7 +90,7 @@ def test_the_run_block_records_what_was_actually_tested(report):
 def test_the_data_block_states_the_span_and_its_gaps(report):
     data = report.to_dict()["data"]
     assert data["bars"] == 400
-    assert data["bars_after_warmup"] == 380
+    assert data["bars_after_warmup"] == 381
     assert data["first_bar"] < data["last_bar"]
     assert data["gaps"] == 0  # the fixture is a contiguous M15 series
 

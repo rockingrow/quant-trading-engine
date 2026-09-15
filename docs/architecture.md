@@ -5,8 +5,8 @@ are.
 
 ## Why two NATS namespaces
 
-`QTE.*` is ours — ticks and candle closes, on **core** NATS. At twenty ticks a
-second a dropped tick is replaced by a fresher one immediately, so paying
+`QTE.<env>.<mode>.<provider>.*` is ours — ticks and candle closes, on **core**
+NATS. At twenty ticks a second a dropped tick is replaced by a fresher one immediately, so paying
 JetStream's persistence cost for raw market data buys nothing. Candle closes
 are different: ingestion stages them in a Redis outbox before publishing and
 only removes them after Core NATS accepts the publish. A crash can replay a
@@ -89,19 +89,52 @@ the last write. The runner rebuilds its indicator window from Redis on boot
 instead of waiting hours for live candles, which is what makes a restart resume
 trading on the next close.
 
-Two keys make that rebuild trustworthy. `qte:decided:<strategy>:<symbol>:<tf>`
+Two keys make that rebuild trustworthy. `qte:<namespace>:decided:<strategy>:<symbol>:<tf>`
 holds the newest bar each pair was fed. Closes published while the runner was
 down or still starting are the bars newer than it, and the runner replays them
 once subscribed — deciding only on those that closed within
 `QTE_RUNNER__CATCH_UP_MAX_AGE`, because a late entry trades a price the backtest
-never saw. `qte:history:provider` names the feed that wrote the candle state:
+never saw. `qte:<namespace>:history:provider` names the feed that wrote the candle state:
 before anything reads it back, ingestion discards candle lists, open bars and
 staged closes that another provider wrote, that no provider was recorded for,
 or that are dated after now. Positions are never part of that discard.
 
-Postgres is the audit trail — written *after* the signal has gone out, and its
-failures are logged rather than raised. A logging outage must not become a
-runner that stops trading.
+Postgres stages each signal as `prepared` before it can go out. The runner
+records `unknown` before calling the broker, then `sent_pending` or
+`shadow_pending` before persisting the resulting position to both stores.
+Only after those writes succeed does the row become `sent` or `shadow`.
+Every unfinished phase is revisited with keyset pagination, and its pair
+cannot decide again until all older rows are reconciled. Accepted rows only
+retry local persistence; they never resend to the broker.
+
+An ambiguous live result, including legacy `pending` rows, requires operator
+reconciliation by default. `QTE_RUNNER__DELIVERY_RETRY_MAX_AGE` can opt into
+retries only inside a verified broker deduplication horizon. It must leave room
+for the publish timeout and network latency; the engine does not infer a
+guarantee from an HTTP header or assume NATS retains message ids forever.
+
+The runner also reconciles Redis before processing a new live close and every
+`QTE_RUNNER__HISTORY_SYNC_INTERVAL` seconds. Missing cached bars are replayed in
+order with the same decision-age limit. Cold windows incorporate backfill that
+finishes after startup; initial history warms without inventing past decisions.
+Only actual cached bars fill gaps, so closed market sessions create no fake bars.
+
+**One active runner per Redis namespace.** A non-expiring `runner:owner` claim
+is acquired before restoration or subscriptions and checked before decisions
+and delivery. Graceful shutdown drains callbacks before releasing it. A second
+process refuses to start; queue groups do not provide shared strategy state.
+There is deliberately no lease timeout or automatic takeover without broker
+fencing. After a crash, stop and verify the previous runner is gone, reconcile
+outstanding broker outcomes, then explicitly remove only that namespace's stale
+ownership key before restarting. Never clear it while an owner may still run.
+Redis persistence and retention of this key are required; do not flush or evict
+the trading namespace while runners are active.
+
+Ingestion keeps each retired candle, including its partial-bar repair state,
+until Redis acknowledges staging. It retries that batch before retiring more
+bars, bounding the backlog by configured series. Redis stages history and the
+candle outbox with an atomic per-series watermark, so a lost response can be
+retried without duplicate history/events or deletion of a newer open candle.
 
 **The open position is the exception, and is written to both.** It is the one
 piece of hot state whose loss is not merely slow to recover from: a runner that
@@ -126,9 +159,14 @@ Four things a strategy is not allowed to own, all in `SignalFactory`:
    that sized itself would be sizing against a number it invented.
 4. **Timeframe spelling** — QTE says `M15`, the broker's contract says `"15"`.
 
-Because both drivers go through the factory, a signal in a backtest report is
-byte-identical to the one a worker would have executed. Reconciliation compares
-two rows, not two implementations.
+Both drivers reject an intent naming a symbol other than its slot before
+building or committing it. Risk sizing rounds down; an invalid budget or a
+quantity below the supported step rejects the trade rather than choosing a
+fallback. The ceiling also applies to fallback quantities.
+
+Because both drivers go through the factory, the trading fields in a backtest
+report match those sent live. The sink injects the current broker credential
+only at delivery; reports, audit payloads and internal mirrors omit it.
 
 ## Why the plugin loader imports by path
 
@@ -331,9 +369,16 @@ process to keep alive, secure and monitor in exchange for a second way to reach
 the same data.
 
 The exception is shadow mode, which genuinely has to reach a *process that is
-already running* — flipping live/paper must not require a restart mid-position.
-That is one message on `QTE.control`, so `qte-control` publishes it straight to
+already running*. It pauses a live book without simulating position changes.
+Paper/live identity is selected at startup; see [state isolation](state-isolation.md).
+The pause is one message on `QTE.<env>.<mode>.<provider>.control`, sent straight to
 NATS and no service is needed to carry it.
+
+The runner reads the durable Redis flag before recovery and again before each
+delivery, including when a broadcast was lost. A delayed message cannot
+overwrite a newer flag. Missing state uses `QTE_BROKER__SHADOW_MODE`; malformed
+or unreadable state fails closed. `QTE_BROKER__FORCE_SHADOW_MODE=true` overrides
+both the persisted flag and runtime controls and never permits live delivery.
 
 Relatedly, `NatsBus.connect` bounds the *initial* connect even though reconnects
 are unlimited: nats-py applies `max_reconnect_attempts` to both, so `-1` (what a
@@ -368,6 +413,11 @@ a plugin would win.
 
 ## Why the strategy sees a bounded window
 
+Both drivers first decide when the closed history contains `warmup` bars,
+including the bar just closed. Replay starts at index `warmup - 1`, and its
+buy-and-hold benchmark starts at that same close. Exactly `warmup` input bars
+are enough for one decision; a shorter history is rejected.
+
 `StrategyBase.history_window()` is read by *both* drivers, and that is the whole
 point of it existing. Before it did, the live runner kept a deque of
 `max(warmup * 2, 400)` candles while the backtest passed `frame.iloc[:i+1]` —
@@ -386,6 +436,22 @@ runner will. Making it faster means incremental indicators that carry state
 between bars, which is a real design change rather than a tuning exercise.
 
 ## Why each service builds its own image
+
+Default Compose startup includes the vendor applications and infrastructure.
+The simulator is behind the `dev` profile; `make dev` opts in and explicitly
+sets development mode. `make start-prod` uses the production overlay and an
+explicit application service list with `QTE_ENV=prod`. Redis, Postgres and
+NATS use `restart: unless-stopped`, matching the applications; the migration
+job remains one-shot. A stale runner ownership claim still needs the manual
+reconciliation described above after an unclean runner exit.
+
+Container Postgres URLs are built from the same `POSTGRES_USER`,
+`POSTGRES_PASSWORD` and `POSTGRES_DB` that initialize Postgres, using
+SQLAlchemy's URL builder to encode credentials. `QTE_POSTGRES__DSN` remains
+the host-tool URL; `QTE_CONTAINER_POSTGRES_DSN` explicitly overrides the URL
+inside containers. All applications and the migrator share that resolution.
+Changing initialization variables does not rename users or databases in an
+existing Postgres volume.
 
 This used to be a uv workspace of six distributions, and `uv sync --package`
 cut the images along that seam. It no longer is, because the seam was in the
@@ -411,6 +477,22 @@ dependency was only ever a proxy for the import — but it is a check somebody
 has to keep running, where the resolver enforced it for free.
 
 ## Why the market data vendor sits behind an interface
+
+Explicit `QTE_ENGINE__SYMBOLS` and `QTE_ENGINE__TIMEFRAMES` override the plan.
+A symbol override selects the exact symbol list; without a timeframe override,
+existing symbols keep their individual planned timeframes and new symbols use
+the engine's timeframe list. A timeframe override applies to every selected
+symbol. Planned markets stay authoritative; a new symbol requires a market in
+`QTE_INGESTION__MARKET_OVERRIDES`. Ingestion and unqualified history downloads
+use the same resolver. A present plan with no enabled symbols stays empty;
+only a missing plan uses default symbols and timeframes.
+
+`QTE_INGESTION__PUBLISH_TICKS` is shared deployment configuration, read by both
+ingestion and runner. When a strategy overrides `on_tick`, or the runner's
+explicit tick subscription is enabled, startup refuses a false publication
+setting before restoring positions or recovering deliveries. Set the variable
+consistently in both processes; Compose uses the shared `.env` for this. This
+checks configuration compatibility, not whether the upstream feed is healthy.
 
 Tiingo used to be spelled out in three places: a WebSocket client inside
 `data_ingestion`, a REST downloader inside `backtest_engine`, a `tiingo_ticker`

@@ -154,7 +154,7 @@ def compute_metrics(
     curve = [equity]
     peak = equity
     max_drawdown = 0.0
-    max_drawdown_pct: float | None = None
+    max_drawdown_pct: float | None = 0.0 if peak > 0 else None
     streak = 0
     worst_streak = 0
     for value in pnls:
@@ -164,8 +164,9 @@ def compute_metrics(
         drawdown = peak - equity
         if drawdown > max_drawdown:
             max_drawdown = drawdown
-            if peak > 0:
-                max_drawdown_pct = round(100.0 * drawdown / peak, 4)
+        if peak > 0:
+            drawdown_percent = 100.0 * drawdown / peak
+            max_drawdown_pct = max(max_drawdown_pct or 0.0, drawdown_percent)
         streak = streak + 1 if value < 0 else 0
         worst_streak = max(worst_streak, streak)
 
@@ -175,7 +176,7 @@ def compute_metrics(
         metrics.return_pct = round(100.0 * metrics.net_pnl / starting_equity, 4)
     metrics.max_consecutive_wins = _longest_run(pnls, winning=True)
     metrics.max_drawdown = round(max_drawdown, 6)
-    metrics.max_drawdown_pct = max_drawdown_pct
+    metrics.max_drawdown_pct = round(max_drawdown_pct, 4) if max_drawdown_pct is not None else None
     metrics.max_consecutive_losses = worst_streak
     metrics.period_start = closed[0].opened_at
     metrics.period_end = closed[-1].closed_at or closed[-1].opened_at

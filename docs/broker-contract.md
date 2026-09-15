@@ -158,14 +158,22 @@ Two consequences worth stating plainly:
 - **QTE never creates or reconfigures the `SIGNALS` stream.** The broker owns
   it; editing another service's durability guarantees from here would be a bug.
 
-Each publish carries a fresh `Nats-Msg-Id` so a retry inside the stream's
-duplicate window is stored once.
+Each outbox row carries a stable `Nats-Msg-Id` across its retries. A confirmed
+send only retries local persistence. Ambiguous live sends require reconciliation
+unless `QTE_RUNNER__DELIVERY_RETRY_MAX_AGE` explicitly enables a bounded retry
+inside a verified broker duplicate window, including time for publication.
 
 ### `http`
 
 `POST {QTE_BROKER__HTTP_URL}/secret/webhook` with the payload as the JSON body.
 This path *does* verify `token` (`QTE_BROKER__TOKEN`, matched against the
 broker's). Use it across any boundary you do not control.
+
+The sink injects the current `QTE_BROKER__TOKEN` for both transports at send
+time. Reports, persisted audit/outbox payloads and internal signal mirrors omit
+the token, including when serializing a legacy signal that still contains one.
+Trading fields remain unchanged. Existing historical files and database rows
+are not automatically rewritten by this change.
 
 ## What QTE does not do
 

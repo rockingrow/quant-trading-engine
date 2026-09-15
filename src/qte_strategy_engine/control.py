@@ -7,10 +7,9 @@ listing strategies, reading the audit trail, running a backtest — is either a
 CLI command already or a SQL query, and neither of those needs a web service
 kept alive to answer it.
 
-Shadow mode is different. It is the live/paper switch, and flipping it must not
-require restarting the runner mid-position. So it travels the same way every
-other engine event does: a message on ``QTE.control``, published straight to
-NATS from here.
+The execution namespace selects paper or live at startup. Shadow mode pauses
+live delivery without converting broker positions into simulated ones. Its
+control message travels on the namespace-qualified NATS control subject.
 
 The flag is written to Redis first and broadcast second. A runner that starts
 *after* the broadcast reads Redis on boot, so it comes up in the mode you last
@@ -56,6 +55,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 async def _set_shadow_mode(enabled: bool) -> None:
+    state_scope = settings.state_scope
+    if not enabled and state_scope.is_paper:
+        raise SystemExit(
+            "Paper state cannot send broker orders; select QTE_STATE__MODE=live and restart"
+        )
+    if not enabled and settings.broker.force_shadow_mode:
+        raise SystemExit("QTE_BROKER__FORCE_SHADOW_MODE forbids disabling shadow mode")
     state = RedisState()
     try:
         await state.connect()
@@ -93,14 +99,17 @@ async def _set_shadow_mode(enabled: bool) -> None:
         payload={"enabled": enabled, "broadcast": broadcast},
     )
 
-    if enabled:
+    print(f"State namespace: {state_scope.namespace}")
+    if enabled and not state_scope.is_paper:
+        print("Live delivery PAUSED; no paper positions are created in this namespace.")
+    elif enabled:
         print("Shadow mode ON — signals are built and audited but will NOT reach the broker.")
     else:
         print("Shadow mode OFF — signals are going LIVE to the broker.")
     if not broadcast:
         print(
-            "WARNING: NATS was unreachable, so runners already running keep their old mode. "
-            "Restart them, or re-run this once NATS is back."
+            "WARNING: NATS was unreachable. Runners refresh the stored flag before their "
+            "next delivery and on periodic synchronization; use ping to check the running mode."
         )
 
 
@@ -114,13 +123,21 @@ async def _show_shadow_mode() -> None:
     finally:
         await state.close()
 
-    if stored is None:
+    if stored is not None and not isinstance(stored, bool):
+        raise SystemExit("Persisted shadow_mode is invalid; runners refuse delivery")
+    state_scope = settings.state_scope
+    print(f"State namespace: {state_scope.namespace}")
+    if state_scope.is_paper:
+        print("Shadow mode is ON (paper), enforced by QTE_STATE__MODE.")
+    elif settings.broker.force_shadow_mode:
+        print("Live delivery is PAUSED, forced by QTE_BROKER__FORCE_SHADOW_MODE.")
+    elif stored is None:
         print(
             f"No stored flag; runners fall back to QTE_BROKER__SHADOW_MODE="
             f"{settings.broker.shadow_mode}."
         )
     else:
-        print(f"Shadow mode is {'ON (paper)' if stored else 'OFF (live)'}.")
+        print(f"Live delivery is {'PAUSED' if stored else 'ENABLED'}.")
 
 
 async def _ping() -> None:

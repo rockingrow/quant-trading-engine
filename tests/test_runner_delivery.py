@@ -16,8 +16,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from qte_shared.config import settings
 from qte_shared.models import OpenPosition, SignalAction
 from qte_shared.strategies.signal_factory import SignalFactory
+from qte_shared.strategies.signal_serialization import signal_record
 from qte_shared.strategies.sizing import PositionSizer
 from qte_shared.strategies.strategy_base import SignalIntent, StrategyBase
 from qte_strategy_engine.broker_sink import DeliveryResult
@@ -39,6 +41,9 @@ class FailedSink:
     shadow_mode = False
     transport = "nats"
 
+    def set_shadow_mode(self, enabled):
+        self.shadow_mode = enabled
+
     async def send(self, signal, *, delivery_id=None):
         return DeliveryResult(status="failed", transport="nats", detail="no ack")
 
@@ -51,9 +56,23 @@ class RecordingSignals:
 
     async def stage_signal(self, signal, **delivery):
         delivery_id = str(uuid.uuid4())
-        metadata = {**delivery, "delivery_id": delivery_id, "delivery_status": "pending"}
+        metadata = {**delivery, "delivery_id": delivery_id, "delivery_status": "prepared"}
         self.rows.append((signal, metadata))
         self._by_id[delivery_id] = metadata
+        self.pending.append(
+            SimpleNamespace(
+                namespace=settings.state_scope.namespace,
+                id=uuid.UUID(delivery_id),
+                created_at=datetime.now(UTC),
+                strategy=signal.strategy,
+                symbol=signal.symbol,
+                payload={"payload": signal_record(signal)},
+                inputs={"__qte_outbox__": delivery.get("recovery_context", {})},
+                delivery_status="prepared",
+                transport=delivery["transport"],
+                shadow=delivery["shadow"],
+            )
+        )
         return delivery_id
 
     async def mark_delivery(self, delivery_id, *, status, error=None):
@@ -66,12 +85,28 @@ class RecordingSignals:
                 row.delivery_error = error
         return True
 
-    async def pending_deliveries(self, *, statuses=("pending", "unknown")):
-        return [row for row in self.pending if row.delivery_status in set(statuses)]
+    async def pending_deliveries(
+        self,
+        page_limit=100,
+        *,
+        statuses=("prepared", "pending", "unknown", "sent_pending", "shadow_pending"),
+        after_cursor=None,
+        include_ids=(),
+    ):
+        candidates = sorted(self.pending, key=lambda record: (record.created_at, record.id))
+        return [
+            record
+            for record in candidates
+            if (record.delivery_status in statuses or str(record.id) in include_ids)
+            and (after_cursor is None or (record.created_at, record.id) > after_cursor)
+        ][:page_limit]
 
     @staticmethod
     def recovery_context(row):
         return row.inputs.get("__qte_outbox__", {})
+
+    async def get_delivery(self, delivery_id):
+        return next((record for record in self.pending if str(record.id) == delivery_id), None)
 
 
 class RecordingBus:
@@ -84,6 +119,9 @@ class RecordingBus:
 
 async def test_failed_entry_delivery_does_not_create_a_ghost_live_cycle():
     runner = StrategyRunner(sink=FailedSink())
+    runner.state = FakeState()
+    runner.state.owner_id = runner._owner_id
+    runner._ownership_acquired = True
     runner.signals = RecordingSignals()
     runner.bus = RecordingBus()
     factory = SignalFactory("DELIVERY_PROBE", timeframe="M15", token="test")
@@ -116,6 +154,9 @@ class AcceptingSink:
     def __init__(self):
         self.delivery_ids = []
 
+    def set_shadow_mode(self, enabled):
+        self.shadow_mode = enabled
+
     async def send(self, signal, *, delivery_id=None):
         self.delivery_ids.append(delivery_id)
         return DeliveryResult(status="sent", transport="nats")
@@ -127,6 +168,29 @@ class FakeState:
     def __init__(self, held: dict | None = None) -> None:
         self.held = dict(held or {})
         self.cleared: list[tuple[str, str]] = []
+        self.flags = {}
+        self.owner_id = None
+
+    async def get_flag(self, flag_name, default=None):
+        return self.flags.get(flag_name, default)
+
+    async def set_flag(self, flag_name, flag_value):
+        self.flags[flag_name] = flag_value
+
+    async def claim_runner(self, owner_id):
+        if self.owner_id is not None:
+            return False
+        self.owner_id = owner_id
+        return True
+
+    async def owns_runner(self, owner_id):
+        return self.owner_id == owner_id
+
+    async def release_runner(self, owner_id):
+        if self.owner_id != owner_id:
+            return False
+        self.owner_id = None
+        return True
 
     async def get_open_position(self, strategy, symbol):
         return self.held.get((strategy, symbol))
@@ -164,6 +228,8 @@ def _runner(state=None, positions=None, sink=None):
     runner.signals = RecordingSignals()
     runner.bus = RecordingBus()
     runner.state = state or FakeState()
+    runner.state.owner_id = runner._owner_id
+    runner._ownership_acquired = True
     runner.positions = positions or FakePositions()
     return runner
 
@@ -288,6 +354,7 @@ async def test_a_signal_is_not_sent_when_the_durable_outbox_cannot_be_written():
 
 def _held(**kwargs) -> OpenPosition:
     defaults = {
+        "state_namespace": settings.state_scope.namespace,
         "signal_uxid": "9F2C4B7E18A3D605",
         "strategy": "DELIVERY_PROBE",
         "symbol": "XAUUSD",
@@ -349,10 +416,14 @@ async def test_startup_replays_a_pending_signal_with_its_original_delivery_id():
     intent = SignalIntent(action=SignalAction.LONG, price=2334.50, sl=2329.50)
     signal = source.factory.build(intent, symbol="XAUUSD", moment=MOMENT, commit=False)
     row = SimpleNamespace(
+        namespace=settings.state_scope.namespace,
         id=delivery_id,
+        created_at=datetime.now(UTC),
+        strategy=signal.strategy,
+        symbol=signal.symbol,
         payload=signal.to_envelope(),
         inputs={"__qte_outbox__": source.factory.pending_delivery_context("XAUUSD")},
-        delivery_status="pending",
+        delivery_status="prepared",
         delivery_error=None,
         transport="nats",
         shadow=False,
@@ -382,7 +453,11 @@ async def test_a_pending_shadow_signal_cannot_turn_live_during_recovery():
         commit=False,
     )
     row = SimpleNamespace(
+        namespace=settings.state_scope.namespace,
         id=delivery_id,
+        created_at=datetime.now(UTC),
+        strategy=signal.strategy,
+        symbol=signal.symbol,
         payload=signal.to_envelope(),
         inputs={"__qte_outbox__": source.factory.pending_delivery_context("XAUUSD")},
         delivery_status="pending",
@@ -398,8 +473,9 @@ async def test_a_pending_shadow_signal_cannot_turn_live_during_recovery():
     await runner._recover_pending_deliveries()
 
     assert sink.delivery_ids == []
-    assert row.delivery_status == "shadow"
-    assert slot.factory.open_cycle("XAUUSD") == signal.signal_uxid
+    assert row.delivery_status == "pending"
+    assert slot.factory.open_cycle("XAUUSD") is None
+    assert slot.key in runner._uncertain_pairs
 
 
 def test_replaying_the_same_partial_close_does_not_reduce_position_twice():
@@ -423,3 +499,12 @@ def test_replaying_the_same_partial_close_does_not_reduce_position_twice():
     factory.commit(partial, delivery_id="partial-id")
 
     assert factory.open_position("XAUUSD").remaining == remaining
+
+
+@pytest.fixture(autouse=True)
+def live_state_scope(monkeypatch):
+    """Exercise broker paths with an explicitly selected live book and fake transports."""
+    from qte_shared.config import settings
+
+    monkeypatch.setattr(settings, "env", "prod")
+    monkeypatch.setattr(settings.state_config, "execution_mode", "live")

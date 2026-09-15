@@ -12,7 +12,7 @@ So before ingestion reads anything back, this module decides whether the candle
 state belongs to the market it is about to feed. It does not when:
 
 * **another provider wrote it** — the name is recorded under
-  ``qte:history:provider`` on every start, so a switch shows on the next one;
+  ``qte:<namespace>:history:provider`` on every start, so a switch shows on the next one;
 * **nobody recorded who wrote it** — state from before that key existed has no
   provenance at all, and a simulator replay placed on past buckets looks exactly
   like vendor history, so unmarked state is discarded once rather than trusted;
@@ -23,7 +23,7 @@ state belongs to the market it is about to feed. It does not when:
   synthetic provider is exempt from this test and only from this one.
 
 Foreign state is discarded: each subscribed pair's candle list and open bar, and
-the candle outbox. That is a cache, which backfill rebuilds from the vendor in
+the candle outbox and cached ticks. That is a cache, which backfill rebuilds from the vendor in
 seconds. Open positions are **not** touched: a cycle is trading state rather
 than market history, and deleting one could orphan a position the broker still
 holds.
@@ -33,6 +33,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+from qte_shared.config import settings
 from qte_shared.logging_setup import get_logger
 from qte_shared.market_data_plan import SymbolFeed
 from qte_shared.timeframes import CLOCK_TOLERANCE, bucket_close
@@ -55,6 +56,10 @@ async def discard_foreign_candle_state(
     """
     horizon = (moment or datetime.now(UTC)) + CLOCK_TOLERANCE
     reasons: list[str] = []
+    state_scope = settings.state_scope
+    expected_origin = state_scope.origin(synthetic=synthetic)
+    if expected_origin.provider != provider_name:
+        raise ValueError("Configured state provider does not match the ingestion provider")
 
     recorded = await candle_state.get_history_provider()
     if recorded is None:
@@ -62,6 +67,19 @@ async def discard_foreign_candle_state(
             reasons.append("no provider was ever recorded as its writer")
     elif recorded != provider_name:
         reasons.append(f"it was written by provider {recorded!r}")
+    for symbol_feed in subscriptions:
+        cached_tick = await candle_state.get_last_tick(symbol_feed.symbol)
+        if cached_tick is None or cached_tick.origin != expected_origin:
+            await candle_state.discard_last_tick(symbol_feed.symbol)
+        for timeframe in symbol_feed.timeframes:
+            candles = await candle_state.get_candles(symbol_feed.symbol, timeframe)
+            opened = await candle_state.get_open_candle(symbol_feed.symbol, timeframe)
+            if opened is not None:
+                candles = [*candles, opened]
+            if any(candle.origin != expected_origin for candle in candles):
+                reasons.append("market data has missing or foreign provenance")
+    if any(candle.origin != expected_origin for candle in await candle_state.pending_candles()):
+        reasons.append("the candle outbox has missing or foreign provenance")
     if not synthetic:
         future_bars = await _future_dated_bars(candle_state, subscriptions, horizon)
         if future_bars:
@@ -76,6 +94,7 @@ async def discard_foreign_candle_state(
             " and ".join(reasons),
         )
         for symbol_feed in subscriptions:
+            await candle_state.discard_last_tick(symbol_feed.symbol)
             for timeframe in symbol_feed.timeframes:
                 await candle_state.discard_candle_state(symbol_feed.symbol, timeframe)
         await candle_state.discard_candle_outbox()

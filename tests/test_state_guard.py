@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 
 from qte_ingestion.state_guard import discard_foreign_candle_state
 from qte_shared.cache.redis_state import RedisState
+from qte_shared.config import settings
 from qte_shared.market_data_plan import SymbolFeed
 from qte_shared.models import Candle
 
@@ -20,6 +21,7 @@ SUBSCRIPTIONS = [SymbolFeed(symbol="XAUUSD", market="fx", timeframes=("M15",))]
 
 def candle_at(open_time: datetime, *, closed: bool = True) -> Candle:
     return Candle(
+        origin=settings.state_scope.origin(),
         symbol="XAUUSD",
         timeframe="M15",
         open_time=open_time,
@@ -44,6 +46,12 @@ class RecordingState:
         self.open_bar = open_bar
         self.outbox = list(outbox or [])
         self.operations: list[str] = []
+
+    async def get_last_tick(self, symbol):
+        return None
+
+    async def discard_last_tick(self, symbol):
+        pass
 
     async def get_history_provider(self):
         return self.provider
@@ -149,7 +157,8 @@ async def test_a_future_close_waiting_in_the_outbox_is_discarded():
     assert "discard_outbox" in candle_state.operations
 
 
-async def test_a_synthetic_provider_keeps_its_own_forward_anchored_bars():
+async def test_a_synthetic_provider_keeps_its_own_forward_anchored_bars(monkeypatch):
+    monkeypatch.setattr(settings.market_data, "provider", "simulator")
     candle_state = RecordingState(
         provider="simulator",
         candles=[candle_at(datetime(2026, 9, 13, 19, 45, tzinfo=UTC))],
@@ -179,6 +188,7 @@ async def test_discarding_removes_candles_open_bar_and_outbox_but_no_cycle(monke
     assert fake_client.deleted == [
         redis_state.key("candles", "XAUUSD", "M15"),
         redis_state.key("open_candle", "XAUUSD", "M15"),
+        redis_state.key("staged", "XAUUSD", "M15"),
         redis_state.key("outbox", "candles"),
     ]
     assert not [deleted_key for deleted_key in fake_client.deleted if ":cycle:" in deleted_key]

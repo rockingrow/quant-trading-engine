@@ -22,14 +22,14 @@ uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --timeframe M15 \
 | --- | --- |
 | `reading_guide` | The conventions an agent would otherwise have to guess — what R means, what the fill model assumes, why there is only ever one position. |
 | `run` | Strategy, class, module, params, warm-up, starting equity and the `risk_percent` every quantity was sized at. |
-| `data` | Bar count, first and last bar, bars left after warm-up, gap count. |
+| `data` | Bar count, first and last bar, decision-eligible bars including the warm-up boundary, gap count. |
 | `market` | A downsampled OHLC window of the replayed history, plus the buy-and-hold basis — the one thing the trades cannot re-derive. |
 | `costs` | Spread, slippage, commission, contract size, derived round-trip cost. |
 | `metrics` | Currency **and** R-multiple statistics, excursion averages, exit-reason counts, direction split, exposure, streaks, equity curve. |
 | `diagnostics` | Findings, most severe first, each with its threshold, its evidence and one concrete change. |
 | `activity` | Trades taken, entries rejected, signals emitted. |
 | `trades` | Every trade — entry, exit, bars held, initial risk, R-multiple, MAE/MFE, and each partial leg. |
-| `signals` | The exact broker payloads the run would have published. |
+| `signals` | Broker trading fields the run would have published; authentication token omitted. |
 
 Two design choices to know about:
 
@@ -45,6 +45,13 @@ Two design choices to know about:
   would be a coarser answer wearing the same name.
 
 ## Reading it
+
+Live and replay may first decide on the closed bar that completes `warmup`
+bars of history (zero-based index `warmup - 1`). Exactly `warmup` input bars
+therefore allow one decision. The benchmark starts on that same bar, and
+`data.bars_after_warmup` includes it. Older reports used the following bar.
+Cash and percentage maximum drawdown are tracked independently over realised
+equity; their worst points need not be the same trade.
 
 Everything risk-normalised is in **R** — profit divided by the risk taken at
 entry (`|entry - initial_sl| × quantity × contract_size`). Read expectancy and

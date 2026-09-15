@@ -1,9 +1,9 @@
 """Turning a strategy's :class:`SignalIntent` into a broker-shaped payload.
 
 Both drivers use this — the backtest replay and the live runner — so a signal
-recorded in a backtest report is byte-identical to the one a worker would have
-executed. That is the whole point: reconciliation compares two rows, not two
-implementations.
+recorded in a backtest report has the same trading fields as a live command.
+Authentication is injected by the delivery sink and omitted from secondary
+records. Reconciliation compares trading data, not credentials.
 
 The factory owns four things a strategy is deliberately not allowed to:
 
@@ -35,7 +35,6 @@ from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
 
-from qte_shared.config import settings
 from qte_shared.logging_setup import get_logger
 from qte_shared.models import (
     QUANTITY_EPSILON,
@@ -123,7 +122,9 @@ class SignalFactory:
     ) -> None:
         self.strategy_name = strategy_name
         self.timeframe = timeframe
-        self.token = token if token is not None else settings.broker.token
+        # Explicit tokens remain supported for broker contract fixtures. Live
+        # credentials belong to the sink and never enter backtest factories.
+        self.token = token or ""
         self.bracket = bracket or BracketPolicy()
         self.inputs = dict(inputs or {})
         #: Risk sizing for this pair. Built from ``QTE_ACCOUNT__*`` and the
@@ -132,8 +133,8 @@ class SignalFactory:
         self.sizer = sizer or PositionSizer.from_settings(
             self.inputs, risk_percent=self.bracket.risk_percent
         )
-        #: Size for an entry the sizer could not size — no stop, or a stop
-        #: sitting on the entry. ``None`` keeps whatever the strategy proposed.
+        #: Size when sizing inputs are missing. Rejected sizes never fall back.
+        #: ``None`` keeps the strategy proposal, subject to the account ceiling.
         self.default_quantity = default_quantity
         #: What the pair's configuration says about equity sizing, mirrored
         #: onto every payload. It never changes the number above.
@@ -277,7 +278,11 @@ class SignalFactory:
         cannot act on — an entry with no size, a close with no cycle to close.
         Failing here keeps a malformed signal off the wire entirely.
         """
-        target_symbol = (intent.symbol or symbol).upper()
+        target_symbol = symbol.upper()
+        if intent.symbol is not None and intent.symbol.upper() != target_symbol:
+            raise ValueError(
+                f"Intent symbol {intent.symbol!r} differs from slot symbol {target_symbol!r}"
+            )
         if intent.action.is_entry:
             uxid = self._prepare_entry(intent, target_symbol)
         else:
@@ -336,6 +341,9 @@ class SignalFactory:
         if sized is None:
             if proposed is None and self.default_quantity is not None:
                 intent.quantity = self.default_quantity
+            if intent.quantity is not None:
+                intent.quantity = self.sizer.limit_quantity(intent.quantity)
+                self._pending_scale[symbol] = intent.quantity / proposed if proposed else 1.0
             log.debug(
                 "Entry for %s could not be risk-sized (price=%s sl=%s); keeping quantity=%s",
                 symbol,

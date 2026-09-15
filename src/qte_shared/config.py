@@ -14,8 +14,11 @@ from typing import Literal
 from dotenv import load_dotenv
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import URL
 
-from qte_shared.market_data_plan import MarketDataPlan
+from qte_shared.market_data_plan import MarketDataPlan, SymbolFeed
+from qte_shared.state_scope import ExecutionMode, StateScope
+from qte_shared.symbols import build_specs
 from qte_shared.timeframes import normalize_timeframe
 
 
@@ -92,6 +95,8 @@ class BrokerSettings(BaseSettings):
     # it would do live — build the signal, log it, audit it — but stops short of
     # handing it to the broker.
     shadow_mode: bool = True
+    #: Deployment safety override; persisted or broadcast controls cannot disable it.
+    force_shadow_mode: bool = False
 
 
 class AccountSettings(BaseSettings):
@@ -145,11 +150,41 @@ class PostgresSettings(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="QTE_POSTGRES__", extra="ignore")
 
-    dsn: str = "postgresql+asyncpg://qte:qte@localhost:5432/qte_audit"
+    dsn: str = Field(default="postgresql+asyncpg://qte:qte@localhost:5432/qte_audit", repr=False)
+    #: Compose supplies components when DSN is empty; URL.create escapes credentials.
+    hostname: str = "localhost"
+    port_number: int = Field(default=5432, ge=1, le=65535)
+    username: str = "qte"
+    password: str = Field(default="qte", repr=False)
+    database: str = "qte_audit"
     pool_size: int = 5
     max_overflow: int = 5
     echo: bool = False
     enabled: bool = True
+
+    @model_validator(mode="after")
+    def _resolve_database_url(self) -> PostgresSettings:
+        if not self.dsn:
+            self.dsn = URL.create(
+                "postgresql+asyncpg",
+                username=self.username,
+                password=self.password,
+                host=self.hostname,
+                port=self.port_number,
+                database=self.database,
+            ).render_as_string(hide_password=False)
+        return self
+
+
+class MarketStreamSettings(BaseSettings):
+    """Feed configuration shared by ingestion and its consumers."""
+
+    model_config = SettingsConfigDict(env_prefix="QTE_INGESTION__", extra="ignore")
+
+    #: Markets for symbols absent from the plan; planned markets retain precedence.
+    market_overrides: dict[str, str] = Field(default_factory=dict)
+    #: Required when any runner strategy consumes ticks. Configure both services alike.
+    publish_ticks: bool = False
 
 
 class MarketDataSettings(BaseSettings):
@@ -210,8 +245,12 @@ class EngineSettings(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="QTE_ENGINE__", extra="ignore")
 
-    symbols: list[str] = Field(default_factory=lambda: market_data_plan().symbols or ["XAUUSD"])
-    timeframes: list[str] = Field(default_factory=lambda: market_data_plan().timeframes or ["M15"])
+    symbols: list[str] = Field(
+        default_factory=lambda: market_data_plan().symbols if market_data_plan() else ["XAUUSD"]
+    )
+    timeframes: list[str] = Field(
+        default_factory=lambda: market_data_plan().timeframes if market_data_plan() else ["M15"]
+    )
     signal_timeframe: str = "M15"
     warmup_candles: int = 300
     strategies_dir: Path = REPO_ROOT / "__strategies__"
@@ -224,6 +263,36 @@ class EngineSettings(BaseSettings):
     #: ``mt5/`` for a CSV import) so a file's path names its origin.
     parquet_dir: Path = REPO_ROOT / "data" / "parquet"
     reports_dir: Path = REPO_ROOT / "data" / "reports"
+
+    def resolve_subscriptions(
+        self, market_plan: MarketDataPlan, market_overrides: dict[str, str]
+    ) -> list[SymbolFeed]:
+        """Apply explicit symbol/timeframe overrides without flattening plan defaults."""
+        symbols = (
+            self.symbols
+            if "symbols" in self.model_fields_set or not market_plan
+            else market_plan.symbols
+        )
+        timeframes = tuple(dict.fromkeys(normalize_timeframe(label) for label in self.timeframes))
+        markets = {symbol.upper(): market for symbol, market in market_overrides.items()}
+        markets.update(
+            {symbol_feed.symbol: symbol_feed.market for symbol_feed in market_plan.feeds}
+        )
+        subscriptions = []
+        for symbol in dict.fromkeys(symbol.upper() for symbol in symbols):
+            planned_feed = market_plan.feed_for(symbol)
+            resolved_frames = (
+                planned_feed.timeframes
+                if planned_feed is not None and "timeframes" not in self.model_fields_set
+                else timeframes
+            )
+            if not resolved_frames:
+                raise ValueError(f"No resampled timeframes configured for {symbol}")
+            specification = build_specs([symbol], markets)[0]
+            subscriptions.append(
+                SymbolFeed(symbol=symbol, market=specification.market, timeframes=resolved_frames)
+            )
+        return subscriptions
 
     @model_validator(mode="after")
     def _signal_timeframe_is_resampled(self) -> EngineSettings:
@@ -239,12 +308,19 @@ class EngineSettings(BaseSettings):
             resampled = {normalize_timeframe(label) for label in self.timeframes}
         except ValueError as exc:
             raise ValueError(f"QTE_ENGINE__ timeframe is not a valid label: {exc}") from exc
-        if signal not in resampled:
+        if self.symbols and signal not in resampled:
             raise ValueError(
                 f"QTE_ENGINE__SIGNAL_TIMEFRAME={self.signal_timeframe!r} is not one of the "
                 f"resampled timeframes {sorted(resampled)} — nothing would ever close for it"
             )
         return self
+
+
+class StateSettings(BaseSettings):
+    """Execution mode is explicit and independent of the hot delivery pause."""
+
+    model_config = SettingsConfigDict(env_prefix="QTE_STATE__", extra="ignore")
+    execution_mode: ExecutionMode = Field(default="shadow", validation_alias="QTE_STATE__MODE")
 
 
 class Settings(BaseSettings):
@@ -259,6 +335,7 @@ class Settings(BaseSettings):
 
     env: Literal["dev", "staging", "prod"] = "dev"
     log_level: str = "INFO"
+    state_config: StateSettings = Field(default_factory=StateSettings)
 
     nats: NatsSettings = Field(default_factory=NatsSettings)
     account: AccountSettings = Field(default_factory=AccountSettings)
@@ -266,7 +343,14 @@ class Settings(BaseSettings):
     redis: RedisSettings = Field(default_factory=RedisSettings)
     postgres: PostgresSettings = Field(default_factory=PostgresSettings)
     market_data: MarketDataSettings = Field(default_factory=MarketDataSettings)
+    market_stream: MarketStreamSettings = Field(default_factory=MarketStreamSettings)
     engine: EngineSettings = Field(default_factory=EngineSettings)
+
+    @property
+    def state_scope(self) -> StateScope:
+        return StateScope(
+            self.env, self.state_config.execution_mode, self.market_data.provider.strip().lower()
+        )
 
     @property
     def broker_nats_url(self) -> str:

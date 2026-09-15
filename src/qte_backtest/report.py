@@ -45,6 +45,7 @@ from qte_backtest.execution import SimulatedPosition
 from qte_backtest.replay import BacktestResult
 from qte_backtest.visualize import render_html
 from qte_shared.logging_setup import get_logger
+from qte_shared.strategies.signal_serialization import signal_record
 
 log = get_logger(__name__)
 
@@ -96,7 +97,7 @@ READING_GUIDE = {
         "each row aggregates bucket_bars consecutive bars (first open, highest high, "
         "lowest low, last close). Never compute a statistic from it — every metric in "
         "this report comes from the full series. buy_hold is the same instrument held "
-        "at the strategy's default size from the first bar after warm-up to the last, "
+        "at the strategy's default size from the bar completing warm-up to the last, "
         "paying no spread, no slippage and no commission: the floor a strategy has to "
         "beat, not a like-for-like trade."
     ),
@@ -138,7 +139,7 @@ class BacktestReport:
             },
             "data": {
                 "bars": result.bars,
-                "bars_after_warmup": max(result.bars - result.warmup, 0),
+                "bars_after_warmup": max(result.bars - max(result.warmup, 1) + 1, 0),
                 "first_bar": _iso(result.data_start),
                 "last_bar": _iso(result.data_end),
                 "gaps": result.data_gaps,
@@ -165,13 +166,10 @@ class BacktestReport:
                 _trade_to_dict(index, position)
                 for index, position in enumerate(_closed(result.positions), start=1)
             ],
-            # The exact broker payloads this run would have published. Keeping
-            # them here is what makes a backtest report comparable against the
-            # live audit trail row by row.
+            # Trading fields match the live audit trail; broker authentication
+            # is never part of a downloadable report.
             "signals": (
-                [signal.model_dump(mode="json") for signal in result.signals]
-                if include_signals
-                else []
+                [signal_record(signal) for signal in result.signals] if include_signals else []
             ),
         }
 

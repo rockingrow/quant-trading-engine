@@ -1,0 +1,25 @@
+name: qte-prod-${QTE_STATE__MODE:-shadow}-${QTE_MARKET_DATA__PROVIDER:-tiingo}
+
+# Production images with an explicit mode; broker shadow controls remain in .env.
+# `make start-prod` selects only the applications, migrator and dependencies.
+services:
+  data-ingestion:
+    environment:
+      QTE_ENV: prod
+      QTE_STATE__MODE: ${QTE_STATE__MODE:-shadow}
+  strategy-runner:
+    environment:
+      QTE_ENV: prod
+      QTE_STATE__MODE: ${QTE_STATE__MODE:-shadow}
+  db-migrate:
+    environment:
+      QTE_ENV: prod
+      QTE_STATE__MODE: ${QTE_STATE__MODE:-shadow}
+
+volumes:
+  redis-data:
+    name: qte-prod-${QTE_STATE__MODE:-shadow}-${QTE_MARKET_DATA__PROVIDER:-tiingo}-redis
+  postgres-data:
+    name: qte-prod-${QTE_STATE__MODE:-shadow}-${QTE_MARKET_DATA__PROVIDER:-tiingo}-postgres
+  nats-data:
+    name: qte-prod-${QTE_STATE__MODE:-shadow}-${QTE_MARKET_DATA__PROVIDER:-tiingo}-nats

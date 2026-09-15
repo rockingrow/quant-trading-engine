@@ -66,7 +66,7 @@ def test_the_strategy_only_ever_sees_closed_history(trending_frame):
             return None
 
     BacktestEngine(Recorder(), symbol="XAUUSD").run(trending_frame)
-    assert seen == list(range(6, len(trending_frame) + 1))
+    assert seen == list(range(5, len(trending_frame) + 1))
 
 
 def test_a_full_run_produces_matching_positions_and_signals(trending_frame):
@@ -130,6 +130,23 @@ def test_too_little_history_for_the_warmup_is_an_error(trending_frame):
 
     with pytest.raises(ValueError, match="warm-up"):
         BacktestEngine(Hungry(), symbol="XAUUSD").run(trending_frame)
+
+
+def test_exact_warmup_history_allows_one_entry_and_final_liquidation(trending_frame):
+    strategy = BuyOnceStrategy()
+    history = trending_frame.iloc[: strategy.warmup]
+    replay_result = BacktestEngine(
+        strategy,
+        symbol="XAUUSD",
+        costs=CostModel(commission_per_unit=0.25),
+        starting_equity=1000,
+    ).run(history)
+    assert strategy.calls == 1
+    assert len(replay_result.signals) == replay_result.metrics.trades == 1
+    position = replay_result.positions[0]
+    assert position.opened_at == position.closed_at == history.index[-1]
+    assert position.exit_reason == ExitReason.END_OF_DATA
+    assert replay_result.metrics.ending_equity < 1000
 
 
 def test_trade_rows_are_shaped_for_the_audit_table(trending_frame):

@@ -10,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from qte_backtest.db.models import BacktestRun, BacktestTrade
+from qte_shared.config import settings
 from qte_shared.db.session import Database, get_database
 from qte_shared.logging_setup import get_logger
 
@@ -21,6 +22,8 @@ class BacktestRepository:
 
     def __init__(self, database: Database | None = None) -> None:
         self._db = database or get_database()
+        self._scope = settings.state_scope
+        self._namespace = self._scope.namespace
 
     async def record_backtest(
         self,
@@ -35,6 +38,7 @@ class BacktestRepository:
         trades: Sequence[dict[str, Any]] = (),
     ) -> str | None:
         run = BacktestRun(
+            namespace=self._namespace,
             strategy=strategy,
             symbol=symbol,
             timeframe=timeframe,
@@ -64,7 +68,12 @@ class BacktestRepository:
         ``run.trades`` can never be lazy-loaded afterwards — the relationship is
         configured to say that plainly rather than fail from inside the ORM.
         """
-        statement = select(BacktestRun).order_by(BacktestRun.created_at.desc()).limit(limit)
+        statement = (
+            select(BacktestRun)
+            .where(BacktestRun.namespace == self._namespace)
+            .order_by(BacktestRun.created_at.desc())
+            .limit(limit)
+        )
         if with_trades:
             # selectinload, not joinedload: one extra query rather than a join
             # that repeats every run row once per trade it owns.

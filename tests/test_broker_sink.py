@@ -47,7 +47,10 @@ def _signal(action: SignalAction = SignalAction.LONG) -> BrokerSignal:
     )
 
 
-async def test_shadow_mode_builds_and_logs_but_never_sends():
+async def test_shadow_mode_builds_and_logs_but_never_sends(monkeypatch):
+    from qte_shared.config import settings
+
+    monkeypatch.setattr(settings.state_config, "execution_mode", "shadow")
     bus = FakeBus()
     sink = BrokerSink(transport="nats", bus=bus, shadow_mode=True)
     await sink.start()
@@ -164,3 +167,12 @@ async def test_the_shadow_switch_flips_at_runtime():
     await sink.send(_signal())
 
     assert len(bus.published) == 1
+
+
+@pytest.fixture(autouse=True)
+def live_state_scope(monkeypatch):
+    """Exercise broker paths with an explicitly selected live book and fake transports."""
+    from qte_shared.config import settings
+
+    monkeypatch.setattr(settings, "env", "prod")
+    monkeypatch.setattr(settings.state_config, "execution_mode", "live")

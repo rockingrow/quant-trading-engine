@@ -18,8 +18,8 @@ class RunnerSettings(BaseSettings):
     audit_on_start: Literal["off", "warn", "error", "strict"] = "warn"
     #: Default size attached to an entry whose strategy did not set one.
     default_quantity: float = 0.01
-    #: NATS queue group. Two runner replicas in the same group split candles
-    #: between them, so exactly one of them acts on each close.
+    #: Subscription label. A Redis ownership claim enforces one active runner;
+    #: queue distribution alone cannot share its candle or position state.
     queue_group: str = "qte-runners"
     #: Subscribe to ticks. Only worth it when a strategy overrides ``on_tick``;
     #: the runner turns it on automatically when one does.
@@ -27,6 +27,12 @@ class RunnerSettings(BaseSettings):
     #: Seconds between retries of broker deliveries whose acknowledgement
     #: timed out. The durable row keeps every attempt on the same delivery ID.
     delivery_retry_interval: float = Field(default=5.0, gt=0)
+    #: Retry ambiguous live sends only inside a verified broker deduplication
+    #: horizon. Zero requires operator reconciliation; never assume that an
+    #: HTTP Idempotency-Key or a NATS message id is retained indefinitely.
+    delivery_retry_max_age: float = Field(default=0.0, ge=0)
+    #: Reconcile Redis history even if the last NATS close was lost entirely.
+    history_sync_interval: float = Field(default=5.0, gt=0)
     #: Level for the ``numba`` logger tree, independent of QTE_LOG_LEVEL. JIT
     #: compilation of pandas-ta indicators logs one DEBUG line per SSA/byteflow
     #: step, which drowns the runner's own output when QTE_LOG_LEVEL=DEBUG.

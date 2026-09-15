@@ -235,13 +235,16 @@ build: strategy-requirements ## Rebuild every service image
 build-prod: strategy-requirements ## Rebuild every service image except the dev simulator
 	docker compose build db-migrate data-ingestion strategy-runner
 
-up: market-plan strategy-requirements ## Start the whole stack
+up: market-plan strategy-requirements ## Start the application stack without the dev simulator
 	docker compose up -d --build
 
-start: market-plan strategy-requirements ## `up` + wait for db-migrate to finish; the local dev entry point
+start: market-plan strategy-requirements ## Start app images; migration completes before apps boot
 	docker compose up -d --build
 	@echo "Stack is up. Data-ingestion / strategy-runner block until db-migrate exits 0."
-	@echo "Drive the simulator with: make bar O=2400 H=2412.5 L=2396.25 C=2408.75"
+	@echo "For the simulator and source mounts, use make dev."
+
+start-prod: market-plan strategy-requirements ## Build and start production services with QTE_ENV=prod
+	docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build db-migrate data-ingestion strategy-runner
 
 stop: ## Stop the stack (volumes survive) — alias of `down`
 	docker compose down
@@ -259,7 +262,7 @@ restart: market-plan strategy-requirements ## Recreate ingestion and runner, pre
 # live in the container, so the loop is: edit -> `make dev-restart` (seconds,
 # no rebuild) -> `make logs`. A dependency change still needs `make dev` again.
 
-DEV_COMPOSE := -f docker-compose.yml -f docker-compose.dev.yml
+DEV_COMPOSE := -f docker-compose.yml -f docker-compose.dev.yml --profile dev
 
 dev: market-plan strategy-requirements ## `start` with src/ bind-mounted for live editing
 	docker compose $(DEV_COMPOSE) up -d --build

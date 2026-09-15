@@ -83,8 +83,8 @@ def test_the_window_still_ends_on_the_bar_being_decided(trending_frame):
 
     # Clipping the *start* must not disturb the invariant that df.iloc[-1] is
     # the bar just closed — that is what makes the frame non-repainting.
-    assert strategy.sizes[0] == 31  # warmup bars + the one being decided
-    assert len(strategy.sizes) == len(trending_frame) - 30
+    assert strategy.sizes[0] == 30  # The bar completing warm-up is already closed.
+    assert len(strategy.sizes) == len(trending_frame) - 30 + 1
 
 
 def test_an_unbounded_strategy_really_sees_everything(trending_frame):
@@ -145,7 +145,7 @@ def test_replay_cost_stays_linear_in_the_number_of_bars(max_history, trending_fr
     strategy = Windowed()
     BacktestEngine(strategy, symbol="XAUUSD").run(trending_frame)
 
-    bars = len(trending_frame) - 30
+    bars = len(trending_frame) - 30 + 1
     total_rows = sum(strategy.sizes)
     if max_history == 0:
         assert total_rows > bars * 100  # unbounded: grows with the file

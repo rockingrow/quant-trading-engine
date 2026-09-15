@@ -10,7 +10,7 @@
 # either way for QTE's own candle traffic, or set QTE_NATS__URL to the broker's
 # cluster and drop this service.
 
-name: qte
+name: qte-${QTE_ENV:-dev}-${QTE_STATE__MODE:-shadow}-${QTE_MARKET_DATA__PROVIDER:-tiingo}
 
 # Container-side network URLs. .env carries the host-side ones (127.0.0.1) so
 # alembic / qte-simulator / qte-backtest on the host work out of the box;
@@ -18,9 +18,20 @@ name: qte
 # inside the network. `environment:` wins over `env_file:` in compose, so the
 # same .env drives both worlds.
 x-container-envs: &container-envs
+  QTE_ENV: ${QTE_ENV:-dev}
+  QTE_STATE__MODE: ${QTE_STATE__MODE:-shadow}
+  QTE_MARKET_DATA__PROVIDER: ${QTE_MARKET_DATA__PROVIDER:-tiingo}
   QTE_NATS__URL: nats://nats:4222
   QTE_REDIS__URL: redis://redis-cache:6379/0
-  QTE_POSTGRES__DSN: postgresql+asyncpg://qte:qte@postgres-audit:5432/qte_audit
+  # Empty DSN selects URL-encoded components shared with postgres-audit.
+  # A separate explicit DSN permits an external/container database without
+  # accidentally reusing the host-side localhost URL from .env.
+  QTE_POSTGRES__DSN: ${QTE_CONTAINER_POSTGRES_DSN:-}
+  QTE_POSTGRES__HOSTNAME: postgres-audit
+  QTE_POSTGRES__PORT_NUMBER: "5432"
+  QTE_POSTGRES__USERNAME: ${POSTGRES_USER:-qte}
+  QTE_POSTGRES__PASSWORD: ${POSTGRES_PASSWORD:-qte}
+  QTE_POSTGRES__DATABASE: ${POSTGRES_DB:-qte_audit}
   QTE_SIMULATOR__URL: ws://market-simulator:8901/stream
 
 x-app: &app
@@ -48,6 +59,7 @@ x-app: &app
 services:
   redis-cache:
     image: redis:7-alpine
+    restart: unless-stopped
     # AOF on: hot state (open cycles, the warm-up window) has to survive a
     # restart, and losing the cycle id of an open position means the engine
     # forgets which trade it is in.
@@ -63,6 +75,7 @@ services:
 
   postgres-audit:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-qte}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-qte}
@@ -71,13 +84,14 @@ services:
       - postgres-data:/var/lib/postgresql/data
     ports: ["${QTE_POSTGRES_PORT:-5432}:5432"]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-qte} -d ${POSTGRES_DB:-qte_audit}"]
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
       interval: 5s
       timeout: 3s
       retries: 10
 
   nats:
     image: nats:2-alpine
+    restart: unless-stopped
     command: ["-c", "/etc/nats/nats.conf"]
     volumes:
       - ./config/nats.conf:/etc/nats/nats.conf:ro
@@ -130,15 +144,14 @@ services:
 
   # The dev-only market data simulator.
   #
-  # Started by every `docker compose up` — the in-process guard
-  # (`qte_shared.dev_only`) refuses to run outside dev, so leaving it out of
-  # a profile is safe. Ingestion selects one provider; an idle simulator does
-  # not inject ticks into a vendor feed. Stop it when it is not needed.
+  # Opt in with the dev profile (`make dev`). The in-process environment
+  # guard still refuses to fabricate prices outside QTE_ENV=dev.
   #
   # It depends on nothing: no Redis, no Postgres, no NATS. It owns a socket and
   # the ticks it is told to send, and everything downstream of that is the real
   # pipeline — which is what makes the rehearsal worth running.
   market-simulator:
+    profiles: ["dev"]
     env_file: [.env]
     environment: *container-envs
     restart: unless-stopped
@@ -188,5 +201,8 @@ services:
 
 volumes:
   redis-data:
+    name: qte-${QTE_ENV:-dev}-${QTE_STATE__MODE:-shadow}-${QTE_MARKET_DATA__PROVIDER:-tiingo}-redis
   postgres-data:
+    name: qte-${QTE_ENV:-dev}-${QTE_STATE__MODE:-shadow}-${QTE_MARKET_DATA__PROVIDER:-tiingo}-postgres
   nats-data:
+    name: qte-${QTE_ENV:-dev}-${QTE_STATE__MODE:-shadow}-${QTE_MARKET_DATA__PROVIDER:-tiingo}-nats

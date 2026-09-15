@@ -19,7 +19,8 @@ class Subjects:
     """Subject builders. Instantiate with a prefix or use the module default."""
 
     def __init__(self, prefix: str | None = None) -> None:
-        self.prefix = prefix or settings.nats.subject_prefix
+        namespace = settings.state_scope.namespace.replace(":", ".")
+        self.prefix = f"{prefix or settings.nats.subject_prefix}.{namespace}"
 
     # ── QTE internal ────────────────────────────────────────────────
 

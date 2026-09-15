@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from qte_ingestion.backfill import HistoryBackfiller, open_history_source
@@ -54,34 +55,27 @@ from qte_shared.logging_setup import get_logger
 from qte_shared.market_data_plan import SymbolFeed
 from qte_shared.models import Candle, CandleClosedEvent, Tick, TickEvent
 from qte_shared.providers import create_provider
-from qte_shared.symbols import build_specs
-from qte_shared.timeframes import normalize_timeframe
+from qte_shared.state_scope import stamp_market_data
 
 log = get_logger(__name__)
 
 SERVICE_NAME = "data-ingestion"
 
 
+@dataclass
+class RetiredCandle:
+    """A retired bucket retained until Redis acknowledges durable staging."""
+
+    candle: Candle
+    partial: bool
+    close_is_current: bool
+
+
 def resolve_subscriptions() -> list[SymbolFeed]:
-    """What this process subscribes to, and where that was decided.
-
-    ``config/<provider>.toml`` is the answer when it exists: it states the
-    symbols, each one's market and the timeframes it is resampled to, which is
-    the only form that can differ per symbol. With no plan on disk the engine
-    falls back to what it read before the file existed —
-    ``QTE_ENGINE__SYMBOLS`` × ``QTE_ENGINE__TIMEFRAMES``, with every symbol's
-    market from ``QTE_INGESTION__MARKET_OVERRIDES`` — which is what a simulator
-    dev stack runs on.
-    """
-    plan = market_data_plan()
-    if plan.feeds:
-        return list(plan.feeds)
-
-    timeframes = tuple(normalize_timeframe(label) for label in settings.engine.timeframes)
-    return [
-        SymbolFeed(symbol=spec.symbol, market=spec.market, timeframes=timeframes)
-        for spec in build_specs(settings.engine.symbols, ingestion_settings.market_overrides)
-    ]
+    """Use the shared precedence rules, preserving an intentionally empty plan."""
+    return settings.engine.resolve_subscriptions(
+        market_data_plan(), ingestion_settings.market_overrides
+    )
 
 
 class IngestionService:
@@ -89,6 +83,11 @@ class IngestionService:
 
     def __init__(self) -> None:
         self.subscriptions = resolve_subscriptions()
+        if not self.subscriptions:
+            raise ValueError(
+                "Market-data configuration enables no subscriptions. Enable a planned symbol "
+                "or configure QTE_ENGINE__SYMBOLS and timeframes before starting ingestion."
+            )
         self.specs = [feed.spec for feed in self.subscriptions]
         #: Every timeframe anything is resampled to — for the log, the start
         #: event and the outbox drain. What a given symbol gets is its own
@@ -101,6 +100,8 @@ class IngestionService:
         self.subjects = Subjects()
         self.events = EventRepository()
         self.provider = create_provider(capability=Capability.LIVE)
+        self._scope = settings.state_scope
+        self._origin = self._scope.origin(synthetic=self.provider.synthetic)
         self._resamplers: dict[str, Resampler] = {
             feed.symbol: Resampler(feed.symbol, list(feed.timeframes))
             for feed in self.subscriptions
@@ -111,6 +112,8 @@ class IngestionService:
         self._flush_task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
         self._outbox_lock = asyncio.Lock()
+        self._processing_lock = asyncio.Lock()
+        self._retired_candles: dict[tuple[str, str, datetime], RetiredCandle] = {}
         self._cleaned = False
 
     # ── Lifecycle ─────────────────────────────────────────────────────
@@ -266,6 +269,20 @@ class IngestionService:
     # ── Tick path ─────────────────────────────────────────────────────
 
     async def _handle_tick(self, tick: Tick) -> None:
+        async with self._processing_guard():
+            # Do not retire another batch while Redis cannot retain the first.
+            # This bounds memory by the configured series, rather than ticks.
+            if getattr(self, "_retired_candles", None):
+                await self._emit_candles([])
+            await self._handle_tick_serialized(tick)
+
+    def _processing_guard(self) -> asyncio.Lock:
+        if not hasattr(self, "_processing_lock"):
+            self._processing_lock = asyncio.Lock()
+        return self._processing_lock
+
+    async def _handle_tick_serialized(self, tick: Tick) -> None:
+        tick = stamp_market_data(tick, self._origin)
         await self.state.set_last_tick(tick)
         if ingestion_settings.publish_ticks:
             await self.bus.publish(
@@ -298,8 +315,10 @@ class IngestionService:
         while not self._stopping.is_set():
             await asyncio.sleep(ingestion_settings.flush_interval)
             try:
-                await self._drain_candle_outbox()
-                await self._emit_candles(self._close_ended_bars(datetime.now(UTC)))
+                async with self._processing_guard():
+                    if getattr(self, "_retired_candles", None):
+                        await self._emit_candles([])
+                    await self._emit_candles(self._close_ended_bars(datetime.now(UTC)))
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -329,21 +348,36 @@ class IngestionService:
         outage that outlasted their bucket: this process's last tick for them
         predates the outage, so their close comes from the vendor as well.
         """
-        partial_bars: list[Candle] = []
+        if not hasattr(self, "_retired_candles"):
+            self._retired_candles = {}
+        # Retain the entire batch and its partial flags before the first await.
+        # A failure on any item must leave that item and all later ones intact.
         for candle in candles:
+            candle = stamp_market_data(candle, self._origin)
             resampler = self._resamplers.get(candle.symbol)
-            if resampler is not None and resampler.take_partial(candle):
-                partial_bars.append(candle)
-            else:
-                await self.state.stage_closed_candle(candle)
+            marker = (candle.symbol, candle.timeframe, candle.open_time)
+            if marker not in self._retired_candles:
+                self._retired_candles[marker] = RetiredCandle(
+                    candle=candle,
+                    partial=resampler is not None and resampler.take_partial(candle),
+                    close_is_current=close_is_current,
+                )
+        for marker, retired in list(self._retired_candles.items()):
+            if not retired.partial:
+                await self.state.stage_closed_candle(retired.candle)
+                del self._retired_candles[marker]
         await self._drain_candle_outbox()
-        for candle in partial_bars:
-            if self._repairer is None:
-                repaired = candle
-            else:
-                repaired = await self._repairer.repair(candle, close_is_current=close_is_current)
-            await self.state.stage_closed_candle(repaired)
-        if partial_bars:
+        had_partial_bars = bool(self._retired_candles)
+        for marker, retired in list(self._retired_candles.items()):
+            if self._repairer is not None:
+                retired.candle = await self._repairer.repair(
+                    retired.candle, close_is_current=retired.close_is_current
+                )
+                retired.candle = stamp_market_data(retired.candle, self._origin)
+            retired.partial = False
+            await self.state.stage_closed_candle(retired.candle)
+            del self._retired_candles[marker]
+        if had_partial_bars:
             await self._drain_candle_outbox()
 
     async def _drain_candle_outbox(self) -> None:
@@ -362,6 +396,8 @@ class IngestionService:
             lock = self._outbox_lock = asyncio.Lock()
         async with lock:
             while candle := await self.state.peek_pending_candle():
+                if not self._scope.accepts(candle.origin):
+                    raise ValueError("Refusing to publish a candle from another state scope")
                 await self.bus.publish(
                     self.subjects.candle_closed(candle.symbol, candle.timeframe),
                     CandleClosedEvent(
