@@ -1,3 +1,5 @@
+name: qte-dev-dev-${QTE_MARKET_DATA__PROVIDER:-tiingo}
+
 # Local development overlay — `make dev` loads it with
 # `-f docker-compose.yml -f docker-compose.dev.yml`; nothing else does.
 #
@@ -14,24 +16,25 @@
 # Not covered by the mount: a dependency change (a new entry in a pyproject or
 # uv.lock) still needs `make dev` to rebuild — /opt/venv is not mounted.
 
-name: qte
-
 services:
   data-ingestion:
     environment:
       QTE_ENV: dev
+      QTE_STATE__MODE: dev
     volumes:
       - ./src:/app/src
 
   strategy-runner:
     environment:
       QTE_ENV: dev
+      QTE_STATE__MODE: dev
     volumes:
       - ./src:/app/src
 
   market-simulator:
     environment:
       QTE_ENV: dev
+      QTE_STATE__MODE: dev
     volumes:
       - ./src:/app/src
 
@@ -40,7 +43,16 @@ services:
   db-migrate:
     environment:
       QTE_ENV: dev
+      QTE_STATE__MODE: dev
     volumes:
       - ./src:/app/src
       - ./migrations:/app/migrations
       - ./alembic.ini:/app/alembic.ini
+
+volumes:
+  redis-data:
+    name: qte-dev-dev-${QTE_MARKET_DATA__PROVIDER:-tiingo}-redis
+  postgres-data:
+    name: qte-dev-dev-${QTE_MARKET_DATA__PROVIDER:-tiingo}-postgres
+  nats-data:
+    name: qte-dev-dev-${QTE_MARKET_DATA__PROVIDER:-tiingo}-nats

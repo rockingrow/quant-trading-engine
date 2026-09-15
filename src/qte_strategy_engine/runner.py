@@ -116,6 +116,8 @@ class StrategyRunner:
         self.signals = SignalRepository()
         self.positions = OpenPositionRepository()
         self.sink = sink or BrokerSink()
+        self._scope = settings.state_scope
+        self._scope.origin(synthetic=self._provider_is_synthetic())
         self._configured_shadow_mode = self.sink.shadow_mode
         self._history_started_at = datetime.now(UTC)
         self._owner_id = str(uuid4())
@@ -211,11 +213,17 @@ class StrategyRunner:
         except Exception:
             self.sink.set_shadow_mode(True)
             raise
-        effective_mode = settings.broker.force_shadow_mode or (
-            self._configured_shadow_mode if stored_mode is None else stored_mode
+        effective_mode = (
+            self._scope.is_paper
+            or settings.broker.force_shadow_mode
+            or (self._configured_shadow_mode if stored_mode is None else stored_mode)
         )
         if self.sink.shadow_mode != effective_mode:
             self.sink.set_shadow_mode(effective_mode)
+
+    async def _live_delivery_paused(self) -> bool:
+        await self._refresh_shadow_mode()
+        return not self._scope.is_paper and self.sink.shadow_mode
 
     async def _check_ownership(self) -> None:
         """Refuse all decisions and effects after shutdown or ownership loss."""
@@ -389,7 +397,8 @@ class StrategyRunner:
         stored = await self.state.get_candles(
             strategy_slot.symbol, strategy_slot.timeframe, strategy_slot.buffer.maxlen or 0
         )
-        return _clean_history(stored, strategy_slot, allow_future=allow_future)
+        trusted = [candle for candle in stored if self._scope.accepts(candle.origin)]
+        return _clean_history(trusted, strategy_slot, allow_future=allow_future)
 
     async def _decided_open_time(
         self, strategy_slot: StrategySlot, *, allow_future: bool
@@ -552,10 +561,14 @@ class StrategyRunner:
             position = await self.positions.get(strategy, symbol)
             source = "postgres"
             if position is not None:
+                if position.state_namespace != self._scope.namespace:
+                    raise ValueError("Stored position has missing or foreign state provenance")
                 await self.state.set_open_position(position)
 
         if position is None:
             return
+        if position.state_namespace != self._scope.namespace:
+            raise ValueError("Cannot restore a position with missing or foreign state provenance")
         slot.factory.restore_position(position, symbol=symbol)
         log.info(
             "Restored open cycle from %s strategy=%s symbol=%s uxid=%s qty=%s remaining=%s",
@@ -597,11 +610,16 @@ class StrategyRunner:
 
     async def _on_candle_message(self, msg: Msg) -> None:
         event = CandleClosedEvent.model_validate_json(msg.data)
+        if (event.symbol, event.timeframe) != (event.candle.symbol, event.candle.timeframe):
+            raise ValueError("Candle envelope does not match its market data")
         slots = self._by_subject.get((event.symbol, normalize_timeframe(event.timeframe)), [])
         for slot in slots:
             await self._feed_candle(slot, event.candle)
 
     async def _feed_candle(self, slot: StrategySlot, candle: Candle) -> None:
+        if not self._scope.accepts(candle.origin):
+            log.warning("Ignored candle with missing or foreign provenance")
+            return
         async with slot.lock:
             if slot.buffer and candle.open_time <= slot.buffer[-1].open_time:
                 return
@@ -609,6 +627,8 @@ class StrategyRunner:
             await self._feed_if_current(slot, candle)
 
     async def _feed_candle_serialized(self, slot: StrategySlot, candle: Candle) -> None:
+        if not self._scope.accepts(candle.origin):
+            return
         await self._check_ownership()
         if slot.buffer and candle.open_time <= slot.buffer[-1].open_time:
             # A redelivery or a duplicate close. Acting on it twice would open a
@@ -636,7 +656,7 @@ class StrategyRunner:
             )
             return
 
-        if slot.key in self._uncertain_pairs:
+        if slot.key in self._uncertain_pairs or await self._live_delivery_paused():
             return
 
         context = StrategyContext(
@@ -673,12 +693,21 @@ class StrategyRunner:
 
     async def _on_tick_message(self, msg: Msg) -> None:
         event = TickEvent.model_validate_json(msg.data)
+        if event.symbol != event.tick.symbol or not self._scope.accepts(event.tick.origin):
+            log.warning("Ignored tick with missing or foreign provenance")
+            return
+        if event.tick.ts.tzinfo is None or (
+            not event.tick.origin.synthetic and event.tick.ts > datetime.now(UTC) + CLOCK_TOLERANCE
+        ):
+            return
         price = event.tick.price
         for slot in self.slots:
             if slot.symbol != event.symbol or not slot.started or slot.key in self._uncertain_pairs:
                 continue
             async with slot.lock:
                 await self._check_ownership()
+                if await self._live_delivery_paused():
+                    continue
                 context = StrategyContext(
                     symbol=slot.symbol,
                     timeframe=slot.timeframe,
@@ -724,6 +753,9 @@ class StrategyRunner:
                         {
                             "service": SERVICE_NAME,
                             "slots": len(self.slots),
+                            "namespace": self._scope.namespace,
+                            "execution_mode": self._scope.execution_mode,
+                            "delivery_paused": not self._scope.is_paper and self.sink.shadow_mode,
                             "shadow_mode": self.sink.shadow_mode,
                             "ready": all(slot.is_warm for slot in self.slots)
                             and not self._uncertain_pairs,
@@ -740,6 +772,8 @@ class StrategyRunner:
     ) -> None:
         await self._check_ownership()
         await self._refresh_shadow_mode()
+        if not self._scope.is_paper and self.sink.shadow_mode:
+            return
         if slot.key in self._uncertain_pairs:
             log.error(
                 "Dropped intent for uncertain delivery strategy=%s symbol=%s; "
@@ -815,6 +849,8 @@ class StrategyRunner:
         """Record uncertainty before crossing the broker boundary."""
         await self._check_ownership()
         await self._refresh_shadow_mode()
+        if shadow != self._scope.is_paper:
+            raise ValueError("Outbox execution mode does not match the state namespace")
         if shadow:
             return DeliveryResult(status="shadow", transport=self.sink.transport)
         if self.sink.shadow_mode:
@@ -917,6 +953,15 @@ class StrategyRunner:
         pending_row = await self.signals.get_delivery(delivery_id)
         if pending_row is None:
             raise ValueError("Outbox row disappeared during recovery")
+        if (
+            pending_row.namespace != self._scope.namespace
+            or pending_row.shadow != self._scope.is_paper
+        ):
+            raise ValueError("Outbox record belongs to another state namespace or execution mode")
+        if pending_row.delivery_status in {"shadow", "shadow_pending"} and not self._scope.is_paper:
+            raise ValueError("Paper delivery cannot become a live position")
+        if pending_row.delivery_status in {"sent", "sent_pending"} and self._scope.is_paper:
+            raise ValueError("Broker delivery cannot become a paper position")
         if pending_row.delivery_status in {"sent", "shadow", "failed"}:
             if delivery_id not in self._pending_results:
                 return True
@@ -984,6 +1029,9 @@ class StrategyRunner:
         return await self._persist_position(position)
 
     async def _persist_position(self, position: OpenPosition) -> bool:
+        if position.state_namespace not in (None, self._scope.namespace):
+            raise ValueError("Cannot persist a position from another state namespace")
+        position.state_namespace = self._scope.namespace
         await self.state.set_open_position(position)
         return await self.positions.upsert(position)
 

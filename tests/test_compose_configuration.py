@@ -130,3 +130,56 @@ def test_infrastructure_recovers_with_apps_and_migration_remains_one_shot(render
     for service_name in ("redis-cache", "postgres-audit", "nats", *APPLICATIONS[:2]):
         assert document["services"][service_name]["restart"] == "unless-stopped"
     assert document["services"]["db-migrate"]["restart"] == "no"
+
+
+def test_modes_and_providers_use_disjoint_volumes_even_with_a_project_override(render_compose):
+    volumes_seen = set()
+    for execution_mode, provider in (
+        ("dev", "simulator"),
+        ("dev", "tiingo"),
+        ("shadow", "tiingo"),
+        ("live", "tiingo"),
+    ):
+        environment = "dev" if execution_mode == "dev" else "prod"
+        document = render_compose(
+            {
+                "QTE_ENV": environment,
+                "QTE_STATE__MODE": execution_mode,
+                "QTE_MARKET_DATA__PROVIDER": provider,
+                "COMPOSE_PROJECT_NAME": "same-project",
+            }
+        )
+        volume_names = {volume["name"] for volume in document["volumes"].values()}
+        assert not volume_names & volumes_seen
+        volumes_seen.update(volume_names)
+        for application in APPLICATIONS:
+            configuration = document["services"][application]["environment"]
+            assert configuration["QTE_STATE__MODE"] == execution_mode
+            assert configuration["QTE_MARKET_DATA__PROVIDER"] == provider
+
+
+def test_dev_overlay_cannot_mount_a_production_live_volume(render_compose):
+    document = render_compose(
+        {"QTE_ENV": "prod", "QTE_STATE__MODE": "live"},
+        overlay="docker-compose.dev.yml",
+        profiles=("dev",),
+    )
+    assert document["name"] == "qte-dev-dev-tiingo"
+    assert all(
+        volume["name"].startswith("qte-dev-dev-tiingo-") for volume in document["volumes"].values()
+    )
+    assert all(
+        document["services"][application]["environment"]["QTE_STATE__MODE"] == "dev"
+        for application in (*APPLICATIONS, "market-simulator")
+    )
+
+
+def test_production_overlay_uses_its_forced_environment_in_volume_names(render_compose):
+    document = render_compose(
+        {"QTE_ENV": "dev", "QTE_STATE__MODE": "shadow"}, overlay="docker-compose.prod.yml"
+    )
+    assert document["name"] == "qte-prod-shadow-tiingo"
+    assert all(
+        volume["name"].startswith("qte-prod-shadow-tiingo-")
+        for volume in document["volumes"].values()
+    )

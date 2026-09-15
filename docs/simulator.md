@@ -9,14 +9,15 @@ resampler, Redis candle outbox and NATS subjects. It does not publish candles
 directly. Its protocol is simulator-specific, not Tiingo's wire format; the
 provider boundary is what makes both feeds drive the same pipeline.
 
-Keep `QTE_ENV=dev` and `QTE_BROKER__SHADOW_MODE=true` throughout. The server and
+Keep `QTE_ENV=dev`, `QTE_STATE__MODE=dev` and
+`QTE_BROKER__SHADOW_MODE=true` throughout. The server and
 provider refuse to run outside dev. Shadow signals are built, risk-sized,
-audited and mirrored on `QTE.signal.emitted`, but never delivered to the broker.
+audited and mirrored on `QTE.dev.dev.simulator.signal.emitted`, but never delivered to the broker.
 
 ```text
 market-simulator --WebSocket ticks--> data-ingestion
                                        |-- Redis: ticks, open bars, history
-                                       |-- NATS: QTE.candle.closed.XAUUSD.M15
+                                       |-- NATS: QTE.dev.dev.simulator.candle.closed.XAUUSD.M15
                                                        |
                                                 strategy-runner
                                                        |
@@ -52,6 +53,7 @@ Create `.env` in this rehearsal checkout:
 ```dotenv
 # ── .env — local Docker dev ───────────────────────────────────────────
 QTE_ENV=dev
+QTE_STATE__MODE=dev
 QTE_LOG_LEVEL=INFO
 
 # ── Host ports (the container side never changes) ─────────────────────

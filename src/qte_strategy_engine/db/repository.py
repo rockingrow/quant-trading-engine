@@ -9,6 +9,7 @@ from datetime import datetime
 from sqlalchemy import delete, or_, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert
 
+from qte_shared.config import settings
 from qte_shared.db.session import Database, get_database
 from qte_shared.logging_setup import get_logger
 from qte_shared.models import BrokerSignal, OpenPosition
@@ -25,6 +26,8 @@ class SignalRepository:
 
     def __init__(self, database: Database | None = None) -> None:
         self._db = database or get_database()
+        self._scope = settings.state_scope
+        self._namespace = self._scope.namespace
 
     async def stage_signal(
         self,
@@ -43,6 +46,7 @@ class SignalRepository:
         delivery_id = uuid.uuid4()
         row = _signal_row(
             signal,
+            namespace=self._namespace,
             row_id=delivery_id,
             transport=transport,
             delivery_status="prepared",
@@ -77,7 +81,7 @@ class SignalRepository:
             async with self._db.session() as session:
                 execution = await session.execute(
                     update(SignalAudit)
-                    .where(SignalAudit.id == row_id)
+                    .where(SignalAudit.id == row_id, SignalAudit.namespace == self._namespace)
                     .values(delivery_status=status, delivery_error=error)
                 )
             return execution.rowcount == 1
@@ -102,6 +106,7 @@ class SignalRepository:
         """Outbox rows whose final broker outcome is not known yet."""
         statement = (
             select(SignalAudit)
+            .where(SignalAudit.namespace == self._namespace)
             .where(
                 or_(
                     SignalAudit.delivery_status.in_(statuses),
@@ -121,7 +126,11 @@ class SignalRepository:
     async def get_delivery(self, delivery_id: str) -> SignalAudit | None:
         """Refresh a scanned row after acquiring its pair lock."""
         async with self._db.session() as session:
-            return await session.get(SignalAudit, uuid.UUID(delivery_id))
+            statement = select(SignalAudit).where(
+                SignalAudit.id == uuid.UUID(delivery_id),
+                SignalAudit.namespace == self._namespace,
+            )
+            return (await session.execute(statement)).scalar_one_or_none()
 
     async def record_signal(
         self,
@@ -140,6 +149,7 @@ class SignalRepository:
         """
         row = _signal_row(
             signal,
+            namespace=self._namespace,
             transport=transport,
             delivery_status=delivery_status,
             delivery_error=delivery_error,
@@ -162,7 +172,12 @@ class SignalRepository:
         since: datetime | None = None,
         limit: int = 100,
     ) -> Sequence[SignalAudit]:
-        statement = select(SignalAudit).order_by(SignalAudit.created_at.desc()).limit(limit)
+        statement = (
+            select(SignalAudit)
+            .where(SignalAudit.namespace == self._namespace)
+            .order_by(SignalAudit.created_at.desc())
+            .limit(limit)
+        )
         if strategy:
             statement = statement.where(SignalAudit.strategy == strategy)
         if symbol:
@@ -176,6 +191,7 @@ class SignalRepository:
         """Every action of one trade cycle, oldest first — the reconcile view."""
         statement = (
             select(SignalAudit)
+            .where(SignalAudit.namespace == self._namespace)
             .where(SignalAudit.signal_uxid == signal_uxid)
             .order_by(SignalAudit.created_at.asc())
         )
@@ -189,6 +205,7 @@ def _signal_row(
     transport: str,
     delivery_status: str,
     shadow: bool,
+    namespace: str | None = None,
     row_id: uuid.UUID | None = None,
     delivery_error: str | None = None,
     recovery_context: dict | None = None,
@@ -197,6 +214,7 @@ def _signal_row(
     if recovery_context:
         audit_inputs[OUTBOX_CONTEXT_KEY] = recovery_context
     return SignalAudit(
+        namespace=namespace or settings.state_scope.namespace,
         id=row_id or uuid.uuid4(),
         signal_uxid=signal.signal_uxid,
         strategy=signal.strategy,
@@ -235,9 +253,14 @@ class OpenPositionRepository:
 
     def __init__(self, database: Database | None = None) -> None:
         self._db = database or get_database()
+        self._scope = settings.state_scope
+        self._namespace = self._scope.namespace
 
     async def upsert(self, position: OpenPosition) -> bool:
         """Write the pair's current cycle, replacing whatever was there."""
+        if position.state_namespace not in (None, self._namespace):
+            raise ValueError("Cannot persist a position from another state namespace")
+        position = position.model_copy(update={"state_namespace": self._namespace})
         values = {
             "signal_uxid": position.signal_uxid,
             "action": position.action.value,
@@ -253,7 +276,12 @@ class OpenPositionRepository:
         }
         statement = (
             insert(OpenPositionRow)
-            .values(strategy=position.strategy, symbol=position.symbol, **values)
+            .values(
+                namespace=self._namespace,
+                strategy=position.strategy,
+                symbol=position.symbol,
+                **values,
+            )
             .on_conflict_do_update(constraint="uq_open_positions_pair", set_=values)
         )
         try:
@@ -272,6 +300,7 @@ class OpenPositionRepository:
             async with self._db.session() as session:
                 await session.execute(
                     delete(OpenPositionRow).where(
+                        OpenPositionRow.namespace == self._namespace,
                         OpenPositionRow.strategy == strategy,
                         OpenPositionRow.symbol == symbol.upper(),
                     )
@@ -283,7 +312,9 @@ class OpenPositionRepository:
 
     async def get(self, strategy: str, symbol: str) -> OpenPosition | None:
         statement = select(OpenPositionRow).where(
-            OpenPositionRow.strategy == strategy, OpenPositionRow.symbol == symbol.upper()
+            OpenPositionRow.namespace == self._namespace,
+            OpenPositionRow.strategy == strategy,
+            OpenPositionRow.symbol == symbol.upper(),
         )
         try:
             async with self._db.session() as session:
@@ -294,7 +325,11 @@ class OpenPositionRepository:
         return _as_position(row)
 
     async def list_open(self, strategy: str | None = None) -> list[OpenPosition]:
-        statement = select(OpenPositionRow).order_by(OpenPositionRow.opened_at.asc())
+        statement = (
+            select(OpenPositionRow)
+            .where(OpenPositionRow.namespace == self._namespace)
+            .order_by(OpenPositionRow.opened_at.asc())
+        )
         if strategy:
             statement = statement.where(OpenPositionRow.strategy == strategy)
         try:
@@ -315,7 +350,11 @@ def _as_position(row: OpenPositionRow | None) -> OpenPosition | None:
     if row is None:
         return None
     try:
-        return OpenPosition.model_validate(row.state)
+        position = OpenPosition.model_validate(row.state)
     except ValueError:
         log.error("Unreadable open_positions.state for %s %s", row.strategy, row.symbol)
         return None
+
+    if position.state_namespace != row.namespace:
+        raise ValueError("Stored position has missing or foreign state provenance")
+    return position

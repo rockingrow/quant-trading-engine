@@ -12,7 +12,7 @@ Postgres stays the audit trail; nothing here is a system of record.
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 import redis.asyncio as redis
@@ -20,6 +20,8 @@ import redis.asyncio as redis
 from qte_shared.config import settings
 from qte_shared.logging_setup import get_logger
 from qte_shared.models import Candle, OpenPosition, Tick
+from qte_shared.state_scope import stamp_market_data
+from qte_shared.timeframes import CLOCK_TOLERANCE
 
 log = get_logger(__name__)
 
@@ -57,7 +59,8 @@ class RedisState:
 
     def __init__(self, url: str | None = None, prefix: str | None = None) -> None:
         self._url = url or settings.redis.url
-        self._prefix = prefix or settings.redis.key_prefix
+        self._scope = settings.state_scope
+        self._prefix = f"{prefix or settings.redis.key_prefix}:{self._scope.namespace}"
         self._client: redis.Redis | None = None
 
     @property
@@ -110,11 +113,24 @@ class RedisState:
     # ── Ticks ─────────────────────────────────────────────────────────
 
     async def set_last_tick(self, tick: Tick) -> None:
+        tick = stamp_market_data(tick, self._scope.origin())
         await self.client.set(self.key("tick", tick.symbol), tick.model_dump_json())
 
     async def get_last_tick(self, symbol: str) -> Tick | None:
         raw = await self.client.get(self.key("tick", symbol))
-        return Tick.model_validate_json(raw) if raw else None
+        if not raw:
+            return None
+        tick = Tick.model_validate_json(raw)
+        if not self._scope.accepts(tick.origin):
+            return None
+        if tick.ts.tzinfo is None or (
+            not tick.origin.synthetic and tick.ts > datetime.now(UTC) + CLOCK_TOLERANCE
+        ):
+            return None
+        return tick
+
+    async def discard_last_tick(self, symbol: str) -> None:
+        await self.client.delete(self.key("tick", symbol))
 
     # ── Candles ───────────────────────────────────────────────────────
 
@@ -124,6 +140,7 @@ class RedisState:
         Newest is pushed on the right and the list trimmed from the left, so
         :meth:`get_candles` can return oldest-first without reversing.
         """
+        candle = stamp_market_data(candle, self._scope.origin())
         limit = max_len or settings.redis.candle_history
         key = self.key("candles", candle.symbol, candle.timeframe)
         pipe = self.client.pipeline()
@@ -142,6 +159,7 @@ class RedisState:
         queue append in one transaction also prevents a restart from seeing a
         candle in one representation but not the other.
         """
+        candle = stamp_market_data(candle, self._scope.origin())
         await self.client.eval(
             STAGE_CLOSED_CANDLE,
             4,
@@ -189,7 +207,7 @@ class RedisState:
         if not candles:
             return 0
         limit = max_len or settings.redis.candle_history
-        retained = candles[-limit:]
+        retained = [stamp_market_data(candle, self._scope.origin()) for candle in candles[-limit:]]
         key = self.key("candles", symbol, timeframe)
         pipe = self.client.pipeline()
         pipe.delete(key)
@@ -201,6 +219,7 @@ class RedisState:
 
     async def set_open_candle(self, candle: Candle) -> None:
         """Persist the bar currently being built so a restart mid-bar resumes it."""
+        candle = stamp_market_data(candle, self._scope.origin())
         await self.client.set(
             self.key("open_candle", candle.symbol, candle.timeframe),
             candle.model_dump_json(),
@@ -276,13 +295,22 @@ class RedisState:
         the broker renders the exit as an unrelated trade instead of closing
         the entry's broadcast.
         """
+        if position.state_namespace not in (None, self._scope.namespace):
+            raise ValueError("Cannot persist a position from another state namespace")
+        position = position.model_copy(update={"state_namespace": self._scope.namespace})
         await self.client.hset(
             self.key("cycle", position.strategy), position.symbol, position.model_dump_json()
         )
 
     async def get_open_position(self, strategy: str, symbol: str) -> OpenPosition | None:
         raw = await self.client.hget(self.key("cycle", strategy), symbol)
-        return _decode_position(raw, strategy=strategy, symbol=symbol)
+        position = _decode_position(raw, strategy=strategy, symbol=symbol)
+        self._validate_position_scope(position)
+        return position
+
+    def _validate_position_scope(self, position: OpenPosition | None) -> None:
+        if position is not None and position.state_namespace != self._scope.namespace:
+            raise ValueError("Stored position has missing or foreign state provenance")
 
     async def get_open_positions(self, strategy: str) -> dict[str, OpenPosition]:
         """Every cycle *strategy* holds, keyed by symbol."""
@@ -290,6 +318,7 @@ class RedisState:
         positions = {}
         for symbol, raw in (stored or {}).items():
             position = _decode_position(raw, strategy=strategy, symbol=symbol)
+            self._validate_position_scope(position)
             if position is not None:
                 positions[symbol] = position
         return positions

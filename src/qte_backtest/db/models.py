@@ -22,6 +22,10 @@ class BacktestRun(Base):
 
     __tablename__ = "backtest_runs"
 
+    namespace: Mapped[str] = mapped_column(
+        String(160), nullable=False, server_default="legacy", index=True
+    )
+
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=new_uuid)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

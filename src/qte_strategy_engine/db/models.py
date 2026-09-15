@@ -30,6 +30,10 @@ class SignalAudit(Base):
 
     __tablename__ = "signals"
 
+    namespace: Mapped[str] = mapped_column(
+        String(160), nullable=False, server_default="legacy", index=True
+    )
+
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=new_uuid)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -78,6 +82,10 @@ class OpenPositionRow(Base):
 
     __tablename__ = "open_positions"
 
+    namespace: Mapped[str] = mapped_column(
+        String(160), nullable=False, server_default="legacy", index=True
+    )
+
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=new_uuid)
     strategy: Mapped[str] = mapped_column(String(128), nullable=False)
     symbol: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -103,6 +111,6 @@ class OpenPositionRow(Base):
     __table_args__ = (
         # One live cycle per pair, enforced by the database rather than by the
         # runner remembering to check — two runner replicas share this table.
-        UniqueConstraint("strategy", "symbol", name="uq_open_positions_pair"),
+        UniqueConstraint("namespace", "strategy", "symbol", name="uq_open_positions_pair"),
         Index("ix_open_positions_uxid", "signal_uxid"),
     )

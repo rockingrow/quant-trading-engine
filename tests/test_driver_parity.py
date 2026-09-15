@@ -6,6 +6,7 @@ import pytest
 from test_runner_catch_up import CandleStore, DecisionRecorder, bar_at, build_runner, deliver_live
 
 from qte_backtest.replay import BacktestEngine
+from qte_shared.config import settings
 from qte_shared.strategies.strategy_base import candles_to_frame
 from qte_strategy_engine import runner as runner_module
 
@@ -14,6 +15,7 @@ from qte_strategy_engine import runner as runner_module
 async def test_first_decision_and_benchmark_match_live_warmup(
     monkeypatch, required_bars, extra_bars
 ):
+    monkeypatch.setattr(settings.market_data, "provider", "simulator")
     candles = [
         bar_at(datetime(2026, 1, 1, tzinfo=UTC) + timedelta(minutes=15 * offset))
         for offset in range(required_bars + extra_bars)

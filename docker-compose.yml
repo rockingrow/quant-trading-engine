@@ -10,7 +10,7 @@
 # either way for QTE's own candle traffic, or set QTE_NATS__URL to the broker's
 # cluster and drop this service.
 
-name: qte
+name: qte-${QTE_ENV:-dev}-${QTE_STATE__MODE:-shadow}-${QTE_MARKET_DATA__PROVIDER:-tiingo}
 
 # Container-side network URLs. .env carries the host-side ones (127.0.0.1) so
 # alembic / qte-simulator / qte-backtest on the host work out of the box;
@@ -18,6 +18,9 @@ name: qte
 # inside the network. `environment:` wins over `env_file:` in compose, so the
 # same .env drives both worlds.
 x-container-envs: &container-envs
+  QTE_ENV: ${QTE_ENV:-dev}
+  QTE_STATE__MODE: ${QTE_STATE__MODE:-shadow}
+  QTE_MARKET_DATA__PROVIDER: ${QTE_MARKET_DATA__PROVIDER:-tiingo}
   QTE_NATS__URL: nats://nats:4222
   QTE_REDIS__URL: redis://redis-cache:6379/0
   # Empty DSN selects URL-encoded components shared with postgres-audit.
@@ -198,5 +201,8 @@ services:
 
 volumes:
   redis-data:
+    name: qte-${QTE_ENV:-dev}-${QTE_STATE__MODE:-shadow}-${QTE_MARKET_DATA__PROVIDER:-tiingo}-redis
   postgres-data:
+    name: qte-${QTE_ENV:-dev}-${QTE_STATE__MODE:-shadow}-${QTE_MARKET_DATA__PROVIDER:-tiingo}-postgres
   nats-data:
+    name: qte-${QTE_ENV:-dev}-${QTE_STATE__MODE:-shadow}-${QTE_MARKET_DATA__PROVIDER:-tiingo}-nats

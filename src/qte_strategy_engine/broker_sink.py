@@ -61,8 +61,11 @@ class BrokerSink:
         shadow_mode: bool | None = None,
     ) -> None:
         self.transport = transport or settings.broker.transport
-        self.shadow_mode = settings.broker.force_shadow_mode or (
-            settings.broker.shadow_mode if shadow_mode is None else shadow_mode
+        self._scope = settings.state_scope
+        self.shadow_mode = (
+            self._scope.is_paper
+            or settings.broker.force_shadow_mode
+            or (settings.broker.shadow_mode if shadow_mode is None else shadow_mode)
         )
         self._bus = bus
         self._owns_bus = bus is None
@@ -100,7 +103,7 @@ class BrokerSink:
             self._bus = None
 
     def set_shadow_mode(self, enabled: bool) -> None:
-        enabled = enabled or settings.broker.force_shadow_mode
+        enabled = enabled or self._scope.is_paper or settings.broker.force_shadow_mode
         log.warning(
             "Shadow mode %s",
             "ENABLED — signals will NOT reach the broker"
@@ -120,7 +123,11 @@ class BrokerSink:
         """
         signal.validate_shape()
 
-        if self.shadow_mode or settings.broker.force_shadow_mode:
+        if not self._scope.is_paper and (self.shadow_mode or settings.broker.force_shadow_mode):
+            return DeliveryResult(
+                status="failed", transport=self.transport, detail="Live delivery is paused"
+            )
+        if self._scope.is_paper:
             log.info(
                 "SHADOW %s %s %s price=%s qty=%s sl=%s tp1=%s tp2=%s uxid=%s",
                 signal.strategy,

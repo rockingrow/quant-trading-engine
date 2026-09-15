@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from qte_shared.config import settings
 from qte_shared.db.models import EngineEvent
 from qte_shared.db.session import Database, get_database
 from qte_shared.logging_setup import get_logger
@@ -16,6 +17,8 @@ class EventRepository:
 
     def __init__(self, database: Database | None = None) -> None:
         self._db = database or get_database()
+        self._scope = settings.state_scope
+        self._namespace = self._scope.namespace
 
     async def record_event(
         self,
@@ -34,7 +37,13 @@ class EventRepository:
         try:
             async with self._db.session() as session:
                 session.add(
-                    EngineEvent(service=service, event=event, level=level, payload=payload or {})
+                    EngineEvent(
+                        namespace=self._namespace,
+                        service=service,
+                        event=event,
+                        level=level,
+                        payload=payload or {},
+                    )
                 )
         except Exception as exc:
             log.debug("Engine event write failed (%s/%s): %s", service, event, exc)

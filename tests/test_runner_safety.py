@@ -31,6 +31,7 @@ def pending_signal(strategy_slot, *, status="prepared", shadow=False, created_at
         commit=False,
     )
     return SimpleNamespace(
+        namespace=settings.state_scope.namespace,
         id=uuid4(),
         created_at=created_at or datetime.now(UTC),
         strategy=signal.strategy,
@@ -85,7 +86,8 @@ async def test_failed_control_broadcast_is_observed_before_next_delivery():
     runner.state.flags["shadow_mode"] = True
     await _enter(runner, strategy_slot)
     assert runner.sink.delivery_ids == []
-    assert runner.signals.pending[0].delivery_status == "shadow"
+    assert runner.signals.pending == []
+    assert runner.state.held == {}
 
 
 async def test_forced_shadow_overrides_a_persisted_live_switch(monkeypatch):
@@ -272,14 +274,14 @@ async def test_blocked_first_page_does_not_starve_later_pairs():
     blocked_rows = [pending_signal(blocked_slot, status="unknown") for _ in range(105)]
     later_slot = _slot()
     later_slot.symbol = "EURUSD"
-    later_row = pending_signal(later_slot, shadow=True)
+    later_row = pending_signal(later_slot, status="sent_pending")
     later_row.created_at = max(record.created_at for record in blocked_rows) + timedelta(seconds=1)
     runner.slots = [blocked_slot, later_slot]
     runner.signals = RecordingSignals([*blocked_rows, later_row])
     await runner._recover_pending_deliveries()
     assert blocked_slot.key in runner._uncertain_pairs
     assert later_slot.key not in runner._uncertain_pairs
-    assert later_row.delivery_status == "shadow"
+    assert later_row.delivery_status == "sent"
     assert runner.sink.delivery_ids == []
 
 
@@ -341,3 +343,10 @@ async def test_failed_stage_is_reconciled_before_the_pair_can_emit_again(monkeyp
     await runner._recover_pending_deliveries()
     assert strategy_slot.key not in runner._uncertain_pairs
     assert len(runner.sink.delivery_ids) == int(committed)
+
+
+@pytest.fixture(autouse=True)
+def live_state_scope(monkeypatch):
+    """Select a live book; all broker transports in this suite are test doubles."""
+    monkeypatch.setattr(settings, "env", "prod")
+    monkeypatch.setattr(settings.state_config, "execution_mode", "live")

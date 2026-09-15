@@ -79,7 +79,7 @@ async def test_turning_shadow_on_stores_the_flag_and_broadcasts_it(wired, capsys
     subject, payload = bus.published[0]
     assert subject.endswith(".control")
     assert payload == {"action": "set_shadow_mode", "enabled": True}
-    assert "will NOT reach the broker" in capsys.readouterr().out
+    assert "Live delivery PAUSED" in capsys.readouterr().out
 
 
 async def test_going_live_is_announced_plainly(wired, capsys):
@@ -121,7 +121,7 @@ async def test_the_change_is_audited(wired):
 async def test_status_reads_the_stored_flag(monkeypatch, capsys):
     monkeypatch.setattr(control, "RedisState", lambda *a, **k: FakeRedis({"shadow_mode": False}))
     await control._show_shadow_mode()
-    assert "OFF (live)" in capsys.readouterr().out
+    assert "Live delivery is ENABLED" in capsys.readouterr().out
 
 
 async def test_status_falls_back_to_the_configured_default(monkeypatch, capsys):
@@ -201,3 +201,12 @@ async def test_a_dependency_failure_prints_one_line_not_a_traceback(monkeypatch,
     assert "Could not reach Redis" in error
     assert "Traceback" not in error
     assert "ConnectionError" in error  # the cause is still named
+
+
+@pytest.fixture(autouse=True)
+def live_state_scope(monkeypatch):
+    """Exercise broker paths with an explicitly selected live book and fake transports."""
+    from qte_shared.config import settings
+
+    monkeypatch.setattr(settings, "env", "prod")
+    monkeypatch.setattr(settings.state_config, "execution_mode", "live")

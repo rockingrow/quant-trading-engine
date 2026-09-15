@@ -657,14 +657,15 @@ stream's duplicate window is stored once and a worker opens one position.
 ## Operating a running engine
 
 There is no web service. The one control that genuinely has to reach a *running*
-process is shadow mode — the live/paper switch, which must not require
-restarting a runner mid-position — and it travels on NATS like every other
-engine event:
+process is the delivery pause. Paper and live use separate state selected by
+`QTE_STATE__MODE` at startup. The pause travels on scoped NATS subjects. See
+[state isolation and deployment transitions](docs/state-isolation.md) before
+changing an existing deployment:
 
 ```bash
 uv run qte-control shadow status   # is it paper or live right now?
 uv run qte-control shadow on       # pause delivery to the broker
-uv run qte-control shadow off      # GO LIVE — prompts unless you pass --yes
+uv run qte-control shadow off      # resume a live namespace; prompts for confirmation
 uv run qte-control ping            # which runners are up, and in what mode
 ```
 
@@ -757,16 +758,20 @@ publishing to a second cluster means nobody ever receives the signals.
 ### Going live
 
 1. **Backtest** until the numbers hold up.
-2. **Shadow mode** — `QTE_BROKER__SHADOW_MODE=true` (the default). Ingestion and
+2. **Shadow mode** — select `QTE_STATE__MODE=shadow` (the default). Ingestion and
    strategies run, signals are built, logged and audited, and nothing reaches
    the broker.
 3. **Reconcile** — read the `signals` table and check the entries and exits
    against the chart. Filtering by `signal_uxid` gives you one trade end to end.
-4. **Go live** — `make shadow-off`. It takes effect on every running runner
-   immediately, and the flag is stored in Redis so a restart comes up in the
-   mode you last chose.
+4. **Select live state** — stop paper, select `QTE_ENV=prod` and
+   `QTE_STATE__MODE=live`, and restart into the separate live volumes. Keep
+   delivery paused while reconciling the actual broker account. Paper positions
+   are never carried into the live book.
+5. **Enable delivery** — run `make shadow-off` with the matching live identity
+   and confirm the target. The pause flag persists within that namespace.
 
-`make shadow-on` puts it back. That is the kill switch; keep it to hand.
+`make shadow-on` pauses live decisions and delivery while preserving broker
+positions. It does not create simulated trades in the live book.
 
 ---
 

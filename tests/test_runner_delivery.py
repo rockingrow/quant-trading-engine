@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from qte_shared.config import settings
 from qte_shared.models import OpenPosition, SignalAction
 from qte_shared.strategies.signal_factory import SignalFactory
 from qte_shared.strategies.signal_serialization import signal_record
@@ -60,6 +61,7 @@ class RecordingSignals:
         self._by_id[delivery_id] = metadata
         self.pending.append(
             SimpleNamespace(
+                namespace=settings.state_scope.namespace,
                 id=uuid.UUID(delivery_id),
                 created_at=datetime.now(UTC),
                 strategy=signal.strategy,
@@ -352,6 +354,7 @@ async def test_a_signal_is_not_sent_when_the_durable_outbox_cannot_be_written():
 
 def _held(**kwargs) -> OpenPosition:
     defaults = {
+        "state_namespace": settings.state_scope.namespace,
         "signal_uxid": "9F2C4B7E18A3D605",
         "strategy": "DELIVERY_PROBE",
         "symbol": "XAUUSD",
@@ -413,6 +416,7 @@ async def test_startup_replays_a_pending_signal_with_its_original_delivery_id():
     intent = SignalIntent(action=SignalAction.LONG, price=2334.50, sl=2329.50)
     signal = source.factory.build(intent, symbol="XAUUSD", moment=MOMENT, commit=False)
     row = SimpleNamespace(
+        namespace=settings.state_scope.namespace,
         id=delivery_id,
         created_at=datetime.now(UTC),
         strategy=signal.strategy,
@@ -449,6 +453,7 @@ async def test_a_pending_shadow_signal_cannot_turn_live_during_recovery():
         commit=False,
     )
     row = SimpleNamespace(
+        namespace=settings.state_scope.namespace,
         id=delivery_id,
         created_at=datetime.now(UTC),
         strategy=signal.strategy,
@@ -468,8 +473,9 @@ async def test_a_pending_shadow_signal_cannot_turn_live_during_recovery():
     await runner._recover_pending_deliveries()
 
     assert sink.delivery_ids == []
-    assert row.delivery_status == "shadow"
-    assert slot.factory.open_cycle("XAUUSD") == signal.signal_uxid
+    assert row.delivery_status == "pending"
+    assert slot.factory.open_cycle("XAUUSD") is None
+    assert slot.key in runner._uncertain_pairs
 
 
 def test_replaying_the_same_partial_close_does_not_reduce_position_twice():
@@ -493,3 +499,12 @@ def test_replaying_the_same_partial_close_does_not_reduce_position_twice():
     factory.commit(partial, delivery_id="partial-id")
 
     assert factory.open_position("XAUUSD").remaining == remaining
+
+
+@pytest.fixture(autouse=True)
+def live_state_scope(monkeypatch):
+    """Exercise broker paths with an explicitly selected live book and fake transports."""
+    from qte_shared.config import settings
+
+    monkeypatch.setattr(settings, "env", "prod")
+    monkeypatch.setattr(settings.state_config, "execution_mode", "live")

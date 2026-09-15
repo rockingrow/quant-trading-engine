@@ -29,6 +29,7 @@ def pytest_configure(config):
         if variable.startswith("QTE_"):
             isolated.delenv(variable)
     isolated.setenv("QTE_ENV", "dev")
+    isolated.setenv("QTE_STATE__MODE", "dev")
     isolated.setenv("QTE_MARKET_DATA__CONFIG_FILE", str(Path(directory.name) / "missing.toml"))
     isolated.setenv("QTE_ENGINE__MAPPING_FILE", str(Path(directory.name) / "mapping.toml"))
     isolated.setattr("dotenv.load_dotenv", lambda *arguments, **keywords: False)

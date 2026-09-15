@@ -17,6 +17,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import URL
 
 from qte_shared.market_data_plan import MarketDataPlan, SymbolFeed
+from qte_shared.state_scope import ExecutionMode, StateScope
 from qte_shared.symbols import build_specs
 from qte_shared.timeframes import normalize_timeframe
 
@@ -315,6 +316,13 @@ class EngineSettings(BaseSettings):
         return self
 
 
+class StateSettings(BaseSettings):
+    """Execution mode is explicit and independent of the hot delivery pause."""
+
+    model_config = SettingsConfigDict(env_prefix="QTE_STATE__", extra="ignore")
+    execution_mode: ExecutionMode = Field(default="shadow", validation_alias="QTE_STATE__MODE")
+
+
 class Settings(BaseSettings):
     """Root settings object — import :data:`settings`, not this class."""
 
@@ -327,6 +335,7 @@ class Settings(BaseSettings):
 
     env: Literal["dev", "staging", "prod"] = "dev"
     log_level: str = "INFO"
+    state_config: StateSettings = Field(default_factory=StateSettings)
 
     nats: NatsSettings = Field(default_factory=NatsSettings)
     account: AccountSettings = Field(default_factory=AccountSettings)
@@ -336,6 +345,12 @@ class Settings(BaseSettings):
     market_data: MarketDataSettings = Field(default_factory=MarketDataSettings)
     market_stream: MarketStreamSettings = Field(default_factory=MarketStreamSettings)
     engine: EngineSettings = Field(default_factory=EngineSettings)
+
+    @property
+    def state_scope(self) -> StateScope:
+        return StateScope(
+            self.env, self.state_config.execution_mode, self.market_data.provider.strip().lower()
+        )
 
     @property
     def broker_nats_url(self) -> str:

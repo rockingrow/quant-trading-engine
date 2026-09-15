@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 
 from qte_ingestion.service import IngestionService
+from qte_shared.config import settings
 from qte_shared.market_data_plan import SymbolFeed
 
 
@@ -69,6 +70,8 @@ class SilentEvents:
 async def test_start_up_guards_restores_closes_backfills_then_listens(monkeypatch):
     journal: list[str] = []
     service = object.__new__(IngestionService)
+    service._scope = settings.state_scope
+    service._origin = service._scope.origin()
     service.subscriptions = [SymbolFeed(symbol="XAUUSD", market="fx", timeframes=("M15",))]
     service.specs = [symbol_feed.spec for symbol_feed in service.subscriptions]
     service.timeframes = ["M15"]

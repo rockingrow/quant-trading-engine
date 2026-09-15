@@ -177,3 +177,10 @@ async def test_delivery_injects_current_credentials_without_mutating_stored_sign
     assert signal_record(signal) == original_record
     signal.token = "DIFFERENT_STORED_CREDENTIAL"
     assert signal_delivery_id(signal) == original_identifier
+
+
+@pytest.fixture(autouse=True)
+def live_state_scope(monkeypatch):
+    """Select a live book; all broker transports in this suite are test doubles."""
+    monkeypatch.setattr(settings, "env", "prod")
+    monkeypatch.setattr(settings.state_config, "execution_mode", "live")

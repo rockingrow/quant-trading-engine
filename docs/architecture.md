@@ -5,8 +5,8 @@ are.
 
 ## Why two NATS namespaces
 
-`QTE.*` is ours — ticks and candle closes, on **core** NATS. At twenty ticks a
-second a dropped tick is replaced by a fresher one immediately, so paying
+`QTE.<env>.<mode>.<provider>.*` is ours — ticks and candle closes, on **core**
+NATS. At twenty ticks a second a dropped tick is replaced by a fresher one immediately, so paying
 JetStream's persistence cost for raw market data buys nothing. Candle closes
 are different: ingestion stages them in a Redis outbox before publishing and
 only removes them after Core NATS accepts the publish. A crash can replay a
@@ -89,12 +89,12 @@ the last write. The runner rebuilds its indicator window from Redis on boot
 instead of waiting hours for live candles, which is what makes a restart resume
 trading on the next close.
 
-Two keys make that rebuild trustworthy. `qte:decided:<strategy>:<symbol>:<tf>`
+Two keys make that rebuild trustworthy. `qte:<namespace>:decided:<strategy>:<symbol>:<tf>`
 holds the newest bar each pair was fed. Closes published while the runner was
 down or still starting are the bars newer than it, and the runner replays them
 once subscribed — deciding only on those that closed within
 `QTE_RUNNER__CATCH_UP_MAX_AGE`, because a late entry trades a price the backtest
-never saw. `qte:history:provider` names the feed that wrote the candle state:
+never saw. `qte:<namespace>:history:provider` names the feed that wrote the candle state:
 before anything reads it back, ingestion discards candle lists, open bars and
 staged closes that another provider wrote, that no provider was recorded for,
 or that are dated after now. Positions are never part of that discard.
@@ -369,8 +369,9 @@ process to keep alive, secure and monitor in exchange for a second way to reach
 the same data.
 
 The exception is shadow mode, which genuinely has to reach a *process that is
-already running* — flipping live/paper must not require a restart mid-position.
-That is one message on `QTE.control`, so `qte-control` publishes it straight to
+already running*. It pauses a live book without simulating position changes.
+Paper/live identity is selected at startup; see [state isolation](state-isolation.md).
+The pause is one message on `QTE.<env>.<mode>.<provider>.control`, sent straight to
 NATS and no service is needed to carry it.
 
 The runner reads the durable Redis flag before recovery and again before each

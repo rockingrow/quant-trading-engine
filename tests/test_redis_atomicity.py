@@ -9,6 +9,7 @@ from fakeredis.aioredis import FakeRedis
 from redis.exceptions import ResponseError
 
 from qte_shared.cache.redis_state import RedisState
+from qte_shared.config import settings
 from qte_shared.models import Candle
 
 
@@ -24,6 +25,7 @@ async def candle_state():
 
 def closed_candle(offset=0):
     return Candle(
+        origin=settings.state_scope.origin(),
         symbol="XAUUSD",
         timeframe="M15",
         open_time=datetime(2026, 9, 14, tzinfo=UTC) + timedelta(minutes=offset),

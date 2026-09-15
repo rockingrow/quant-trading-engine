@@ -45,6 +45,7 @@ class DecisionRecorder(StrategyBase):
 
 def bar_at(open_time: datetime, *, tick_count: int = 5) -> Candle:
     return Candle(
+        origin=settings.state_scope.origin(),
         symbol="XAUUSD",
         timeframe="M15",
         open_time=open_time,
@@ -268,6 +269,7 @@ async def test_restored_history_drops_duplicates_and_future_bars(monkeypatch):
 
 
 async def test_a_synthetic_feed_keeps_its_forward_anchored_bars(monkeypatch):
+    monkeypatch.setattr(settings.market_data, "provider", "simulator")
     allow_catch_up_within(monkeypatch, 86_400)
     now_bucket = floor_to_bucket(datetime.now(UTC), "M15")
     forward = [bar_at(now_bucket + BAR_LENGTH * offset) for offset in range(3)]

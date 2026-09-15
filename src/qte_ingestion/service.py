@@ -55,6 +55,7 @@ from qte_shared.logging_setup import get_logger
 from qte_shared.market_data_plan import SymbolFeed
 from qte_shared.models import Candle, CandleClosedEvent, Tick, TickEvent
 from qte_shared.providers import create_provider
+from qte_shared.state_scope import stamp_market_data
 
 log = get_logger(__name__)
 
@@ -99,6 +100,8 @@ class IngestionService:
         self.subjects = Subjects()
         self.events = EventRepository()
         self.provider = create_provider(capability=Capability.LIVE)
+        self._scope = settings.state_scope
+        self._origin = self._scope.origin(synthetic=self.provider.synthetic)
         self._resamplers: dict[str, Resampler] = {
             feed.symbol: Resampler(feed.symbol, list(feed.timeframes))
             for feed in self.subscriptions
@@ -279,6 +282,7 @@ class IngestionService:
         return self._processing_lock
 
     async def _handle_tick_serialized(self, tick: Tick) -> None:
+        tick = stamp_market_data(tick, self._origin)
         await self.state.set_last_tick(tick)
         if ingestion_settings.publish_ticks:
             await self.bus.publish(
@@ -349,6 +353,7 @@ class IngestionService:
         # Retain the entire batch and its partial flags before the first await.
         # A failure on any item must leave that item and all later ones intact.
         for candle in candles:
+            candle = stamp_market_data(candle, self._origin)
             resampler = self._resamplers.get(candle.symbol)
             marker = (candle.symbol, candle.timeframe, candle.open_time)
             if marker not in self._retired_candles:
@@ -368,6 +373,7 @@ class IngestionService:
                 retired.candle = await self._repairer.repair(
                     retired.candle, close_is_current=retired.close_is_current
                 )
+                retired.candle = stamp_market_data(retired.candle, self._origin)
             retired.partial = False
             await self.state.stage_closed_candle(retired.candle)
             del self._retired_candles[marker]
@@ -390,6 +396,8 @@ class IngestionService:
             lock = self._outbox_lock = asyncio.Lock()
         async with lock:
             while candle := await self.state.peek_pending_candle():
+                if not self._scope.accepts(candle.origin):
+                    raise ValueError("Refusing to publish a candle from another state scope")
                 await self.bus.publish(
                     self.subjects.candle_closed(candle.symbol, candle.timeframe),
                     CandleClosedEvent(
