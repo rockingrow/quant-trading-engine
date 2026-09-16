@@ -42,6 +42,12 @@ class RunnerSettings(BaseSettings):
     #: older missed bar joins the window as history only: an entry decided
     #: minutes late would go out at a price the backtest never traded.
     catch_up_max_age: float = Field(default=120.0, ge=0)
+    #: Seconds between sweeps that flatten an open position whose strategy's
+    #: declared weekend window has opened, with no candle close to trigger it.
+    #: Bar-driven flattening is the path the backtest also takes, but it leaves
+    #: a feed that stalls at 16:50 on a Friday holding the position all weekend.
+    #: Zero disables the sweep, leaving only the bar-driven path.
+    weekend_flat_sweep_interval: float = Field(default=60.0, ge=0)
 
 
 runner_settings = RunnerSettings()

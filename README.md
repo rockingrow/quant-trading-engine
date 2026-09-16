@@ -298,6 +298,39 @@ engine recognises a strategy structurally — a concrete `on_candle_closed`, a
 models. That is what lets a plugin repo run its own lint, test and release cycle
 with this one nowhere in sight.
 
+A manifest may expose a second hook, `load_settings()`, returning
+`{alias: settings}` — what the engine should enforce *around* each strategy
+rather than ask it about. Optional, and today it carries one setting, the
+weekend flat:
+
+```python
+# __strategies__/my-strategies/src/mine/settings.py
+SETTINGS = {
+    "MT5_GOLD_M5_SCALP": {
+        "weekend_flat": {
+            "enabled": True,
+            "flat_from": "FRI 17:00",  # when the instrument shuts
+            "flat_until": "SUN 22:00",  # when it reopens
+        },
+    },
+}
+
+
+def load_settings():
+    return SETTINGS
+```
+
+Inside that window the engine refuses new entries and closes any open position
+with a `FLAT` — in the backtest and in the live runner alike. Exits are never
+blocked. The strategy declares the calendar and does not implement it, because a
+cut-off written inside one strategy is one the next strategy can forget to copy.
+`QTE_ENGINE__WEEKEND_FLAT_TIMEZONE` (default `UTC`) decides whose clock those
+times are read on, and `QTE_RUNNER__WEEKEND_FLAT_SWEEP_INTERVAL` how often the
+runner also checks between bars — a stalled feed otherwise leaves no close to
+act on. A repo with no settings hook, and a strategy missing from the table,
+get no weekend flat; a setting that will not parse stops that strategy loading
+rather than quietly reverting to "off".
+
 **A directory scan — for a single file.** Failing a manifest, every `.py` under
 the directory is imported and anything that looks like a strategy is collected.
 Drop a single `.py` file in and it runs, no ceremony.
@@ -334,8 +367,9 @@ passing is not even imported. Fix what the audit found and mount it again.
 `make strategies` lists what the engine can see; `uv run qte-strategy-mount
 --show` lists what the mount recorded.
 
-> Why a manifest, why the contract is structural rather than nominal, and why
-> the interface is seven methods rather than one:
+> Why a manifest, why the contract is structural rather than nominal, why the
+> weekend flat is the engine's job rather than a strategy's, and why the
+> interface is seven methods rather than one:
 > [`docs/architecture.md`](docs/architecture.md).
 
 ---

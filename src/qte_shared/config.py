@@ -10,6 +10,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
 from pydantic import Field, model_validator
@@ -241,6 +242,11 @@ class EngineSettings(BaseSettings):
     engine, not a per-symbol one. It has to be a bar some symbol is resampled
     to, or the runner subscribes to a candle subject that never fires; the
     validator below refuses that outright rather than let it start quiet.
+
+    ``weekend_flat_timezone`` is in this block and not in ``QTE_RUNNER__`` for
+    the same reason: the live runner and the backtest replay both have to read a
+    strategy's declared weekend window in the same zone, or a backtest stops
+    predicting what the runner trades.
     """
 
     model_config = SettingsConfigDict(env_prefix="QTE_ENGINE__", extra="ignore")
@@ -263,6 +269,17 @@ class EngineSettings(BaseSettings):
     #: ``mt5/`` for a CSV import) so a file's path names its origin.
     parquet_dir: Path = REPO_ROOT / "data" / "parquet"
     reports_dir: Path = REPO_ROOT / "data" / "reports"
+    #: The zone a strategy's declared weekend-flat window is read in — see
+    #: :mod:`qte_shared.strategies.strategy_settings`. An IANA name; ``UTC``
+    #: takes the declared times literally, which is what the mounted strategies
+    #: state them in. The strategy owns *when* its market shuts, the operator
+    #: owns *whose clock* that is.
+    weekend_flat_timezone: str = "UTC"
+
+    @property
+    def market_zone(self) -> ZoneInfo:
+        """:attr:`weekend_flat_timezone` as a tzinfo, validated on construction."""
+        return ZoneInfo(self.weekend_flat_timezone)
 
     def resolve_subscriptions(
         self, market_plan: MarketDataPlan, market_overrides: dict[str, str]
@@ -313,6 +330,23 @@ class EngineSettings(BaseSettings):
                 f"QTE_ENGINE__SIGNAL_TIMEFRAME={self.signal_timeframe!r} is not one of the "
                 f"resampled timeframes {sorted(resampled)} — nothing would ever close for it"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _weekend_flat_timezone_exists(self) -> EngineSettings:
+        """Refuse an unknown zone name here, not on the first Friday.
+
+        Left unchecked, a typo would raise inside the runner's candle handler
+        every bar once a strategy declaring a weekend window was mounted — or,
+        worse, be caught by the handler's own guard and simply never flatten.
+        """
+        try:
+            ZoneInfo(self.weekend_flat_timezone)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(
+                f"QTE_ENGINE__WEEKEND_FLAT_TIMEZONE={self.weekend_flat_timezone!r} is not an "
+                f"IANA timezone name ({exc}) — 'UTC' or, for example, 'Europe/Nicosia'"
+            ) from exc
         return self
 
 
