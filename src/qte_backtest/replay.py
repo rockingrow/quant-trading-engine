@@ -12,6 +12,14 @@ closed by a decision made after the bar that would have stopped it out. Entries
 fill at the signal bar's close rather than the next bar's open, which is the
 common convention — it is slightly optimistic on a gap, and the gap handling in
 :class:`~qte_backtest.execution.FillSimulator` is where that is paid back.
+
+Step 3 has one gate that is not the strategy's. Inside the weekend-flat window
+a strategy's repository declared — see
+:mod:`qte_shared.strategies.strategy_settings` — entry intents are dropped and
+an open cycle is closed with a ``FLAT``. The live runner applies exactly this,
+in exactly this position in the bar, which is what keeps a replay a prediction
+of what the runner does over a Friday evening rather than a strictly
+more-traded version of it.
 """
 
 from __future__ import annotations
@@ -24,6 +32,7 @@ import pandas as pd
 
 from qte_backtest.execution import CostModel, ExitReason, FillSimulator, SimulatedPosition
 from qte_backtest.metrics import BacktestMetrics, compute_metrics, format_report
+from qte_shared.config import settings
 from qte_shared.logging_setup import get_logger
 from qte_shared.models import BrokerSignal, SignalAction
 from qte_shared.strategies.signal_factory import BracketPolicy, SignalFactory
@@ -34,6 +43,7 @@ from qte_shared.strategies.strategy_base import (
     StrategyLike,
     as_intents,
 )
+from qte_shared.strategies.strategy_settings import NO_WEEKEND_FLAT, WeekendFlatPolicy
 from qte_shared.timeframes import timeframe_seconds
 
 log = get_logger(__name__)
@@ -151,6 +161,7 @@ class BacktestEngine:
         bracket: BracketPolicy | None = None,
         default_quantity: float = 1.0,
         sizer: PositionSizer | None = None,
+        weekend_flat: WeekendFlatPolicy | None = None,
     ) -> None:
         self.strategy = strategy
         self.symbol = symbol.upper()
@@ -158,6 +169,12 @@ class BacktestEngine:
         self.simulator = FillSimulator(costs or CostModel())
         self.starting_equity = starting_equity
         self.default_quantity = default_quantity
+        # The calendar the *runner* would enforce around this strategy, read
+        # from the same setting in the same zone — see the module docstring.
+        # Defaulting to off rather than to the mounted repo's declaration keeps
+        # a hand-built engine in a test from needing a strategies directory.
+        self.weekend_flat = weekend_flat or NO_WEEKEND_FLAT
+        self.market_zone = settings.engine.market_zone
         # The same sizer the live runner builds, so a backtested trade is the
         # size the runner would have sent. Without a caller-supplied one it
         # reads QTE_ACCOUNT__* and the strategy's own params, which is where
@@ -174,6 +191,9 @@ class BacktestEngine:
         self.signals: list[BrokerSignal] = []
         self._open: SimulatedPosition | None = None
         self._rejected = 0
+        #: Entries the weekend window refused. Counted separately from
+        #: ``_rejected`` because these are not malformed — the calendar said no.
+        self._blocked = 0
 
     def run(self, frame: pd.DataFrame) -> BacktestResult:
         if frame.empty:
@@ -213,8 +233,17 @@ class BacktestEngine:
             context.open_uxid = self.factory.open_cycle(self.symbol)
             start = 0 if window_size is None else max(0, position + 1 - window_size)
             window = frame.iloc[start : position + 1]
+            close = float(bar["close"])
+            market_is_shut = self.weekend_flat.covers(bar_time, self.market_zone)
             for intent in as_intents(self.strategy.on_candle_closed(window, context)):
-                self._apply(intent, bar_time, float(bar["close"]))
+                if market_is_shut and intent.action.is_entry:
+                    self._blocked += 1
+                    continue
+                self._apply(intent, bar_time, close)
+            if market_is_shut:
+                # After the strategy's own exits, as in the runner: a bar that
+                # hit the stop stopped out, and the flat is what is left.
+                self._flatten_for_the_weekend(bar_time, close)
 
         # A position still open at the last bar is marked out at the final close
         # rather than dropped, so its unrealised P&L cannot silently flatter the
@@ -228,6 +257,15 @@ class BacktestEngine:
             )
 
         self.strategy.on_stop()
+        if self.weekend_flat.enabled:
+            # Worth one line: a run whose entry count dropped after this setting
+            # arrived should be able to show that the calendar is the reason.
+            log.info(
+                "Weekend flat %s (%s) blocked %d entries",
+                self.weekend_flat.describe(),
+                self.market_zone.key,
+                self._blocked,
+            )
         return BacktestResult(
             strategy=self.strategy.name,
             symbol=self.symbol,
@@ -256,6 +294,27 @@ class BacktestEngine:
         )
 
     # ── Intent handling ───────────────────────────────────────────────
+
+    def _flatten_for_the_weekend(self, bar_time: datetime, close: float) -> None:
+        """Close whatever is open, because this strategy's market is shutting.
+
+        Put through :meth:`_apply` like any other intent, so the trade is
+        filled, costed and published into ``signals`` exactly as the runner
+        would stage and deliver it. A pair already flat produces nothing, which
+        is what makes this safe to call on every bar inside the window.
+        """
+        if self.factory.open_cycle(self.symbol) is None:
+            return
+        self._apply(
+            SignalIntent(
+                action=SignalAction.FLAT,
+                symbol=self.symbol,
+                price=close,
+                reason="WEEKEND_FLAT",
+            ),
+            bar_time,
+            close,
+        )
 
     def _apply(self, intent: SignalIntent, bar_time: datetime, close: float) -> None:
         if intent.price is None:

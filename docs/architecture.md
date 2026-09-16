@@ -248,6 +248,58 @@ The scan is still there for the one-file case, and the two mix: a loose
 manifest. What a manifest claims, the scan leaves alone — importing those
 modules a second time would register every class twice.
 
+## Why the weekend flat is the engine's job, not the strategy's
+
+A CFD book closes on Friday evening and reopens on Sunday. A position left open
+across that gap cannot be stopped out, and Monday's first print reprices it
+against two days of news. Something has to be flat before the close.
+
+For a while that something was the strategy. `MT5_GOLD_M5_V2` carried a
+`use_weekend_flat` param, a `weekend_flat_time`, a cut-off parser, a term in its
+entry gate and a `FLAT` branch in its trade mirror — five places, all correct,
+all invisible from outside the file. The trouble is what that implies for the
+second strategy on the same instrument: it either copies the five, or it does
+not have them. A protection you can forget by omission is not a protection, and
+"did anyone remember the Friday cut-off in this one?" is not a question a code
+review reliably catches.
+
+So the decision moved, and the declaration stayed. A strategy repository
+declares its market's window as data — `flat_from`, `flat_until`, a weekday and
+a wall time — in a settings file beside its alias table, published through a
+second manifest hook (`load_settings`, alongside `load_all`). The engine parses
+it at the plugin boundary and enforces it: inside the window entry intents are
+dropped and any open cycle is closed with a `FLAT`. The strategy stops owning
+the clock and keeps owning the only part that was ever its business, which is
+knowing when its instrument trades.
+
+Three details are load-bearing.
+
+**It is a window, not a cut-off.** A cut-off says when to close and not when the
+block ends, so the engine would flatten at 17:00 and the strategy — no longer
+holding a gate of its own — would re-enter on the next bar and be flattened
+again, taking turns until the market shut. `flat_until` is what makes the block
+terminate, and stating the reopen is also the honest way to describe a weekend.
+
+**The zone is the operator's, not the strategy's.**
+`QTE_ENGINE__WEEKEND_FLAT_TIMEZONE` decides whose clock those wall times are
+read on, default `UTC`. It sits in the engine block rather than the runner's
+because the backtest reads it too: a replay evaluating a different window from
+the runner would stop predicting the one thing this feature changes.
+
+**A setting that will not parse stops the strategy loading.** The alternative is
+falling back to "off", which turns a misspelled `flat_form` into a position held
+through a shut market — the exact failure the setting exists to prevent. The
+loader records it as a load failure, so `make audit` reports it and
+`QTE_RUNNER__AUDIT_ON_START=error` refuses to start on it.
+
+The runner has one thing the replay does not: a periodic sweep that also
+flattens between bars. Bar-driven evaluation is what keeps the two drivers
+deciding alike, and it is not enough on its own — a feed that stalls at 16:50 on
+a Friday delivers no further close, and the position rides through the weekend.
+The sweep only ever fires at moments that have no bar, which is precisely the
+set a backtest cannot represent, so it costs no parity.
+`QTE_RUNNER__WEEKEND_FLAT_SWEEP_INTERVAL=0` turns it off.
+
 ## Why the strategy interface is seven methods, not one
 
 A strategy could say everything it has to say through `on_candle_closed`, and

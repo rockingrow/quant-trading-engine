@@ -74,7 +74,12 @@ async def run_backtest(
     # the command line would be the only way to reproduce production, and
     # forgetting it would silently measure a different book.
     params = {**_mapped_params(request), **request.params}
-    strategy = loader.load_one(request.strategy, params)
+    # `find` rather than `load_one`: the replay needs the settings the mounted
+    # repository declared beside the class — the weekend window the live runner
+    # would enforce — or it would measure a strategy trading a Friday evening
+    # the runner closes it out of.
+    discovered = loader.find(request.strategy)
+    strategy = discovered.instantiate(params)
 
     frame = load_history(
         request.history_file,
@@ -108,6 +113,7 @@ async def run_backtest(
         sizer=PositionSizer.from_settings(params, risk_percent=request.risk_percent).replace(
             capital=request.starting_equity, contract_size=request.contract_size
         ),
+        weekend_flat=discovered.settings.weekend_flat,
     )
     result = engine.run(frame)
     report = build_report(result)

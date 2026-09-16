@@ -23,6 +23,15 @@ Three ordering rules matter here:
   old, kept as history otherwise — with every slot held, so a live close cannot
   overtake it.
 
+One decision here is the runner's own rather than a strategy's. While a
+strategy's declared weekend window is open — see
+:mod:`qte_shared.strategies.strategy_settings` — its entries are dropped and any
+open cycle is closed with a ``FLAT``, because a market that is shut cannot be
+stopped out of. The backtest replay applies the identical rule, so the two still
+decide the same things; the periodic sweep that also flattens between bars is
+the one part with no replay counterpart, and it only fires at moments a backtest
+has no bar for.
+
 Position state is written twice on purpose. The cycle a pair is holding goes to
 Redis (hot, read on every bar) *and* to Postgres (durable), and boot prefers
 Redis and falls back to the table. A re-provisioned cache would otherwise be
@@ -48,7 +57,14 @@ from qte_shared.config import settings
 from qte_shared.db import EventRepository
 from qte_shared.interfaces.market_data import ProviderError
 from qte_shared.logging_setup import get_logger
-from qte_shared.models import BrokerSignal, Candle, CandleClosedEvent, OpenPosition, TickEvent
+from qte_shared.models import (
+    BrokerSignal,
+    Candle,
+    CandleClosedEvent,
+    OpenPosition,
+    SignalAction,
+    TickEvent,
+)
 from qte_shared.providers import get_provider_class
 from qte_shared.strategies.mapping import SymbolMapping
 from qte_shared.strategies.plugin_loader import load_strategies
@@ -63,6 +79,7 @@ from qte_shared.strategies.strategy_base import (
     candles_to_frame,
     overrides_on_tick,
 )
+from qte_shared.strategies.strategy_settings import NO_WEEKEND_FLAT, WeekendFlatPolicy
 from qte_shared.timeframes import (
     CLOCK_TOLERANCE,
     bucket_close,
@@ -82,10 +99,21 @@ SERVICE_NAME = "strategy-runner"
 class StrategySlot:
     """One strategy bound to one symbol, with its own candle buffer and cycle."""
 
-    def __init__(self, strategy: StrategyLike, symbol: str, factory: SignalFactory) -> None:
+    def __init__(
+        self,
+        strategy: StrategyLike,
+        symbol: str,
+        factory: SignalFactory,
+        weekend_flat: WeekendFlatPolicy = NO_WEEKEND_FLAT,
+    ) -> None:
         self.strategy = strategy
         self.symbol = symbol
         self.factory = factory
+        # The market calendar this pair trades on, as its repository declared
+        # it. It sits on the slot rather than on the strategy because going
+        # flat before the market shuts is the engine's decision — a strategy
+        # that could read this is a strategy that could ignore it.
+        self.weekend_flat = weekend_flat
         self.timeframe = normalize_timeframe(strategy.timeframe)
         # Exactly the window the backtest hands the same strategy — the bound
         # lives on the strategy contract so the two drivers cannot drift apart.
@@ -118,6 +146,9 @@ class StrategyRunner:
         self.sink = sink or BrokerSink()
         self._scope = settings.state_scope
         self._scope.origin(synthetic=self._provider_is_synthetic())
+        #: The zone every slot's weekend window is read in. One value for the
+        #: process, resolved once — the backtest reads the same setting.
+        self._market_zone = settings.engine.market_zone
         self._configured_shadow_mode = self.sink.shadow_mode
         self._history_started_at = datetime.now(UTC)
         self._owner_id = str(uuid4())
@@ -180,6 +211,12 @@ class StrategyRunner:
             self._tasks.append(
                 asyncio.create_task(self._history_sync_loop(), name="runner-history-sync")
             )
+            if runner_settings.weekend_flat_sweep_interval > 0 and any(
+                strategy_slot.weekend_flat.enabled for strategy_slot in self.slots
+            ):
+                self._tasks.append(
+                    asyncio.create_task(self._weekend_flat_loop(), name="runner-weekend-flat")
+                )
 
             await self.events.record_event(
                 service=SERVICE_NAME,
@@ -284,18 +321,23 @@ class StrategyRunner:
                     sizer=sizer,
                     default_quantity=runner_settings.default_quantity,
                 )
-                slot = StrategySlot(strategy, symbol, factory)
+                slot = StrategySlot(
+                    strategy, symbol, factory, weekend_flat=entry.settings.weekend_flat
+                )
                 self._warn_if_history_exceeds_redis(slot)
                 self.slots.append(slot)
                 self._by_subject[(symbol, slot.timeframe)].append(slot)
                 log.info(
-                    "Slot ready strategy=%s symbol=%s tf=%s warmup=%d risk=%.3f%% of %.2f",
+                    "Slot ready strategy=%s symbol=%s tf=%s warmup=%d risk=%.3f%% of %.2f "
+                    "weekend_flat=%s (%s)",
                     strategy.name,
                     symbol,
                     slot.timeframe,
                     strategy.warmup,
                     sizer.risk_percent,
                     sizer.capital,
+                    slot.weekend_flat.describe(),
+                    self._market_zone.key,
                 )
 
     @staticmethod
@@ -688,8 +730,116 @@ class StrategyRunner:
             )
             return
 
+        market_is_shut = slot.weekend_flat.covers(context.now, self._market_zone)
         for intent in as_intents(result):
+            if market_is_shut and intent.action.is_entry:
+                # The market this pair trades shuts before the next bar the
+                # strategy could manage this position on. Dropped here rather
+                # than in the strategy: the gate belongs to the calendar, and
+                # without it the FLAT below and the next entry would take turns
+                # every bar until the close.
+                log.info(
+                    "Blocked %s for %s %s at %s: inside the weekend-flat window %s (%s)",
+                    intent.action.value,
+                    slot.strategy.name,
+                    slot.symbol,
+                    context.now,
+                    slot.weekend_flat.describe(),
+                    self._market_zone.key,
+                )
+                continue
             await self._emit(slot, intent, candle.close, context.now)
+
+        if market_is_shut:
+            # After the strategy's own exits, not before them: a bar that hit
+            # the stop stopped out, and the flat is what is left over.
+            await self._flatten_for_the_weekend(slot, candle.close, context.now)
+
+    async def _flatten_for_the_weekend(
+        self, slot: StrategySlot, price: float, moment: datetime
+    ) -> None:
+        """Close whatever is open on *slot*, because its market is shutting.
+
+        Emitted as an ordinary intent on the ordinary path, so it is staged in
+        the outbox, sized, delivered and audited exactly like a strategy's own
+        exit — there is no second delivery route to keep correct.
+
+        A pair that is already flat produces nothing, which is what makes this
+        safe to call on every bar inside the window and from the sweep.
+        """
+        if slot.factory.open_cycle(slot.symbol) is None:
+            return
+        log.warning(
+            "Weekend flat: closing %s on %s at %s — window %s (%s)",
+            slot.strategy.name,
+            slot.symbol,
+            moment,
+            slot.weekend_flat.describe(),
+            self._market_zone.key,
+        )
+        await self._emit(
+            slot,
+            SignalIntent(
+                action=SignalAction.FLAT,
+                symbol=slot.symbol,
+                price=price,
+                reason="WEEKEND_FLAT",
+            ),
+            price,
+            moment,
+        )
+
+    async def _weekend_flat_loop(self) -> None:
+        """Flatten a shut market even when no candle closes to prompt it.
+
+        The bar-driven path in :meth:`_feed_candle_serialized` is the one the
+        backtest also takes, so the two drivers decide alike on every bar. It is
+        not enough on its own: a feed that stalls at 16:50 on a Friday delivers
+        no further close, and the position rides through the weekend. This loop
+        covers exactly the moments a backtest has no bar for, which is why it
+        can exist without the replay drifting from the runner.
+
+        ``QTE_RUNNER__WEEKEND_FLAT_SWEEP_INTERVAL=0`` turns it off and leaves
+        only the bar-driven path.
+        """
+        while not self._stopping.is_set():
+            await asyncio.sleep(runner_settings.weekend_flat_sweep_interval)
+            for strategy_slot in self.slots:
+                if not strategy_slot.weekend_flat.enabled or not strategy_slot.buffer:
+                    continue
+                try:
+                    async with strategy_slot.lock:
+                        await self._sweep_one_slot(strategy_slot)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # One pair whose ownership check or delivery failed must not
+                    # stop the sweep reaching the others; the next interval
+                    # retries it, and the window is open for hours.
+                    log.exception(
+                        "Weekend-flat sweep failed for %s %s; retrying at the next interval",
+                        strategy_slot.strategy.name,
+                        strategy_slot.symbol,
+                    )
+
+    async def _sweep_one_slot(self, strategy_slot: StrategySlot) -> None:
+        """One slot's share of :meth:`_weekend_flat_loop`, under its lock.
+
+        The moment tested is the wall clock and not a bar time: the whole point
+        is that no bar arrived. The price on the intent is the last close this
+        pair saw, which is the only price the runner has when the feed is the
+        thing that stopped — a ``FLAT`` carries no size or level to the broker,
+        so it is the audit trail that reads it rather than the fill.
+        """
+        moment = datetime.now(UTC)
+        if not strategy_slot.weekend_flat.covers(moment, self._market_zone):
+            return
+        if strategy_slot.key in self._uncertain_pairs:
+            return
+        await self._check_ownership()
+        if await self._live_delivery_paused():
+            return
+        await self._flatten_for_the_weekend(strategy_slot, strategy_slot.buffer[-1].close, moment)
 
     async def _on_tick_message(self, msg: Msg) -> None:
         event = TickEvent.model_validate_json(msg.data)
@@ -723,7 +873,20 @@ class StrategyRunner:
                         "Strategy %s raised on tick for %s", slot.strategy.name, slot.symbol
                     )
                     continue
+                # The same calendar gate the candle path applies. A tick-driven
+                # entry into a market that is shutting is the same mistake, and
+                # exits still pass so a position can always be got out of.
+                market_is_shut = slot.weekend_flat.covers(event.tick.ts, self._market_zone)
                 for intent in as_intents(result):
+                    if market_is_shut and intent.action.is_entry:
+                        log.info(
+                            "Blocked tick %s for %s %s: inside the weekend-flat window %s",
+                            intent.action.value,
+                            slot.strategy.name,
+                            slot.symbol,
+                            slot.weekend_flat.describe(),
+                        )
+                        continue
                     await self._emit(slot, intent, price, event.tick.ts)
 
     async def _on_control_message(self, msg: Msg) -> None:

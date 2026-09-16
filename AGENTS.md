@@ -81,6 +81,7 @@ package; never scan from the repository root.
 | Strategy contract and its seven methods | `src/qte_shared/strategies/strategy_base.py` |
 | Strategy discovery and manifests | `src/qte_shared/strategies/plugin_loader.py` |
 | What `make strategy-mount` recorded, per strategy | `src/qte_shared/strategies/mount_manifest.py`, `__strategies__/strategies.toml` |
+| Per-strategy settings a repo declares; the weekend flat | `src/qte_shared/strategies/strategy_settings.py`, each repo's `settings.py` |
 | Intent to broker payload | `src/qte_shared/strategies/signal_factory.py` |
 | Position sizing and account risk | `src/qte_shared/strategies/sizing.py` |
 | Indicators (pure, arrays in and out) | `src/qte_shared/indicators.py` |

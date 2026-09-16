@@ -15,7 +15,9 @@ path, a package name or a
 directory layout, so the plugin repo can reorganise itself freely, and it
 decides for itself which of its classes are deployed — a half-finished
 experiment sitting in the tree cannot start trading because someone forgot it
-was a strategy subclass.
+was a strategy subclass. A manifest may expose a second hook, ``load_settings``,
+declaring what the engine should do *around* each strategy — going flat before
+its market shuts; see :mod:`qte_shared.strategies.strategy_settings`.
 
 **A directory scan.** Failing a manifest, every ``.py`` under the directory is
 imported and anything that looks like a strategy is collected. This is what
@@ -53,6 +55,12 @@ from qte_shared.strategies.strategy_base import (
     implements_strategy_contract,
     looks_like_a_strategy,
 )
+from qte_shared.strategies.strategy_settings import (
+    DEFAULT_SETTINGS,
+    STRATEGY_SETTINGS_HOOK,
+    StrategySettings,
+    parse_settings_table,
+)
 
 log = get_logger(__name__)
 
@@ -65,6 +73,18 @@ MANIFEST_FILENAMES = ("strategies.py", "manifest.py")
 
 #: …exposing this callable, which returns ``{alias: strategy class}``.
 MANIFEST_HOOK = "load_all"
+
+#: …and, optionally, this one, which returns ``{alias: settings}``. Optional
+#: because it is what a repo declares about the *market* rather than about its
+#: own code — see :mod:`qte_shared.strategies.strategy_settings`. A repo that
+#: omits it, and every loose file the scan finds, keeps the engine's defaults.
+SETTINGS_HOOK = STRATEGY_SETTINGS_HOOK
+
+SETTINGS_FIX = (
+    "correct the settings table beside the repo's alias table — the error above names "
+    "the alias and the key; a strategy whose declared market policy will not parse is "
+    "not run at all"
+)
 
 #: How deep below the strategies directory a manifest is looked for. One level
 #: is what the layout produces: ``__strategies__/`` is the mount point and the
@@ -130,12 +150,18 @@ class Candidate:
     ``via`` says how it was found. A ``"manifest"`` candidate was named by the
     repo and is therefore certainly meant as a strategy; a ``"scan"`` candidate
     is a guess — see :func:`~qte_shared.strategies.strategy_base.looks_like_a_strategy`.
+
+    ``settings`` is what the candidate's repository declared about the market it
+    trades, already parsed. ``None`` means the settings did not read and this
+    candidate must not be run — :meth:`StrategyLoader.discover` drops it, and
+    the matching :class:`LoadFailure` is what the audit reports.
     """
 
     name: str
     obj: Any
     source: Path
     via: Literal["manifest", "scan"]
+    settings: StrategySettings | None = DEFAULT_SETTINGS
 
 
 @dataclass(slots=True)
@@ -151,6 +177,12 @@ class LoadFailure:
     path: Path
     reason: str
     error: BaseException | None = None
+    #: What to do about it, when the loader knows something more specific than
+    #: the auditor's default guess. A failed import is nearly always a missing
+    #: dependency; a settings table that would not parse is not, and telling
+    #: someone to reinstall dependencies over a misspelled key wastes the one
+    #: line they were going to read.
+    fix: str | None = None
 
     @property
     def detail(self) -> str:
@@ -166,11 +198,16 @@ class LoadedStrategy:
     ``cls`` is a class the engine can drive, which is not the same as a
     :class:`~qte_shared.strategies.strategy_base.StrategyBase` subclass — see that
     module's docstring.
+
+    ``settings`` travels beside the class rather than inside it: it is what the
+    *engine* does around the strategy — going flat before the market shuts —
+    and a strategy that could read it would be a strategy that could ignore it.
     """
 
     name: str
     cls: StrategyLike
     source: Path
+    settings: StrategySettings = DEFAULT_SETTINGS
 
     def instantiate(self, params: dict[str, Any] | None = None) -> StrategyLike:
         return self.cls(params or {})
@@ -275,6 +312,17 @@ class StrategyLoader:
             if not implements_strategy_contract(candidate.obj):
                 self._report_undrivable(candidate)
                 continue
+            if candidate.settings is None:
+                # Its repository declared settings that would not parse. Running
+                # it anyway would mean trading without the weekend flat it was
+                # deployed with — see :meth:`_manifest_settings`.
+                log.error(
+                    "Not running %s from %s: the settings its repository declares did not "
+                    "read, so the market policy it should be trading under is unknown",
+                    candidate.name,
+                    candidate.source,
+                )
+                continue
             if candidate.name in disabled:
                 # Its repository came in for the sake of a sibling that passed.
                 log.warning(
@@ -285,9 +333,19 @@ class StrategyLoader:
                 )
                 continue
             found.append(
-                LoadedStrategy(name=candidate.name, cls=candidate.obj, source=candidate.source)
+                LoadedStrategy(
+                    name=candidate.name,
+                    cls=candidate.obj,
+                    source=candidate.source,
+                    settings=candidate.settings,
+                )
             )
-            log.info("Registered strategy %s from %s", candidate.name, candidate.source)
+            log.info(
+                "Registered strategy %s from %s weekend_flat=%s",
+                candidate.name,
+                candidate.source,
+                candidate.settings.weekend_flat.describe(),
+            )
 
         self._warn_on_duplicates(found)
         return found
@@ -318,16 +376,26 @@ class StrategyLoader:
                 candidate.source,
             )
 
-    def load_one(self, name: str, params: dict[str, Any] | None = None) -> StrategyLike:
-        """Instantiate the single strategy called *name*."""
+    def find(self, name: str) -> LoadedStrategy:
+        """The single discovered strategy called *name*, settings and all.
+
+        Separate from :meth:`load_one` because a caller that has to apply the
+        strategy's settings — the backtest, so a replay measures the same
+        weekend behaviour the runner trades — needs the record and not just an
+        instance of the class.
+        """
         discovered = self.discover()
-        for candidate in discovered:
-            if candidate.name == name or candidate.cls.__name__ == name:
-                return candidate.instantiate(params)
+        for entry in discovered:
+            if entry.name == name or entry.cls.__name__ == name:
+                return entry
         available = ", ".join(sorted(entry.name for entry in discovered)) or "none"
         raise LookupError(
             f"Strategy {name!r} not found in {self.directory} (available: {available})"
         )
+
+    def load_one(self, name: str, params: dict[str, Any] | None = None) -> StrategyLike:
+        """Instantiate the single strategy called *name*."""
+        return self.find(name).instantiate(params)
 
     # ── Manifests ─────────────────────────────────────────────────────
 
@@ -386,10 +454,71 @@ class StrategyLoader:
             self.failures.append(LoadFailure(path, f"{MANIFEST_HOOK}() raised", error))
             return []
 
+        declared = self._manifest_settings(module, path, published)
         return [
-            Candidate(name=str(alias), obj=strategy, source=path, via="manifest")
+            Candidate(
+                name=str(alias),
+                obj=strategy,
+                source=path,
+                via="manifest",
+                settings=declared.get(str(alias), DEFAULT_SETTINGS),
+            )
             for alias, strategy in published.items()
         ]
+
+    def _manifest_settings(
+        self, module: Any, path: Path, published: dict[Any, Any]
+    ) -> dict[str, StrategySettings | None]:
+        """What one repository declared about the markets its strategies trade.
+
+        A repo with no :data:`SETTINGS_HOOK` declares nothing, which is not an
+        error — every strategy mounted before the hook existed is in that case.
+
+        A hook that *is* there and does not read is a different matter. The
+        settings carry the weekend flat, so falling back to the default would
+        replace a policy the repo meant to declare with "trade through the
+        weekend" — the exact failure the setting exists to prevent. So every
+        strategy in the repo maps to ``None`` here and
+        :meth:`discover` refuses to run them, loudly and in the audit.
+        """
+        aliases = [str(alias) for alias in published]
+        hook = getattr(module, SETTINGS_HOOK, None)
+        if hook is None:
+            return {}
+        if not callable(hook):
+            log.error("%s defines %s but it is not callable", path, SETTINGS_HOOK)
+            self.failures.append(
+                LoadFailure(path, f"{SETTINGS_HOOK} is not callable", fix=SETTINGS_FIX)
+            )
+            return dict.fromkeys(aliases, None)
+
+        try:
+            declared = parse_settings_table(hook())
+        except Exception as error:
+            log.exception(
+                "%s.%s() did not read — refusing to run the strategies it speaks for",
+                path,
+                SETTINGS_HOOK,
+            )
+            self.failures.append(
+                LoadFailure(path, f"{SETTINGS_HOOK}() did not read", error, fix=SETTINGS_FIX)
+            )
+            return dict.fromkeys(aliases, None)
+
+        unpublished = sorted(set(declared) - set(aliases))
+        if unpublished:
+            # Not fatal: the settings still apply to what *is* published. But an
+            # alias in this table and not in the other one is a rename nobody
+            # finished, and the symptom without this line is a strategy that
+            # trades with no weekend flat and no indication why.
+            log.error(
+                "%s declares settings for %s, which %s() does not publish — those "
+                "settings apply to nothing",
+                path,
+                ", ".join(unpublished),
+                MANIFEST_HOOK,
+            )
+        return dict(declared)
 
     # ── Directory scan ────────────────────────────────────────────────
 
