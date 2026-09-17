@@ -130,6 +130,9 @@ class NoPositions:
     async def get(self, strategy, symbol):
         return None
 
+    async def list_open(self, strategy=None):
+        return []
+
 
 class NoPendingSignals:
     async def pending_deliveries(self, **query_options):

@@ -707,12 +707,26 @@ The flag is written to Redis first and broadcast second, so a runner that starts
 *after* the broadcast still comes up in the mode you last chose. If NATS is
 unreachable the command says so explicitly rather than reporting success.
 
+**Coming back from an outage.** One strategy-symbol pair holds one trade cycle
+at a time, so a position that outlived a long downtime locks that pair: every
+entry the strategy proposes afterwards is refused, against a position whose
+bracket the market left behind hours ago. On start the runner closes anything
+older than `QTE_RUNNER__STALE_POSITION_MAX_AGE` (default one hour) with an
+`R_SL`, which ends the cycle and frees the pair. A deploy or a config change
+comes back well inside that window and keeps its positions, which is what the
+Redis and Postgres recovery path is for. Set
+`QTE_RUNNER__FLUSH_STALE_POSITIONS=warn` to see what a first run would close
+before letting it close anything, `off` to disable it, or the age to `0` to
+close the book on every start. Why it is age-gated rather than unconditional:
+[`docs/architecture.md`](docs/architecture.md).
+
 Everything else the engine knows is a CLI command or a SQL query:
 
 | Want | Do |
 | --- | --- |
 | Signal audit trail | `SELECT * FROM signals ORDER BY created_at DESC LIMIT 20` |
 | One trade cycle end to end | `SELECT * FROM signals WHERE signal_uxid = '…' ORDER BY created_at` |
+| What is open right now | `SELECT strategy, symbol, signal_uxid, remaining, updated_at FROM open_positions` |
 | What strategies are loaded | `make strategies` |
 | Look at a report | `make chart REPORT=data/reports/….json`, then open the HTML |
 | Rehearse the live path | `make sim`, then `qte-simulator replay …` (dev only) |

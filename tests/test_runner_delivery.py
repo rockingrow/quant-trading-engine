@@ -222,6 +222,13 @@ class FakePositions:
         self.cleared.append((strategy, symbol))
         return True
 
+    async def list_open(self, strategy=None):
+        return [
+            position
+            for (held_strategy, _), position in self.held.items()
+            if strategy is None or held_strategy == strategy
+        ]
+
 
 def _runner(state=None, positions=None, sink=None):
     runner = StrategyRunner(sink=sink or AcceptingSink())
