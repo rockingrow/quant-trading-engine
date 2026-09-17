@@ -33,11 +33,11 @@ class BacktestRequest:
     start: datetime | None = None
     end: datetime | None = None
     params: dict[str, Any] = field(default_factory=dict)
-    spread: float = 0.0
-    slippage: float = 0.0
     #: Defaulted from ``QTE_ACCOUNT__*`` so a run with no flags is priced and
     #: capitalised the way the live account is. Pass a value to override one
     #: without disturbing the rest.
+    spread: float = field(default_factory=lambda: settings.account.spread)
+    slippage: float = field(default_factory=lambda: settings.account.slippage)
     commission_per_unit: float = field(default_factory=lambda: settings.account.commission_per_unit)
     contract_size: float = field(default_factory=lambda: settings.account.contract_size)
     #: Fallback size for an entry the risk sizer could not size (no stop).

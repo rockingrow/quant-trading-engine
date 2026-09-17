@@ -69,9 +69,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fallback size for an entry the risk sizer cannot size (no stop)",
     )
     run.add_argument(
-        "--spread", type=float, default=0.0, help="Full bid/ask distance in price units"
+        "--spread",
+        type=float,
+        default=settings.account.spread,
+        help="Full bid/ask distance in price units (default: QTE_ACCOUNT__SPREAD)",
     )
-    run.add_argument("--slippage", type=float, default=0.0)
+    run.add_argument(
+        "--slippage",
+        type=float,
+        default=settings.account.slippage,
+        help="Added on top of half the spread, each side (default: QTE_ACCOUNT__SLIPPAGE)",
+    )
     run.add_argument(
         "--commission",
         type=float,

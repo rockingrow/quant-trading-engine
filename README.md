@@ -440,6 +440,8 @@ the pair's own value in `config/strategies_mapping.toml`, falling back to
 QTE_ACCOUNT__CAPITAL=1000.0          # the account, and what a % of risk is a % of
 QTE_ACCOUNT__RISK_PERCENT=1.0        # fallback when a pair states none
 QTE_ACCOUNT__COMMISSION_PER_UNIT=0.0 # backtest cost, charged each side
+QTE_ACCOUNT__SPREAD=0.0              # full bid/ask distance, each side pays half
+QTE_ACCOUNT__SLIPPAGE=0.0            # on top of half the spread, each side
 QTE_ACCOUNT__CONTRACT_SIZE=1.0
 ```
 
