@@ -48,6 +48,22 @@ class RunnerSettings(BaseSettings):
     #: a feed that stalls at 16:50 on a Friday holding the position all weekend.
     #: Zero disables the sweep, leaving only the bar-driven path.
     weekend_flat_sweep_interval: float = Field(default=60.0, ge=0)
+    #: What to do on start about an open position the outage left behind. One
+    #: pair holds one cycle at a time, so a stale row locks it: every entry the
+    #: strategy proposes is refused while the position it is locked on was sized
+    #: against a bracket the market left behind hours ago.
+    #:
+    #:   off     leave the table alone.
+    #:   warn    report what would be closed, send nothing — look before acting.
+    #:   close   send R_SL for it, which ends the cycle and frees the pair.
+    flush_stale_positions: Literal["off", "warn", "close"] = "close"
+    #: How old a position has to be, in seconds since its last transition,
+    #: before the flush above counts it as stale. The restart this protects
+    #: against is the long one; a deploy or a config change comes back inside
+    #: this window and keeps its positions, which is what the Redis/Postgres
+    #: recovery path exists for. Zero makes every open position stale, which is
+    #: the unconditional flush.
+    stale_position_max_age: float = Field(default=3600.0, ge=0)
 
 
 runner_settings = RunnerSettings()

@@ -37,6 +37,14 @@ Redis (hot, read on every bar) *and* to Postgres (durable), and boot prefers
 Redis and falls back to the table. A re-provisioned cache would otherwise be
 indistinguishable from "flat", and the runner would mint a second cycle against
 a position the broker still has open.
+
+Restoring a cycle is the right answer for a restart and the wrong one for an
+outage. One pair holds one cycle at a time, so a row that outlived a long
+downtime locks it: every entry the strategy proposes is refused, and the
+position it is locked on was sized against a bracket the market left behind
+hours ago. So :meth:`StrategyRunner._flush_stale_positions` closes what has gone
+stale — ``R_SL``, on the ordinary delivery path — while anything younger than
+``QTE_RUNNER__STALE_POSITION_MAX_AGE`` is restored exactly as before.
 """
 
 from __future__ import annotations
@@ -45,6 +53,7 @@ import asyncio
 import contextlib
 import json
 from collections import defaultdict, deque
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
@@ -196,6 +205,11 @@ class StrategyRunner:
             self._validate_tick_publication()
             await self._restore_state()
             await self._recover_pending_deliveries()
+            # After recovery, so the outbox has reconciled every ambiguous
+            # delivery and the book is what it says it is. Before the
+            # subscriptions below, so no live close races the flush and no
+            # strategy is ever asked to decide a bar against a stale position.
+            await self._flush_stale_positions()
             # Every slot is held while the subscriptions go live and the missed
             # closes are replayed. A close that arrives meanwhile waits for the
             # replay, then finds its bar already fed and is ignored, so no bar is
@@ -622,6 +636,204 @@ class StrategyRunner:
             position.remaining,
         )
 
+    # ── Stale positions ───────────────────────────────────────────────
+
+    async def _flush_stale_positions(self) -> None:
+        """Close what an outage left open, so the pair is not locked on it.
+
+        The lock is the point. One ``(strategy, symbol)`` pair holds one cycle
+        at a time — ``uq_open_positions_pair`` in the database, and
+        :meth:`SignalFactory._prepare_entry` refusing an entry that would
+        replace an open cycle — so a row that survived a long downtime means
+        every entry the strategy proposes from here on is refused, against a
+        position whose bracket the market left behind hours ago.
+
+        Age is what separates that from an ordinary restart. A deploy comes back
+        inside ``QTE_RUNNER__STALE_POSITION_MAX_AGE`` and keeps its positions,
+        which is what the Redis/Postgres recovery path is for; anything older is
+        closed with ``R_SL``, a terminal action, so the cycle ends and the pair
+        is free. Zero makes every open position stale.
+
+        ``warn`` reports and sends nothing, which is how to see what a first
+        ``close`` run would do before letting it do it.
+        """
+        mode = runner_settings.flush_stale_positions
+        # What locks a pair is the cycle `_restore_position` put on its slot,
+        # and that came from Redis in preference to Postgres. Deciding from the
+        # table instead would miss a cycle Redis holds and Postgres does not —
+        # `_persist_position` writes Redis first and `upsert` swallows its own
+        # failure, so the two can disagree, and the pair would come back locked
+        # on a position this never looked at.
+        locked_pairs = [
+            (strategy_slot, position)
+            for strategy_slot in self.slots
+            if (position := strategy_slot.factory.open_position(strategy_slot.symbol)) is not None
+        ]
+        # The table is still read, for the two things the slots cannot show:
+        # rows belonging to no running strategy, and duplicate cycle ids across
+        # the whole namespace. Best-effort — `list_open` reports its own
+        # failures and answers with an empty list.
+        listed = await self.positions.list_open()
+        # Whatever the mode: a duplicated cycle id is a correctness problem
+        # rather than a staleness one, and "off" must not hide it. Checked over
+        # both sources so an unreadable table cannot make this pass on no data.
+        self._verify_position_uxids(self.slots, listed)
+        if mode == "off":
+            return
+        self._report_orphan_positions(listed)
+
+        max_age = runner_settings.stale_position_max_age
+        moment = datetime.now(UTC)
+        for strategy_slot, position in locked_pairs:
+            if strategy_slot.key in self._uncertain_pairs:
+                log.warning(
+                    "Not flushing %s %s: its delivery is still unreconciled. The outbox "
+                    "settles first; the next start will flush it if it is still stale.",
+                    position.strategy,
+                    position.symbol,
+                )
+                continue
+
+            age = (moment - _as_aware(position.updated_at)).total_seconds()
+            if age < max_age:
+                log.info(
+                    "Keeping open cycle %s on %s %s: %.0fs old, inside the %.0fs window",
+                    position.signal_uxid,
+                    strategy_slot.strategy.name,
+                    strategy_slot.symbol,
+                    age,
+                    max_age,
+                )
+                continue
+
+            log.warning(
+                "Stale open cycle %s on %s %s: %.0fs since its last transition, over the "
+                "%.0fs window — %s",
+                position.signal_uxid,
+                strategy_slot.strategy.name,
+                strategy_slot.symbol,
+                age,
+                max_age,
+                "closing it with R_SL" if mode == "close" else "would close it with R_SL",
+            )
+            if mode == "close":
+                await self._close_stale_position(strategy_slot, position)
+
+    def _report_orphan_positions(self, listed: list[OpenPosition]) -> None:
+        """Name every table row belonging to a strategy this runner is not driving.
+
+        Reported and not closed: :class:`OpenPosition` records no timeframe and
+        the broker payload requires one, so the engine cannot build a truthful
+        signal for a strategy it is not running. An error rather than a note,
+        because nobody else will ever close these either — the strategy was
+        unmapped or removed while it still held a position.
+        """
+        driven = {strategy_slot.key for strategy_slot in self.slots}
+        for position in listed:
+            if (position.strategy, position.symbol) in driven:
+                continue
+            log.error(
+                "Open position %s %s uxid=%s belongs to no running strategy — this "
+                "runner cannot close it. Map the strategy again and restart, or "
+                "reconcile the position with the broker and delete the row.",
+                position.strategy,
+                position.symbol,
+                position.signal_uxid,
+            )
+
+    async def _close_stale_position(
+        self, strategy_slot: StrategySlot, position: OpenPosition
+    ) -> None:
+        """Send the ``R_SL`` that ends one stale cycle.
+
+        ``R_SL`` rather than ``FLAT``: both are terminal, but ``FLAT`` is the
+        broker's "close everything on this strategy" and this closes exactly one
+        cycle, named by the uxid the factory carries. Only the action and a price
+        are set — :meth:`SignalFactory._size_close` fills the quantity from what
+        is left of the position, and ``_carry_entry_context`` restates the rest,
+        so the payload says the same things a strategy's own exit would.
+
+        Emitted through :meth:`_emit`, so it is staged in the durable outbox,
+        delivered and audited like any other exit and inherits every guard there
+        — ownership, shadow mode, the uncertain-pair block.
+        """
+        price = self._last_known_price(strategy_slot, position)
+        async with strategy_slot.lock:
+            await self._emit(
+                strategy_slot,
+                SignalIntent(
+                    action=SignalAction.R_SL,
+                    symbol=strategy_slot.symbol,
+                    price=price,
+                    reason="STALE_POSITION_FLUSH",
+                ),
+                price,
+                datetime.now(UTC),
+            )
+
+    @staticmethod
+    def _last_known_price(strategy_slot: StrategySlot, position: OpenPosition) -> float | None:
+        """The freshest price this pair has, for the audit trail.
+
+        The broker closes at market, so this number is what an operator reads
+        back later rather than what the trade fills at. Redis history is
+        preferred because it is the most recent thing the engine saw; after a
+        long outage the cache may hold nothing current, and the entry price is
+        then the only honest answer available.
+
+        ``None`` when there is neither — a cycle restored from a bare uxid, in a
+        cache that came back empty. The broker's schema leaves a close's price
+        optional for exactly this, and an absent price says "unknown" where a
+        zero would have said the trade closed at nothing.
+        """
+        if strategy_slot.buffer:
+            return strategy_slot.buffer[-1].close
+        return position.price
+
+    @staticmethod
+    def _verify_position_uxids(
+        *sources: Sequence[OpenPosition] | Sequence[StrategySlot],
+    ) -> None:
+        """Refuse to trade a book where two pairs claim one cycle id.
+
+        The broker groups a whole trade by ``signal_uxid``, so a close on either
+        pair would close the other's position and the audit trail would show
+        nothing wrong. ``uq_open_positions_uxid`` makes this impossible to
+        write; this catches rows that predate the constraint, or were put there
+        by hand, and it raises rather than warning because every entry and exit
+        on either pair is unsafe until an operator says which is real.
+
+        Every source is read because each one alone can be blind. The restored
+        slots are the live book and always available; the table adds the pairs
+        this runner is not driving, and it answers with an empty list when it
+        could not be read at all — so checking only the table would let a
+        transient database error pass this on no data.
+        """
+        holders: dict[str, set[str]] = defaultdict(set)
+        for source in sources:
+            for entry in source:
+                position = (
+                    entry.factory.open_position(entry.symbol)
+                    if isinstance(entry, StrategySlot)
+                    else entry
+                )
+                if position is None:
+                    continue
+                holders[position.signal_uxid].add(f"{position.strategy}/{position.symbol}")
+
+        duplicated = {uxid: pairs for uxid, pairs in holders.items() if len(pairs) > 1}
+        if not duplicated:
+            return
+        described = "; ".join(
+            f"{uxid} held by {', '.join(sorted(pairs))}"
+            for uxid, pairs in sorted(duplicated.items())
+        )
+        raise RuntimeError(
+            "Open positions share a trade-cycle id, so a close on one would close the "
+            f"other at the broker: {described}. Reconcile with the broker, delete the row "
+            "that is not real, and start again."
+        )
+
     def _wants_ticks(self) -> bool:
         return runner_settings.subscribe_ticks or any(
             overrides_on_tick(strategy_slot.strategy) for strategy_slot in self.slots
@@ -931,7 +1143,11 @@ class StrategyRunner:
     # ── Emission ──────────────────────────────────────────────────────
 
     async def _emit(
-        self, slot: StrategySlot, intent: SignalIntent, fallback_price: float, moment: datetime
+        self,
+        slot: StrategySlot,
+        intent: SignalIntent,
+        fallback_price: float | None,
+        moment: datetime,
     ) -> None:
         await self._check_ownership()
         await self._refresh_shadow_mode()
@@ -1302,6 +1518,21 @@ def _clean_history(
             ordered[-1].open_time.isoformat(),
         )
     return finished
+
+
+def _as_aware(moment: datetime) -> datetime:
+    """A stored timestamp as an aware one, so arithmetic on it cannot raise.
+
+    ``OpenPosition.updated_at`` is typed ``datetime`` with no timezone
+    requirement and pydantic accepts a naive value, so a row written by an older
+    build or edited by hand can come back naive. Subtracting that from an aware
+    ``now()`` raises, and the flush runs inside ``start()`` — the runner would
+    refuse to boot over one malformed row. Read as UTC, which is what every
+    writer in this engine stores.
+    """
+    if moment.tzinfo is None:
+        return moment.replace(tzinfo=UTC)
+    return moment
 
 
 def _encode(payload: dict[str, Any]) -> bytes:

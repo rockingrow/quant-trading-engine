@@ -112,5 +112,12 @@ class OpenPositionRow(Base):
         # One live cycle per pair, enforced by the database rather than by the
         # runner remembering to check — two runner replicas share this table.
         UniqueConstraint("namespace", "strategy", "symbol", name="uq_open_positions_pair"),
-        Index("ix_open_positions_uxid", "signal_uxid"),
+        # And one pair per cycle id, which is the other direction of the same
+        # rule. The broker groups a whole trade by `signal_uxid`, so two pairs
+        # sharing one would let a close on either of them close the other's
+        # position — a loss nothing in the audit trail would explain. Scoped by
+        # namespace like the pair constraint above: separate books (paper and
+        # live, one per provider) reusing an id is not a collision. Unique
+        # rather than the plain index this replaces, which enforced nothing.
+        UniqueConstraint("namespace", "signal_uxid", name="uq_open_positions_uxid"),
     )

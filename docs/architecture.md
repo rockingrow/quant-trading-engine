@@ -145,6 +145,63 @@ in Postgres answers that question and the runner re-seeds Redis from it. That
 table is the only mutable row QTE keeps — everything else there is append-only —
 which is exactly why it is a table of its own rather than a column on `signals`.
 
+## Why a stale position is flushed on start
+
+Remembering a cycle across a restart is the right answer, and it has a failure
+mode of its own. One `(strategy, symbol)` pair holds one cycle at a time —
+`uq_open_positions_pair` in the database, and `SignalFactory._prepare_entry`
+refusing an entry that "would replace open cycle X". That rule is what makes a
+long outage expensive rather than merely inconvenient: the row survives, the
+pair comes back still believing it holds that cycle, and every entry the
+strategy proposes from then on is refused. The pair is locked, and the position
+it is locked on was sized against a bracket the market left behind hours ago.
+
+So the runner closes what has gone stale, on start, with `R_SL` — a terminal
+action, so the cycle ends and the pair is free. `R_SL` rather than `FLAT`
+because `FLAT` means "close everything on this strategy" and this closes exactly
+one cycle, named by its `signal_uxid`. It goes out through the ordinary `_emit`
+path, so it is staged in the durable outbox, delivered and audited like any
+strategy exit and inherits every guard there.
+
+**Age is the whole design.** An unconditional flush would close the book on
+every deploy, and would make most of the recovery machinery above pointless —
+the runner would be carefully restoring a cycle it is about to close. So
+`QTE_RUNNER__STALE_POSITION_MAX_AGE` draws the line: inside it, nothing changes
+and the position is restored exactly as before; outside it, the position is
+treated as what it is, a leftover. `0` restores the unconditional behaviour for
+an operator who wants it, and `QTE_RUNNER__FLUSH_STALE_POSITIONS=warn` lists
+what a first `close` run would do without doing it.
+
+**It decides from the slots, not from the table.** What locks a pair is the
+cycle `_restore_position` put on its slot, and that came from Redis in
+preference to Postgres. The two can disagree: `_persist_position` writes Redis
+first, and `OpenPositionRepository.upsert` swallows its own failure by design,
+so a cycle can live in the cache and not in the table. A flush driven by the
+table would skip exactly that pair and leave it locked — the failure it was
+added to prevent. The table is still read, for the two things the slots cannot
+show: rows belonging to no running strategy, and duplicate ids across the whole
+namespace.
+
+Two things it deliberately does not do. It skips a pair whose delivery the
+outbox has not reconciled, because flushing over an ambiguous send would
+manufacture a second command against the same cycle. And it does not close a
+position belonging to a strategy this runner is not driving — `OpenPosition`
+records no timeframe and the broker payload needs one, so the engine cannot
+speak for a strategy it is not running. That case is logged as an error rather
+than swallowed, because nobody else will ever close it either.
+
+The same section of the boot sequence enforces the other direction of the pair
+rule: two pairs must never hold one `signal_uxid`. The broker groups a whole
+trade by that id, so a close on either pair would close the other's position and
+nothing in the audit trail would explain the loss.
+`uq_open_positions_uxid` makes it impossible to write; the startup check catches
+rows that predate the constraint or were inserted by hand, and it refuses to
+start rather than warning, because every entry and exit on either pair is unsafe
+until an operator says which one is real. It reads the restored slots as well as
+the table, because `list_open` answers with an empty list when it could not read
+at all — a check resting on the table alone would pass on no data the first time
+Postgres was slow to accept connections.
+
 ## Why the strategy returns intents instead of publishing
 
 Four things a strategy is not allowed to own, all in `SignalFactory`:
