@@ -159,6 +159,23 @@ def test_every_trade_carries_what_the_aggregates_were_derived_from(report):
         assert trade["legs"], "a closed trade must record how it closed"
 
 
+def test_a_discretionary_exit_carries_the_strategys_reason_into_the_report(trending_frame):
+    class FlatWithReason(TwoTradeStrategy):
+        name = "FLAT_WITH_REASON"
+
+        def on_candle_closed(self, df, context):
+            if context.open_uxid is None:
+                return super().on_candle_closed(df, context)
+            close = float(df["close"].iloc[-1])
+            return SignalIntent(action=SignalAction.FLAT, price=close, reason="BASIS_TRAIL_STOP")
+
+    result = BacktestEngine(FlatWithReason(), symbol="XAUUSD").run(trending_frame)
+    trades = build_report(result).to_dict()["trades"]
+    assert trades, "the probe strategy should have traded"
+    assert trades[0]["exit_note"] == "BASIS_TRAIL_STOP"
+    assert trades[0]["legs"][-1]["note"] == "BASIS_TRAIL_STOP"
+
+
 def test_partial_exits_are_visible_leg_by_leg(report):
     # A trade that took TP1 then stopped at breakeven is a different lesson
     # from one that ran to TP2, and only the legs distinguish them.

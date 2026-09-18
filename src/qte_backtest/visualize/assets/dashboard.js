@@ -1536,7 +1536,7 @@ function tradesPanel(view) {
   let filter = "all";
   const search = h("input", {
     type: "search",
-    placeholder: "exit reason, id…",
+    placeholder: "exit reason, note, id…",
     style: "background:var(--panel-2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:5px 10px;font:inherit;font-size:12px",
     oninput: () => redraw(),
   });
@@ -1575,6 +1575,7 @@ function tradesPanel(view) {
     { key: "exit_price", label: "Exit", cell: (row) => price(row.exit_price), value: (row) => row.exit_price },
     { key: "quantity", label: "Qty", cell: (row) => num(row.quantity, 2), value: (row) => row.quantity },
     { key: "exit_reason", label: "Exit", cell: (row) => h("td", { text: row.exit_reason || NA }), value: (row) => row.exit_reason },
+    { key: "exit_note", label: "Reason", cell: (row) => h("td", { text: row.exit_note || NA }), value: (row) => row.exit_note || "" },
     {
       key: "r_multiple",
       label: "R",
@@ -1603,7 +1604,9 @@ function tradesPanel(view) {
         if (filter === "win" && !(row.net_pnl > 0)) return false;
         if (filter === "loss" && !(row.net_pnl < 0)) return false;
         if (!needle) return true;
-        return `${row.exit_reason} ${row.signal_uxid} ${row.direction}`.toLowerCase().includes(needle);
+        return `${row.exit_reason} ${row.exit_note} ${row.signal_uxid} ${row.direction}`
+          .toLowerCase()
+          .includes(needle);
       })
     );
   }

@@ -124,6 +124,35 @@ def test_a_position_still_open_at_the_end_is_marked_out(trending_frame):
     assert result.positions[0].exit_reason == "END_OF_DATA"
 
 
+def test_a_strategys_flat_reason_lands_on_the_closed_position(trending_frame):
+    class FlatWithReason(BuyOnceStrategy):
+        name = "FLAT_WITH_REASON"
+
+        def on_candle_closed(self, df, context):
+            close = float(df["close"].iloc[-1])
+            if not self.fired:
+                self.fired = True
+                self.calls += 1
+                return SignalIntent(
+                    action=SignalAction.LONG,
+                    price=close,
+                    quantity=1.0,
+                    sl=close - 10_000,
+                    tp1=close + 10_000,
+                )
+            if self.calls == 1:
+                self.calls += 1
+                return SignalIntent(
+                    action=SignalAction.FLAT, price=close, reason="RSI_REVERSAL"
+                )
+            return None
+
+    result = BacktestEngine(FlatWithReason(), symbol="XAUUSD").run(trending_frame)
+    position = result.positions[0]
+    assert position.exit_reason == "FLAT"
+    assert position.exit_note == "RSI_REVERSAL"
+
+
 def test_too_little_history_for_the_warmup_is_an_error(trending_frame):
     class Hungry(BuyOnceStrategy):
         warmup = 10_000

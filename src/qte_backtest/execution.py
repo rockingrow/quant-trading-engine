@@ -70,6 +70,12 @@ class ClosedLeg:
     reason: ExitReason
     gross_pnl: float
     fees: float
+    #: The strategy's own explanation for a discretionary close — whatever it
+    #: set on ``SignalIntent.reason`` — carried through so the report can show
+    #: *why*, not just which category the exit falls in. ``None`` for a bracket
+    #: fill (``process_bar`` closing a naked TP/SL level): the strategy was
+    #: never asked, so there is nothing of its to attribute the exit to.
+    note: str | None = None
 
     @property
     def net_pnl(self) -> float:
@@ -153,6 +159,11 @@ class SimulatedPosition:
     @property
     def exit_reason(self) -> str | None:
         return self.legs[-1].reason.value if self.legs else None
+
+    @property
+    def exit_note(self) -> str | None:
+        """The strategy's own explanation for the final leg, if it gave one."""
+        return self.legs[-1].note if self.legs else None
 
     @property
     def initial_risk(self) -> float | None:
@@ -327,6 +338,7 @@ class FillSimulator:
         reason: ExitReason = ExitReason.FLAT,
         *,
         quantity: float | None = None,
+        note: str | None = None,
     ) -> None:
         """Discretionary close — a FLAT intent, or the end of the data."""
         if position.is_open:
@@ -336,6 +348,7 @@ class FillSimulator:
                 self.costs.exit_fill(price, position.direction),
                 position.remaining if quantity is None else quantity,
                 reason,
+                note=note,
             )
 
     # ── Internals ─────────────────────────────────────────────────────
@@ -370,6 +383,8 @@ class FillSimulator:
         price: float,
         quantity: float,
         reason: ExitReason,
+        *,
+        note: str | None = None,
     ) -> None:
         quantity = min(quantity, position.remaining)
         if quantity <= 0:
@@ -388,6 +403,7 @@ class FillSimulator:
                 reason=reason,
                 gross_pnl=gross,
                 fees=self.costs.commission(quantity),
+                note=note,
             )
         )
         position.remaining -= quantity

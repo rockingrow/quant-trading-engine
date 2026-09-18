@@ -362,6 +362,7 @@ class BacktestEngine:
                 block.price if block.price is not None else close,
                 _EXIT_REASONS.get(intent.action, ExitReason.FLAT),
                 quantity=block.quantity,
+                note=intent.reason or None,
             )
             if intent.action is SignalAction.TP1:
                 self._open.tp1_filled = True

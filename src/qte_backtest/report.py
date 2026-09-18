@@ -51,7 +51,7 @@ log = get_logger(__name__)
 
 #: Bump the major part when a consumer that understood the old shape would
 #: misread the new one.
-SCHEMA_VERSION = "1.2"
+SCHEMA_VERSION = "1.0"
 
 #: A compact orientation for whoever reads the JSON cold. It costs a few
 #: hundred bytes and saves an agent from inferring the conventions — or, worse,
@@ -77,7 +77,11 @@ READING_GUIDE = {
     "exit_reasons": (
         "TP1/TP2 targets, SL stop, R_SL stop after it moved to breakeven, FLAT a "
         "discretionary close, END_OF_DATA the replay running out of bars with the "
-        "position still open — the last one is usually a bug, not a trade."
+        "position still open — the last one is usually a bug, not a trade. "
+        "exit_note is the strategy's own explanation for the final leg, taken "
+        "verbatim from SignalIntent.reason wherever it set one; null on a bracket "
+        "fill (TP1/TP2/SL hit on a level, never routed through the strategy) or "
+        "when the strategy left reason blank."
     ),
     "position_sizing": (
         "Every entry is sized by the engine, not by the strategy: quantity = "
@@ -282,7 +286,7 @@ class BacktestReport:
                     f"| {index} | {'L' if position.direction == 1 else 'S'} "
                     f"| {position.opened_at:%Y-%m-%d %H:%M} | {position.bars_held} "
                     f"| {position.entry_price:.5f} | {_fmt(position.exit_price, '{:.5f}')} "
-                    f"| {position.exit_reason or '—'} "
+                    f"| {_exit_label(position)} "
                     f"| {_fmt(position.r_multiple, '{:+.2f}')} "
                     f"| {_fmt(position.mae_r, '{:.2f}')} "
                     f"| {_fmt(position.mfe_r, '{:.2f}')} |"
@@ -375,6 +379,7 @@ def _trade_to_dict(index: int, position: SimulatedPosition) -> dict[str, Any]:
         "tp2": position.tp2,
         "initial_risk": position.initial_risk,
         "exit_reason": position.exit_reason,
+        "exit_note": position.exit_note,
         "gross_pnl": round(position.gross_pnl, 8),
         "fees": round(position.fees, 8),
         "net_pnl": round(position.net_pnl, 8),
@@ -389,6 +394,7 @@ def _trade_to_dict(index: int, position: SimulatedPosition) -> dict[str, Any]:
             {
                 "closed_at": _iso(leg.closed_at),
                 "reason": leg.reason.value,
+                "note": leg.note,
                 "price": leg.price,
                 "quantity": leg.quantity,
                 "gross_pnl": round(leg.gross_pnl, 8),
@@ -461,6 +467,12 @@ def _most_instructive(
         chosen[index] = position
 
     return sorted(chosen.items())[:limit]
+
+
+def _exit_label(position: SimulatedPosition) -> str:
+    """The Markdown table's ``Why`` cell: category, plus the strategy's own note."""
+    reason = position.exit_reason or "—"
+    return f"{reason} ({position.exit_note})" if position.exit_note else reason
 
 
 def _exit_summary(reasons: dict[str, int]) -> str:

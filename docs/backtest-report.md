@@ -28,7 +28,7 @@ uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --timeframe M15 \
 | `metrics` | Currency **and** R-multiple statistics, excursion averages, exit-reason counts, direction split, exposure, streaks, equity curve. |
 | `diagnostics` | Findings, most severe first, each with its threshold, its evidence and one concrete change. |
 | `activity` | Trades taken, entries rejected, signals emitted. |
-| `trades` | Every trade — entry, exit, bars held, initial risk, R-multiple, MAE/MFE, and each partial leg. |
+| `trades` | Every trade — entry, exit, bars held, initial risk, R-multiple, MAE/MFE, and each partial leg. `exit_note` (also on each leg) is the strategy's own explanation for that close, taken verbatim from `SignalIntent.reason`; null on a bracket fill, since the strategy is never consulted when a TP/SL level is simply touched. |
 | `signals` | Broker trading fields the run would have published; authentication token omitted. |
 
 Two design choices to know about:
