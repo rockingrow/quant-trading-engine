@@ -337,6 +337,14 @@ holding a gate of its own — would re-enter on the next bar and be flattened
 again, taking turns until the market shut. `flat_until` is what makes the block
 terminate, and stating the reopen is also the honest way to describe a weekend.
 
+Shortened holiday sessions can start the block earlier through `extra_windows`,
+a list of `{flat_from: "YYYY-MM-DD HH:MM", flat_until: "YYYY-MM-DD HH:MM"}`
+declarations in that same market zone. These half-open dated windows extend
+the weekly block; they cannot reopen a market inside it. Both drivers and the
+runner's between-bar sweep use the same predicate. Dates must be maintained
+against the broker calendar: neither driver guesses a holiday from a future
+bar or invents a fill after the market has already closed.
+
 **The zone is the operator's, not the strategy's.**
 `QTE_ENGINE__WEEKEND_FLAT_TIMEZONE` decides whose clock those wall times are
 read on, default `UTC`. It sits in the engine block rather than the runner's

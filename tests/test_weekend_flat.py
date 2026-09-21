@@ -379,6 +379,93 @@ def test_the_mounted_repositories_declare_the_windows_they_trade():
         assert declared.get(alias) == "FRI 17:00 -> SUN 22:00", declared
 
 
+def holiday_policy() -> WeekendFlatPolicy:
+    """A known shortened Friday, declared before either driver sees any bars."""
+    return WeekendFlatPolicy.parse(
+        {
+            **GOLD_WINDOW,
+            "extra_windows": [{"flat_from": "2026-06-19 13:00", "flat_until": "2026-06-21 22:00"}],
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "timestamp,expected",
+    [
+        ("2026-06-19 12:59", False),
+        ("2026-06-19 13:00", True),
+        ("2026-06-19 16:00", True),
+        ("2026-06-21 21:59", True),
+        ("2026-06-21 22:00", False),
+        ("2026-06-26 13:00", False),
+        ("2026-06-26 17:00", True),
+    ],
+)
+def test_dated_closures_extend_only_the_declared_week(timestamp, expected):
+    assert holiday_policy().covers(moment_at(timestamp), UTC_ZONE) is expected
+
+
+def test_dated_closures_follow_the_configured_market_zone():
+    policy = holiday_policy()
+    timestamp = moment_at("2026-06-19 04:00")
+    assert policy.covers(timestamp, ZoneInfo("Asia/Tokyo"))
+    assert not policy.covers(timestamp, UTC_ZONE)
+    assert policy.covers(datetime(2026, 6, 19, 13), UTC_ZONE)
+
+
+def test_a_dated_window_cannot_shorten_the_weekly_block():
+    policy = WeekendFlatPolicy.parse(
+        {
+            **GOLD_WINDOW,
+            "extra_windows": [{"flat_from": "2026-06-19 13:00", "flat_until": "2026-06-19 16:00"}],
+        }
+    )
+    assert policy.covers(moment_at("2026-06-19 13:00"), UTC_ZONE)
+    assert not policy.covers(moment_at("2026-06-19 16:30"), UTC_ZONE)
+    assert policy.covers(moment_at("2026-06-19 17:00"), UTC_ZONE)
+
+
+@pytest.mark.parametrize(
+    "declared",
+    [
+        None,
+        "2026-06-19",
+        [False],
+        [{"flat_from": "2026-06-19 13:00"}],
+        [{"flat_from": "2026-06-19", "flat_until": "2026-06-21 22:00"}],
+        [{"flat_from": 1300, "flat_until": "2026-06-21 22:00"}],
+        [{"flat_from": "2026-06-19 13:00Z", "flat_until": "2026-06-21 22:00"}],
+        [{"flat_from": "2026-06-19 13:00", "flat_until": "2026-06-19 13:00"}],
+        [{"flat_from": "2026-06-21 22:00", "flat_until": "2026-06-19 13:00"}],
+    ],
+)
+def test_malformed_dated_closures_fail_instead_of_disabling_protection(declared):
+    with pytest.raises(ValueError, match="extra_windows"):
+        WeekendFlatPolicy.parse({**GOLD_WINDOW, "extra_windows": declared})
+
+
+def test_malformed_dated_closures_prevent_plugin_loading(tmp_path):
+    mount_repository(
+        tmp_path,
+        settings_body="""
+        def load_settings():
+            return {'WEEKEND_PROBE': {'weekend_flat': {
+                'flat_from': 'FRI 17:00', 'flat_until': 'SUN 22:00',
+                'extra_windows': [{'flat_from': '2026-06-19 13:00'}],
+            }}}
+        """,
+    )
+    loader = StrategyLoader(tmp_path)
+    assert loader.discover() == []
+    assert [failure.reason for failure in loader.failures] == ["load_settings() did not read"]
+
+
+def test_dated_closures_are_visible_in_the_policy_description():
+    description = holiday_policy().describe()
+    assert description.startswith("FRI 17:00 -> SUN 22:00")
+    assert "2026-06-19 13:00 -> 2026-06-21 22:00" in description
+
+
 # ── The live runner ──────────────────────────────────────────────────────
 
 
@@ -579,6 +666,20 @@ async def test_the_sweep_does_nothing_before_the_cut_off(monkeypatch):
     assert strategy_slot.factory.open_cycle("XAUUSD") is not None
 
 
+async def test_the_sweep_honors_an_early_holiday_cutoff_without_new_bars(monkeypatch):
+    runner, strategy_slot = weekend_runner(policy=holiday_policy())
+    await feed_one_bar(runner, strategy_slot, moment_at("2026-06-19 12:45"))
+    runner.signals.rows.clear()
+
+    SweepClock.current_time = moment_at("2026-06-19 13:00")
+    monkeypatch.setattr("qte_strategy_engine.runner.datetime", SweepClock)
+    await runner._sweep_one_slot(strategy_slot)
+    await runner._sweep_one_slot(strategy_slot)
+
+    assert emitted_actions(runner) == ["FLAT"]
+    assert strategy_slot.factory.open_cycle("XAUUSD") is None
+
+
 class SweepClock(datetime):
     """``datetime.now()`` pinned to one instant, as test_driver_parity does it.
 
@@ -671,6 +772,49 @@ def test_the_two_drivers_flatten_on_the_same_bar():
         moment.to_pydatetime() for moment in bars if policy.covers(moment, UTC_ZONE)
     )
     assert first_flat == first_covered
+
+
+async def test_both_drivers_flatten_before_a_shortened_friday_session_ends():
+    policy = holiday_policy()
+    timestamps = [
+        moment_at("2026-06-19 12:45"),
+        moment_at("2026-06-19 13:00"),
+        moment_at("2026-06-19 13:45"),
+        moment_at("2026-06-21 21:45"),
+        moment_at("2026-06-21 22:00"),
+        moment_at("2026-06-21 22:15"),
+    ]
+    candles = pd.DataFrame(
+        {"open": 2000.0, "high": 2001.0, "low": 1999.0, "close": 2000.5, "volume": 1.0},
+        index=pd.DatetimeIndex(timestamps),
+    )
+    engine = BacktestEngine(
+        EntryEveryBar(),
+        symbol="XAUUSD",
+        starting_equity=10_000.0,
+        sizer=PositionSizer(capital=10_000.0, risk_percent=1.0),
+        weekend_flat=policy,
+    )
+    result = engine.run(candles)
+    runner, strategy_slot = weekend_runner(policy=policy)
+    for timestamp in timestamps:
+        await feed_one_bar(runner, strategy_slot, timestamp)
+
+    expected = [
+        (timestamps[0], SignalAction.LONG),
+        (timestamps[1], SignalAction.FLAT),
+        (timestamps[4], SignalAction.LONG),
+    ]
+    assert [(signal.timestamp, signal.position.action) for signal in result.signals] == expected
+    assert [
+        (signal.timestamp, signal.position.action) for signal in emitted_signals(runner)
+    ] == expected
+    assert result.positions[0].closed_at == timestamps[1]
+    assert all(
+        not policy.covers(signal.timestamp, UTC_ZONE)
+        for signal in result.signals
+        if signal.position.action.is_entry
+    )
 
 
 @pytest.fixture(autouse=True)

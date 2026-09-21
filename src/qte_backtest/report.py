@@ -51,7 +51,17 @@ log = get_logger(__name__)
 
 #: Bump the major part when a consumer that understood the old shape would
 #: misread the new one.
-SCHEMA_VERSION = "1.0"
+#:
+#: 2.0 — ``market.rows`` carries epoch-second integers in ``t`` where 1.x
+#: carried ISO strings, and the rows are now the run's own bars rather than a
+#: fixed-count downsampling of them. A reader that fed ``t`` to a date parser
+#: would get a number it cannot parse, which is what a major bump is for.
+SCHEMA_VERSION = "2.0"
+
+#: Stands in for ``market.rows`` while the document is indented, so the rows
+#: can be written back one per line. Chosen to be something no value in the
+#: report could ever be, since it is substituted by a plain string replace.
+_ROWS_TOKEN = "@@qte.market.rows@@"
 
 #: A compact orientation for whoever reads the JSON cold. It costs a few
 #: hundred bytes and saves an agent from inferring the conventions — or, worse,
@@ -97,9 +107,11 @@ READING_GUIDE = {
         "dropped for that reason."
     ),
     "market_and_benchmark": (
-        "The market block is a downsampled OHLC window kept so the run can be *drawn*: "
-        "each row aggregates bucket_bars consecutive bars (first open, highest high, "
-        "lowest low, last close). Never compute a statistic from it — every metric in "
+        "The market block is the OHLC window kept so the run can be *drawn*. rows are "
+        "[t, o, h, l, c] with t in epoch seconds UTC, at market.base_timeframe — the "
+        "run's own timeframe unless the history was too long to carry whole, in which "
+        "case bucket_bars says how many of the run's bars a row nominally covers. "
+        "Never compute a statistic from it — every metric in "
         "this report comes from the full series. buy_hold is the same instrument held "
         "at the strategy's default size from the bar completing warm-up to the last, "
         "paying no spread, no slippage and no commission: the floor a strategy has to "
@@ -191,7 +203,24 @@ class BacktestReport:
     # ── Rendering ─────────────────────────────────────────────────────
 
     def to_json(self, indent: int = 2, include_signals: bool = True) -> str:
-        return json.dumps(self.to_dict(include_signals=include_signals), indent=indent, default=str)
+        payload = self.to_dict(include_signals=include_signals)
+        rows = (payload.get("market") or {}).get("rows")
+        if not rows:
+            return json.dumps(payload, indent=indent, default=str)
+
+        # One OHLC row per line instead of five values per row on five lines.
+        # `market.rows` is now the whole replayed series — tens of thousands of
+        # rows — and indenting it the way the rest of the document is indented
+        # more than doubles the file for no reader's benefit: nobody reads a
+        # candle down a column. Everything else keeps its indentation, so the
+        # report stays something a person can open and a diff can show.
+        payload["market"] = {**payload["market"], "rows": _ROWS_TOKEN}
+        text = json.dumps(payload, indent=indent, default=str)
+        margin = " " * (indent * 3)
+        packed = ",\n".join(
+            margin + json.dumps(row, separators=(",", ":"), default=str) for row in rows
+        )
+        return text.replace(f'"{_ROWS_TOKEN}"', f"[\n{packed}\n{' ' * (indent * 2)}]")
 
     def to_html(self, title: str | None = None) -> str:
         """The dashboard, as one self-contained page.
@@ -420,6 +449,7 @@ def _market_to_dict(result: BacktestResult) -> dict[str, Any] | None:
     hold_pnl = (market.last_close - market.benchmark_close) * size
     return {
         "bucket_bars": market.bucket_bars,
+        "base_timeframe": market.base_timeframe,
         "columns": list(market.columns),
         "rows": market.rows,
         "buy_hold": {

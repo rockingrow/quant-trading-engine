@@ -107,7 +107,11 @@ def test_the_market_block_carries_a_drawable_window_and_a_benchmark(report):
     assert market["columns"] == ["t", "o", "h", "l", "c"]
     assert market["rows"], "a replayed run should carry a window to draw"
     assert market["bucket_bars"] >= 1
-    for _, open_, high, low, close in market["rows"]:
+    # The run's own bars unless the history was too long to carry whole, so a
+    # chart of an M15 replay can be drawn at M15.
+    assert market["base_timeframe"] == "M15"
+    for moment, open_, high, low, close in market["rows"]:
+        assert isinstance(moment, int), "t is epoch seconds since schema 2.0"
         assert high >= max(open_, close) and low <= min(open_, close)
 
     hold = market["buy_hold"]
@@ -251,3 +255,20 @@ def test_two_runs_do_not_overwrite_each_other(report, tmp_path):
 def test_an_unknown_format_is_refused_rather_than_silently_skipped(report, tmp_path):
     with pytest.raises(ValueError, match="Unknown report format"):
         report.write(tmp_path, formats=("pdf",))
+
+
+def test_the_json_keeps_one_candle_per_line(report):
+    """`market.rows` is the whole series now; indenting it doubles the file.
+
+    Asserted on the text rather than on the parsed document because the point
+    is the formatting: everything else stays indented and diff-readable, and
+    only the rows are packed.
+    """
+    text = report.to_json()
+
+    assert '"rows": [\n      [' in text, "rows start on their own lines"
+    assert '"schema_version": "2.0"' in text
+    assert "@@qte.market.rows@@" not in text, "the placeholder must not survive"
+    rows = json.loads(text)["market"]["rows"]
+    assert rows == report.to_dict()["market"]["rows"]
+    assert all(line.count("[") <= 1 for line in text.splitlines() if line.strip().startswith("["))

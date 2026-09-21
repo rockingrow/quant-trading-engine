@@ -93,7 +93,9 @@ class BracketPolicy:
             )
 
         risk = abs(intent.price - intent.sl)
-        if intent.tp1 is None and risk > 0:
+        # A supplied TP2 with no TP1 is an intentional single-target bracket.
+        # Synthesizing a nearer TP1 would close it before the strategy's target.
+        if intent.tp1 is None and intent.tp2 is None and risk > 0:
             intent.tp1 = intent.price + direction * risk * self.tp1_r
         if intent.tp2 is None and risk > 0:
             intent.tp2 = intent.price + direction * risk * self.tp2_r

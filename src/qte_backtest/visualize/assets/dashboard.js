@@ -224,6 +224,10 @@ function hideTip() {
  * series is already computed.
  */
 function mount(container, height, draw) {
+  // One observer per container, replaced rather than added to: an interactive
+  // chart re-mounts itself on every state change, and a fresh observer each
+  // time would leave the old ones redrawing a container they no longer own.
+  if (container.resizeWatcher) container.resizeWatcher.disconnect();
   const render = () => {
     const width = Math.max(container.clientWidth, 220);
     container.textContent = "";
@@ -237,8 +241,9 @@ function mount(container, height, draw) {
     draw(svg, width, height);
   };
   render();
-  new ResizeObserver(debounce(render, 80)).observe(container);
-  return container;
+  container.resizeWatcher = new ResizeObserver(debounce(render, 80));
+  container.resizeWatcher.observe(container);
+  return render;
 }
 function debounce(fn, wait) {
   let timer = null;
@@ -484,81 +489,389 @@ function performanceChart(container, view, enabled) {
  * candles either side of a gap.
  */
 
-function priceChart(container, view) {
-  const rows = view.market.rows;
-  if (!rows.length) return container.appendChild(h("p", { class: "empty", text: "No price window in this report." }));
-  const times = rows.map((row) => ms(row[0]));
-  const highs = rows.map((row) => row[2]);
-  const lows = rows.map((row) => row[3]);
-  const [lo, hi] = padDomain(Math.min(...lows), Math.max(...highs), 0.05);
+/** Seconds per timeframe, the same table the engine keeps in `qte_shared.timeframes`. */
+const TIMEFRAME_SECONDS = { M1: 60, M5: 300, M15: 900, M30: 1800, H1: 3600, H4: 14400, D1: 86400 };
 
-  const at = (moment) => {
-    const value = ms(moment);
-    if (!Number.isFinite(value)) return null;
-    if (value <= times[0]) return 0;
-    if (value >= times[times.length - 1]) return times.length - 1;
-    let low = 0;
-    let high = times.length - 1;
-    while (high - low > 1) {
-      const mid = (low + high) >> 1;
-      if (times[mid] <= value) low = mid;
-      else high = mid;
+/** Fewest candles a zoom may leave on screen. Below this the chart stops being one. */
+const MIN_VISIBLE_CANDLES = 12;
+
+/** Pixels of vertical drag on the price axis that scale the range by e. */
+const PRICE_DRAG_PIXELS = 180;
+/** How far the price axis may be stretched (below 1) or squeezed (above 1). */
+const MIN_PRICE_SCALE = 0.02;
+const MAX_PRICE_SCALE = 50;
+
+/** How many candles the TP/SL stubs drawn at an entry reach to the right. */
+const BRACKET_CANDLES = 3;
+
+/**
+ * A market row's `t` as epoch milliseconds.
+ *
+ * Epoch seconds since report schema 2.0, an ISO string before it. Both are read
+ * because `qte-backtest chart` re-renders reports written by an older engine,
+ * and refusing those would make every archived run unopenable.
+ */
+const rowMs = (value) => (typeof value === "number" ? value * 1000 : ms(value));
+
+/**
+ * Roll rows up into calendar buckets of `seconds`.
+ *
+ * Buckets are floored on the epoch, which is where the engine's own
+ * `floor_to_bucket` puts them, so an H1 candle here opens on the hour rather
+ * than on whatever bar happened to be first. Counting bars into groups instead
+ * would produce candles whose span changes across every session break.
+ */
+function rollUp(rows, seconds) {
+  const span = seconds * 1000;
+  const out = [];
+  let bucket = null;
+  for (const row of rows) {
+    const start = Math.floor(row[0] / span) * span;
+    if (bucket === null || bucket[0] !== start) {
+      bucket = [start, row[1], row[2], row[3], row[4]];
+      out.push(bucket);
+    } else {
+      if (row[2] > bucket[2]) bucket[2] = row[2];
+      if (row[3] < bucket[3]) bucket[3] = row[3];
+      bucket[4] = row[4];
     }
-    const span = times[high] - times[low] || 1;
-    return low + (value - times[low]) / span;
+  }
+  return out;
+}
+
+/**
+ * The timeframes offered: the one the rows arrived at, then every coarser one.
+ *
+ * Reports before schema 2.0 name no base timeframe, so it is measured off the
+ * rows instead — by the median gap, which a weekend cannot move. Offering a
+ * timeframe finer than the rows would be offering to un-aggregate them.
+ */
+function timeframeChoices(base, rows) {
+  const seconds = TIMEFRAME_SECONDS[base] || spacingSeconds(rows);
+  const coarser = Object.keys(TIMEFRAME_SECONDS)
+    .filter((label) => TIMEFRAME_SECONDS[label] > seconds)
+    .sort((left, right) => TIMEFRAME_SECONDS[left] - TIMEFRAME_SECONDS[right]);
+  return [{ label: base || "source", seconds: 0 }].concat(
+    coarser.map((label) => ({ label, seconds: TIMEFRAME_SECONDS[label] }))
+  );
+}
+
+/** Seconds between rows, as the median gap over a sample of them. */
+function spacingSeconds(rows) {
+  const gaps = [];
+  for (let index = 1; index < rows.length && gaps.length < 400; index++) {
+    gaps.push((rows[index][0] - rows[index - 1][0]) / 1000);
+  }
+  if (!gaps.length) return 0;
+  gaps.sort((left, right) => left - right);
+  return gaps[gaps.length >> 1];
+}
+
+const stamp = (at) => new Date(at).toISOString().slice(0, 16).replace("T", " ");
+
+/**
+ * Candles, the trades that happened on them, and the controls to look around.
+ *
+ * The report carries the run's own bars, so this has to be navigable rather
+ * than merely drawn: fifteen thousand M15 candles across a chart is a smear,
+ * and the answer to "what did the tape do around that trade" is a zoom, not a
+ * coarser picture. Hence a visible window that the wheel and a drag move, and a
+ * timeframe row that rolls the same rows up without going back to the engine.
+ *
+ * Below roughly one pixel per candle the candles are replaced by a close line
+ * and a high-low band. A body drawn a twentieth of a pixel wide is not a candle
+ * anyone can read, and pretending otherwise costs fifteen thousand DOM nodes.
+ */
+function priceChart(container, view) {
+  const source = view.market.rows.map((row) => [rowMs(row[0]), row[1], row[2], row[3], row[4]]);
+  if (!source.length) {
+    return container.appendChild(h("p", { class: "empty", text: "No price window in this report." }));
+  }
+
+  const choices = timeframeChoices(view.market.base_timeframe, source);
+  // `priceScale` and `priceShift` are the price axis once a viewer has taken
+  // it over: a multiplier on the auto-fitted range and an offset in units of
+  // that range. Relative rather than absolute prices, so panning in time
+  // still follows the candles instead of leaving them off the top.
+  const state = {
+    choice: 0,
+    rows: source,
+    from: 0,
+    to: source.length - 1,
+    priceScale: 1,
+    priceShift: 0,
+    manualPrice: false,
+  };
+  let geometry = null;
+  let redraw = () => {};
+
+  const clamp = (from, to) => {
+    const count = state.rows.length;
+    let span = Math.min(Math.max(Math.round(to - from), MIN_VISIBLE_CANDLES - 1), count - 1);
+    if (span < 0) span = 0;
+    let start = Math.round(from);
+    if (start < 0) start = 0;
+    if (start + span > count - 1) start = count - 1 - span;
+    state.from = start;
+    state.to = start + span;
   };
 
-  mount(container, 320, (svg, width, height) => {
-    const { plot, y } = frame(svg, width, height, {
-      domain: [lo, hi],
-      yTicks: 5,
-      format: price,
+  const showAll = () => clamp(0, state.rows.length - 1);
+  const autoPrice = () => {
+    state.priceScale = 1;
+    state.priceShift = 0;
+    state.manualPrice = false;
+  };
+  const zoomed = () => state.from > 0 || state.to < state.rows.length - 1;
+
+  const chooseTimeframe = (index) => {
+    // The window is kept in *time*, not in row numbers: rolling M15 up to H1
+    // divides every index by four, and a viewer who was looking at one March
+    // afternoon should still be looking at it afterwards.
+    const wasFull = !zoomed();
+    const fromAt = state.rows[state.from][0];
+    const toAt = state.rows[state.to][0];
+    state.choice = index;
+    const seconds = choices[index].seconds;
+    state.rows = seconds ? rollUp(source, seconds) : source;
+    if (wasFull) showAll();
+    else clamp(indexAt(state.rows, fromAt), indexAt(state.rows, toAt));
+    buttons.forEach((button, position) =>
+      button.setAttribute("aria-selected", String(position === index))
+    );
+    redraw();
+  };
+
+  const toolbar = h("div", { class: "chart-tools" });
+  const buttons = choices.map((choice, index) =>
+    h("button", {
+      class: "tab",
+      type: "button",
+      "aria-selected": String(index === 0),
+      text: choice.label,
+      title: index === 0 ? "The timeframe this run was replayed on" : `Rolled up to ${choice.label}`,
+      onclick: () => chooseTimeframe(index),
+    })
+  );
+  const reset = h("button", {
+    class: "tab",
+    type: "button",
+    text: "Fit all",
+    title: "Show the whole history again",
+    onclick: () => {
+      showAll();
+      autoPrice();
+      redraw();
+    },
+  });
+  const readout = h("span", { class: "hint muted" });
+  add(toolbar, [h("span", { class: "hint muted", text: "Timeframe" }), buttons, reset, readout]);
+
+  const box = h("div", { class: "chart" });
+  container.appendChild(toolbar);
+  container.appendChild(box);
+
+  box.addEventListener(
+    "wheel",
+    (event) => {
+      if (!geometry) return;
+      event.preventDefault();
+      const grip = Math.min(Math.max((event.offsetX - geometry.x0) / geometry.w, 0), 1);
+      const anchor = state.from + grip * (state.to - state.from);
+      const span = (state.to - state.from) * (event.deltaY > 0 ? 1.3 : 1 / 1.3);
+      clamp(anchor - grip * span, anchor - grip * span + span);
+      redraw();
+    },
+    { passive: false }
+  );
+
+  // The strip right of the plot is the price axis, as on TradingView: a
+  // vertical drag there stretches or squeezes the price range, a double click
+  // hands it back to the auto-fit. Anywhere else a drag pans — in time always,
+  // and in price too once the axis has been taken over.
+  const onPriceAxis = (event) => geometry !== null && event.offsetX > geometry.x1;
+  let dragging = null;
+  box.addEventListener("pointerdown", (event) => {
+    if (!geometry) return;
+    dragging = {
+      axis: onPriceAxis(event),
+      at: event.clientX,
+      atY: event.clientY,
+      from: state.from,
+      to: state.to,
+      priceScale: state.priceScale,
+      priceShift: state.priceShift,
+    };
+    box.setPointerCapture(event.pointerId);
+    box.classList.add(dragging.axis ? "scaling" : "grabbing");
+  });
+  box.addEventListener("pointermove", (event) => {
+    if (!geometry) return;
+    if (!dragging) {
+      box.classList.toggle("on-axis", onPriceAxis(event));
+      return;
+    }
+    const rise = event.clientY - dragging.atY;
+    if (dragging.axis) {
+      // Down squeezes (a wider range on the same height), up stretches.
+      const factor = Math.exp(rise / PRICE_DRAG_PIXELS);
+      state.priceScale = Math.min(Math.max(dragging.priceScale * factor, MIN_PRICE_SCALE), MAX_PRICE_SCALE);
+      state.manualPrice = true;
+      redraw();
+      return;
+    }
+    const span = dragging.to - dragging.from;
+    const step = ((dragging.at - event.clientX) / geometry.w) * span;
+    clamp(dragging.from + step, dragging.to + step);
+    if (state.manualPrice) state.priceShift = dragging.priceShift + rise / geometry.h;
+    redraw();
+  });
+  box.addEventListener("dblclick", (event) => {
+    if (!onPriceAxis(event)) return;
+    autoPrice();
+    redraw();
+  });
+  box.addEventListener("pointerleave", () => box.classList.remove("on-axis"));
+  const release = (event) => {
+    if (!dragging) return;
+    dragging = null;
+    box.releasePointerCapture(event.pointerId);
+    box.classList.remove("grabbing", "scaling");
+  };
+  box.addEventListener("pointerup", release);
+  box.addEventListener("pointercancel", release);
+
+  redraw = mount(box, 320, (canvas, width, height) => {
+    const rows = state.rows.slice(state.from, state.to + 1);
+    const times = rows.map((row) => row[0]);
+    const at = (moment) => {
+      const value = ms(moment);
+      if (!Number.isFinite(value) || value < times[0] || value > times[times.length - 1]) return null;
+      return positionAt(times, value);
+    };
+
+    const visibleTrades = view.market.trades.filter((trade) => {
+      const entryIndex = at(trade.entry_t);
+      return entryIndex !== null || (trade.legs || []).some((leg) => at(leg.t) !== null);
     });
+    // Labels only while there is room for them; zoomed out they would be a
+    // smear of overlapping text over the candles they are meant to explain.
+    const labelled = visibleTrades.length > 0 && width / visibleTrades.length >= 34;
+
+    // Zoomed in, the bracket of every entry on screen is drawn, so the price
+    // axis stretches to hold it: a stop left off the chart is a stop the
+    // viewer cannot see, which is the one thing the stub is there to show.
+    const levels = labelled
+      ? visibleTrades
+          .filter((trade) => at(trade.entry_t) !== null)
+          .flatMap((trade) => [trade.tp1, trade.tp2, trade.sl])
+          .filter((level) => level !== null && level !== undefined && Number.isFinite(level))
+      : [];
+    const [fitLo, fitHi] = padDomain(
+      Math.min(...rows.map((row) => row[3]), ...levels),
+      Math.max(...rows.map((row) => row[2]), ...levels),
+      0.05
+    );
+    const halfRange = ((fitHi - fitLo) / 2) * state.priceScale;
+    const middle = (fitLo + fitHi) / 2 + state.priceShift * halfRange * 2;
+    const [lo, hi] = [middle - halfRange, middle + halfRange];
+    const { plot, y } = frame(canvas, width, height, { domain: [lo, hi], yTicks: 5, format: price });
     const x = scale(0, rows.length - 1, plot.x0 + 3, plot.x1 - 3);
-    const bar = Math.max(1, Math.min(8, (plot.w / rows.length) * 0.68));
+    geometry = { x0: plot.x0, x1: plot.x1, w: plot.w, h: plot.h };
+
+    // Candles and trade marks are drawn into a layer clipped to the plot: with
+    // the price axis stretched they reach past it, and would otherwise paint
+    // over the toolbar above and the time axis below.
+    const clipId = "price-clip-" + ++gradientSeq;
+    canvas.appendChild(
+      svgEl(
+        "defs",
+        {},
+        svgEl("clipPath", { id: clipId }, svgEl("rect", { x: plot.x0, y: plot.y0, width: plot.w, height: plot.h }))
+      )
+    );
+    const svg = svgEl("g", { "clip-path": `url(#${clipId})` });
+    canvas.appendChild(svg);
+
+    readout.textContent = `${rows.length} of ${state.rows.length} candles · ${stamp(
+      times[0]
+    )} → ${stamp(times[times.length - 1])}`;
 
     const format = timeFormatter(times[times.length - 1] - times[0]);
     xLabels(
-      svg,
+      canvas,
       plot,
       timeTicks(0, rows.length - 1, 6).map((index) => [x(index), format(times[Math.round(index)])])
     );
 
-    rows.forEach((row, index) => {
-      const rising = row[4] >= row[1];
-      const cx = x(index);
+    const step = plot.w / Math.max(rows.length, 1);
+    if (step < 1.2) {
       svg.appendChild(
-        svgEl("line", {
-          class: rising ? "candle-up" : "candle-down",
-          "stroke-width": Math.max(0.7, bar * 0.16),
-          x1: cx,
-          x2: cx,
-          y1: y(row[2]),
-          y2: y(row[3]),
+        svgEl("path", {
+          class: "fill-blue-soft",
+          opacity: 0.55,
+          d:
+            linePath(rows.map((row, index) => [x(index), y(row[2])])) +
+            " " +
+            rows
+              .map((row, index) => [x(rows.length - 1 - index), y(rows[rows.length - 1 - index][3])])
+              .map((point) => "L" + point[0].toFixed(2) + " " + point[1].toFixed(2))
+              .join(" ") +
+            " Z",
         })
       );
-      const top = y(Math.max(row[1], row[4]));
-      const bottom = y(Math.min(row[1], row[4]));
       svg.appendChild(
-        svgEl("rect", {
-          class: rising ? "candle-up" : "candle-down",
-          x: cx - bar / 2,
-          y: top,
-          width: bar,
-          height: Math.max(bottom - top, 0.8),
+        svgEl("path", {
+          class: "stroke-blue",
+          "stroke-width": 1.2,
+          d: linePath(rows.map((row, index) => [x(index), y(row[4])])),
         })
       );
-    });
-
-    for (const trade of view.market.trades) {
-      const entryIndex = at(trade.entry_t);
-      const exitIndex = at(trade.exit_t);
-      if (entryIndex === null) continue;
-      const won = trade.pnl > 0;
-      if (exitIndex !== null && trade.exit !== null) {
+    } else {
+      const bar = Math.max(1, Math.min(8, step * 0.68));
+      rows.forEach((row, index) => {
+        const rising = row[4] >= row[1];
+        const cx = x(index);
         svg.appendChild(
           svgEl("line", {
-            class: won ? "stroke-up" : "stroke-down",
+            class: rising ? "candle-up" : "candle-down",
+            "stroke-width": Math.max(0.7, bar * 0.16),
+            x1: cx,
+            x2: cx,
+            y1: y(row[2]),
+            y2: y(row[3]),
+          })
+        );
+        const top = y(Math.max(row[1], row[4]));
+        const bottom = y(Math.min(row[1], row[4]));
+        svg.appendChild(
+          svgEl("rect", {
+            class: rising ? "candle-up" : "candle-down",
+            x: cx - bar / 2,
+            y: top,
+            width: bar,
+            height: Math.max(bottom - top, 0.8),
+          })
+        );
+      });
+    }
+
+    // Markers and their labels ignore the pointer: the candle hover below
+    // reports every entry and exit on the bar under the cursor, and a marker
+    // that swallowed the event would hide the very candle it sits on.
+    const candleStep = rows.length > 1 ? x(1) - x(0) : plot.w;
+    const label = (text, cx, cy, klass) =>
+      svg.appendChild(svgEl("text", { class: "trade-label " + (klass || ""), x: cx, y: cy, text }));
+
+    for (const trade of visibleTrades) {
+      const entryIndex = at(trade.entry_t);
+      const exitIndex = at(trade.exit_t);
+      const won = trade.pnl > 0;
+      const up = trade.dir === "LONG";
+      if (entryIndex !== null && exitIndex !== null && trade.exit !== null) {
+        svg.appendChild(
+          svgEl("line", {
+            class: (won ? "stroke-up" : "stroke-down") + " trade-mark",
             "stroke-width": 1,
             "stroke-dasharray": "3 2",
             opacity: 0.75,
@@ -569,52 +882,173 @@ function priceChart(container, view) {
           })
         );
       }
-      const cx = x(entryIndex);
-      const cy = y(trade.entry);
-      const size = 4.2;
-      const up = trade.dir === "LONG";
-      const marker = svgEl("path", {
-        class: (up ? "series-up" : "series-down") + " marker",
-        d: up
-          ? `M ${cx} ${cy + size * 1.6} l ${size} ${size * 1.4} l ${-size * 2} 0 Z`
-          : `M ${cx} ${cy - size * 1.6} l ${size} ${-size * 1.4} l ${-size * 2} 0 Z`,
-      });
-      marker.addEventListener("mousemove", (event) =>
-        showTip(
-          event,
-          [`#${trade.i} ${trade.dir}`, dateLabel(trade.entry_t, true)],
-          [
-            ["Entry", price(trade.entry)],
-            ["Exit", price(trade.exit)],
-            ["Stop", price(trade.sl)],
-            ["P&L", money(trade.pnl), tone(trade.pnl)],
-            ["R", rMultiple(trade.r), tone(trade.r)],
-            ["Exit reason", trade.reason || NA],
-          ]
-        )
-      );
-      marker.addEventListener("mouseleave", hideTip);
-      svg.appendChild(marker);
+
+      if (entryIndex !== null) {
+        const cx = x(entryIndex);
+        const cy = y(trade.entry);
+        const size = 4.2;
+        svg.appendChild(
+          svgEl("path", {
+            class: (up ? "series-up" : "series-down") + " marker trade-mark",
+            d: up
+              ? `M ${cx} ${cy + size * 1.6} l ${size} ${size * 1.4} l ${-size * 2} 0 Z`
+              : `M ${cx} ${cy - size * 1.6} l ${size} ${-size * 1.4} l ${-size * 2} 0 Z`,
+          })
+        );
+        // On the triangle's far side from the entry price, so the text never
+        // sits on the candle the trade was taken on.
+        if (labelled) {
+          label(up ? "Long" : "Short", cx, up ? cy + size * 3 + 10 : cy - size * 3 - 4, up ? "up" : "down");
+          // The bracket as it stood at entry: a short stub per level, long
+          // enough to read against the next few candles and no longer, so a
+          // stop that later moved is not drawn as if it had stayed put.
+          const reach = cx + Math.max(BRACKET_CANDLES * candleStep, 18);
+          for (const [name, level, klass] of [
+            ["TP1", trade.tp1, "up"],
+            ["TP2", trade.tp2, "up"],
+            ["SL", trade.sl, "down"],
+          ]) {
+            if (level === null || level === undefined) continue;
+            const ly = y(level);
+            if (ly < plot.y0 || ly > plot.y1) continue;
+            svg.appendChild(
+              svgEl("line", {
+                class: `stroke-${klass} trade-mark`,
+                "stroke-width": 1,
+                "stroke-dasharray": "4 3",
+                x1: cx,
+                x2: Math.min(reach, plot.x1),
+                y1: ly,
+                y2: ly,
+              })
+            );
+            svg.appendChild(
+              svgEl("text", { class: `trade-label level ${klass}`, x: cx - 4, y: ly + 3.5, text: name })
+            );
+          }
+        }
+      }
+
+      for (const leg of trade.legs || []) {
+        const legIndex = at(leg.t);
+        if (legIndex === null || leg.price === null) continue;
+        const cx = x(legIndex);
+        const cy = y(leg.price);
+        const size = 3.6;
+        svg.appendChild(
+          svgEl("path", {
+            class: exitClass(leg.reason) + " marker trade-mark",
+            d: `M ${cx} ${cy - size} l ${size} ${size} l ${-size} ${size} l ${-size} ${-size} Z`,
+          })
+        );
+        if (!labelled) continue;
+        // A long is closed by selling, so its exit reads above the fill and its
+        // entry below: the two labels of one trade point away from each other.
+        const lines = [leg.reason || "Exit"];
+        if (leg.note) lines.push(truncate(leg.note, 26));
+        const lineHeight = 11;
+        const first = up ? cy - size - 5 - lineHeight * (lines.length - 1) : cy + size + 11;
+        lines.forEach((text, row) =>
+          label(text, cx, first + row * lineHeight, row === 0 ? "" : "note")
+        );
+      }
     }
 
+    // How far a candle reaches in time, so the hover can say which fills
+    // landed inside it. The last candle has no successor to measure against.
+    const candleMs = (choices[state.choice].seconds || spacingSeconds(state.rows)) * 1000;
+    const within = (moment, start, end) => {
+      const value = ms(moment);
+      return Number.isFinite(value) && value >= start && value < end;
+    };
+    const fillsOn = (start, end) => {
+      const lines = [];
+      for (const trade of view.market.trades) {
+        const direction = trade.dir === "LONG" ? "Long" : "Short";
+        if (within(trade.entry_t, start, end)) {
+          lines.push([`Entry #${trade.i} ${direction}`, `${price(trade.entry)} × ${quantity(trade.quantity)}`]);
+        }
+        const legs = trade.legs || [];
+        legs.forEach((leg, position) => {
+          if (!within(leg.t, start, end)) return;
+          lines.push([
+            `Exit #${trade.i} ${leg.reason || NA}`,
+            `${price(leg.price)} × ${quantity(leg.quantity)}`,
+            exitTone(leg.reason),
+          ]);
+          if (leg.note) lines.push(["Reason", leg.note, "note"]);
+          if (position === legs.length - 1) {
+            lines.push([`P&L #${trade.i}`, `${money(trade.pnl)} · ${rMultiple(trade.r)}`, tone(trade.pnl)]);
+          }
+        });
+      }
+      return lines;
+    };
+
     hover(
-      svg,
+      canvas,
       plot,
       (px) => {
-        const index = Math.max(0, Math.min(rows.length - 1, Math.round((px - plot.x0 - 3) / ((plot.w - 6) / (rows.length - 1 || 1)))));
+        const index = Math.max(
+          0,
+          Math.min(rows.length - 1, Math.round((px - plot.x0 - 3) / ((plot.w - 6) / (rows.length - 1 || 1))))
+        );
         return { index, x: x(index), y: y(rows[index][4]) };
       },
       (event, found) => {
         const row = rows[found.index];
-        showTip(event, [view.meta.symbol, dateLabel(row[0], true)], [
+        const next = rows[found.index + 1];
+        const end = next ? next[0] : row[0] + (candleMs || 1);
+        showTip(event, [view.meta.symbol, stamp(row[0])], [
           ["Open", price(row[1])],
           ["High", price(row[2])],
           ["Low", price(row[3])],
           ["Close", price(row[4])],
+          ...fillsOn(row[0], end),
         ]);
       }
     );
   });
+}
+
+/** Colour of an exit by what closed it: a target, a stop, or anything else. */
+function exitClass(reason) {
+  if (reason === "TP1" || reason === "TP2") return "series-up";
+  if (reason === "SL") return "series-down";
+  return "series-muted";
+}
+function exitTone(reason) {
+  return { "series-up": "up", "series-down": "down" }[exitClass(reason)] || "";
+}
+
+/** A position size, with as many decimals as it actually has (up to four). */
+function quantity(value) {
+  if (value === null || value === undefined || Number.isNaN(value)) return NA;
+  return new Intl.NumberFormat(undefined, { maximumFractionDigits: 4 }).format(value);
+}
+
+function truncate(text, limit) {
+  return text.length > limit ? text.slice(0, limit - 1) + "…" : text;
+}
+
+/** Where `value` sits among ascending `times`, as a fractional index. */
+function positionAt(times, value) {
+  if (value <= times[0]) return 0;
+  if (value >= times[times.length - 1]) return times.length - 1;
+  let low = 0;
+  let high = times.length - 1;
+  while (high - low > 1) {
+    const mid = (low + high) >> 1;
+    if (times[mid] <= value) low = mid;
+    else high = mid;
+  }
+  const span = times[high] - times[low] || 1;
+  return low + (value - times[low]) / span;
+}
+
+/** The row whose bucket contains `at`, for carrying a window across timeframes. */
+function indexAt(rows, at) {
+  return Math.round(positionAt(rows.map((row) => row[0]), at));
 }
 
 /* ── Categorical bars ────────────────────────────────────────────────── */
@@ -1124,13 +1558,21 @@ function performancePanel(view) {
 
 function pricePanel(view) {
   if (!view.market.available) return null;
+  const rows = view.market.rows.length;
+  const base = view.market.base_timeframe;
+  const bars = view.market.bucket_bars;
+  const grain =
+    bars > 1
+      ? `${rows} ${base || ""} candles, each aggregating ${bars} bars of the run's timeframe`
+      : `${rows} ${base || ""} candles — the run's own bars`;
   const section = panel(
     "Price and trades",
-    `${view.market.rows.length} candles, each aggregating ${view.market.bucket_bars} bar${
-      view.market.bucket_bars > 1 ? "s" : ""
-    } — a drawing of the window, not the data the metrics came from`
+    `${grain}. Scroll to zoom, drag to pan, or roll them up to a higher timeframe`
   );
-  const box = h("div", { class: "chart" });
+  // A plain wrapper, not a `.chart`: this chart builds its own toolbar and its
+  // own `.chart` box, and nesting one inside another would put the grab cursor
+  // and the pan handlers on the toolbar as well.
+  const box = h("div", {});
   section.body.appendChild(box);
   priceChart(box, view);
   return section.node;

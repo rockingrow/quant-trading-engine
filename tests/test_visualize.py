@@ -18,6 +18,7 @@ from qte_backtest.execution import CostModel
 from qte_backtest.replay import BacktestEngine
 from qte_backtest.report import build_report
 from qte_backtest.visualize import build_view, render_html
+from qte_backtest.visualize.view import BENCHMARK_POINTS
 from qte_shared.models import SignalAction
 from qte_shared.strategies.strategy_base import SignalIntent, StrategyBase
 
@@ -286,6 +287,56 @@ def test_the_engine_fills_the_market_block_in(report_dict):
     assert market["buy_hold"]["entry_close"] > 0
 
 
+@pytest.mark.parametrize("tp1,tp2", [(None, 2050.0), (2020.0, None)])
+def test_price_chart_preserves_absent_targets_as_null(tp1, tp2):
+    position = _trade(1, +5.0, closed=START + timedelta(hours=1), tp1=tp1, tp2=tp2)
+    rendered = build_view(_report([position], market=_market([2000.0, 2010.0, 2020.0])))
+    assert rendered["market"]["trades"][0]["tp1"] == tp1
+    assert rendered["market"]["trades"][0]["tp2"] == tp2
+
+
+def test_price_chart_trades_carry_every_exit_leg_with_its_note():
+    closed = START + timedelta(days=2)
+    legs = [
+        {
+            "closed_at": (START + timedelta(days=1)).isoformat(),
+            "reason": "TP1",
+            "note": None,
+            "price": 2004.0,
+            "quantity": 0.5,
+        },
+        {
+            "closed_at": closed.isoformat(),
+            "reason": "R_SL",
+            "note": "trend flipped",
+            "price": 2000.0,
+            "quantity": 0.5,
+        },
+    ]
+    trades = [_trade(1, +2.0, closed=closed, legs=legs, exit_note="trend flipped")]
+    view = build_view(_report(trades, market=_market([100.0, 110.0, 120.0])))
+    trade = view["market"]["trades"][0]
+    assert trade["quantity"] == 1.0
+    assert trade["note"] == "trend flipped"
+    assert [(leg["reason"], leg["price"], leg["quantity"]) for leg in trade["legs"]] == [
+        ("TP1", 2004.0, 0.5),
+        ("R_SL", 2000.0, 0.5),
+    ]
+    assert trade["legs"][1]["note"] == "trend flipped"
+
+
+def test_a_trade_without_legs_still_gets_its_own_exit_but_an_open_one_gets_none():
+    closed = START + timedelta(days=2)
+    finished = _trade(1, +2.0, closed=closed)
+    still_open = _trade(2, 0.0, closed=closed, closed_at=None, exit_price=None)
+    view = build_view(_report([finished, still_open], market=_market([100.0, 110.0, 120.0])))
+    first, second = view["market"]["trades"]
+    assert first["legs"] == [
+        {"t": closed.isoformat(), "price": 2002.0, "quantity": 1.0, "reason": "TP1", "note": None}
+    ]
+    assert second["legs"] == []
+
+
 # ── The page ──────────────────────────────────────────────────────────
 
 
@@ -347,3 +398,50 @@ def test_the_page_leaves_the_signal_payloads_out(trending_frame):
     assert report.to_dict()["signals"], "the run should have emitted signals"
     payload = report.to_html().split('<script id="view" type="application/json">')[1]
     assert '"signals"' not in payload.split("</script>")[0]
+
+
+# ── The price window at full resolution ───────────────────────────────
+
+
+def _epoch_market(closes: list[float]) -> dict:
+    """The same window a schema-2.0 report carries: epoch seconds, not ISO."""
+    market = _market(closes)
+    market["base_timeframe"] = "M15"
+    market["rows"] = [
+        [int(datetime.fromisoformat(row[0]).timestamp()), row[1], row[2], row[3], row[4]]
+        for row in market["rows"]
+    ]
+    market["buy_hold"]["from"] = datetime.fromisoformat(market["buy_hold"]["from"]).isoformat()
+    return market
+
+
+def test_the_view_reads_epoch_rows_and_iso_rows_alike():
+    """`qte-backtest chart` re-renders reports written before schema 2.0.
+
+    Refusing those would make every archived run unopenable, so the dashboard
+    accepts both and the benchmark it derives has to come out the same.
+    """
+    closes = [100.0, 110.0, 120.0]
+    modern = build_view(_report([], market=_epoch_market(closes)))
+    legacy = build_view(_report([], market=_market(closes)))
+
+    assert modern["benchmark"]["points"] == legacy["benchmark"]["points"]
+    assert modern["market"]["base_timeframe"] == "M15"
+    assert legacy["market"]["base_timeframe"] is None
+
+
+def test_the_benchmark_line_is_thinned_but_still_ends_where_the_series_does():
+    """One line on one chart against tens of thousands of bars.
+
+    Copying every row into the benchmark block would duplicate the whole series
+    as four-key objects. Thinning is safe for a line read for its level — but
+    the last point has to survive, or the line ends short of the real result.
+    """
+    closes = [100.0 + index for index in range(5000)]
+    view = build_view(_report([], market=_epoch_market(closes)))
+    points = view["benchmark"]["points"]
+
+    assert len(points) <= BENCHMARK_POINTS + 1
+    assert points[0]["close"] == closes[0]
+    assert points[-1]["close"] == closes[-1]
+    assert [point["close"] for point in points] == sorted(point["close"] for point in points)

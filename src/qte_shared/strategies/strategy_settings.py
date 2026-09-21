@@ -29,6 +29,8 @@ every Friday, not on one Friday, so the window is stated as a pair of weekly
 moments and evaluated modulo the week. ``flat_from`` falling later in the week
 than ``flat_until`` is the normal case rather than an error: ``FRI 17:00`` to
 ``SUN 22:00`` wraps past Sunday midnight, which is the shape a weekend has.
+Explicit dated ``extra_windows`` can extend that recurring block for holiday
+sessions; they use the same market zone and never infer dates from future bars.
 
 **Which zone that wall time is read in is the operator's call**, not the
 strategy's — ``QTE_ENGINE__WEEKEND_FLAT_TIMEZONE``, passed in as *market_zone*
@@ -79,7 +81,7 @@ WEEKDAY_LABELS = ("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN")
 
 #: The keys :meth:`WeekendFlatPolicy.parse` accepts. Anything else is refused
 #: rather than ignored — see the method.
-WEEKEND_FLAT_KEYS = frozenset({"enabled", "flat_from", "flat_until"})
+WEEKEND_FLAT_KEYS = frozenset({"enabled", "flat_from", "flat_until", "extra_windows"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,8 +143,48 @@ class WeeklyMoment:
 
 
 @dataclass(frozen=True, slots=True)
+class DatedFlatWindow:
+    """A declared holiday closure, read in the same zone as the weekly window.
+
+    These dates come from the repository's calendar, never from looking ahead
+    for a gap in replay data. They extend the protection without moving the
+    recurring Friday cut-off on ordinary weeks.
+    """
+
+    flat_from: datetime
+    flat_until: datetime
+
+    @classmethod
+    def from_mapping(cls, payload: Any) -> DatedFlatWindow:
+        if not isinstance(payload, Mapping) or set(payload) != {"flat_from", "flat_until"}:
+            raise ValueError("each extra window needs exactly flat_from and flat_until")
+        moments: list[datetime] = []
+        for boundary in ("flat_from", "flat_until"):
+            declared = payload[boundary]
+            try:
+                if not isinstance(declared, str):
+                    raise ValueError
+                moments.append(datetime.strptime(declared, "%Y-%m-%d %H:%M"))
+            except ValueError:
+                raise ValueError(
+                    f"extra window {boundary} must be YYYY-MM-DD HH:MM in the market zone"
+                ) from None
+        if moments[0] >= moments[1]:
+            raise ValueError("extra window flat_until must be after flat_from")
+        return cls(flat_from=moments[0], flat_until=moments[1])
+
+    def covers(self, moment: datetime, market_zone: ZoneInfo) -> bool:
+        if moment.tzinfo is not None:
+            moment = moment.astimezone(market_zone)
+        return self.flat_from <= moment.replace(tzinfo=None) < self.flat_until
+
+    def describe(self) -> str:
+        return f"{self.flat_from:%Y-%m-%d %H:%M} -> {self.flat_until:%Y-%m-%d %H:%M}"
+
+
+@dataclass(frozen=True, slots=True)
 class WeekendFlatPolicy:
-    """When this strategy's market is shut, as a recurring weekly window.
+    """A recurring weekly closure, optionally extended by dated holiday windows.
 
     Half-open, ``[flat_from, flat_until)``: the bar exactly on the cut-off is
     inside the window and the bar exactly on the reopen is outside it, so the
@@ -156,6 +198,7 @@ class WeekendFlatPolicy:
     enabled: bool = False
     flat_from: WeeklyMoment | None = None
     flat_until: WeeklyMoment | None = None
+    extra_windows: tuple[DatedFlatWindow, ...] = ()
 
     @classmethod
     def parse(cls, payload: Any) -> WeekendFlatPolicy:
@@ -187,7 +230,7 @@ class WeekendFlatPolicy:
             # which is the one failure this module exists to prevent.
             raise ValueError(
                 f"weekend_flat has no setting called {', '.join(sorted(unknown))} — "
-                "it takes enabled, flat_from and flat_until"
+                "it takes enabled, flat_from, flat_until and extra_windows"
             )
 
         enabled = payload.get("enabled", True)
@@ -212,7 +255,21 @@ class WeekendFlatPolicy:
                 f"weekend_flat opens and closes at the same moment ({flat_from.describe()}) — "
                 "set enabled = false to turn it off instead"
             )
-        return cls(enabled=True, flat_from=flat_from, flat_until=flat_until)
+        declared_windows = payload.get("extra_windows", [])
+        if not isinstance(declared_windows, (list, tuple)):
+            raise ValueError("weekend_flat.extra_windows must be a list of dated windows")
+        try:
+            extra_windows = tuple(
+                DatedFlatWindow.from_mapping(window) for window in declared_windows
+            )
+        except ValueError as parse_error:
+            raise ValueError(f"weekend_flat.extra_windows: {parse_error}") from None
+        return cls(
+            enabled=True,
+            flat_from=flat_from,
+            flat_until=flat_until,
+            extra_windows=extra_windows,
+        )
 
     def covers(self, moment: datetime, market_zone: ZoneInfo) -> bool:
         """Whether *moment* falls inside the window, read in *market_zone*.
@@ -223,6 +280,8 @@ class WeekendFlatPolicy:
         """
         if not self.enabled or self.flat_from is None or self.flat_until is None:
             return False
+        if any(window.covers(moment, market_zone) for window in self.extra_windows):
+            return True
         opened_at = self.flat_from.offset
         span = (self.flat_until.offset - opened_at) % MINUTES_PER_WEEK
         elapsed = (WeeklyMoment.of(moment, market_zone).offset - opened_at) % MINUTES_PER_WEEK
@@ -232,7 +291,11 @@ class WeekendFlatPolicy:
         """One line for a log or a report: the window, or that there is none."""
         if not self.enabled or self.flat_from is None or self.flat_until is None:
             return "off"
-        return f"{self.flat_from.describe()} -> {self.flat_until.describe()}"
+        recurring = f"{self.flat_from.describe()} -> {self.flat_until.describe()}"
+        if self.extra_windows:
+            closures = "; ".join(window.describe() for window in self.extra_windows)
+            return f"{recurring}; extra windows: {closures}"
+        return recurring
 
 
 #: What a strategy that declared no weekend flat gets. Shared rather than
@@ -334,6 +397,7 @@ def _parse_clock(text: str) -> int:
 
 __all__ = [
     "DEFAULT_SETTINGS",
+    "DatedFlatWindow",
     "NO_WEEKEND_FLAT",
     "STRATEGY_SETTINGS_HOOK",
     "StrategySettings",
