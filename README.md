@@ -331,6 +331,15 @@ act on. A repo with no settings hook, and a strategy missing from the table,
 get no weekend flat; a setting that will not parse stops that strategy loading
 rather than quietly reverting to "off".
 
+`enabled` is the strategy's *default*; the pair decides. Set `use_weekend_flat`
+in `config/strategies_mapping.toml` — under `[strategies.<name>]` for every pair,
+or `[symbols.<symbol>.params.<name>]` for one — or pass `--param
+use_weekend_flat=true` to a backtest, and it overrides the declared `enabled`
+for that pair in both drivers. A window declared with `enabled = false` is still
+parsed and validated, so switching it on is a mapping edit. Switching on a
+window the repo never declared, or giving the key anything but `true`/`false`,
+stops the runner (and the backtest) from starting that pair.
+
 **A directory scan — for a single file.** Failing a manifest, every `.py` under
 the directory is imported and anything that looks like a strategy is collected.
 Drop a single `.py` file in and it runs, no ceremony.

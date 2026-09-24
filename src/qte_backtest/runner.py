@@ -18,6 +18,7 @@ from qte_shared.strategies.mapping import SymbolMapping
 from qte_shared.strategies.plugin_loader import StrategyLoader
 from qte_shared.strategies.signal_factory import BracketPolicy
 from qte_shared.strategies.sizing import PositionSizer
+from qte_shared.strategies.strategy_settings import resolve_weekend_flat
 
 log = get_logger(__name__)
 
@@ -79,6 +80,9 @@ async def run_backtest(
     # would enforce — or it would measure a strategy trading a Friday evening
     # the runner closes it out of.
     discovered = loader.find(request.strategy)
+    # The pair's `use_weekend_flat`, if the mapping or `--param` set one, decides
+    # whether that window is enforced — resolved exactly as the runner resolves it.
+    weekend_flat = resolve_weekend_flat(discovered.settings.weekend_flat, params)
     strategy = discovered.instantiate(params)
 
     frame = load_history(
@@ -113,7 +117,7 @@ async def run_backtest(
         sizer=PositionSizer.from_settings(params, risk_percent=request.risk_percent).replace(
             capital=request.starting_equity, contract_size=request.contract_size
         ),
-        weekend_flat=discovered.settings.weekend_flat,
+        weekend_flat=weekend_flat,
     )
     result = engine.run(frame)
     report = build_report(result)

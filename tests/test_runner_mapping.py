@@ -214,3 +214,98 @@ def test_an_empty_mapping_object_is_falsy_but_a_read_one_is_not():
     """The distinction `_build_slots` branches on."""
     assert not SymbolMapping()
     assert SymbolMapping(source=Path("strategies_mapping.toml"))
+
+
+# ── The pair's weekend-flat switch ───────────────────────────────────────
+
+
+@pytest.fixture
+def switchable_runner(monkeypatch, tmp_path):
+    """One strategy whose repository declares a weekend window that is off by default."""
+    from qte_shared.strategies.plugin_loader import LoadedStrategy
+    from qte_shared.strategies.strategy_settings import StrategySettings, WeekendFlatPolicy
+
+    declared = StrategySettings(
+        weekend_flat=WeekendFlatPolicy.parse(
+            {"enabled": False, "flat_from": "FRI 20:00", "flat_until": "SUN 23:00"}
+        )
+    )
+    discovered = [
+        LoadedStrategy(name="GOLD_M15", cls=Edge, source=tmp_path / "edge.py", settings=declared)
+    ]
+    monkeypatch.setattr(
+        "qte_strategy_engine.runner.load_strategies", lambda *a, **k: list(discovered)
+    )
+    return StrategyRunner()
+
+
+def weekend_policies(runner) -> dict[str, str]:
+    return {slot.symbol: slot.weekend_flat.describe() for slot in runner.slots}
+
+
+def test_a_declared_window_stays_off_until_the_table_switches_it_on(
+    switchable_runner, monkeypatch, tmp_path
+):
+    mapping = table(tmp_path, '[symbols.XAUUSD]\nstrategies = ["GOLD_M15"]\n')
+    build(switchable_runner, monkeypatch, mapping)
+
+    assert weekend_policies(switchable_runner) == {
+        "XAUUSD": "off (declared: FRI 20:00 -> SUN 23:00)"
+    }
+
+
+def test_the_pair_switch_beats_the_per_strategy_default(switchable_runner, monkeypatch, tmp_path):
+    """The same two layers as every other param: the pair's own value wins."""
+    mapping = table(
+        tmp_path,
+        """
+        [strategies.GOLD_M15]
+        use_weekend_flat = true
+
+        [symbols.XAUUSD]
+        strategies = ["GOLD_M15"]
+
+        [symbols.BTCUSDT]
+        strategies = ["GOLD_M15"]
+
+        [symbols.BTCUSDT.params.GOLD_M15]
+        use_weekend_flat = false
+        """,
+    )
+    build(switchable_runner, monkeypatch, mapping)
+
+    by_symbol = {slot.symbol: slot.weekend_flat for slot in switchable_runner.slots}
+    assert by_symbol["XAUUSD"].enabled
+    assert by_symbol["XAUUSD"].describe() == "FRI 20:00 -> SUN 23:00"
+    assert not by_symbol["BTCUSDT"].enabled
+
+
+def test_a_switch_that_cannot_be_honoured_stops_the_build(switchable_runner, monkeypatch, tmp_path):
+    """A pair configured to be flat must never quietly trade through the weekend."""
+    mapping = table(
+        tmp_path,
+        """
+        [symbols.XAUUSD]
+        strategies = ["GOLD_M15"]
+
+        [symbols.XAUUSD.params.GOLD_M15]
+        use_weekend_flat = "yes"
+        """,
+    )
+    with pytest.raises(ValueError, match="GOLD_M15 on XAUUSD: use_weekend_flat must be true"):
+        build(switchable_runner, monkeypatch, mapping)
+
+
+def test_switching_on_a_window_nobody_declared_stops_the_build(runner, monkeypatch, tmp_path):
+    mapping = table(
+        tmp_path,
+        """
+        [symbols.XAUUSD]
+        strategies = ["GOLD_M15"]
+
+        [symbols.XAUUSD.params.GOLD_M15]
+        use_weekend_flat = true
+        """,
+    )
+    with pytest.raises(ValueError, match="declares no weekend window"):
+        build(runner, monkeypatch, mapping)

@@ -56,6 +56,11 @@ SETTINGS: dict[str, dict[str, Any]] = {
         # times in the zone that deployment runs — UTC unless you know better —
         # and pick a cut-off that exists on the broker's Friday calendar with
         # room to spare, because one after the last Friday bar never fires.
+        #
+        # `enabled` is only the default. A pair's `use_weekend_flat` in
+        # config/strategies_mapping.toml (or `--param` on a backtest) overrides
+        # it, and a window declared with `enabled: False` is kept so the mapping
+        # can switch it on.
         "weekend_flat": {
             "enabled": True,
             "flat_from": "FRI 20:00",

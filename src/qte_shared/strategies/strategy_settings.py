@@ -39,12 +39,22 @@ read literally; an operator whose broker closes on a local exchange calendar
 changes one variable instead of every strategy. Nothing in this module reads
 settings itself, so the backtest and the live runner cannot end up evaluating
 one window in two different zones.
+
+**Whether the window is enforced is the pair's call.** The repository states the
+window and its default (``enabled``); a pair's params may override the default
+with ``use_weekend_flat`` — from the mapping table's ``[strategies.<name>]`` or
+``[symbols.<symbol>.params.<name>]``, or ``--param`` on a backtest.
+:func:`resolve_weekend_flat` applies it, and both drivers call it with the same
+params, so a replay still predicts the runner. A window declared with
+``enabled = false`` is parsed and kept for exactly this: switching it on is a
+mapping edit, not a redeploy of the strategy repository. Switching on a window
+nobody declared is refused rather than guessed.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -82,6 +92,10 @@ WEEKDAY_LABELS = ("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN")
 #: The keys :meth:`WeekendFlatPolicy.parse` accepts. Anything else is refused
 #: rather than ignored — see the method.
 WEEKEND_FLAT_KEYS = frozenset({"enabled", "flat_from", "flat_until", "extra_windows"})
+
+#: The pair-level switch :func:`resolve_weekend_flat` reads from a pair's params.
+#: Absent means the repository's declared ``enabled`` stands.
+WEEKEND_FLAT_PARAM = "use_weekend_flat"
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,8 +250,11 @@ class WeekendFlatPolicy:
         enabled = payload.get("enabled", True)
         if not isinstance(enabled, bool):
             raise ValueError(f"weekend_flat.enabled must be true or false, not {enabled!r}")
-        if not enabled:
+        if not enabled and (payload.get("flat_from") is None or payload.get("flat_until") is None):
             return cls()
+        # A window declared with `enabled = false` is parsed and kept, off: it is
+        # what a pair's `use_weekend_flat = true` switches on, so it is validated
+        # now rather than on the day someone first relies on it.
 
         for name in ("flat_from", "flat_until"):
             if payload.get(name) is None:
@@ -253,7 +270,7 @@ class WeekendFlatPolicy:
             # written, and nobody meant either. Saying so beats picking one.
             raise ValueError(
                 f"weekend_flat opens and closes at the same moment ({flat_from.describe()}) — "
-                "set enabled = false to turn it off instead"
+                "give it a real window, or remove it to declare none"
             )
         declared_windows = payload.get("extra_windows", [])
         if not isinstance(declared_windows, (list, tuple)):
@@ -265,7 +282,7 @@ class WeekendFlatPolicy:
         except ValueError as parse_error:
             raise ValueError(f"weekend_flat.extra_windows: {parse_error}") from None
         return cls(
-            enabled=True,
+            enabled=enabled,
             flat_from=flat_from,
             flat_until=flat_until,
             extra_windows=extra_windows,
@@ -287,20 +304,56 @@ class WeekendFlatPolicy:
         elapsed = (WeeklyMoment.of(moment, market_zone).offset - opened_at) % MINUTES_PER_WEEK
         return elapsed < span
 
+    @property
+    def declares_window(self) -> bool:
+        """Whether there is a window to enforce, switched on or not."""
+        return self.flat_from is not None and self.flat_until is not None
+
     def describe(self) -> str:
-        """One line for a log or a report: the window, or that there is none."""
-        if not self.enabled or self.flat_from is None or self.flat_until is None:
+        """One line for a log or a report: the window, or that there is none.
+
+        A declared window that is switched off says so and names itself, so the
+        runner's slot line shows what ``use_weekend_flat = true`` would enforce.
+        """
+        if self.flat_from is None or self.flat_until is None:
             return "off"
         recurring = f"{self.flat_from.describe()} -> {self.flat_until.describe()}"
         if self.extra_windows:
             closures = "; ".join(window.describe() for window in self.extra_windows)
-            return f"{recurring}; extra windows: {closures}"
-        return recurring
+            recurring = f"{recurring}; extra windows: {closures}"
+        return recurring if self.enabled else f"off (declared: {recurring})"
 
 
 #: What a strategy that declared no weekend flat gets. Shared rather than
 #: rebuilt per strategy, so the common case allocates nothing.
 NO_WEEKEND_FLAT = WeekendFlatPolicy()
+
+
+def resolve_weekend_flat(policy: WeekendFlatPolicy, params: Mapping[str, Any]) -> WeekendFlatPolicy:
+    """The policy one pair trades under: the declaration, with its switch applied.
+
+    *params* are the pair's resolved params — mapping defaults, the pair's own
+    overrides and, on a backtest, ``--param`` — the same dict both drivers
+    instantiate the strategy with. ``use_weekend_flat`` absent (or ``None``)
+    leaves the declared ``enabled`` alone; ``true`` or ``false`` overrides it.
+
+    ``ValueError`` when the value is not a boolean, or when it asks for a window
+    the repository never declared: silently trading through the weekend on a
+    pair configured to be flat is the failure this setting exists to prevent.
+    """
+    switch = params.get(WEEKEND_FLAT_PARAM)
+    if switch is None:
+        return policy
+    if not isinstance(switch, bool):
+        raise ValueError(f"{WEEKEND_FLAT_PARAM} must be true or false, not {switch!r}")
+    if not switch:
+        return replace(policy, enabled=False)
+    if not policy.declares_window:
+        raise ValueError(
+            f"{WEEKEND_FLAT_PARAM} = true, but the strategy's repository declares no "
+            "weekend window to enforce — add flat_from and flat_until to its settings"
+        )
+    return replace(policy, enabled=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -401,7 +454,9 @@ __all__ = [
     "NO_WEEKEND_FLAT",
     "STRATEGY_SETTINGS_HOOK",
     "StrategySettings",
+    "WEEKEND_FLAT_PARAM",
     "WeeklyMoment",
     "WeekendFlatPolicy",
     "parse_settings_table",
+    "resolve_weekend_flat",
 ]

@@ -40,9 +40,12 @@ from qte_shared.strategies.signal_factory import SignalFactory
 from qte_shared.strategies.sizing import PositionSizer
 from qte_shared.strategies.strategy_base import SignalIntent, StrategyBase
 from qte_shared.strategies.strategy_settings import (
+    NO_WEEKEND_FLAT,
+    WEEKEND_FLAT_PARAM,
     WeekendFlatPolicy,
     WeeklyMoment,
     parse_settings_table,
+    resolve_weekend_flat,
 )
 from qte_strategy_engine.runner import StrategyRunner, StrategySlot
 
@@ -141,7 +144,75 @@ def test_a_window_inside_one_day_does_not_wrap():
 def test_a_disabled_policy_covers_nothing():
     assert not WeekendFlatPolicy().covers(moment_at("2026-09-19 12:00"), UTC_ZONE)
     assert WeekendFlatPolicy.parse(False).describe() == "off"
-    assert WeekendFlatPolicy.parse({"enabled": False, **GOLD_WINDOW}).describe() == "off"
+    declared_off = WeekendFlatPolicy.parse({"enabled": False, **GOLD_WINDOW})
+    assert not declared_off.covers(moment_at("2026-09-19 12:00"), UTC_ZONE)
+    assert declared_off.describe() == "off (declared: FRI 17:00 -> SUN 22:00)"
+
+
+def test_a_window_declared_off_is_kept_and_validated():
+    """It is what a pair's switch turns on, so a typo must fail now, not then."""
+    declared_off = WeekendFlatPolicy.parse(
+        {
+            "enabled": False,
+            **GOLD_WINDOW,
+            "extra_windows": [{"flat_from": "2026-06-19 13:00", "flat_until": "2026-06-21 22:00"}],
+        }
+    )
+    assert declared_off.declares_window and not declared_off.enabled
+    assert "extra windows: 2026-06-19 13:00 -> 2026-06-21 22:00" in declared_off.describe()
+    with pytest.raises(ValueError, match="not a HH:MM time"):
+        WeekendFlatPolicy.parse(
+            {"enabled": False, "flat_from": "FRI 5pm", "flat_until": "SUN 22:00"}
+        )
+
+
+def test_a_disabled_declaration_without_a_complete_window_is_plain_off():
+    assert WeekendFlatPolicy.parse({"enabled": False}) == NO_WEEKEND_FLAT
+    assert WeekendFlatPolicy.parse({"enabled": False, "flat_from": "FRI 17:00"}) == NO_WEEKEND_FLAT
+
+
+# ── The pair's switch ────────────────────────────────────────────────────
+
+
+def test_no_switch_leaves_the_declaration_alone():
+    declared_on, declared_off = (
+        gold_policy(),
+        WeekendFlatPolicy.parse({"enabled": False, **GOLD_WINDOW}),
+    )
+    assert resolve_weekend_flat(declared_on, {}) is declared_on
+    assert resolve_weekend_flat(declared_off, {"risk_percent": 1.0}) is declared_off
+    assert resolve_weekend_flat(declared_on, {WEEKEND_FLAT_PARAM: None}) is declared_on
+
+
+def test_the_switch_turns_a_declared_window_on_and_off():
+    friday_evening = moment_at("2026-09-18 18:00")
+    switched_on = resolve_weekend_flat(
+        WeekendFlatPolicy.parse({"enabled": False, **GOLD_WINDOW}), {WEEKEND_FLAT_PARAM: True}
+    )
+    switched_off = resolve_weekend_flat(gold_policy(), {WEEKEND_FLAT_PARAM: False})
+
+    assert switched_on.covers(friday_evening, UTC_ZONE)
+    assert switched_on.describe() == "FRI 17:00 -> SUN 22:00"
+    assert not switched_off.covers(friday_evening, UTC_ZONE)
+    assert switched_off.describe() == "off (declared: FRI 17:00 -> SUN 22:00)"
+
+
+@pytest.mark.parametrize(
+    "policy,switch,message",
+    [
+        (NO_WEEKEND_FLAT, True, "declares no weekend window"),
+        (WeekendFlatPolicy.parse({"enabled": False}), True, "declares no weekend window"),
+        (NO_WEEKEND_FLAT, "true", "must be true or false"),
+        (NO_WEEKEND_FLAT, 1, "must be true or false"),
+    ],
+)
+def test_a_switch_that_cannot_be_honoured_is_refused(policy, switch, message):
+    with pytest.raises(ValueError, match=message):
+        resolve_weekend_flat(policy, {WEEKEND_FLAT_PARAM: switch})
+
+
+def test_switching_off_what_nobody_declared_is_harmless():
+    assert not resolve_weekend_flat(NO_WEEKEND_FLAT, {WEEKEND_FLAT_PARAM: False}).enabled
 
 
 @pytest.mark.parametrize(

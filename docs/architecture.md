@@ -351,6 +351,17 @@ read on, default `UTC`. It sits in the engine block rather than the runner's
 because the backtest reads it too: a replay evaluating a different window from
 the runner would stop predicting the one thing this feature changes.
 
+**The repository declares the window; the pair switches it.** Whether a market
+shuts is the instrument's business, but whether *this* book wants to hold
+through it is a risk decision, and those live in the mapping table beside
+`risk_percent`. So `enabled` in the declaration is a default, and a pair's
+`use_weekend_flat` — `[strategies.<name>]`, `[symbols.<symbol>.params.<name>]`,
+or `--param` on a backtest — overrides it. Both drivers resolve it with the same
+function from the same params, so the replay keeps predicting the runner. A
+window declared `enabled = false` is still parsed, so turning it on cannot
+surface a typo on the day it matters; asking for a window nobody declared, or
+writing anything but a boolean, stops that pair from starting.
+
 **A setting that will not parse stops the strategy loading.** The alternative is
 falling back to "off", which turns a misspelled `flat_form` into a position held
 through a shut market — the exact failure the setting exists to prevent. The
