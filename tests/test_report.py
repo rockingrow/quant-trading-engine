@@ -237,12 +237,40 @@ def test_the_markdown_renders_without_a_single_trade(trending_frame):
     json.loads(empty.to_json())
 
 
-def test_write_produces_both_files_named_by_run_and_timestamp(report, tmp_path):
+def test_write_produces_all_three_files_named_by_run_and_timestamp(report, tmp_path):
     written = report.write(tmp_path)
-    assert {path.suffix for path in written} == {".json", ".md"}
+    assert {path.suffix for path in written} == {".json", ".md", ".html"}
     for path in written:
         assert path.exists() and path.stat().st_size > 0
         assert path.stem.startswith("REPORT_PROBE_XAUUSD_M15_")
+
+
+@pytest.mark.parametrize(
+    ("extra_arguments", "expected"),
+    [
+        ([], ("json", "md", "html")),
+        (["--report-format", "json"], ("json",)),
+        (["--report-format", "json,md", "--chart"], ("json", "md", "html")),
+    ],
+)
+def test_the_cli_writes_all_three_formats_unless_told_otherwise(extra_arguments, expected):
+    from qte_backtest.__main__ import _report_formats, build_parser
+
+    arguments = build_parser().parse_args(
+        [
+            "run",
+            "--strategy",
+            "REPORT_PROBE",
+            "--symbol",
+            "XAUUSD",
+            "--timeframe",
+            "M15",
+            "--file",
+            "history.parquet",
+            *extra_arguments,
+        ]
+    )
+    assert _report_formats(arguments) == expected
 
 
 def test_two_runs_do_not_overwrite_each_other(report, tmp_path):

@@ -331,7 +331,7 @@ class BacktestReport:
         directory: Path | str,
         *,
         stem: str | None = None,
-        formats: Sequence[str] = ("json", "md"),
+        formats: Sequence[str] = ("json", "md", "html"),
         include_signals: bool = True,
     ) -> list[Path]:
         """Write the report and return the paths written.

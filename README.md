@@ -578,13 +578,14 @@ strategy, not flatter one:
 
 ### The report
 
-`--report` writes a JSON artefact for an agent to analyse plus a Markdown
-companion for a human — same object, two renderings:
+`--report` writes a JSON artefact for an agent to analyse, a Markdown companion
+for a human and an HTML dashboard — same object, three renderings.
+`--report-format json` (or any comma-separated subset) writes fewer:
 
 ```bash
 uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --timeframe M15 \
     --file data/parquet/tiingo/XAUUSD_M15.parquet --report
-# → data/reports/MY_EDGE_XAUUSD_M15_20260823T150404Z.{json,md}
+# → data/reports/MY_EDGE_XAUUSD_M15_20260823T150404Z.{json,md,html}
 ```
 
 Beyond the headline metrics it carries what makes a result diagnosable: every

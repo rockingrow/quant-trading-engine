@@ -53,7 +53,7 @@ class BacktestRequest:
     #: the report object is built either way, because the diagnostics are worth
     #: having in the return value even when nothing lands on disk.
     report_dir: Path | None = None
-    report_formats: tuple[str, ...] = ("json", "md")
+    report_formats: tuple[str, ...] = ("json", "md", "html")
     report_include_signals: bool = True
 
 

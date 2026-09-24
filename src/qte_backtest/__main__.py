@@ -112,8 +112,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument(
         "--report-format",
-        default="json,md",
-        help="Comma-separated: json, md, html (default: json,md)",
+        default="json,md,html",
+        help="Comma-separated: json, md, html (default: json,md,html)",
     )
     run.add_argument(
         "--no-report-signals",
@@ -123,7 +123,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--chart",
         action="store_true",
-        help="Also write the interactive HTML dashboard (same as adding html to --report-format)",
+        help=(
+            "Also write the interactive HTML dashboard — already in the default "
+            "--report-format; adds html back to an explicit list that left it out"
+        ),
     )
     run.add_argument(
         "--param",

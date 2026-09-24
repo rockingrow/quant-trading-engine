@@ -1,19 +1,19 @@
 # The backtest report
 
 `qte_backtest.report` writes a JSON artefact meant for an AI agent or a script,
-a Markdown companion rendering the same object for a human, and — on request —
-an HTML dashboard rendering it again as charts. They are not a summary and a
-detail view of different numbers: the Markdown is the JSON laid out for reading,
-and the HTML is the JSON drawn.
+a Markdown companion rendering the same object for a human, and an HTML
+dashboard rendering it again as charts — all three by default. They are not a
+summary and a detail view of different numbers: the Markdown is the JSON laid
+out for reading, and the HTML is the JSON drawn.
 
 ```bash
 uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --timeframe M15 \
     --file data/parquet/tiingo/XAUUSD_M15.parquet --report
-# → data/reports/MY_EDGE_XAUUSD_M15_20260823T150404Z.{json,md}
+# → data/reports/MY_EDGE_XAUUSD_M15_20260823T150404Z.{json,md,html}
 
 uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --timeframe M15 \
-    --file data/parquet/tiingo/XAUUSD_M15.parquet --report --chart
-# → …{json,md,html}
+    --file data/parquet/tiingo/XAUUSD_M15.parquet --report --report-format json
+# → …json only
 ```
 
 ## What the JSON contains

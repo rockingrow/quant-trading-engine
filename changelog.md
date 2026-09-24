@@ -65,6 +65,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A backtest report is written in all three formats by default.**
+  `--report` now writes `json,md,html`; `--report-format` narrows it
+  (`--report-format json`), and `--chart` still adds `html` back to an explicit
+  list that left it out. `BacktestRequest.report_formats` and
+  `BacktestReport.write` share the same default, so `make backtest` writes the
+  dashboard too.
+
 - **A symbol's market is stated, never guessed.** `qte_shared.symbols` had two
   hardcoded lists — crypto base assets and stablecoin quotes — that
   `infer_market()` matched a symbol name against to pick `fx` or `crypto`. A
