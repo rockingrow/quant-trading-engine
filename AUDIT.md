@@ -145,11 +145,32 @@ line to be understood costs a reader (and an agent) a file jump every time.
 
 ---
 
+## 6. Every backtest writes its HTML dashboard
+
+A backtest is not finished until its HTML dashboard sits beside its JSON. The
+JSON is what a script reads, but the dashboard is where equity, drawdown, the
+trade marks on price and the diagnostics get looked at, and a run that exists
+only as JSON is one nobody reviews.
+
+- `qte-backtest run --report` and `make backtest` write `json,md,html` by
+  default. Do not narrow `--report-format` to a list that leaves `html` out.
+- Research scripts that drive `BacktestEngine` themselves must write it too:
+  `build_report(result).write(directory, formats=("json", "md", "html"))`, or
+  the default of `BacktestReport.write`, which already includes it.
+- A JSON report without its dashboard, from an older run or another machine,
+  gets one without re-running anything:
+  `make chart REPORT=data/reports/<file>.json` (or
+  `uv run qte-backtest chart <file>.json`), which writes `<file>.html` beside it.
+- An audit that cites a backtest links the dashboard as well as the JSON.
+
+---
+
 ## Before you call the work done
 
 - [ ] `make check` passes (Ruff + pytest)
 - [ ] Comments, docstrings and Markdown are English (rule 2)
 - [ ] New names are explicit and ≥ 6 characters (rule 3)
 - [ ] Reports in `data/reports/`, audits in `data/audits/`, both git-ignored (rule 5)
+- [ ] Every backtest has its HTML dashboard beside its JSON (rule 6)
 - [ ] Commit message is English with no generated-by footer (rule 1)
 - [ ] PR base branch is `dev` (rule 4)

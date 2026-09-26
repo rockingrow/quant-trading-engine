@@ -88,7 +88,11 @@ from qte_shared.strategies.strategy_base import (
     candles_to_frame,
     overrides_on_tick,
 )
-from qte_shared.strategies.strategy_settings import NO_WEEKEND_FLAT, WeekendFlatPolicy
+from qte_shared.strategies.strategy_settings import (
+    NO_WEEKEND_FLAT,
+    WeekendFlatPolicy,
+    resolve_weekend_flat,
+)
 from qte_shared.timeframes import (
     CLOCK_TOLERANCE,
     bucket_close,
@@ -323,6 +327,13 @@ class StrategyRunner:
                 # Params layer: the strategy's [strategies.<name>] defaults,
                 # then this pair's [symbols.<symbol>.params.<name>] on top.
                 params = {**defaults, **mapping.params_for(symbol, entry.name)}
+                # The repo declares the window; this pair's `use_weekend_flat`
+                # decides whether it is enforced — the same call the backtest makes.
+                # A value that cannot be honoured stops the start, never reads as off.
+                try:
+                    weekend_flat = resolve_weekend_flat(entry.settings.weekend_flat, params)
+                except ValueError as error:
+                    raise ValueError(f"{entry.name} on {symbol}: {error}") from None
                 strategy = entry.instantiate(params)
                 # Size against the account, at the risk this pair is mapped at.
                 # The strategy is never told either — see qte_shared.strategies.sizing.
@@ -335,9 +346,7 @@ class StrategyRunner:
                     sizer=sizer,
                     default_quantity=runner_settings.default_quantity,
                 )
-                slot = StrategySlot(
-                    strategy, symbol, factory, weekend_flat=entry.settings.weekend_flat
-                )
+                slot = StrategySlot(strategy, symbol, factory, weekend_flat=weekend_flat)
                 self._warn_if_history_exceeds_redis(slot)
                 self.slots.append(slot)
                 self._by_subject[(symbol, slot.timeframe)].append(slot)

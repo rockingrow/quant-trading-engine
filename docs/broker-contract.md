@@ -38,6 +38,10 @@ QTE emits the broker's `WebhookPayload` (`broker/schemas/webhook_schema.py`):
 
 Field-level notes:
 
+- **A supplied `tp2` with `tp1 = null` is a single full-position target.**
+  The shared factory preserves that null instead of inventing an earlier TP1.
+  Replay closes the remaining position at TP2; the chart omits a null TP1.
+  Entries without either target still receive the default bracket.
 - **`timeframe` is TradingView's spelling** — the bare minute count (`"15"`,
   `"60"`), not QTE's `M15`. `qte_shared.timeframes.to_broker_timeframe` converts.
 - **`price`/`quantity` are optional in the schema** because a `FLAT` carries

@@ -337,11 +337,30 @@ holding a gate of its own — would re-enter on the next bar and be flattened
 again, taking turns until the market shut. `flat_until` is what makes the block
 terminate, and stating the reopen is also the honest way to describe a weekend.
 
+Shortened holiday sessions can start the block earlier through `extra_windows`,
+a list of `{flat_from: "YYYY-MM-DD HH:MM", flat_until: "YYYY-MM-DD HH:MM"}`
+declarations in that same market zone. These half-open dated windows extend
+the weekly block; they cannot reopen a market inside it. Both drivers and the
+runner's between-bar sweep use the same predicate. Dates must be maintained
+against the broker calendar: neither driver guesses a holiday from a future
+bar or invents a fill after the market has already closed.
+
 **The zone is the operator's, not the strategy's.**
 `QTE_ENGINE__WEEKEND_FLAT_TIMEZONE` decides whose clock those wall times are
 read on, default `UTC`. It sits in the engine block rather than the runner's
 because the backtest reads it too: a replay evaluating a different window from
 the runner would stop predicting the one thing this feature changes.
+
+**The repository declares the window; the pair switches it.** Whether a market
+shuts is the instrument's business, but whether *this* book wants to hold
+through it is a risk decision, and those live in the mapping table beside
+`risk_percent`. So `enabled` in the declaration is a default, and a pair's
+`use_weekend_flat` — `[strategies.<name>]`, `[symbols.<symbol>.params.<name>]`,
+or `--param` on a backtest — overrides it. Both drivers resolve it with the same
+function from the same params, so the replay keeps predicting the runner. A
+window declared `enabled = false` is still parsed, so turning it on cannot
+surface a typo on the day it matters; asking for a window nobody declared, or
+writing anything but a boolean, stops that pair from starting.
 
 **A setting that will not parse stops the strategy loading.** The alternative is
 falling back to "off", which turns a misspelled `flat_form` into a position held

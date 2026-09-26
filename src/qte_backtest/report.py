@@ -51,7 +51,17 @@ log = get_logger(__name__)
 
 #: Bump the major part when a consumer that understood the old shape would
 #: misread the new one.
-SCHEMA_VERSION = "1.2"
+#:
+#: 2.0 — ``market.rows`` carries epoch-second integers in ``t`` where 1.x
+#: carried ISO strings, and the rows are now the run's own bars rather than a
+#: fixed-count downsampling of them. A reader that fed ``t`` to a date parser
+#: would get a number it cannot parse, which is what a major bump is for.
+SCHEMA_VERSION = "2.0"
+
+#: Stands in for ``market.rows`` while the document is indented, so the rows
+#: can be written back one per line. Chosen to be something no value in the
+#: report could ever be, since it is substituted by a plain string replace.
+_ROWS_TOKEN = "@@qte.market.rows@@"
 
 #: A compact orientation for whoever reads the JSON cold. It costs a few
 #: hundred bytes and saves an agent from inferring the conventions — or, worse,
@@ -77,7 +87,11 @@ READING_GUIDE = {
     "exit_reasons": (
         "TP1/TP2 targets, SL stop, R_SL stop after it moved to breakeven, FLAT a "
         "discretionary close, END_OF_DATA the replay running out of bars with the "
-        "position still open — the last one is usually a bug, not a trade."
+        "position still open — the last one is usually a bug, not a trade. "
+        "exit_note is the strategy's own explanation for the final leg, taken "
+        "verbatim from SignalIntent.reason wherever it set one; null on a bracket "
+        "fill (TP1/TP2/SL hit on a level, never routed through the strategy) or "
+        "when the strategy left reason blank."
     ),
     "position_sizing": (
         "Every entry is sized by the engine, not by the strategy: quantity = "
@@ -93,9 +107,12 @@ READING_GUIDE = {
         "dropped for that reason."
     ),
     "market_and_benchmark": (
-        "The market block is a downsampled OHLC window kept so the run can be *drawn*: "
-        "each row aggregates bucket_bars consecutive bars (first open, highest high, "
-        "lowest low, last close). Never compute a statistic from it — every metric in "
+        "The market block is the OHLC window kept so the run can be *drawn*. rows are "
+        "[t, o, h, l, c] with t in epoch seconds UTC, at market.base_timeframe — the "
+        "run's own timeframe and the whole history, so bucket_bars is 1 (a caller "
+        "that capped the rows gets a coarser timeframe, and bucket_bars then says how "
+        "many of the run's bars a row nominally covers). "
+        "Never compute a statistic from it — every metric in "
         "this report comes from the full series. buy_hold is the same instrument held "
         "at the strategy's default size from the bar completing warm-up to the last, "
         "paying no spread, no slippage and no commission: the floor a strategy has to "
@@ -187,7 +204,24 @@ class BacktestReport:
     # ── Rendering ─────────────────────────────────────────────────────
 
     def to_json(self, indent: int = 2, include_signals: bool = True) -> str:
-        return json.dumps(self.to_dict(include_signals=include_signals), indent=indent, default=str)
+        payload = self.to_dict(include_signals=include_signals)
+        rows = (payload.get("market") or {}).get("rows")
+        if not rows:
+            return json.dumps(payload, indent=indent, default=str)
+
+        # One OHLC row per line instead of five values per row on five lines.
+        # `market.rows` is now the whole replayed series — tens of thousands of
+        # rows — and indenting it the way the rest of the document is indented
+        # more than doubles the file for no reader's benefit: nobody reads a
+        # candle down a column. Everything else keeps its indentation, so the
+        # report stays something a person can open and a diff can show.
+        payload["market"] = {**payload["market"], "rows": _ROWS_TOKEN}
+        text = json.dumps(payload, indent=indent, default=str)
+        margin = " " * (indent * 3)
+        packed = ",\n".join(
+            margin + json.dumps(row, separators=(",", ":"), default=str) for row in rows
+        )
+        return text.replace(f'"{_ROWS_TOKEN}"', f"[\n{packed}\n{' ' * (indent * 2)}]")
 
     def to_html(self, title: str | None = None) -> str:
         """The dashboard, as one self-contained page.
@@ -282,7 +316,7 @@ class BacktestReport:
                     f"| {index} | {'L' if position.direction == 1 else 'S'} "
                     f"| {position.opened_at:%Y-%m-%d %H:%M} | {position.bars_held} "
                     f"| {position.entry_price:.5f} | {_fmt(position.exit_price, '{:.5f}')} "
-                    f"| {position.exit_reason or '—'} "
+                    f"| {_exit_label(position)} "
                     f"| {_fmt(position.r_multiple, '{:+.2f}')} "
                     f"| {_fmt(position.mae_r, '{:.2f}')} "
                     f"| {_fmt(position.mfe_r, '{:.2f}')} |"
@@ -298,7 +332,7 @@ class BacktestReport:
         directory: Path | str,
         *,
         stem: str | None = None,
-        formats: Sequence[str] = ("json", "md"),
+        formats: Sequence[str] = ("json", "md", "html"),
         include_signals: bool = True,
     ) -> list[Path]:
         """Write the report and return the paths written.
@@ -375,6 +409,7 @@ def _trade_to_dict(index: int, position: SimulatedPosition) -> dict[str, Any]:
         "tp2": position.tp2,
         "initial_risk": position.initial_risk,
         "exit_reason": position.exit_reason,
+        "exit_note": position.exit_note,
         "gross_pnl": round(position.gross_pnl, 8),
         "fees": round(position.fees, 8),
         "net_pnl": round(position.net_pnl, 8),
@@ -389,6 +424,7 @@ def _trade_to_dict(index: int, position: SimulatedPosition) -> dict[str, Any]:
             {
                 "closed_at": _iso(leg.closed_at),
                 "reason": leg.reason.value,
+                "note": leg.note,
                 "price": leg.price,
                 "quantity": leg.quantity,
                 "gross_pnl": round(leg.gross_pnl, 8),
@@ -414,6 +450,7 @@ def _market_to_dict(result: BacktestResult) -> dict[str, Any] | None:
     hold_pnl = (market.last_close - market.benchmark_close) * size
     return {
         "bucket_bars": market.bucket_bars,
+        "base_timeframe": market.base_timeframe,
         "columns": list(market.columns),
         "rows": market.rows,
         "buy_hold": {
@@ -461,6 +498,12 @@ def _most_instructive(
         chosen[index] = position
 
     return sorted(chosen.items())[:limit]
+
+
+def _exit_label(position: SimulatedPosition) -> str:
+    """The Markdown table's ``Why`` cell: category, plus the strategy's own note."""
+    reason = position.exit_reason or "—"
+    return f"{reason} ({position.exit_note})" if position.exit_note else reason
 
 
 def _exit_summary(reasons: dict[str, int]) -> str:

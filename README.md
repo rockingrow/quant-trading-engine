@@ -331,6 +331,15 @@ act on. A repo with no settings hook, and a strategy missing from the table,
 get no weekend flat; a setting that will not parse stops that strategy loading
 rather than quietly reverting to "off".
 
+`enabled` is the strategy's *default*; the pair decides. Set `use_weekend_flat`
+in `config/strategies_mapping.toml` — under `[strategies.<name>]` for every pair,
+or `[symbols.<symbol>.params.<name>]` for one — or pass `--param
+use_weekend_flat=true` to a backtest, and it overrides the declared `enabled`
+for that pair in both drivers. A window declared with `enabled = false` is still
+parsed and validated, so switching it on is a mapping edit. Switching on a
+window the repo never declared, or giving the key anything but `true`/`false`,
+stops the runner (and the backtest) from starting that pair.
+
 **A directory scan — for a single file.** Failing a manifest, every `.py` under
 the directory is imported and anything that looks like a strategy is collected.
 Drop a single `.py` file in and it runs, no ceremony.
@@ -440,6 +449,8 @@ the pair's own value in `config/strategies_mapping.toml`, falling back to
 QTE_ACCOUNT__CAPITAL=1000.0          # the account, and what a % of risk is a % of
 QTE_ACCOUNT__RISK_PERCENT=1.0        # fallback when a pair states none
 QTE_ACCOUNT__COMMISSION_PER_UNIT=0.0 # backtest cost, charged each side
+QTE_ACCOUNT__SPREAD=0.0              # full bid/ask distance, each side pays half
+QTE_ACCOUNT__SLIPPAGE=0.0            # on top of half the spread, each side
 QTE_ACCOUNT__CONTRACT_SIZE=1.0
 ```
 
@@ -567,13 +578,14 @@ strategy, not flatter one:
 
 ### The report
 
-`--report` writes a JSON artefact for an agent to analyse plus a Markdown
-companion for a human — same object, two renderings:
+`--report` writes a JSON artefact for an agent to analyse, a Markdown companion
+for a human and an HTML dashboard — same object, three renderings.
+`--report-format json` (or any comma-separated subset) writes fewer:
 
 ```bash
 uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --timeframe M15 \
     --file data/parquet/tiingo/XAUUSD_M15.parquet --report
-# → data/reports/MY_EDGE_XAUUSD_M15_20260823T150404Z.{json,md}
+# → data/reports/MY_EDGE_XAUUSD_M15_20260823T150404Z.{json,md,html}
 ```
 
 Beyond the headline metrics it carries what makes a result diagnosable: every

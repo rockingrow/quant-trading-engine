@@ -44,26 +44,40 @@ from qte_shared.strategies.strategy_base import (
     as_intents,
 )
 from qte_shared.strategies.strategy_settings import NO_WEEKEND_FLAT, WeekendFlatPolicy
-from qte_shared.timeframes import timeframe_seconds
+from qte_shared.timeframes import TIMEFRAME_SECONDS, timeframe_seconds
 
 log = get_logger(__name__)
 
 
-#: How many OHLC rows the report carries for drawing. Enough that a chart of a
-#: multi-year run still looks like a chart, small enough that the block stays a
-#: rounding error next to the trade list.
-MARKET_ROWS = 480
+#: Ceiling on the OHLC rows the report carries for drawing — ``None``, none.
+#:
+#: Every run ships its bars **at the timeframe it was run on**, however long the
+#: history: a chart of an M15 replay has to be an M15 chart, and the dashboard can
+#: roll those bars up to H1 or D1 on its own, which it cannot undo from bars that
+#: arrived pre-aggregated. The price is size — five years of M15 is ~120k rows,
+#: about 6 MB of report and dashboard, and a slower page — and it is paid on
+#: purpose: a 20k-row ceiling here once turned a five-year M15 run into an H4
+#: chart nobody could inspect a trade on. :func:`sample_market` still takes a
+#: ``max_rows`` for a caller that wants the old calendar roll-up.
+MARKET_MAX_ROWS: int | None = None
 
 
 @dataclass(slots=True)
 class MarketWindow:
-    """A downsampled OHLC view of the replayed history — for drawing only.
+    """An OHLC view of the replayed history — for drawing only.
 
     Every number in the report is computed from the full series; these rows
-    exist so a chart can show *where* the trades happened without the report
-    carrying a copy of the parquet file. Each row aggregates ``bucket_bars``
-    consecutive bars honestly (first open, highest high, lowest low, last
-    close), so the shape is the market's, only coarser.
+    exist so a chart can show *where* the trades happened. They **are** the full
+    series, at the timeframe the run was made on: a reader looking at an M15
+    backtest should see M15 candles, and a dashboard can aggregate those up to
+    H1 or D1 itself. Only a caller that passes :func:`sample_market` a
+    ``max_rows`` below the history's length gets a higher timeframe instead, and
+    :attr:`base_timeframe` says which one it chose.
+
+    Aggregation, when it happens, is by the **calendar**, not by counting bars:
+    buckets land on the same boundaries the rest of the engine uses, so a
+    candle covers one real hour rather than "the next 32 bars, whatever hours
+    those turned out to span across a weekend".
 
     ``benchmark_close`` is the close of the first bar the strategy could act on
     — the bar completing warm-up — which is what a buy-and-hold comparison has to be
@@ -71,14 +85,21 @@ class MarketWindow:
     charge the benchmark for a stretch the strategy was never allowed to trade.
     """
 
+    #: Nominal bars of the run's timeframe per row: 1 when the rows are the
+    #: bars themselves. A calendar bucket spanning a session break holds fewer.
     bucket_bars: int
+    #: The timeframe :attr:`rows` are drawn at — the run's own unless the file
+    #: was too long to carry at that resolution.
+    base_timeframe: str
     rows: list[list[Any]]
     benchmark_close: float
     last_close: float
     benchmark_from: datetime | None = None
 
     #: Column order of :attr:`rows`, carried into the JSON so a consumer reads
-    #: the arrays rather than guessing at them.
+    #: the arrays rather than guessing at them. ``t`` is **epoch seconds**, UTC:
+    #: an integer per row rather than a 25-character timestamp, which is a third
+    #: of this block's size once the rows are the whole series.
     columns: tuple[str, ...] = ("t", "o", "h", "l", "c")
 
 
@@ -290,7 +311,7 @@ class BacktestEngine:
             starting_equity=self.starting_equity,
             risk_percent=self.factory.sizer.risk_percent,
             quantity=self.default_quantity,
-            market=sample_market(frame, warmup),
+            market=sample_market(frame, warmup, self.timeframe),
         )
 
     # ── Intent handling ───────────────────────────────────────────────
@@ -362,6 +383,7 @@ class BacktestEngine:
                 block.price if block.price is not None else close,
                 _EXIT_REASONS.get(intent.action, ExitReason.FLAT),
                 quantity=block.quantity,
+                note=intent.reason or None,
             )
             if intent.action is SignalAction.TP1:
                 self._open.tp1_filled = True
@@ -399,35 +421,90 @@ _EXIT_REASONS = {
 }
 
 
-def sample_market(frame: pd.DataFrame, warmup: int, rows: int = MARKET_ROWS) -> MarketWindow:
-    """Aggregate *frame* down to at most *rows* OHLC buckets.
+def sample_market(
+    frame: pd.DataFrame,
+    warmup: int,
+    timeframe: str,
+    max_rows: int | None = MARKET_MAX_ROWS,
+) -> MarketWindow:
+    """The OHLC rows the report carries for drawing, at the finest timeframe that fits.
 
-    Aggregation, not sampling: taking every Nth bar would drop the highs and
-    lows that a chart is mostly there to show, and a candle drawn from one
-    surviving bar is a claim about a range that was never traded.
+    The run's own timeframe, the whole history, by default: a chart drawn from
+    pre-aggregated bars can never be shown at a *finer* resolution than it
+    arrived at, so handing the viewer coarse bars decides for it. Only with a
+    *max_rows* below the history's length does this climb the timeframe ladder
+    — M15 to M30 to H1 and so on — and take the first rung that fits.
+
+    Aggregation is by the calendar and never by counting bars. Taking every Nth
+    bar would drop the highs and lows a chart is mostly there to show, and
+    counting bars into buckets produces candles whose span changes across every
+    session break and weekend.
     """
-    bucket = max(1, -(-len(frame) // max(rows, 1)))
-    ohlc: list[list[Any]] = []
-    for start in range(0, len(frame), bucket):
-        chunk = frame.iloc[start : start + bucket]
-        ohlc.append(
-            [
-                _as_datetime(chunk.index[0]).isoformat(),
-                round(float(chunk["open"].iloc[0]), 8),
-                round(float(chunk["high"].max()), 8),
-                round(float(chunk["low"].min()), 8),
-                round(float(chunk["close"].iloc[-1]), 8),
-            ]
+    base_timeframe, drawn = _drawable_series(frame, timeframe, max_rows)
+    rows = [
+        [
+            int(_as_datetime(moment).timestamp()),
+            round(float(open_), 8),
+            round(float(high), 8),
+            round(float(low), 8),
+            round(float(close), 8),
+        ]
+        for moment, open_, high, low, close in zip(
+            drawn.index,
+            drawn["open"],
+            drawn["high"],
+            drawn["low"],
+            drawn["close"],
+            strict=True,
         )
+    ]
 
     anchor = min(max(warmup - 1, 0), len(frame) - 1)
     return MarketWindow(
-        bucket_bars=bucket,
-        rows=ohlc,
+        bucket_bars=max(1, timeframe_seconds(base_timeframe) // timeframe_seconds(timeframe)),
+        base_timeframe=base_timeframe,
+        rows=rows,
         benchmark_close=round(float(frame["close"].iloc[anchor]), 8),
         last_close=round(float(frame["close"].iloc[-1]), 8),
         benchmark_from=_as_datetime(frame.index[anchor]),
     )
+
+
+def _drawable_series(
+    frame: pd.DataFrame, timeframe: str, max_rows: int | None
+) -> tuple[str, pd.DataFrame]:
+    """*frame* itself, or the coarsest-necessary calendar resampling of it."""
+    if max_rows is None or len(frame) <= max_rows:
+        return timeframe, frame
+
+    seconds = timeframe_seconds(timeframe)
+    ladder = sorted(
+        (label for label, span in TIMEFRAME_SECONDS.items() if span > seconds),
+        key=lambda label: TIMEFRAME_SECONDS[label],
+    )
+    for label in ladder:
+        # ``origin="epoch"`` is the boundary `floor_to_bucket` uses, so a bucket
+        # here opens at the same moment the ingestion side would open it.
+        resampled = (
+            frame.resample(
+                pd.Timedelta(seconds=TIMEFRAME_SECONDS[label]),
+                label="left",
+                closed="left",
+                origin="epoch",
+            )
+            .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
+            .dropna()
+        )
+        if len(resampled) <= max_rows:
+            return label, resampled
+
+    # Longer than `max_rows` days. Draw it daily and say so rather than
+    # inventing a timeframe the rest of the engine does not have a name for.
+    log.warning(
+        "History is %d bars; drawing the price chart at D1, the coarsest timeframe there is",
+        len(frame),
+    )
+    return "D1", resampled
 
 
 def count_gaps(frame: pd.DataFrame, timeframe: str) -> int:
