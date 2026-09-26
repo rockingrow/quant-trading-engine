@@ -285,6 +285,25 @@ def test_a_short_run_is_carried_at_its_own_timeframe(trending_frame):
     assert len(window.rows) == len(trending_frame)
 
 
+def test_a_long_run_is_still_carried_whole_at_its_own_timeframe():
+    """Five years of M15 is ~120k bars, and the chart still gets every one.
+
+    A row ceiling here used to turn such a run into an H4 chart on which no
+    trade could be inspected; the report is larger on purpose.
+    """
+    moments = pd.date_range("2021-07-05", periods=50_000, freq="15min", tz="UTC")
+    closes = pd.Series(range(len(moments)), index=moments) * 0.0002 + 70.0
+    frame = pd.DataFrame(
+        {"open": closes, "high": closes + 0.1, "low": closes - 0.1, "close": closes},
+        index=moments,
+    )
+    window = sample_market(frame, warmup=150, timeframe="M15")
+
+    assert window.base_timeframe == "M15"
+    assert window.bucket_bars == 1
+    assert len(window.rows) == len(frame)
+
+
 def test_rows_carry_epoch_seconds(trending_frame):
     window = sample_market(trending_frame, warmup=5, timeframe="M15")
     first = window.rows[0]

@@ -109,8 +109,9 @@ READING_GUIDE = {
     "market_and_benchmark": (
         "The market block is the OHLC window kept so the run can be *drawn*. rows are "
         "[t, o, h, l, c] with t in epoch seconds UTC, at market.base_timeframe — the "
-        "run's own timeframe unless the history was too long to carry whole, in which "
-        "case bucket_bars says how many of the run's bars a row nominally covers. "
+        "run's own timeframe and the whole history, so bucket_bars is 1 (a caller "
+        "that capped the rows gets a coarser timeframe, and bucket_bars then says how "
+        "many of the run's bars a row nominally covers). "
         "Never compute a statistic from it — every metric in "
         "this report comes from the full series. buy_hold is the same instrument held "
         "at the strategy's default size from the bar completing warm-up to the last, "

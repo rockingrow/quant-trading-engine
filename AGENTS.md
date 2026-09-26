@@ -34,6 +34,10 @@ table and the check commands; read it before you commit or open a PR.
 5. **Artefacts**: backtest output to `data/reports/`, audits to `data/audits/`
    (`YYYY-MM-DD-<topic>.md`) — both git-ignored and local-only, never pushed to
    GitHub. Never into `docs/` or the repository root.
+6. **Every backtest writes its HTML dashboard** beside its JSON — the default
+   of `--report` and `make backtest`; never narrow `--report-format` to drop
+   `html`. Research scripts pass `formats=("json", "md", "html")`, and a JSON
+   without its page gets one from `make chart REPORT=<file>.json`.
 
 ## Working approach
 

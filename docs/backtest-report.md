@@ -42,10 +42,13 @@ Two design choices to know about:
   `[t, o, h, l, c]` with `t` in **epoch seconds, UTC**, and they are the bars of
   the run's own timeframe: `base_timeframe` names it and `bucket_bars` is 1. A
   dashboard can roll those up to H1 or D1 itself, which it cannot do from bars
-  that arrived pre-aggregated. Only above 20,000 rows does the engine climb the
-  timeframe ladder first — `base_timeframe` then names the coarser timeframe and
-  `bucket_bars` says how many of the run's bars a row nominally covers, first
-  open, highest high, lowest low, last close, bucketed on the calendar. Every
+  that arrived pre-aggregated. There is no row ceiling: five years of M15 ships
+  ~120k rows, a report and dashboard of about 6 MB each, and a slower page — the
+  cost of a chart on which every trade can still be inspected. Only a caller
+  that passes `sample_market` a `max_rows` gets the timeframe ladder —
+  `base_timeframe` then names the coarser timeframe and `bucket_bars` says how
+  many of the run's bars a row nominally covers, first open, highest high,
+  lowest low, last close, bucketed on the calendar. Every
   metric in the report comes from the full series regardless; anything computed
   off these rows would be a coarser answer wearing the same name.
 - **The rows are written one per line.** The rest of the document is indented;

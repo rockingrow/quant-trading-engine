@@ -49,15 +49,17 @@ from qte_shared.timeframes import TIMEFRAME_SECONDS, timeframe_seconds
 log = get_logger(__name__)
 
 
-#: Ceiling on the OHLC rows the report carries for drawing.
+#: Ceiling on the OHLC rows the report carries for drawing — ``None``, none.
 #:
-#: Sized so a normal run ships its bars **at the timeframe it was run on** — a
-#: chart of an M15 replay should look like an M15 chart, and the dashboard can
-#: roll those bars up to H1 or D1 on its own, which it cannot do from bars that
-#: arrived pre-aggregated. A year of M15 is ~35k bars and a year of M1 is ~370k,
-#: so the ceiling still has to exist; past it :func:`sample_market` climbs the
-#: timeframe ladder instead of the report becoming a copy of the parquet.
-MARKET_MAX_ROWS = 20_000
+#: Every run ships its bars **at the timeframe it was run on**, however long the
+#: history: a chart of an M15 replay has to be an M15 chart, and the dashboard can
+#: roll those bars up to H1 or D1 on its own, which it cannot undo from bars that
+#: arrived pre-aggregated. The price is size — five years of M15 is ~120k rows,
+#: about 6 MB of report and dashboard, and a slower page — and it is paid on
+#: purpose: a 20k-row ceiling here once turned a five-year M15 run into an H4
+#: chart nobody could inspect a trade on. :func:`sample_market` still takes a
+#: ``max_rows`` for a caller that wants the old calendar roll-up.
+MARKET_MAX_ROWS: int | None = None
 
 
 @dataclass(slots=True)
@@ -65,12 +67,12 @@ class MarketWindow:
     """An OHLC view of the replayed history — for drawing only.
 
     Every number in the report is computed from the full series; these rows
-    exist so a chart can show *where* the trades happened. Normally they **are**
-    the full series, at the timeframe the run was made on: a reader looking at
-    an M15 backtest should see M15 candles, and a dashboard can aggregate those
-    up to H1 or D1 itself. Only when the file is longer than
-    :data:`MARKET_MAX_ROWS` does :func:`sample_market` hand over a higher
-    timeframe instead, and :attr:`base_timeframe` says which one it chose.
+    exist so a chart can show *where* the trades happened. They **are** the full
+    series, at the timeframe the run was made on: a reader looking at an M15
+    backtest should see M15 candles, and a dashboard can aggregate those up to
+    H1 or D1 itself. Only a caller that passes :func:`sample_market` a
+    ``max_rows`` below the history's length gets a higher timeframe instead, and
+    :attr:`base_timeframe` says which one it chose.
 
     Aggregation, when it happens, is by the **calendar**, not by counting bars:
     buckets land on the same boundaries the rest of the engine uses, so a
@@ -423,16 +425,15 @@ def sample_market(
     frame: pd.DataFrame,
     warmup: int,
     timeframe: str,
-    max_rows: int = MARKET_MAX_ROWS,
+    max_rows: int | None = MARKET_MAX_ROWS,
 ) -> MarketWindow:
     """The OHLC rows the report carries for drawing, at the finest timeframe that fits.
 
-    The run's own timeframe when the file is short enough to carry whole, which
-    is the normal case and the one that matters: a chart drawn from
+    The run's own timeframe, the whole history, by default: a chart drawn from
     pre-aggregated bars can never be shown at a *finer* resolution than it
-    arrived at, so handing the viewer coarse bars decides for it. Above
-    *max_rows* this climbs the timeframe ladder — M15 to M30 to H1 and so on —
-    and takes the first rung that fits.
+    arrived at, so handing the viewer coarse bars decides for it. Only with a
+    *max_rows* below the history's length does this climb the timeframe ladder
+    — M15 to M30 to H1 and so on — and take the first rung that fits.
 
     Aggregation is by the calendar and never by counting bars. Taking every Nth
     bar would drop the highs and lows a chart is mostly there to show, and
@@ -470,10 +471,10 @@ def sample_market(
 
 
 def _drawable_series(
-    frame: pd.DataFrame, timeframe: str, max_rows: int
+    frame: pd.DataFrame, timeframe: str, max_rows: int | None
 ) -> tuple[str, pd.DataFrame]:
     """*frame* itself, or the coarsest-necessary calendar resampling of it."""
-    if len(frame) <= max_rows:
+    if max_rows is None or len(frame) <= max_rows:
         return timeframe, frame
 
     seconds = timeframe_seconds(timeframe)
