@@ -257,7 +257,7 @@ class OpenPositionRepository:
         self._namespace = self._scope.namespace
 
     async def upsert(self, position: OpenPosition) -> bool:
-        """Write the pair's current cycle, replacing whatever was there."""
+        """Write one cycle's current state, replacing that cycle's previous row."""
         if position.state_namespace not in (None, self._namespace):
             raise ValueError("Cannot persist a position from another state namespace")
         position = position.model_copy(update={"state_namespace": self._namespace})
@@ -282,7 +282,7 @@ class OpenPositionRepository:
                 symbol=position.symbol,
                 **values,
             )
-            .on_conflict_do_update(constraint="uq_open_positions_pair", set_=values)
+            .on_conflict_do_update(constraint="uq_open_positions_uxid", set_=values)
         )
         try:
             async with self._db.session() as session:
@@ -294,35 +294,46 @@ class OpenPositionRepository:
             )
             return False
 
-    async def clear(self, strategy: str, symbol: str) -> bool:
-        """Drop the pair's row — the cycle is over."""
+    async def clear(self, strategy: str, symbol: str, signal_uxid: str | None = None) -> bool:
+        """Drop one cycle's row, or every row of the pair when no cycle is named."""
+        statement = delete(OpenPositionRow).where(
+            OpenPositionRow.namespace == self._namespace,
+            OpenPositionRow.strategy == strategy,
+            OpenPositionRow.symbol == symbol.upper(),
+        )
+        if signal_uxid is not None:
+            statement = statement.where(OpenPositionRow.signal_uxid == signal_uxid)
         try:
             async with self._db.session() as session:
-                await session.execute(
-                    delete(OpenPositionRow).where(
-                        OpenPositionRow.namespace == self._namespace,
-                        OpenPositionRow.strategy == strategy,
-                        OpenPositionRow.symbol == symbol.upper(),
-                    )
-                )
+                await session.execute(statement)
             return True
         except Exception as exc:
             log.error("Could not clear open position %s %s: %s", strategy, symbol, exc)
             return False
 
     async def get(self, strategy: str, symbol: str) -> OpenPosition | None:
-        statement = select(OpenPositionRow).where(
-            OpenPositionRow.namespace == self._namespace,
-            OpenPositionRow.strategy == strategy,
-            OpenPositionRow.symbol == symbol.upper(),
+        """The most recent cycle on the pair — the whole book for a single-cycle pair."""
+        positions = await self.list_for(strategy, symbol)
+        return positions[-1] if positions else None
+
+    async def list_for(self, strategy: str, symbol: str) -> list[OpenPosition]:
+        """Every cycle the pair holds, oldest first."""
+        statement = (
+            select(OpenPositionRow)
+            .where(
+                OpenPositionRow.namespace == self._namespace,
+                OpenPositionRow.strategy == strategy,
+                OpenPositionRow.symbol == symbol.upper(),
+            )
+            .order_by(OpenPositionRow.opened_at.asc())
         )
         try:
             async with self._db.session() as session:
-                row = (await session.execute(statement)).scalar_one_or_none()
+                rows = (await session.execute(statement)).scalars().all()
         except Exception as exc:
-            log.error("Could not read open position %s %s: %s", strategy, symbol, exc)
-            return None
-        return _as_position(row)
+            log.error("Could not read open positions %s %s: %s", strategy, symbol, exc)
+            return []
+        return [position for position in map(_as_position, rows) if position is not None]
 
     async def list_open(self, strategy: str | None = None) -> list[OpenPosition]:
         statement = (

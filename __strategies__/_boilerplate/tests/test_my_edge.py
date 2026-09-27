@@ -127,6 +127,34 @@ def test_the_dispatcher_asks_exits_while_holding(
     assert strategy.on_candle_closed(candles, context) == []
 
 
+def test_a_pair_with_room_for_more_cycles_is_asked_for_another_entry(
+    candles: pd.DataFrame, context: StrategyContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With ``max_open_cycles`` above what is open, holding no longer blocks entries."""
+    monkeypatch.setattr(MyEdge, "_rule", lambda self, df, *, direction: direction > 0)
+    strategy = MyEdge({})
+    context.open_uxid = "A000000000000001"
+    context.open_uxids = ("A000000000000001",)
+    context.max_open_cycles = 2
+
+    produced = strategy.on_candle_closed(candles, context)
+    assert [intent.action for intent in produced] == [SignalAction.LONG]
+    assert produced[0].signal_uxid not in context.open_uxids
+
+    context.open_uxids = ("A000000000000001", "B000000000000002")
+    assert strategy.on_candle_closed(candles, context) == [], "the limit is reached"
+
+
+def test_every_entry_carries_its_own_cycle_id(
+    candles: pd.DataFrame, context: StrategyContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(MyEdge, "_rule", lambda self, df, *, direction: direction > 0)
+    strategy = MyEdge({})
+    first, second = strategy.long(candles, context), strategy.long(candles, context)
+    assert first.signal_uxid != second.signal_uxid
+    assert len(first.signal_uxid) == 16 and first.signal_uxid.isupper()
+
+
 def test_the_repo_imports_nothing_from_the_engine() -> None:
     """The isolation rule, enforced rather than documented.
 

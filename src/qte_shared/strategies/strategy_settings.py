@@ -356,6 +356,71 @@ def resolve_weekend_flat(policy: WeekendFlatPolicy, params: Mapping[str, Any]) -
     return replace(policy, enabled=True)
 
 
+#: Pair params that decide how many trade cycles a (strategy, symbol) pair may
+#: hold at once. Mapping-table settings, like ``use_weekend_flat``: they size the
+#: book, so they belong to whoever deploys the strategy, not to the strategy.
+MULTIPLE_CYCLES_PARAM = "allow_multiple_cycles"
+MAX_OPEN_CYCLES_PARAM = "max_open_cycles"
+
+
+@dataclass(frozen=True, slots=True)
+class CyclePolicy:
+    """How many trade cycles one (strategy, symbol) pair may hold at once.
+
+    One by default — a second entry is refused while a position is open, which
+    is how every driver behaved before this setting existed. With
+    ``allow_multiple_cycles = true`` a pair may hold up to ``max_open_cycles``
+    positions side by side, each its own ``signal_uxid`` with its own bracket,
+    and every close names the cycle it closes. The broker keeps them apart by
+    that id; the worker is responsible for a hedging account, since a netting
+    one would merge them into a single position.
+    """
+
+    allow_multiple_cycles: bool = False
+    max_open_cycles: int = 1
+
+    @property
+    def limit(self) -> int:
+        """The number of cycles the pair may hold — 1 unless multiple are allowed."""
+        return self.max_open_cycles if self.allow_multiple_cycles else 1
+
+    def describe(self) -> str:
+        if not self.allow_multiple_cycles:
+            return "single"
+        return f"up to {self.max_open_cycles}"
+
+
+#: One cycle per pair: the policy of every pair that says nothing.
+SINGLE_CYCLE = CyclePolicy()
+
+
+def resolve_cycle_policy(params: Mapping[str, Any]) -> CyclePolicy:
+    """The cycle policy one pair trades under, from its resolved params.
+
+    Read by both drivers from the same params the strategy is instantiated with,
+    so a backtest holds exactly as many positions as the runner would.
+
+    ``ValueError`` on a value that is not a boolean or not a positive integer:
+    a limit that did not parse must stop the start, never fall back to a
+    different number of open positions than the operator configured.
+    """
+    allowed = params.get(MULTIPLE_CYCLES_PARAM)
+    if allowed is None:
+        allowed = False
+    if not isinstance(allowed, bool):
+        raise ValueError(f"{MULTIPLE_CYCLES_PARAM} must be true or false, not {allowed!r}")
+    maximum = params.get(MAX_OPEN_CYCLES_PARAM)
+    if maximum is None:
+        maximum = 1
+    if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 1:
+        raise ValueError(
+            f"{MAX_OPEN_CYCLES_PARAM} must be a whole number of at least 1, not {maximum!r}"
+        )
+    if not allowed:
+        return SINGLE_CYCLE
+    return CyclePolicy(allow_multiple_cycles=True, max_open_cycles=maximum)
+
+
 @dataclass(frozen=True, slots=True)
 class StrategySettings:
     """Everything one strategy declared, parsed and validated.
@@ -449,7 +514,12 @@ def _parse_clock(text: str) -> int:
 
 
 __all__ = [
+    "CyclePolicy",
     "DEFAULT_SETTINGS",
+    "MAX_OPEN_CYCLES_PARAM",
+    "MULTIPLE_CYCLES_PARAM",
+    "SINGLE_CYCLE",
+    "resolve_cycle_policy",
     "DatedFlatWindow",
     "NO_WEEKEND_FLAT",
     "STRATEGY_SETTINGS_HOOK",

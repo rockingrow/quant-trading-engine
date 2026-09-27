@@ -148,9 +148,9 @@ which is exactly why it is a table of its own rather than a column on `signals`.
 ## Why a stale position is flushed on start
 
 Remembering a cycle across a restart is the right answer, and it has a failure
-mode of its own. One `(strategy, symbol)` pair holds one cycle at a time —
-`uq_open_positions_pair` in the database, and `SignalFactory._prepare_entry`
-refusing an entry that "would replace open cycle X". That rule is what makes a
+mode of its own. One `(strategy, symbol)` pair holds one cycle at a time, or
+`max_open_cycles` when its mapping sets `allow_multiple_cycles` —
+`SignalFactory._prepare_entry` refusing an entry over that limit. That rule is what makes a
 long outage expensive rather than merely inconvenient: the row survives, the
 pair comes back still believing it holds that cycle, and every entry the
 strategy proposes from then on is refused. The pair is locked, and the position

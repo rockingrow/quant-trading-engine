@@ -20,6 +20,12 @@ an open cycle is closed with a ``FLAT``. The live runner applies exactly this,
 in exactly this position in the bar, which is what keeps a replay a prediction
 of what the runner does over a Friday evening rather than a strictly
 more-traded version of it.
+
+A pair mapped with ``allow_multiple_cycles`` holds up to ``max_open_cycles``
+positions at once. Each is its own cycle — its own ``signal_uxid``, bracket and
+fill record — step 1 walks every one of them, and each close is routed to the
+cycle its ``signal_uxid`` names. The limit comes from the same factory the
+runner builds, so the replay holds exactly as many positions as live would.
 """
 
 from __future__ import annotations
@@ -210,7 +216,8 @@ class BacktestEngine:
         )
         self.positions: list[SimulatedPosition] = []
         self.signals: list[BrokerSignal] = []
-        self._open: SimulatedPosition | None = None
+        #: signal_uxid → open position, oldest first.
+        self._open: dict[str, SimulatedPosition] = {}
         self._rejected = 0
         #: Entries the weekend window refused. Counted separately from
         #: ``_rejected`` because these are not malformed — the calendar said no.
@@ -237,6 +244,7 @@ class BacktestEngine:
             now=_as_datetime(frame.index[warmup - 1]),
             mode="backtest",
             params=self.strategy.params,
+            max_open_cycles=self.factory.max_open_cycles,
         )
         self.strategy.on_start(context)
 
@@ -244,14 +252,14 @@ class BacktestEngine:
             bar_time = _as_datetime(frame.index[position])
             bar = frame.iloc[position]
 
-            if self._open is not None and self._open.is_open:
-                self.simulator.process_bar(self._open, bar, bar_time)
-                if not self._open.is_open:
-                    self._open = None
-                self._sync_cycle()
+            for open_position in list(self._open.values()):
+                self.simulator.process_bar(open_position, bar, bar_time)
+            self._drop_closed()
+            self._sync_cycle()
 
             context.now = bar_time
-            context.open_uxid = self.factory.open_cycle(self.symbol)
+            context.open_uxids = self.factory.open_cycles(self.symbol)
+            context.open_uxid = context.open_uxids[-1] if context.open_uxids else None
             start = 0 if window_size is None else max(0, position + 1 - window_size)
             window = frame.iloc[start : position + 1]
             close = float(bar["close"])
@@ -269,13 +277,14 @@ class BacktestEngine:
         # A position still open at the last bar is marked out at the final close
         # rather than dropped, so its unrealised P&L cannot silently flatter the
         # report by never being counted.
-        if self._open is not None and self._open.is_open:
-            self.simulator.close_at(
-                self._open,
-                _as_datetime(frame.index[-1]),
-                float(frame.iloc[-1]["close"]),
-                ExitReason.END_OF_DATA,
-            )
+        for open_position in self._open.values():
+            if open_position.is_open:
+                self.simulator.close_at(
+                    open_position,
+                    _as_datetime(frame.index[-1]),
+                    float(frame.iloc[-1]["close"]),
+                    ExitReason.END_OF_DATA,
+                )
 
         self.strategy.on_stop()
         if self.weekend_flat.enabled:
@@ -324,29 +333,30 @@ class BacktestEngine:
         would stage and deliver it. A pair already flat produces nothing, which
         is what makes this safe to call on every bar inside the window.
         """
-        if self.factory.open_cycle(self.symbol) is None:
-            return
-        self._apply(
-            SignalIntent(
-                action=SignalAction.FLAT,
-                symbol=self.symbol,
-                price=close,
-                reason="WEEKEND_FLAT",
-            ),
-            bar_time,
-            close,
-        )
+        # One FLAT per cycle, each naming its own, exactly as the runner sends them.
+        for uxid in self.factory.open_cycles(self.symbol):
+            self._apply(
+                SignalIntent(
+                    action=SignalAction.FLAT,
+                    symbol=self.symbol,
+                    price=close,
+                    reason="WEEKEND_FLAT",
+                    signal_uxid=uxid,
+                ),
+                bar_time,
+                close,
+            )
 
     def _apply(self, intent: SignalIntent, bar_time: datetime, close: float) -> None:
         if intent.price is None:
             intent.price = close
 
-        if intent.action.is_entry and self._open is not None and self._open.is_open:
-            # The broker's workers refuse a second position on the same
-            # symbol+strategy (they answer REJECTED), so a backtest that stacked
-            # them would be scoring trades live trading will never take.
+        if intent.action.is_entry and len(self._open) >= self.factory.max_open_cycles:
+            # The pair holds as many cycles as its mapping allows (one unless
+            # `allow_multiple_cycles`), and the runner would refuse this entry
+            # too — a backtest that stacked it would score a trade live never takes.
             self._rejected += 1
-            log.debug("Rejected %s at %s — position already open", intent.action.value, bar_time)
+            log.debug("Rejected %s at %s — cycle limit reached", intent.action.value, bar_time)
             return
 
         try:
@@ -362,7 +372,7 @@ class BacktestEngine:
         # beside it in the report.
         block = signal.position
         if intent.action.is_entry:
-            self._open = self.simulator.open_position(
+            opened = self.simulator.open_position(
                 symbol=self.symbol,
                 action=intent.action,
                 bar_time=bar_time,
@@ -375,10 +385,11 @@ class BacktestEngine:
                 move_sl_to_be=bool(block.move_sl_to_be),
                 signal_uxid=signal.signal_uxid,
             )
-            self.positions.append(self._open)
-        elif self._open is not None and self._open.is_open:
+            self._open[signal.signal_uxid] = opened
+            self.positions.append(opened)
+        elif (target := self._open.get(signal.signal_uxid)) is not None and target.is_open:
             self.simulator.close_at(
-                self._open,
+                target,
                 bar_time,
                 block.price if block.price is not None else close,
                 _EXIT_REASONS.get(intent.action, ExitReason.FLAT),
@@ -386,12 +397,15 @@ class BacktestEngine:
                 note=intent.reason or None,
             )
             if intent.action is SignalAction.TP1:
-                self._open.tp1_filled = True
-                if self._open.move_sl_to_be and self._open.is_open:
-                    self._open.sl = self._open.entry_price
-            if not self._open.is_open:
-                self._open = None
+                target.tp1_filled = True
+                if target.move_sl_to_be and target.is_open:
+                    target.sl = target.entry_price
+        self._drop_closed()
         self._sync_cycle()
+
+    def _drop_closed(self) -> None:
+        for uxid in [uxid for uxid, position in self._open.items() if not position.is_open]:
+            del self._open[uxid]
 
     def _sync_cycle(self) -> None:
         """Tell the factory what the fill simulator actually did.
@@ -402,14 +416,13 @@ class BacktestEngine:
         on believing the entry quantity is still open and size the next close
         against it — and, worse, never notice that a ``TP1`` finished the trade.
         """
-        position = self.factory.open_position(self.symbol)
-        if position is None:
-            return
-        if self._open is None or not self._open.is_open:
-            self.factory.forget_cycle(self.symbol)
-            return
-        position.remaining = self._open.remaining
-        position.tp1_filled = self._open.tp1_filled
+        for position in self.factory.positions_for(self.symbol):
+            filled = self._open.get(position.signal_uxid)
+            if filled is None or not filled.is_open:
+                self.factory.forget_cycle(self.symbol, position.signal_uxid)
+                continue
+            position.remaining = filled.remaining
+            position.tp1_filled = filled.tp1_filled
 
 
 _EXIT_REASONS = {

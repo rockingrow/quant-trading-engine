@@ -94,6 +94,9 @@ class CandleStore(FakeState):
     async def get_open_position(self, strategy, symbol):
         return None
 
+    async def get_open_positions_for(self, strategy, symbol):
+        return []
+
 
 class SubscribingBus:
     def __init__(self) -> None:
@@ -129,6 +132,9 @@ class QuietSink:
 class NoPositions:
     async def get(self, strategy, symbol):
         return None
+
+    async def list_for(self, strategy, symbol):
+        return []
 
     async def list_open(self, strategy=None):
         return []

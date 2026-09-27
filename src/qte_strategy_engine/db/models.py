@@ -71,7 +71,12 @@ class SignalAudit(Base):
 
 
 class OpenPositionRow(Base):
-    """The trade cycle live on one (strategy, symbol) pair — at most one.
+    """One trade cycle live on a (strategy, symbol) pair.
+
+    A pair holds one row, or up to ``max_open_cycles`` when its mapping sets
+    ``allow_multiple_cycles``. That limit is the signal factory's to enforce —
+    it depends on configuration the database cannot see — so the table only
+    guarantees the rule that holds everywhere: one row per cycle id.
 
     Mirrors :class:`qte_shared.models.OpenPosition`. ``state`` carries the whole
     record so a field added there does not need a migration to be persisted;
@@ -109,15 +114,13 @@ class OpenPositionRow(Base):
     state: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
 
     __table_args__ = (
-        # One live cycle per pair, enforced by the database rather than by the
-        # runner remembering to check — two runner replicas share this table.
-        UniqueConstraint("namespace", "strategy", "symbol", name="uq_open_positions_pair"),
-        # And one pair per cycle id, which is the other direction of the same
-        # rule. The broker groups a whole trade by `signal_uxid`, so two pairs
-        # sharing one would let a close on either of them close the other's
-        # position — a loss nothing in the audit trail would explain. Scoped by
-        # namespace like the pair constraint above: separate books (paper and
-        # live, one per provider) reusing an id is not a collision. Unique
-        # rather than the plain index this replaces, which enforced nothing.
+        # Every cycle a pair holds — one, or several with allow_multiple_cycles.
+        Index("ix_open_positions_pair", "namespace", "strategy", "symbol"),
+        # One row per cycle id. The broker groups a whole trade by
+        # `signal_uxid`, so two rows sharing one would let a close on either
+        # close the other's position — a loss nothing in the audit trail would
+        # explain. Scoped by namespace: separate books (paper and live, one per
+        # provider) reusing an id is not a collision. Also the conflict target
+        # of every upsert, since a pair no longer has a single row to replace.
         UniqueConstraint("namespace", "signal_uxid", name="uq_open_positions_uxid"),
     )

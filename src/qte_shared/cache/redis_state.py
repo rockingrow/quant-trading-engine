@@ -280,8 +280,12 @@ class RedisState:
 
     # ── Strategy cycle state ──────────────────────────────────────────
     #
-    # One hash per strategy, one field per symbol, holding the whole
-    # :class:`~qte_shared.models.OpenPosition` as JSON. The size matters as
+    # One hash per strategy, one field per cycle — ``SYMBOL|SIGNAL_UXID`` —
+    # holding the whole :class:`~qte_shared.models.OpenPosition` as JSON. A pair
+    # allowed several cycles has several fields; one allowed a single cycle has
+    # at most one. A field named by the bare symbol predates this layout and is
+    # still read, so a runner upgraded mid-trade keeps the position it holds;
+    # the next write of that cycle moves it to its own field. The size matters as
     # much as the id: a TP1 that closed the entry's full quantity ends the
     # cycle, and a runner that reloaded only the uxid could not tell that from
     # a partial. Redis runs with AOF on, so a restart loses at most the last
@@ -298,29 +302,53 @@ class RedisState:
         if position.state_namespace not in (None, self._scope.namespace):
             raise ValueError("Cannot persist a position from another state namespace")
         position = position.model_copy(update={"state_namespace": self._scope.namespace})
+        hash_key = self.key("cycle", position.strategy)
         await self.client.hset(
-            self.key("cycle", position.strategy), position.symbol, position.model_dump_json()
+            hash_key,
+            cycle_field(position.symbol, position.signal_uxid),
+            position.model_dump_json(),
         )
+        await self._drop_legacy_field(hash_key, position.symbol, position.signal_uxid)
+
+    async def _drop_legacy_field(self, hash_key: str, symbol: str, signal_uxid: str) -> None:
+        """Remove the pre-cycle-field record of *signal_uxid*, if it is still there."""
+        legacy = _decode_position(
+            await self.client.hget(hash_key, symbol), strategy="", symbol=symbol
+        )
+        if legacy is not None and legacy.signal_uxid == signal_uxid:
+            await self.client.hdel(hash_key, symbol)
+
+    async def get_open_positions_for(self, strategy: str, symbol: str) -> list[OpenPosition]:
+        """Every cycle *strategy* holds on *symbol*, oldest first."""
+        stored = await self.client.hgetall(self.key("cycle", strategy))
+        found: dict[str, OpenPosition] = {}
+        for field_name, raw in (stored or {}).items():
+            if cycle_symbol(field_name) != symbol:
+                continue
+            position = _decode_position(raw, strategy=strategy, symbol=symbol)
+            self._validate_position_scope(position)
+            if position is not None:
+                found.setdefault(position.signal_uxid, position)
+        return sorted(found.values(), key=lambda position: _as_sortable(position.opened_at))
 
     async def get_open_position(self, strategy: str, symbol: str) -> OpenPosition | None:
-        raw = await self.client.hget(self.key("cycle", strategy), symbol)
-        position = _decode_position(raw, strategy=strategy, symbol=symbol)
-        self._validate_position_scope(position)
-        return position
+        """The most recent cycle on *symbol* — the whole book for a single-cycle pair."""
+        positions = await self.get_open_positions_for(strategy, symbol)
+        return positions[-1] if positions else None
 
     def _validate_position_scope(self, position: OpenPosition | None) -> None:
         if position is not None and position.state_namespace != self._scope.namespace:
             raise ValueError("Stored position has missing or foreign state provenance")
 
     async def get_open_positions(self, strategy: str) -> dict[str, OpenPosition]:
-        """Every cycle *strategy* holds, keyed by symbol."""
+        """Every cycle *strategy* holds, keyed by ``signal_uxid``."""
         stored = await self.client.hgetall(self.key("cycle", strategy))
         positions = {}
-        for symbol, raw in (stored or {}).items():
-            position = _decode_position(raw, strategy=strategy, symbol=symbol)
+        for field_name, raw in (stored or {}).items():
+            position = _decode_position(raw, strategy=strategy, symbol=cycle_symbol(field_name))
             self._validate_position_scope(position)
             if position is not None:
-                positions[symbol] = position
+                positions[position.signal_uxid] = position
         return positions
 
     async def set_open_cycle(self, strategy: str, symbol: str, uxid: str) -> None:
@@ -338,7 +366,18 @@ class RedisState:
         return position.signal_uxid if position else None
 
     async def clear_open_cycle(self, strategy: str, symbol: str) -> None:
-        await self.client.hdel(self.key("cycle", strategy), symbol)
+        """Forget every cycle *strategy* holds on *symbol*."""
+        hash_key = self.key("cycle", strategy)
+        stored = await self.client.hgetall(hash_key)
+        fields = [name for name in (stored or {}) if cycle_symbol(name) == symbol]
+        if fields:
+            await self.client.hdel(hash_key, *fields)
+
+    async def clear_open_position(self, strategy: str, symbol: str, signal_uxid: str) -> None:
+        """Forget one cycle — the others on the pair stay open."""
+        hash_key = self.key("cycle", strategy)
+        await self.client.hdel(hash_key, cycle_field(symbol, signal_uxid))
+        await self._drop_legacy_field(hash_key, symbol, signal_uxid)
 
     # ── Generic flags (shadow mode, kill switch, …) ───────────────────
 
@@ -354,6 +393,24 @@ class RedisState:
             return bool(await self.client.ping())
         except Exception:
             return False
+
+
+#: Separates the symbol from the cycle id in a cycle hash field.
+CYCLE_FIELD_SEPARATOR = "|"
+
+
+def cycle_field(symbol: str, signal_uxid: str) -> str:
+    """The hash field one cycle is stored under."""
+    return f"{symbol}{CYCLE_FIELD_SEPARATOR}{signal_uxid}"
+
+
+def cycle_symbol(field_name: str) -> str:
+    """The symbol a cycle field belongs to — the whole name for a legacy field."""
+    return field_name.split(CYCLE_FIELD_SEPARATOR, 1)[0]
+
+
+def _as_sortable(moment: Any) -> str:
+    return moment.isoformat() if moment is not None else ""
 
 
 def _decode_position(raw: str | None, *, strategy: str, symbol: str) -> OpenPosition | None:

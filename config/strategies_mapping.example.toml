@@ -43,6 +43,15 @@ use_equity_sizing = false
 # declared default; true on a strategy that declares no window stops the pair
 # from starting. Applies to the backtest too.
 use_weekend_flat = true
+# Read by the engine, not the strategy: how many trade cycles this strategy may
+# hold on one symbol at once. Off, the pair holds one position and a second
+# entry is refused. On, it may hold up to max_open_cycles positions side by
+# side, each under its own signal_uxid with its own bracket, and every close
+# names the cycle it closes. The broker worker must run a hedging account, or
+# the positions merge. Applies to the backtest too, and a pair may restate
+# either key under [symbols.<symbol>.params.<strategy>].
+allow_multiple_cycles = false
+max_open_cycles = 1
 
 
 # ── One table per symbol ────────────────────────────────────────────────

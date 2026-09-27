@@ -44,6 +44,7 @@ from .contract import (
     SignalIntent,
     SignalStrategy,
     StrategyContext,
+    new_uxid,
 )
 from .indicators import atr, ema
 
@@ -82,8 +83,9 @@ class MyEdge(SignalStrategy):
 
     # -- Entries -------------------------------------------------------
     #
-    # Asked only while flat, in the order long -> short, and the first that
-    # answers wins: a bar cannot be both.
+    # Asked while flat, in the order long -> short, and the first that answers
+    # wins: a bar cannot be both. A pair mapped with `allow_multiple_cycles` is
+    # also asked while holding, as long as `context.can_open`.
 
     def long(self, df: pd.DataFrame, context: StrategyContext) -> IntentResult:
         return self._entry(df, context, direction=1)
@@ -96,7 +98,9 @@ class MyEdge(SignalStrategy):
     # Asked only while holding, in the order sl -> r_sl -> tp1 -> tp2 -> flat,
     # and every one is asked: taking tp1 and trailing the stop on the same bar
     # is normal. The stop comes first because if one bar both stopped out and
-    # reached a target, the stop is what happened.
+    # reached a target, the stop is what happened. With several cycles open,
+    # `context.open_uxids` lists them and each close must carry the
+    # `signal_uxid` of the one it closes.
 
     def sl(self, df: pd.DataFrame, context: StrategyContext) -> IntentResult:
         """The bracket travelled with the entry and the broker's worker holds
@@ -111,8 +115,8 @@ class MyEdge(SignalStrategy):
         """Optional: move the stop mid-trade (break-even, or a trail).
 
         Return a ``SignalIntent(action=SignalAction.R_SL, sl=...)`` carrying
-        ``uxid=context.open_uxid``, so the broker knows which open cycle it
-        re-stops.
+        ``signal_uxid`` of the cycle it re-stops — ``context.open_uxid`` when the
+        pair holds one, the id the entry minted when it holds several.
         """
         return None
 
@@ -176,6 +180,10 @@ class MyEdge(SignalStrategy):
             risk_percent=risk_percent,
             tp1_percent=self.param("tp1_qty_pc", 50.0),
             move_sl_to_be=True,
+            # Minted here rather than by the runner, so a strategy holding
+            # several cycles knows which one each later close belongs to. On a
+            # single-cycle pair this is simply the id the cycle trades under.
+            signal_uxid=new_uxid(),
             # What you want to read back in the audit trail, and what the
             # broker broadcasts, when this trade is questioned months later.
             indicators={
