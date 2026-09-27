@@ -20,6 +20,12 @@ an open cycle is closed with a ``FLAT``. The live runner applies exactly this,
 in exactly this position in the bar, which is what keeps a replay a prediction
 of what the runner does over a Friday evening rather than a strictly
 more-traded version of it.
+
+A pair mapped with ``allow_multiple_cycles`` holds up to ``max_open_cycles``
+positions at once. Each is its own cycle — its own ``signal_uxid``, bracket and
+fill record — step 1 walks every one of them, and each close is routed to the
+cycle its ``signal_uxid`` names. The limit comes from the same factory the
+runner builds, so the replay holds exactly as many positions as live would.
 """
 
 from __future__ import annotations
@@ -44,26 +50,40 @@ from qte_shared.strategies.strategy_base import (
     as_intents,
 )
 from qte_shared.strategies.strategy_settings import NO_WEEKEND_FLAT, WeekendFlatPolicy
-from qte_shared.timeframes import timeframe_seconds
+from qte_shared.timeframes import TIMEFRAME_SECONDS, timeframe_seconds
 
 log = get_logger(__name__)
 
 
-#: How many OHLC rows the report carries for drawing. Enough that a chart of a
-#: multi-year run still looks like a chart, small enough that the block stays a
-#: rounding error next to the trade list.
-MARKET_ROWS = 480
+#: Ceiling on the OHLC rows the report carries for drawing — ``None``, none.
+#:
+#: Every run ships its bars **at the timeframe it was run on**, however long the
+#: history: a chart of an M15 replay has to be an M15 chart, and the dashboard can
+#: roll those bars up to H1 or D1 on its own, which it cannot undo from bars that
+#: arrived pre-aggregated. The price is size — five years of M15 is ~120k rows,
+#: about 6 MB of report and dashboard, and a slower page — and it is paid on
+#: purpose: a 20k-row ceiling here once turned a five-year M15 run into an H4
+#: chart nobody could inspect a trade on. :func:`sample_market` still takes a
+#: ``max_rows`` for a caller that wants the old calendar roll-up.
+MARKET_MAX_ROWS: int | None = None
 
 
 @dataclass(slots=True)
 class MarketWindow:
-    """A downsampled OHLC view of the replayed history — for drawing only.
+    """An OHLC view of the replayed history — for drawing only.
 
     Every number in the report is computed from the full series; these rows
-    exist so a chart can show *where* the trades happened without the report
-    carrying a copy of the parquet file. Each row aggregates ``bucket_bars``
-    consecutive bars honestly (first open, highest high, lowest low, last
-    close), so the shape is the market's, only coarser.
+    exist so a chart can show *where* the trades happened. They **are** the full
+    series, at the timeframe the run was made on: a reader looking at an M15
+    backtest should see M15 candles, and a dashboard can aggregate those up to
+    H1 or D1 itself. Only a caller that passes :func:`sample_market` a
+    ``max_rows`` below the history's length gets a higher timeframe instead, and
+    :attr:`base_timeframe` says which one it chose.
+
+    Aggregation, when it happens, is by the **calendar**, not by counting bars:
+    buckets land on the same boundaries the rest of the engine uses, so a
+    candle covers one real hour rather than "the next 32 bars, whatever hours
+    those turned out to span across a weekend".
 
     ``benchmark_close`` is the close of the first bar the strategy could act on
     — the bar completing warm-up — which is what a buy-and-hold comparison has to be
@@ -71,14 +91,21 @@ class MarketWindow:
     charge the benchmark for a stretch the strategy was never allowed to trade.
     """
 
+    #: Nominal bars of the run's timeframe per row: 1 when the rows are the
+    #: bars themselves. A calendar bucket spanning a session break holds fewer.
     bucket_bars: int
+    #: The timeframe :attr:`rows` are drawn at — the run's own unless the file
+    #: was too long to carry at that resolution.
+    base_timeframe: str
     rows: list[list[Any]]
     benchmark_close: float
     last_close: float
     benchmark_from: datetime | None = None
 
     #: Column order of :attr:`rows`, carried into the JSON so a consumer reads
-    #: the arrays rather than guessing at them.
+    #: the arrays rather than guessing at them. ``t`` is **epoch seconds**, UTC:
+    #: an integer per row rather than a 25-character timestamp, which is a third
+    #: of this block's size once the rows are the whole series.
     columns: tuple[str, ...] = ("t", "o", "h", "l", "c")
 
 
@@ -189,7 +216,8 @@ class BacktestEngine:
         )
         self.positions: list[SimulatedPosition] = []
         self.signals: list[BrokerSignal] = []
-        self._open: SimulatedPosition | None = None
+        #: signal_uxid → open position, oldest first.
+        self._open: dict[str, SimulatedPosition] = {}
         self._rejected = 0
         #: Entries the weekend window refused. Counted separately from
         #: ``_rejected`` because these are not malformed — the calendar said no.
@@ -216,6 +244,7 @@ class BacktestEngine:
             now=_as_datetime(frame.index[warmup - 1]),
             mode="backtest",
             params=self.strategy.params,
+            max_open_cycles=self.factory.max_open_cycles,
         )
         self.strategy.on_start(context)
 
@@ -223,14 +252,14 @@ class BacktestEngine:
             bar_time = _as_datetime(frame.index[position])
             bar = frame.iloc[position]
 
-            if self._open is not None and self._open.is_open:
-                self.simulator.process_bar(self._open, bar, bar_time)
-                if not self._open.is_open:
-                    self._open = None
-                self._sync_cycle()
+            for open_position in list(self._open.values()):
+                self.simulator.process_bar(open_position, bar, bar_time)
+            self._drop_closed()
+            self._sync_cycle()
 
             context.now = bar_time
-            context.open_uxid = self.factory.open_cycle(self.symbol)
+            context.open_uxids = self.factory.open_cycles(self.symbol)
+            context.open_uxid = context.open_uxids[-1] if context.open_uxids else None
             start = 0 if window_size is None else max(0, position + 1 - window_size)
             window = frame.iloc[start : position + 1]
             close = float(bar["close"])
@@ -248,13 +277,14 @@ class BacktestEngine:
         # A position still open at the last bar is marked out at the final close
         # rather than dropped, so its unrealised P&L cannot silently flatter the
         # report by never being counted.
-        if self._open is not None and self._open.is_open:
-            self.simulator.close_at(
-                self._open,
-                _as_datetime(frame.index[-1]),
-                float(frame.iloc[-1]["close"]),
-                ExitReason.END_OF_DATA,
-            )
+        for open_position in self._open.values():
+            if open_position.is_open:
+                self.simulator.close_at(
+                    open_position,
+                    _as_datetime(frame.index[-1]),
+                    float(frame.iloc[-1]["close"]),
+                    ExitReason.END_OF_DATA,
+                )
 
         self.strategy.on_stop()
         if self.weekend_flat.enabled:
@@ -290,7 +320,7 @@ class BacktestEngine:
             starting_equity=self.starting_equity,
             risk_percent=self.factory.sizer.risk_percent,
             quantity=self.default_quantity,
-            market=sample_market(frame, warmup),
+            market=sample_market(frame, warmup, self.timeframe),
         )
 
     # ── Intent handling ───────────────────────────────────────────────
@@ -303,29 +333,30 @@ class BacktestEngine:
         would stage and deliver it. A pair already flat produces nothing, which
         is what makes this safe to call on every bar inside the window.
         """
-        if self.factory.open_cycle(self.symbol) is None:
-            return
-        self._apply(
-            SignalIntent(
-                action=SignalAction.FLAT,
-                symbol=self.symbol,
-                price=close,
-                reason="WEEKEND_FLAT",
-            ),
-            bar_time,
-            close,
-        )
+        # One FLAT per cycle, each naming its own, exactly as the runner sends them.
+        for uxid in self.factory.open_cycles(self.symbol):
+            self._apply(
+                SignalIntent(
+                    action=SignalAction.FLAT,
+                    symbol=self.symbol,
+                    price=close,
+                    reason="WEEKEND_FLAT",
+                    signal_uxid=uxid,
+                ),
+                bar_time,
+                close,
+            )
 
     def _apply(self, intent: SignalIntent, bar_time: datetime, close: float) -> None:
         if intent.price is None:
             intent.price = close
 
-        if intent.action.is_entry and self._open is not None and self._open.is_open:
-            # The broker's workers refuse a second position on the same
-            # symbol+strategy (they answer REJECTED), so a backtest that stacked
-            # them would be scoring trades live trading will never take.
+        if intent.action.is_entry and len(self._open) >= self.factory.max_open_cycles:
+            # The pair holds as many cycles as its mapping allows (one unless
+            # `allow_multiple_cycles`), and the runner would refuse this entry
+            # too — a backtest that stacked it would score a trade live never takes.
             self._rejected += 1
-            log.debug("Rejected %s at %s — position already open", intent.action.value, bar_time)
+            log.debug("Rejected %s at %s — cycle limit reached", intent.action.value, bar_time)
             return
 
         try:
@@ -341,7 +372,7 @@ class BacktestEngine:
         # beside it in the report.
         block = signal.position
         if intent.action.is_entry:
-            self._open = self.simulator.open_position(
+            opened = self.simulator.open_position(
                 symbol=self.symbol,
                 action=intent.action,
                 bar_time=bar_time,
@@ -354,22 +385,27 @@ class BacktestEngine:
                 move_sl_to_be=bool(block.move_sl_to_be),
                 signal_uxid=signal.signal_uxid,
             )
-            self.positions.append(self._open)
-        elif self._open is not None and self._open.is_open:
+            self._open[signal.signal_uxid] = opened
+            self.positions.append(opened)
+        elif (target := self._open.get(signal.signal_uxid)) is not None and target.is_open:
             self.simulator.close_at(
-                self._open,
+                target,
                 bar_time,
                 block.price if block.price is not None else close,
                 _EXIT_REASONS.get(intent.action, ExitReason.FLAT),
                 quantity=block.quantity,
+                note=intent.reason or None,
             )
             if intent.action is SignalAction.TP1:
-                self._open.tp1_filled = True
-                if self._open.move_sl_to_be and self._open.is_open:
-                    self._open.sl = self._open.entry_price
-            if not self._open.is_open:
-                self._open = None
+                target.tp1_filled = True
+                if target.move_sl_to_be and target.is_open:
+                    target.sl = target.entry_price
+        self._drop_closed()
         self._sync_cycle()
+
+    def _drop_closed(self) -> None:
+        for uxid in [uxid for uxid, position in self._open.items() if not position.is_open]:
+            del self._open[uxid]
 
     def _sync_cycle(self) -> None:
         """Tell the factory what the fill simulator actually did.
@@ -380,14 +416,13 @@ class BacktestEngine:
         on believing the entry quantity is still open and size the next close
         against it — and, worse, never notice that a ``TP1`` finished the trade.
         """
-        position = self.factory.open_position(self.symbol)
-        if position is None:
-            return
-        if self._open is None or not self._open.is_open:
-            self.factory.forget_cycle(self.symbol)
-            return
-        position.remaining = self._open.remaining
-        position.tp1_filled = self._open.tp1_filled
+        for position in self.factory.positions_for(self.symbol):
+            filled = self._open.get(position.signal_uxid)
+            if filled is None or not filled.is_open:
+                self.factory.forget_cycle(self.symbol, position.signal_uxid)
+                continue
+            position.remaining = filled.remaining
+            position.tp1_filled = filled.tp1_filled
 
 
 _EXIT_REASONS = {
@@ -399,35 +434,90 @@ _EXIT_REASONS = {
 }
 
 
-def sample_market(frame: pd.DataFrame, warmup: int, rows: int = MARKET_ROWS) -> MarketWindow:
-    """Aggregate *frame* down to at most *rows* OHLC buckets.
+def sample_market(
+    frame: pd.DataFrame,
+    warmup: int,
+    timeframe: str,
+    max_rows: int | None = MARKET_MAX_ROWS,
+) -> MarketWindow:
+    """The OHLC rows the report carries for drawing, at the finest timeframe that fits.
 
-    Aggregation, not sampling: taking every Nth bar would drop the highs and
-    lows that a chart is mostly there to show, and a candle drawn from one
-    surviving bar is a claim about a range that was never traded.
+    The run's own timeframe, the whole history, by default: a chart drawn from
+    pre-aggregated bars can never be shown at a *finer* resolution than it
+    arrived at, so handing the viewer coarse bars decides for it. Only with a
+    *max_rows* below the history's length does this climb the timeframe ladder
+    — M15 to M30 to H1 and so on — and take the first rung that fits.
+
+    Aggregation is by the calendar and never by counting bars. Taking every Nth
+    bar would drop the highs and lows a chart is mostly there to show, and
+    counting bars into buckets produces candles whose span changes across every
+    session break and weekend.
     """
-    bucket = max(1, -(-len(frame) // max(rows, 1)))
-    ohlc: list[list[Any]] = []
-    for start in range(0, len(frame), bucket):
-        chunk = frame.iloc[start : start + bucket]
-        ohlc.append(
-            [
-                _as_datetime(chunk.index[0]).isoformat(),
-                round(float(chunk["open"].iloc[0]), 8),
-                round(float(chunk["high"].max()), 8),
-                round(float(chunk["low"].min()), 8),
-                round(float(chunk["close"].iloc[-1]), 8),
-            ]
+    base_timeframe, drawn = _drawable_series(frame, timeframe, max_rows)
+    rows = [
+        [
+            int(_as_datetime(moment).timestamp()),
+            round(float(open_), 8),
+            round(float(high), 8),
+            round(float(low), 8),
+            round(float(close), 8),
+        ]
+        for moment, open_, high, low, close in zip(
+            drawn.index,
+            drawn["open"],
+            drawn["high"],
+            drawn["low"],
+            drawn["close"],
+            strict=True,
         )
+    ]
 
     anchor = min(max(warmup - 1, 0), len(frame) - 1)
     return MarketWindow(
-        bucket_bars=bucket,
-        rows=ohlc,
+        bucket_bars=max(1, timeframe_seconds(base_timeframe) // timeframe_seconds(timeframe)),
+        base_timeframe=base_timeframe,
+        rows=rows,
         benchmark_close=round(float(frame["close"].iloc[anchor]), 8),
         last_close=round(float(frame["close"].iloc[-1]), 8),
         benchmark_from=_as_datetime(frame.index[anchor]),
     )
+
+
+def _drawable_series(
+    frame: pd.DataFrame, timeframe: str, max_rows: int | None
+) -> tuple[str, pd.DataFrame]:
+    """*frame* itself, or the coarsest-necessary calendar resampling of it."""
+    if max_rows is None or len(frame) <= max_rows:
+        return timeframe, frame
+
+    seconds = timeframe_seconds(timeframe)
+    ladder = sorted(
+        (label for label, span in TIMEFRAME_SECONDS.items() if span > seconds),
+        key=lambda label: TIMEFRAME_SECONDS[label],
+    )
+    for label in ladder:
+        # ``origin="epoch"`` is the boundary `floor_to_bucket` uses, so a bucket
+        # here opens at the same moment the ingestion side would open it.
+        resampled = (
+            frame.resample(
+                pd.Timedelta(seconds=TIMEFRAME_SECONDS[label]),
+                label="left",
+                closed="left",
+                origin="epoch",
+            )
+            .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
+            .dropna()
+        )
+        if len(resampled) <= max_rows:
+            return label, resampled
+
+    # Longer than `max_rows` days. Draw it daily and say so rather than
+    # inventing a timeframe the rest of the engine does not have a name for.
+    log.warning(
+        "History is %d bars; drawing the price chart at D1, the coarsest timeframe there is",
+        len(frame),
+    )
+    return "D1", resampled
 
 
 def count_gaps(frame: pd.DataFrame, timeframe: str) -> int:

@@ -107,6 +107,20 @@ def test_the_strategys_own_levels_are_never_overwritten():
     )
 
 
+@pytest.mark.parametrize(
+    "action,stop_price,target_price",
+    [(SignalAction.LONG, 1990.0, 2050.0), (SignalAction.SHORT, 2010.0, 1950.0)],
+)
+def test_a_tp2_only_entry_does_not_acquire_an_earlier_target(action, stop_price, target_price):
+    signal = _factory().build(
+        SignalIntent(action=action, price=2000.0, sl=stop_price, tp2=target_price),
+        symbol="XAUUSD",
+        moment=NOW,
+    )
+    assert signal.position.tp1 is None
+    assert signal.position.tp2 == target_price
+
+
 def test_timeframe_is_rendered_the_way_the_broker_stores_it():
     signal = _factory().build(
         SignalIntent(action=SignalAction.LONG, price=2000.0, quantity=1.0, sl=1990.0),

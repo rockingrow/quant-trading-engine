@@ -38,6 +38,10 @@ QTE emits the broker's `WebhookPayload` (`broker/schemas/webhook_schema.py`):
 
 Field-level notes:
 
+- **A supplied `tp2` with `tp1 = null` is a single full-position target.**
+  The shared factory preserves that null instead of inventing an earlier TP1.
+  Replay closes the remaining position at TP2; the chart omits a null TP1.
+  Entries without either target still receive the default bracket.
 - **`timeframe` is TradingView's spelling** — the bare minute count (`"15"`,
   `"60"`), not QTE's `M15`. `qte_shared.timeframes.to_broker_timeframe` converts.
 - **`price`/`quantity` are optional in the schema** because a `FLAT` carries
@@ -111,10 +115,20 @@ QTE normalises rather than rejecting, so either spelling round-trips.)
 
 ## The trade cycle
 
-**One cycle per (strategy, symbol) at a time.** A second entry while one is open
-is refused before it reaches the wire — the broker's workers answer `REJECTED`
-rather than stacking, so a backtest that allowed it would be scoring trades live
-trading will never take.
+**One cycle per (strategy, symbol) at a time, unless the pair allows more.** By
+default a second entry while one is open is refused before it reaches the wire,
+so a backtest never scores a trade live trading would not take.
+
+A pair mapped with `allow_multiple_cycles = true` (in
+`config/strategies_mapping.toml`) may hold up to `max_open_cycles` positions at
+once. Each is its own cycle: its own `signal_uxid`, minted on its entry, and its
+own bracket. Every `TP1`/`TP2`/`SL`/`R_SL`/`FLAT` then carries the `signal_uxid`
+of the one cycle it closes — QTE refuses an unnamed close while more than one is
+open, and the weekend flat and the stale-position flush send one close per
+cycle. The worker must keep the positions apart by that id, on a hedging
+account: a netting account would merge them into one position and lose every
+bracket but the last. The backtest enforces the same limit, from the same
+setting.
 
 A cycle ends on `TP2`, `SL`, `R_SL` or `FLAT` — and also on a `TP1` that happens
 to close the entry's whole quantity. A strategy taking "50%" of a position that
@@ -128,7 +142,7 @@ writes it **twice**:
 
 | | Redis | Postgres |
 | --- | --- | --- |
-| Key | hash `qte:cycle:<strategy>`, field `<symbol>` | `open_positions`, unique on (strategy, symbol) |
+| Key | hash `qte:cycle:<strategy>`, field `<symbol>\|<signal_uxid>` | `open_positions`, one row per cycle, unique on `signal_uxid` |
 | Role | hot copy, read on every bar | durable copy |
 | Read on boot | first | when the cache has nothing |
 

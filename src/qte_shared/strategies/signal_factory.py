@@ -21,8 +21,12 @@ The factory owns four things a strategy is deliberately not allowed to:
   every close it emits is scaled by that ratio.
 * **Timeframe spelling.** QTE says ``M15``; the broker's contract says ``"15"``.
 
-**One cycle per (strategy, symbol) at a time.** The factory refuses a second
-entry while one is open, and it is what decides when a cycle is over:
+**One cycle per (strategy, symbol) at a time — unless the pair allows more.**
+By default the factory refuses a second entry while one is open. A pair mapped
+with ``allow_multiple_cycles = true`` may hold up to ``max_open_cycles``, each
+under its own ``signal_uxid``; every close must then name the cycle it closes
+(an unnamed close is only unambiguous while one cycle is open). The factory is
+also what decides when a cycle is over:
 ``TP2``/``SL``/``R_SL``/``FLAT`` end it outright, and so does a ``TP1`` that
 takes the entry's whole quantity. That state is an
 :class:`~qte_shared.models.OpenPosition`, which the live runner persists to
@@ -46,6 +50,7 @@ from qte_shared.models import (
 )
 from qte_shared.strategies.sizing import PositionSizer, resolve_use_equity_sizing
 from qte_shared.strategies.strategy_base import SignalIntent
+from qte_shared.strategies.strategy_settings import CyclePolicy, resolve_cycle_policy
 from qte_shared.timeframes import to_broker_timeframe
 
 log = get_logger(__name__)
@@ -93,7 +98,9 @@ class BracketPolicy:
             )
 
         risk = abs(intent.price - intent.sl)
-        if intent.tp1 is None and risk > 0:
+        # A supplied TP2 with no TP1 is an intentional single-target bracket.
+        # Synthesizing a nearer TP1 would close it before the strategy's target.
+        if intent.tp1 is None and intent.tp2 is None and risk > 0:
             intent.tp1 = intent.price + direction * risk * self.tp1_r
         if intent.tp2 is None and risk > 0:
             intent.tp2 = intent.price + direction * risk * self.tp2_r
@@ -119,6 +126,7 @@ class SignalFactory:
         inputs: dict[str, Any] | None = None,
         sizer: PositionSizer | None = None,
         default_quantity: float | None = None,
+        cycle_policy: CyclePolicy | None = None,
     ) -> None:
         self.strategy_name = strategy_name
         self.timeframe = timeframe
@@ -139,24 +147,46 @@ class SignalFactory:
         #: What the pair's configuration says about equity sizing, mirrored
         #: onto every payload. It never changes the number above.
         self.use_equity_sizing = resolve_use_equity_sizing(self.inputs)
-        #: symbol → the one cycle we believe is open on it.
-        self._book: dict[str, OpenPosition] = {}
+        #: How many cycles one symbol may hold. Read from the pair's params — the
+        #: mapping table's ``allow_multiple_cycles`` / ``max_open_cycles`` — when
+        #: the caller does not pass one, so both drivers agree without wiring.
+        self.cycle_policy = cycle_policy or resolve_cycle_policy(self.inputs)
+        #: symbol → {signal_uxid → cycle}, oldest first.
+        self._book: dict[str, dict[str, OpenPosition]] = {}
         #: symbol → sizing scale of an entry built but not yet committed.
         self._pending_scale: dict[str, float] = {}
 
     # ── Cycle bookkeeping ─────────────────────────────────────────────
 
-    def open_cycle(self, symbol: str) -> str | None:
-        """Cycle id of the position held on *symbol*, or ``None`` when flat."""
-        position = self._book.get(symbol.upper())
-        return position.signal_uxid if position else None
+    @property
+    def max_open_cycles(self) -> int:
+        return self.cycle_policy.limit
 
-    def open_position(self, symbol: str) -> OpenPosition | None:
-        """The whole cycle record — what the runner persists and reloads."""
-        return self._book.get(symbol.upper())
+    def open_cycle(self, symbol: str) -> str | None:
+        """Cycle id of the most recent position on *symbol*, or ``None`` when flat."""
+        cycles = self.open_cycles(symbol)
+        return cycles[-1] if cycles else None
+
+    def open_cycles(self, symbol: str) -> tuple[str, ...]:
+        """Every cycle id open on *symbol*, oldest first."""
+        return tuple(self._book.get(symbol.upper(), {}))
+
+    def open_position(self, symbol: str, signal_uxid: str | None = None) -> OpenPosition | None:
+        """One cycle record — the named one, or the most recent when unnamed."""
+        cycles = self._book.get(symbol.upper(), {})
+        if signal_uxid is not None:
+            return cycles.get(signal_uxid)
+        return next(reversed(cycles.values()), None)
+
+    def positions_for(self, symbol: str) -> list[OpenPosition]:
+        """Every cycle open on *symbol*, oldest first — what the runner persists."""
+        return list(self._book.get(symbol.upper(), {}).values())
 
     def open_positions(self) -> dict[str, OpenPosition]:
-        return dict(self._book)
+        """Every open cycle across every symbol, keyed by ``signal_uxid``."""
+        return {
+            uxid: position for cycles in self._book.values() for uxid, position in cycles.items()
+        }
 
     def restore_cycles(self, cycles: Mapping[str, str]) -> None:
         """Reload bare cycle ids after a restart.
@@ -176,13 +206,23 @@ class SignalFactory:
 
     def restore_position(self, position: OpenPosition, symbol: str | None = None) -> None:
         key = (symbol or position.symbol).upper()
-        self._book[key] = position.model_copy(
+        self._book.setdefault(key, {})[position.signal_uxid] = position.model_copy(
             update={"symbol": key, "strategy": position.strategy or self.strategy_name}
         )
 
-    def forget_cycle(self, symbol: str) -> None:
-        self._book.pop(symbol.upper(), None)
-        self._pending_scale.pop(symbol.upper(), None)
+    def forget_cycle(self, symbol: str, signal_uxid: str | None = None) -> None:
+        """Drop one cycle, or every cycle on *symbol* when none is named."""
+        key = symbol.upper()
+        if signal_uxid is None:
+            self._book.pop(key, None)
+            self._pending_scale.pop(key, None)
+            return
+        cycles = self._book.get(key)
+        if cycles is None:
+            return
+        cycles.pop(signal_uxid, None)
+        if not cycles:
+            self._book.pop(key, None)
 
     def commit(self, signal: BrokerSignal, *, delivery_id: str | None = None) -> None:
         """Apply the cycle transition represented by a delivered signal.
@@ -200,13 +240,13 @@ class SignalFactory:
         action = block.action
 
         if action.is_entry:
-            existing = self._book.get(symbol)
-            if existing is not None and existing.signal_uxid == signal.signal_uxid:
+            cycles = self._book.setdefault(symbol, {})
+            if signal.signal_uxid in cycles:
                 # Recovery may replay an outbox entry after its position state
                 # was already committed but before the audit row was marked.
                 # Never reset that cycle's remaining size back to the entry.
                 return
-            self._book[symbol] = OpenPosition(
+            cycles[signal.signal_uxid] = OpenPosition(
                 signal_uxid=signal.signal_uxid,
                 strategy=signal.strategy,
                 symbol=symbol,
@@ -231,17 +271,15 @@ class SignalFactory:
             )
             return
 
-        position = self._book.get(symbol)
+        # Looked up by id, so a delayed close for an older cycle can never
+        # touch a newer position on the same strategy and symbol.
+        position = self._book.get(symbol, {}).get(signal.signal_uxid)
         if position is None:
-            return
-        # Do not let a delayed close for an older cycle erase a newer position
-        # that happens to use the same strategy and symbol.
-        if position.signal_uxid != signal.signal_uxid:
             return
         if delivery_id and delivery_id in position.applied_delivery_ids:
             return
         if position.apply_close(action, block.quantity):
-            self._book.pop(symbol, None)
+            self.forget_cycle(symbol, signal.signal_uxid)
         elif delivery_id:
             position.applied_delivery_ids.append(delivery_id)
 
@@ -310,11 +348,21 @@ class SignalFactory:
     # ── Entries ───────────────────────────────────────────────────────
 
     def _prepare_entry(self, intent: SignalIntent, symbol: str) -> str:
-        existing = self._book.get(symbol)
-        if existing is not None:
+        cycles = self._book.get(symbol, {})
+        if len(cycles) >= self.max_open_cycles:
+            if self.max_open_cycles == 1:
+                existing = next(iter(cycles))
+                raise ValueError(
+                    f"{intent.action.value} for {symbol} would replace open cycle "
+                    f"{existing} — close the current position before opening another"
+                )
             raise ValueError(
-                f"{intent.action.value} for {symbol} would replace open cycle "
-                f"{existing.signal_uxid} — close the current position before opening another"
+                f"{intent.action.value} for {symbol} would open cycle {len(cycles) + 1} "
+                f"of at most {self.max_open_cycles} — open: {', '.join(cycles)}"
+            )
+        if intent.signal_uxid is not None and intent.signal_uxid in cycles:
+            raise ValueError(
+                f"{intent.action.value} for {symbol} reuses open cycle id {intent.signal_uxid}"
             )
         self.bracket.apply(intent)
         if intent.risk_percent is None:
@@ -359,7 +407,16 @@ class SignalFactory:
     # ── Closes ────────────────────────────────────────────────────────
 
     def _prepare_close(self, intent: SignalIntent, symbol: str) -> str:
-        position = self._book.get(symbol)
+        cycles = self._book.get(symbol, {})
+        if intent.signal_uxid is not None:
+            position = cycles.get(intent.signal_uxid)
+        elif len(cycles) > 1:
+            raise ValueError(
+                f"{intent.action.value} for {symbol} names no cycle while {len(cycles)} are "
+                f"open ({', '.join(cycles)}) — set signal_uxid on the close"
+            )
+        else:
+            position = next(iter(cycles.values()), None)
         uxid = intent.signal_uxid or (position.signal_uxid if position else None)
         if uxid is None:
             raise ValueError(

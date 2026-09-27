@@ -107,7 +107,11 @@ def test_the_market_block_carries_a_drawable_window_and_a_benchmark(report):
     assert market["columns"] == ["t", "o", "h", "l", "c"]
     assert market["rows"], "a replayed run should carry a window to draw"
     assert market["bucket_bars"] >= 1
-    for _, open_, high, low, close in market["rows"]:
+    # The run's own bars unless the history was too long to carry whole, so a
+    # chart of an M15 replay can be drawn at M15.
+    assert market["base_timeframe"] == "M15"
+    for moment, open_, high, low, close in market["rows"]:
+        assert isinstance(moment, int), "t is epoch seconds since schema 2.0"
         assert high >= max(open_, close) and low <= min(open_, close)
 
     hold = market["buy_hold"]
@@ -157,6 +161,23 @@ def test_every_trade_carries_what_the_aggregates_were_derived_from(report):
             "legs",
         }
         assert trade["legs"], "a closed trade must record how it closed"
+
+
+def test_a_discretionary_exit_carries_the_strategys_reason_into_the_report(trending_frame):
+    class FlatWithReason(TwoTradeStrategy):
+        name = "FLAT_WITH_REASON"
+
+        def on_candle_closed(self, df, context):
+            if context.open_uxid is None:
+                return super().on_candle_closed(df, context)
+            close = float(df["close"].iloc[-1])
+            return SignalIntent(action=SignalAction.FLAT, price=close, reason="BASIS_TRAIL_STOP")
+
+    result = BacktestEngine(FlatWithReason(), symbol="XAUUSD").run(trending_frame)
+    trades = build_report(result).to_dict()["trades"]
+    assert trades, "the probe strategy should have traded"
+    assert trades[0]["exit_note"] == "BASIS_TRAIL_STOP"
+    assert trades[0]["legs"][-1]["note"] == "BASIS_TRAIL_STOP"
 
 
 def test_partial_exits_are_visible_leg_by_leg(report):
@@ -216,12 +237,40 @@ def test_the_markdown_renders_without_a_single_trade(trending_frame):
     json.loads(empty.to_json())
 
 
-def test_write_produces_both_files_named_by_run_and_timestamp(report, tmp_path):
+def test_write_produces_all_three_files_named_by_run_and_timestamp(report, tmp_path):
     written = report.write(tmp_path)
-    assert {path.suffix for path in written} == {".json", ".md"}
+    assert {path.suffix for path in written} == {".json", ".md", ".html"}
     for path in written:
         assert path.exists() and path.stat().st_size > 0
         assert path.stem.startswith("REPORT_PROBE_XAUUSD_M15_")
+
+
+@pytest.mark.parametrize(
+    ("extra_arguments", "expected"),
+    [
+        ([], ("json", "md", "html")),
+        (["--report-format", "json"], ("json",)),
+        (["--report-format", "json,md", "--chart"], ("json", "md", "html")),
+    ],
+)
+def test_the_cli_writes_all_three_formats_unless_told_otherwise(extra_arguments, expected):
+    from qte_backtest.__main__ import _report_formats, build_parser
+
+    arguments = build_parser().parse_args(
+        [
+            "run",
+            "--strategy",
+            "REPORT_PROBE",
+            "--symbol",
+            "XAUUSD",
+            "--timeframe",
+            "M15",
+            "--file",
+            "history.parquet",
+            *extra_arguments,
+        ]
+    )
+    assert _report_formats(arguments) == expected
 
 
 def test_two_runs_do_not_overwrite_each_other(report, tmp_path):
@@ -234,3 +283,20 @@ def test_two_runs_do_not_overwrite_each_other(report, tmp_path):
 def test_an_unknown_format_is_refused_rather_than_silently_skipped(report, tmp_path):
     with pytest.raises(ValueError, match="Unknown report format"):
         report.write(tmp_path, formats=("pdf",))
+
+
+def test_the_json_keeps_one_candle_per_line(report):
+    """`market.rows` is the whole series now; indenting it doubles the file.
+
+    Asserted on the text rather than on the parsed document because the point
+    is the formatting: everything else stays indented and diff-readable, and
+    only the rows are packed.
+    """
+    text = report.to_json()
+
+    assert '"rows": [\n      [' in text, "rows start on their own lines"
+    assert '"schema_version": "2.0"' in text
+    assert "@@qte.market.rows@@" not in text, "the placeholder must not survive"
+    rows = json.loads(text)["market"]["rows"]
+    assert rows == report.to_dict()["market"]["rows"]
+    assert all(line.count("[") <= 1 for line in text.splitlines() if line.strip().startswith("["))

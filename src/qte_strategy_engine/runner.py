@@ -88,7 +88,12 @@ from qte_shared.strategies.strategy_base import (
     candles_to_frame,
     overrides_on_tick,
 )
-from qte_shared.strategies.strategy_settings import NO_WEEKEND_FLAT, WeekendFlatPolicy
+from qte_shared.strategies.strategy_settings import (
+    NO_WEEKEND_FLAT,
+    WeekendFlatPolicy,
+    resolve_cycle_policy,
+    resolve_weekend_flat,
+)
 from qte_shared.timeframes import (
     CLOCK_TOLERANCE,
     bucket_close,
@@ -323,6 +328,14 @@ class StrategyRunner:
                 # Params layer: the strategy's [strategies.<name>] defaults,
                 # then this pair's [symbols.<symbol>.params.<name>] on top.
                 params = {**defaults, **mapping.params_for(symbol, entry.name)}
+                # The repo declares the window; this pair's `use_weekend_flat`
+                # decides whether it is enforced — the same call the backtest makes.
+                # A value that cannot be honoured stops the start, never reads as off.
+                try:
+                    weekend_flat = resolve_weekend_flat(entry.settings.weekend_flat, params)
+                    cycle_policy = resolve_cycle_policy(params)
+                except ValueError as error:
+                    raise ValueError(f"{entry.name} on {symbol}: {error}") from None
                 strategy = entry.instantiate(params)
                 # Size against the account, at the risk this pair is mapped at.
                 # The strategy is never told either — see qte_shared.strategies.sizing.
@@ -334,16 +347,15 @@ class StrategyRunner:
                     inputs=strategy.params,
                     sizer=sizer,
                     default_quantity=runner_settings.default_quantity,
+                    cycle_policy=cycle_policy,
                 )
-                slot = StrategySlot(
-                    strategy, symbol, factory, weekend_flat=entry.settings.weekend_flat
-                )
+                slot = StrategySlot(strategy, symbol, factory, weekend_flat=weekend_flat)
                 self._warn_if_history_exceeds_redis(slot)
                 self.slots.append(slot)
                 self._by_subject[(symbol, slot.timeframe)].append(slot)
                 log.info(
                     "Slot ready strategy=%s symbol=%s tf=%s warmup=%d risk=%.3f%% of %.2f "
-                    "weekend_flat=%s (%s)",
+                    "weekend_flat=%s (%s) cycles=%s",
                     strategy.name,
                     symbol,
                     slot.timeframe,
@@ -352,6 +364,7 @@ class StrategyRunner:
                     sizer.capital,
                     slot.weekend_flat.describe(),
                     self._market_zone.key,
+                    cycle_policy.describe(),
                 )
 
     @staticmethod
@@ -602,7 +615,7 @@ class StrategyRunner:
             return False
 
     async def _restore_position(self, slot: StrategySlot) -> None:
-        """Reload the cycle this slot holds — Redis first, Postgres behind it.
+        """Reload every cycle this slot holds — Redis first, Postgres behind it.
 
         The fallback is the point. Redis coming up empty is ambiguous: it means
         "flat" and it means "someone re-provisioned the cache", and acting on
@@ -611,30 +624,43 @@ class StrategyRunner:
         next boot is a cache hit again.
         """
         strategy, symbol = slot.strategy.name, slot.symbol
-        position = await self.state.get_open_position(strategy, symbol)
+        positions = await self.state.get_open_positions_for(strategy, symbol)
         source = "redis"
-        if position is None:
-            position = await self.positions.get(strategy, symbol)
+        if not positions:
+            positions = await self.positions.list_for(strategy, symbol)
             source = "postgres"
-            if position is not None:
+            for position in positions:
                 if position.state_namespace != self._scope.namespace:
                     raise ValueError("Stored position has missing or foreign state provenance")
                 await self.state.set_open_position(position)
 
-        if position is None:
-            return
-        if position.state_namespace != self._scope.namespace:
-            raise ValueError("Cannot restore a position with missing or foreign state provenance")
-        slot.factory.restore_position(position, symbol=symbol)
-        log.info(
-            "Restored open cycle from %s strategy=%s symbol=%s uxid=%s qty=%s remaining=%s",
-            source,
-            strategy,
-            symbol,
-            position.signal_uxid,
-            position.quantity,
-            position.remaining,
-        )
+        for position in positions:
+            if position.state_namespace != self._scope.namespace:
+                raise ValueError(
+                    "Cannot restore a position with missing or foreign state provenance"
+                )
+            slot.factory.restore_position(position, symbol=symbol)
+            log.info(
+                "Restored open cycle from %s strategy=%s symbol=%s uxid=%s qty=%s remaining=%s",
+                source,
+                strategy,
+                symbol,
+                position.signal_uxid,
+                position.quantity,
+                position.remaining,
+            )
+        if len(positions) > slot.factory.max_open_cycles:
+            # Restored rather than refused: these are real positions at the
+            # broker. New entries stay blocked until closes bring the pair
+            # back under its limit.
+            log.warning(
+                "%s %s holds %d open cycles, over its limit of %d — no entry until it is back "
+                "under the limit",
+                strategy,
+                symbol,
+                len(positions),
+                slot.factory.max_open_cycles,
+            )
 
     # ── Stale positions ───────────────────────────────────────────────
 
@@ -642,11 +668,11 @@ class StrategyRunner:
         """Close what an outage left open, so the pair is not locked on it.
 
         The lock is the point. One ``(strategy, symbol)`` pair holds one cycle
-        at a time — ``uq_open_positions_pair`` in the database, and
-        :meth:`SignalFactory._prepare_entry` refusing an entry that would
-        replace an open cycle — so a row that survived a long downtime means
-        every entry the strategy proposes from here on is refused, against a
-        position whose bracket the market left behind hours ago.
+        at a time, or ``max_open_cycles`` with ``allow_multiple_cycles`` —
+        :meth:`SignalFactory._prepare_entry` refuses an entry over that limit —
+        so rows that survived a long downtime mean every entry the strategy
+        proposes from here on is refused, against positions whose brackets the
+        market left behind hours ago. Each stale cycle is closed on its own.
 
         Age is what separates that from an ordinary restart. A deploy comes back
         inside ``QTE_RUNNER__STALE_POSITION_MAX_AGE`` and keeps its positions,
@@ -667,7 +693,7 @@ class StrategyRunner:
         locked_pairs = [
             (strategy_slot, position)
             for strategy_slot in self.slots
-            if (position := strategy_slot.factory.open_position(strategy_slot.symbol)) is not None
+            for position in strategy_slot.factory.positions_for(strategy_slot.symbol)
         ]
         # The table is still read, for the two things the slots cannot show:
         # rows belonging to no running strategy, and duplicate cycle ids across
@@ -766,6 +792,7 @@ class StrategyRunner:
                     symbol=strategy_slot.symbol,
                     price=price,
                     reason="STALE_POSITION_FLUSH",
+                    signal_uxid=position.signal_uxid,
                 ),
                 price,
                 datetime.now(UTC),
@@ -812,14 +839,13 @@ class StrategyRunner:
         holders: dict[str, set[str]] = defaultdict(set)
         for source in sources:
             for entry in source:
-                position = (
-                    entry.factory.open_position(entry.symbol)
+                held = (
+                    entry.factory.positions_for(entry.symbol)
                     if isinstance(entry, StrategySlot)
-                    else entry
+                    else [entry]
                 )
-                if position is None:
-                    continue
-                holders[position.signal_uxid].add(f"{position.strategy}/{position.symbol}")
+                for position in held:
+                    holders[position.signal_uxid].add(f"{position.strategy}/{position.symbol}")
 
         duplicated = {uxid: pairs for uxid, pairs in holders.items() if len(pairs) > 1}
         if not duplicated:
@@ -913,14 +939,7 @@ class StrategyRunner:
         if slot.key in self._uncertain_pairs or await self._live_delivery_paused():
             return
 
-        context = StrategyContext(
-            symbol=slot.symbol,
-            timeframe=slot.timeframe,
-            now=candle.open_time,
-            mode="live",
-            params=slot.strategy.params,
-            open_uxid=slot.factory.open_cycle(slot.symbol),
-        )
+        context = self._strategy_context(slot, candle.open_time)
         if not slot.started:
             slot.strategy.on_start(context)
             slot.started = True
@@ -967,6 +986,21 @@ class StrategyRunner:
             # the stop stopped out, and the flat is what is left over.
             await self._flatten_for_the_weekend(slot, candle.close, context.now)
 
+    @staticmethod
+    def _strategy_context(slot: StrategySlot, moment: datetime) -> StrategyContext:
+        """What the strategy is told on one decision: the pair, the clock and its cycles."""
+        open_uxids = slot.factory.open_cycles(slot.symbol)
+        return StrategyContext(
+            symbol=slot.symbol,
+            timeframe=slot.timeframe,
+            now=moment,
+            mode="live",
+            params=slot.strategy.params,
+            open_uxid=open_uxids[-1] if open_uxids else None,
+            open_uxids=open_uxids,
+            max_open_cycles=slot.factory.max_open_cycles,
+        )
+
     async def _flatten_for_the_weekend(
         self, slot: StrategySlot, price: float, moment: datetime
     ) -> None:
@@ -979,27 +1013,30 @@ class StrategyRunner:
         A pair that is already flat produces nothing, which is what makes this
         safe to call on every bar inside the window and from the sweep.
         """
-        if slot.factory.open_cycle(slot.symbol) is None:
-            return
-        log.warning(
-            "Weekend flat: closing %s on %s at %s — window %s (%s)",
-            slot.strategy.name,
-            slot.symbol,
-            moment,
-            slot.weekend_flat.describe(),
-            self._market_zone.key,
-        )
-        await self._emit(
-            slot,
-            SignalIntent(
-                action=SignalAction.FLAT,
-                symbol=slot.symbol,
-                price=price,
-                reason="WEEKEND_FLAT",
-            ),
-            price,
-            moment,
-        )
+        # One FLAT per cycle, each naming its own: with several open, an
+        # unnamed close would be ambiguous and the factory refuses it.
+        for uxid in slot.factory.open_cycles(slot.symbol):
+            log.warning(
+                "Weekend flat: closing %s on %s uxid=%s at %s — window %s (%s)",
+                slot.strategy.name,
+                slot.symbol,
+                uxid,
+                moment,
+                slot.weekend_flat.describe(),
+                self._market_zone.key,
+            )
+            await self._emit(
+                slot,
+                SignalIntent(
+                    action=SignalAction.FLAT,
+                    symbol=slot.symbol,
+                    price=price,
+                    reason="WEEKEND_FLAT",
+                    signal_uxid=uxid,
+                ),
+                price,
+                moment,
+            )
 
     async def _weekend_flat_loop(self) -> None:
         """Flatten a shut market even when no candle closes to prompt it.
@@ -1070,14 +1107,7 @@ class StrategyRunner:
                 await self._check_ownership()
                 if await self._live_delivery_paused():
                     continue
-                context = StrategyContext(
-                    symbol=slot.symbol,
-                    timeframe=slot.timeframe,
-                    now=event.tick.ts,
-                    mode="live",
-                    params=slot.strategy.params,
-                    open_uxid=slot.factory.open_cycle(slot.symbol),
-                )
+                context = self._strategy_context(slot, event.tick.ts)
                 try:
                     result = slot.strategy.on_tick(price, context)
                 except Exception:
@@ -1271,7 +1301,7 @@ class StrategyRunner:
                 ):
                     return False
                 strategy_slot.factory.commit(signal, delivery_id=delivery_id)
-                if not await self._track_cycle(strategy_slot):
+                if not await self._track_cycle(strategy_slot, signal.signal_uxid):
                     return False
             finalized = await self.signals.mark_delivery(
                 delivery_id, status=outcome.status, error=outcome.detail or None
@@ -1393,18 +1423,18 @@ class StrategyRunner:
             except Exception:
                 log.exception("Signal outbox retry failed — retrying at the next interval")
 
-    async def _track_cycle(self, slot: StrategySlot) -> bool:
-        """Mirror the slot's cycle into Redis and Postgres, or clear both.
+    async def _track_cycle(self, slot: StrategySlot, signal_uxid: str) -> bool:
+        """Mirror one of the slot's cycles into Redis and Postgres, or clear both.
 
         Written from what the factory now believes rather than from the action
         that was just sent, so the "a TP1 taking the whole entry ends the
         cycle" rule is decided once — in :class:`OpenPosition` — instead of
         being restated by everything that persists a transition.
         """
-        position = slot.factory.open_position(slot.symbol)
+        position = slot.factory.open_position(slot.symbol, signal_uxid)
         if position is None:
-            await self.state.clear_open_cycle(slot.strategy.name, slot.symbol)
-            return await self.positions.clear(slot.strategy.name, slot.symbol)
+            await self.state.clear_open_position(slot.strategy.name, slot.symbol, signal_uxid)
+            return await self.positions.clear(slot.strategy.name, slot.symbol, signal_uxid)
         return await self._persist_position(position)
 
     async def _persist_position(self, position: OpenPosition) -> bool:

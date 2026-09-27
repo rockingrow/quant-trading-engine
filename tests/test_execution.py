@@ -68,6 +68,24 @@ def test_tp1_closes_a_share_and_leaves_the_runner():
     assert position.is_open
 
 
+def test_a_bracket_fill_carries_no_strategy_note():
+    # process_bar closes on a level touch alone — the strategy is never asked,
+    # so there is nothing of its to attribute the exit to.
+    simulator = FillSimulator(CostModel())
+    position = _long(simulator, tp1=2010.0, tp1_percent=100.0)
+    simulator.process_bar(position, _bar(2001, 2011, 2000, 2010), NOW)
+    assert position.legs[0].note is None
+    assert position.exit_note is None
+
+
+def test_a_discretionary_close_carries_the_strategys_own_note():
+    simulator = FillSimulator(CostModel())
+    position = _long(simulator)
+    simulator.close_at(position, NOW, 2005.0, ExitReason.FLAT, note="BASIS_TRAIL_STOP")
+    assert position.legs[0].note == "BASIS_TRAIL_STOP"
+    assert position.exit_note == "BASIS_TRAIL_STOP"
+
+
 def test_move_sl_to_be_uses_the_entry_fill_not_the_signalled_price():
     # The spread paid on the way in does not come back at breakeven.
     simulator = FillSimulator(CostModel(spread=2.0))

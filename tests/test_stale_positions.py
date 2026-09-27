@@ -478,9 +478,11 @@ def test_the_table_enforces_one_pair_per_cycle_id():
         if constraint.name is not None
     }
     assert "uq_open_positions_uxid" in constraints
-    assert "uq_open_positions_pair" in constraints
+    # A pair may hold several cycles now; the factory enforces how many.
+    assert "uq_open_positions_pair" not in constraints
     indexes = {index.name for index in OpenPositionRow.__table__.indexes}
     assert "ix_open_positions_uxid" not in indexes, "the unique constraint replaced it"
+    assert "ix_open_positions_pair" in indexes
 
 
 @pytest.fixture(autouse=True)

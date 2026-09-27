@@ -69,9 +69,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fallback size for an entry the risk sizer cannot size (no stop)",
     )
     run.add_argument(
-        "--spread", type=float, default=0.0, help="Full bid/ask distance in price units"
+        "--spread",
+        type=float,
+        default=settings.account.spread,
+        help="Full bid/ask distance in price units (default: QTE_ACCOUNT__SPREAD)",
     )
-    run.add_argument("--slippage", type=float, default=0.0)
+    run.add_argument(
+        "--slippage",
+        type=float,
+        default=settings.account.slippage,
+        help="Added on top of half the spread, each side (default: QTE_ACCOUNT__SLIPPAGE)",
+    )
     run.add_argument(
         "--commission",
         type=float,
@@ -104,8 +112,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument(
         "--report-format",
-        default="json,md",
-        help="Comma-separated: json, md, html (default: json,md)",
+        default="json,md,html",
+        help="Comma-separated: json, md, html (default: json,md,html)",
     )
     run.add_argument(
         "--no-report-signals",
@@ -115,7 +123,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--chart",
         action="store_true",
-        help="Also write the interactive HTML dashboard (same as adding html to --report-format)",
+        help=(
+            "Also write the interactive HTML dashboard — already in the default "
+            "--report-format; adds html back to an explicit list that left it out"
+        ),
     )
     run.add_argument(
         "--param",

@@ -304,8 +304,8 @@ async def test_periodic_retry_revisits_pending_local_persistence(monkeypatch):
     runner.signals = RecordingSignals([pending_signal(strategy_slot, status="sent_pending")])
     original_track = runner._track_cycle
 
-    async def stop_after_tracking(selected_slot):
-        persisted = await original_track(selected_slot)
+    async def stop_after_tracking(selected_slot, signal_uxid):
+        persisted = await original_track(selected_slot, signal_uxid)
         runner.request_stop()
         return persisted
 

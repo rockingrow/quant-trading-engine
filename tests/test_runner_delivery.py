@@ -195,11 +195,21 @@ class FakeState:
     async def get_open_position(self, strategy, symbol):
         return self.held.get((strategy, symbol))
 
+    async def get_open_positions_for(self, strategy, symbol):
+        held = self.held.get((strategy, symbol))
+        return [held] if held is not None else []
+
     async def set_open_position(self, position):
         self.held[(position.strategy, position.symbol)] = position
 
     async def clear_open_cycle(self, strategy, symbol):
         self.held.pop((strategy, symbol), None)
+        self.cleared.append((strategy, symbol))
+
+    async def clear_open_position(self, strategy, symbol, signal_uxid):
+        held = self.held.get((strategy, symbol))
+        if held is not None and held.signal_uxid == signal_uxid:
+            self.held.pop((strategy, symbol))
         self.cleared.append((strategy, symbol))
 
 
@@ -213,12 +223,18 @@ class FakePositions:
     async def get(self, strategy, symbol):
         return self.held.get((strategy, symbol))
 
+    async def list_for(self, strategy, symbol):
+        held = self.held.get((strategy, symbol))
+        return [held] if held is not None else []
+
     async def upsert(self, position):
         self.held[(position.strategy, position.symbol)] = position
         return True
 
-    async def clear(self, strategy, symbol):
-        self.held.pop((strategy, symbol), None)
+    async def clear(self, strategy, symbol, signal_uxid=None):
+        held = self.held.get((strategy, symbol))
+        if held is not None and signal_uxid in (None, held.signal_uxid):
+            self.held.pop((strategy, symbol))
         self.cleared.append((strategy, symbol))
         return True
 

@@ -38,6 +38,20 @@ strategies = []
 risk_percent = 3.0
 tp1_qty_percent = 50
 use_equity_sizing = false
+# Read by the engine, not the strategy: whether the weekend window the strategy's
+# repository declares (settings.py) is enforced. Omit it to keep the repository's
+# declared default; true on a strategy that declares no window stops the pair
+# from starting. Applies to the backtest too.
+use_weekend_flat = true
+# Read by the engine, not the strategy: how many trade cycles this strategy may
+# hold on one symbol at once. Off, the pair holds one position and a second
+# entry is refused. On, it may hold up to max_open_cycles positions side by
+# side, each under its own signal_uxid with its own bracket, and every close
+# names the cycle it closes. The broker worker must run a hedging account, or
+# the positions merge. Applies to the backtest too, and a pair may restate
+# either key under [symbols.<symbol>.params.<strategy>].
+allow_multiple_cycles = false
+max_open_cycles = 1
 
 
 # ── One table per symbol ────────────────────────────────────────────────
@@ -51,6 +65,9 @@ strategies = ["EXAMPLE_GOLD_M15_V1", "EXAMPLE_GOLD_M5_SCALP"]
 [symbols.XAUUSD.params.EXAMPLE_GOLD_M15_V1]
 risk_percent = 1.0
 atr_sl_mult = 1.5
+# A list is passed through to the strategy as a list. Which keys a strategy
+# reads is its own business — this one names UTC windows it takes no entries in.
+skip_windows = ["05:00-09:00", "19:00-20:00"]
 
 [symbols.XAUUSD.params.EXAMPLE_GOLD_M5_SCALP]
 risk_percent = 0.5

@@ -112,9 +112,12 @@ class AccountSettings(BaseSettings):
     stated per (symbol, strategy) in ``config/strategies_mapping.toml``, and
     that value wins. This one covers the pair that declares none.
 
-    ``commission_per_unit`` is a backtest cost — live, the broker charges its
-    own — but it belongs to the account rather than to a run, which is why it
-    sits here and only defaults the CLI flag.
+    ``commission_per_unit``, ``spread`` and ``slippage`` are backtest costs —
+    live, the broker charges and fills its own — but they belong to the
+    account rather than to a run, which is why they sit here and only default
+    the CLI flags. ``spread``/``slippage`` are per-symbol in reality (0.30 on
+    gold, ~2.0 on BTCUSDT); this default only covers a run that names none,
+    it is not a substitute for setting the right value per pair.
     """
 
     model_config = SettingsConfigDict(env_prefix="QTE_ACCOUNT__", extra="ignore")
@@ -127,6 +130,10 @@ class AccountSettings(BaseSettings):
     risk_percent: float = 1.0
     #: Charged per unit on entry and on every partial exit, each side.
     commission_per_unit: float = 0.0
+    #: Full bid/ask distance in price units; each side of a fill pays half.
+    spread: float = 0.0
+    #: Added on top of half the spread, on both entry and exit fills.
+    slippage: float = 0.0
     #: Units per contract/lot. Scales both P&L and commission.
     contract_size: float = 1.0
     #: Hard ceiling on a sized entry. ``0`` means uncapped.

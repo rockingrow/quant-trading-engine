@@ -65,6 +65,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The price chart carries the run's own bars, however long the history.**
+  `market.rows` no longer climbs to a coarser timeframe above 20,000 rows, so a
+  five-year M15 run is drawn at M15 — ~120k rows, a report and dashboard of
+  about 6 MB each, and a slower page, accepted so every trade can be inspected.
+  `sample_market(max_rows=…)` still rolls up for a caller that asks for it.
+
+- **A backtest report is written in all three formats by default.**
+  `--report` now writes `json,md,html`; `--report-format` narrows it
+  (`--report-format json`), and `--chart` still adds `html` back to an explicit
+  list that left it out. `BacktestRequest.report_formats` and
+  `BacktestReport.write` share the same default, so `make backtest` writes the
+  dashboard too.
+
 - **A symbol's market is stated, never guessed.** `qte_shared.symbols` had two
   hardcoded lists — crypto base assets and stablecoin quotes — that
   `infer_market()` matched a symbol name against to pick `fx` or `crypto`. A

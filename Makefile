@@ -309,9 +309,16 @@ csv-import: ## Convert an MT5 CSV export to parquet: make csv-import CSV=data/cs
 download: ## Fetch provider history for the market-data plan [ARGS="--symbol X --timeframe M15 --market fx"]
 	uv run qte-backtest download $(ARGS)
 
-backtest: ## Replay one strategy: make backtest STRATEGY=... SYMBOL=XAUUSD TF=M15 FILE=data/parquet/tiingo/XAUUSD_M15.parquet
+SPREAD ?=
+SLIPPAGE ?=
+COMMISSION ?=
+
+backtest: ## Replay one strategy: make backtest STRATEGY=... SYMBOL=XAUUSD TF=M15 FILE=... [SPREAD=] [SLIPPAGE=] [COMMISSION=]
 	uv run qte-backtest run --strategy $(STRATEGY) --symbol $(SYMBOL) \
-		--timeframe $(TF) --file $(FILE) --report
+		--timeframe $(TF) --file $(FILE) --report \
+		$(if $(SPREAD),--spread $(SPREAD)) \
+		$(if $(SLIPPAGE),--slippage $(SLIPPAGE)) \
+		$(if $(COMMISSION),--commission $(COMMISSION))
 
 chart: ## Draw a report as an interactive HTML dashboard: make chart REPORT=data/reports/x.json
 	uv run qte-backtest chart $(REPORT)

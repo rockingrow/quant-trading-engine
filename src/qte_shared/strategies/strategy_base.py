@@ -120,12 +120,25 @@ class StrategyContext:
     mode: str = "backtest"
     params: dict[str, Any] = field(default_factory=dict)
     #: Cycle id of the position this strategy currently believes it holds, as
-    #: tracked by whoever is driving it. ``None`` means flat.
+    #: tracked by whoever is driving it. ``None`` means flat. With several
+    #: cycles open it is the most recent one; :attr:`open_uxids` lists them all.
     open_uxid: str | None = None
+    #: Every cycle open on this pair, oldest first. Empty when flat.
+    open_uxids: tuple[str, ...] = ()
+    #: How many cycles the pair may hold at once — 1 unless the mapping sets
+    #: ``allow_multiple_cycles``. See :class:`~qte_shared.strategies.strategy_settings.CyclePolicy`.
+    max_open_cycles: int = 1
 
     @property
     def is_live(self) -> bool:
         return self.mode == "live"
+
+    @property
+    def can_open(self) -> bool:
+        """Whether a new entry would be accepted — fewer cycles open than allowed."""
+        # A driver that set only ``open_uxid`` is holding one cycle.
+        held = len(self.open_uxids) or (1 if self.open_uxid is not None else 0)
+        return held < self.max_open_cycles
 
 
 IntentResult = SignalIntent | Sequence[SignalIntent] | None
@@ -492,7 +505,12 @@ class SignalStrategy(StrategyBase):
     * flat → :data:`ENTRY_SIGNAL_ORDER`, first answer wins.
 
     "Holding" is ``context.open_uxid``, which the runner and the backtest both
-    maintain, so the sequencing is identical in the two drivers. Override
+    maintain, so the sequencing is identical in the two drivers. A pair allowed
+    several cycles (``context.max_open_cycles > 1``) is asked for its exits and
+    then, while ``context.can_open``, for a new entry too. Each exit it emits
+    must then carry the ``signal_uxid`` of the cycle it closes; each entry may
+    carry its own, minted with :func:`~qte_shared.models.new_uxid`, which is
+    how the strategy later names that cycle. Override
     :meth:`on_candle_closed` if a strategy needs a different order — the seven
     methods remain the published surface either way, and that surface is what
     the audit reads.
@@ -547,6 +565,12 @@ class SignalStrategy(StrategyBase):
             collected: list[SignalIntent] = []
             for name in EXIT_SIGNAL_ORDER:
                 collected.extend(self._ask(name, df, context))
+            if not context.can_open:
+                return collected
+            for name in ENTRY_SIGNAL_ORDER:
+                produced = self._ask(name, df, context)
+                if produced:
+                    return collected + produced
             return collected
 
         for name in ENTRY_SIGNAL_ORDER:
