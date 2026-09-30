@@ -1,13 +1,14 @@
 """Process configuration, read once from the environment / ``.env``.
 
 Every service imports :data:`settings`. Nested blocks use their own env
-prefixes (``QTE_NATS__URL``, ``QTE_BROKER__TOKEN``, …) so a section can be
+prefixes (``QTE_NATS__URL``, ``ALGO_BROKER__TOKEN``, …) so a section can be
 overridden wholesale in compose without touching the rest.
 """
 
 from __future__ import annotations
 
-from functools import lru_cache
+import re
+from functools import cache, lru_cache
 from pathlib import Path
 from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -58,11 +59,21 @@ load_dotenv(REPO_ROOT / ".env", override=False)
 
 
 class NatsSettings(BaseSettings):
-    """QTE's own internal event bus (candles, ticks, engine control)."""
+    """QTE's own internal event bus (candles, ticks, engine control).
+
+    The bus runs on the Tailscale tailnet, so the default host is the tailnet
+    name of the machine that serves it rather than ``localhost``: every service,
+    on the host or in a container, dials the same address and no compose-private
+    hostname has to be kept in sync with it.
+
+    ``token`` has no usable default. Because the port is reachable from every
+    device on the tailnet, ``NatsBus.connect`` refuses to dial without one —
+    see ``qte_shared.bus.nats_bus``.
+    """
 
     model_config = SettingsConfigDict(env_prefix="QTE_NATS__", extra="ignore")
 
-    url: str = "nats://localhost:4222"
+    url: str = "nats://quanghuynhpc:4222"
     token: str = ""
     subject_prefix: str = "QTE"
     connect_timeout: float = 5.0
@@ -82,7 +93,7 @@ class BrokerSettings(BaseSettings):
     which is the right answer when QTE and the broker share one NATS cluster.
     """
 
-    model_config = SettingsConfigDict(env_prefix="QTE_BROKER__", extra="ignore")
+    model_config = SettingsConfigDict(env_prefix="ALGO_BROKER__", extra="ignore")
 
     transport: Literal["nats", "http"] = "nats"
     nats_url: str = ""
@@ -206,16 +217,67 @@ class MarketDataSettings(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="QTE_MARKET_DATA__", extra="ignore")
 
+    #: One provider, or several separated by commas (``mt5,binance``). Each one
+    #: feeds the symbols its own plan lists; see :attr:`providers`.
     provider: str = "tiingo"
     #: What the provider is asked to feed: symbols, timeframes and its own
     #: knobs (:mod:`qte_shared.market_data_plan`). Empty means the conventional path
     #: for whichever provider is on, so switching vendor switches plan with it.
+    #: Only valid with a single provider: one file cannot be every vendor's plan.
     config_file: Path | None = None
 
+    @model_validator(mode="after")
+    def _one_plan_file_needs_one_provider(self) -> MarketDataSettings:
+        providers = self.providers
+        if self.config_file is not None and len(providers) > 1:
+            raise ValueError(
+                "QTE_MARKET_DATA__CONFIG_FILE names one plan, but QTE_MARKET_DATA__PROVIDER "
+                f"lists {len(providers)} providers; each reads config/<provider>.toml instead"
+            )
+        return self
+
     @property
-    def plan_file(self) -> Path:
-        """The plan this provider reads. Named after it, unless overridden."""
-        return self.config_file or REPO_ROOT / "config" / f"{self.provider}.toml"
+    def providers(self) -> tuple[str, ...]:
+        """The configured providers, normalised, deduplicated, in the order given.
+
+        A name may not contain ``-``: :attr:`provider_key` joins the names with
+        it, and the key has to split back into exactly the same list.
+        """
+        names = tuple(
+            dict.fromkeys(name.strip().lower() for name in self.provider.split(",") if name.strip())
+        )
+        if not names:
+            raise ValueError("QTE_MARKET_DATA__PROVIDER names no provider")
+        for name in names:
+            if not _PROVIDER_NAME.fullmatch(name):
+                raise ValueError(
+                    f"Market data provider name {name!r} must be lowercase letters, digits "
+                    "or underscores; separate several providers with commas"
+                )
+        return names
+
+    @property
+    def provider_key(self) -> str:
+        """The providers as one state-identity component: sorted, joined by ``-``.
+
+        Sorted so that ``mt5,binance`` and ``binance,mt5`` select the same state.
+        A single provider is its own key, which keeps existing state in place.
+        """
+        return "-".join(sorted(self.providers))
+
+    def plan_file_for(self, provider_name: str) -> Path:
+        """The plan *provider_name* reads. Named after it, unless overridden."""
+        return self.config_file or REPO_ROOT / "config" / f"{provider_name}.toml"
+
+    @property
+    def plan_files(self) -> dict[str, Path]:
+        """Each configured provider's plan file."""
+        return {name: self.plan_file_for(name) for name in self.providers}
+
+
+#: What a single provider name may be. No ``-``: see
+#: :attr:`MarketDataSettings.providers`.
+_PROVIDER_NAME = re.compile(r"[a-z0-9_]+")
 
 
 #: Resolved once, before :class:`Settings` is built: :class:`EngineSettings`
@@ -223,15 +285,23 @@ class MarketDataSettings(BaseSettings):
 market_data_settings = MarketDataSettings()
 
 
+@cache
+def provider_market_data_plan(provider_name: str) -> MarketDataPlan:
+    """One provider's own plan, parsed once per process — its ``[provider]`` table included."""
+    return MarketDataPlan.load(market_data_settings.plan_file_for(provider_name))
+
+
 @lru_cache(maxsize=1)
 def market_data_plan() -> MarketDataPlan:
-    """The market-data plan, parsed once per process.
+    """Every configured provider's plan, merged, parsed once per process.
 
     Cached because it is read on every settings construction and its file does
     not change under a running service; a test that writes a plan calls
-    ``market_data_plan.cache_clear()``.
+    ``market_data_plan.cache_clear()`` and ``provider_market_data_plan.cache_clear()``.
     """
-    return MarketDataPlan.load(market_data_settings.plan_file)
+    return MarketDataPlan.merge(
+        {name: provider_market_data_plan(name) for name in market_data_settings.providers}
+    )
 
 
 class EngineSettings(BaseSettings):
@@ -302,6 +372,7 @@ class EngineSettings(BaseSettings):
         markets.update(
             {symbol_feed.symbol: symbol_feed.market for symbol_feed in market_plan.feeds}
         )
+        providers = get_settings().market_data.providers
         subscriptions = []
         for symbol in dict.fromkeys(symbol.upper() for symbol in symbols):
             planned_feed = market_plan.feed_for(symbol)
@@ -314,7 +385,12 @@ class EngineSettings(BaseSettings):
                 raise ValueError(f"No resampled timeframes configured for {symbol}")
             specification = build_specs([symbol], markets)[0]
             subscriptions.append(
-                SymbolFeed(symbol=symbol, market=specification.market, timeframes=resolved_frames)
+                SymbolFeed(
+                    symbol=symbol,
+                    market=specification.market,
+                    timeframes=resolved_frames,
+                    provider=_feeding_provider(symbol, planned_feed, providers),
+                )
             )
         return subscriptions
 
@@ -362,6 +438,10 @@ class StateSettings(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="QTE_STATE__", extra="ignore")
     execution_mode: ExecutionMode = Field(default="shadow", validation_alias="QTE_STATE__MODE")
+    #: The provider component compose names its project and volumes with — the
+    #: providers sorted and joined by ``-``, since a comma is not valid there.
+    #: The Makefile derives it; when set, it must agree with the provider list.
+    provider_key: str | None = Field(default=None, validation_alias="QTE_STATE__PROVIDER_KEY")
 
 
 class Settings(BaseSettings):
@@ -389,9 +469,15 @@ class Settings(BaseSettings):
 
     @property
     def state_scope(self) -> StateScope:
-        return StateScope(
-            self.env, self.state_config.execution_mode, self.market_data.provider.strip().lower()
-        )
+        provider_key = self.market_data.provider_key
+        declared_key = (self.state_config.provider_key or "").strip().lower()
+        if declared_key and declared_key != provider_key:
+            raise ValueError(
+                f"QTE_STATE__PROVIDER_KEY={declared_key!r} does not match "
+                f"QTE_MARKET_DATA__PROVIDER={self.market_data.provider!r}, whose key is "
+                f"{provider_key!r}; compose would mount another provider set's volumes"
+            )
+        return StateScope(self.env, self.state_config.execution_mode, provider_key)
 
     @property
     def broker_nats_url(self) -> str:
@@ -401,6 +487,20 @@ class Settings(BaseSettings):
     @property
     def broker_nats_token(self) -> str:
         return self.broker.nats_token or self.nats.token
+
+
+def _feeding_provider(
+    symbol: str, planned_feed: SymbolFeed | None, providers: tuple[str, ...]
+) -> str:
+    """The provider that feeds *symbol*: its plan's, or the only one configured."""
+    if planned_feed is not None and planned_feed.provider:
+        return planned_feed.provider
+    if len(providers) == 1:
+        return providers[0]
+    raise ValueError(
+        f"{symbol} is on no provider's plan, and {len(providers)} providers are configured "
+        f"({', '.join(providers)}); list it in the plan of the one that should feed it"
+    )
 
 
 @lru_cache(maxsize=1)

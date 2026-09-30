@@ -153,6 +153,23 @@ class PartialBarRepairer:
         )
 
 
+class RoutedBarRepairer:
+    """One :class:`PartialBarRepairer` per provider, chosen by the bar's symbol.
+
+    With several providers each symbol's bars are completed from the history
+    of the provider that fed them, never from another vendor's copy.
+    """
+
+    def __init__(self, repairers_by_symbol: dict[str, PartialBarRepairer]) -> None:
+        self.repairers_by_symbol = dict(repairers_by_symbol)
+
+    async def repair(self, candle: Candle, *, close_is_current: bool = True) -> Candle:
+        repairer = self.repairers_by_symbol.get(candle.symbol)
+        if repairer is None:
+            return candle
+        return await repairer.repair(candle, close_is_current=close_is_current)
+
+
 def merge_partial_bar(
     partial: Candle, vendor_bar: Candle, *, close_is_current: bool = True
 ) -> Candle:

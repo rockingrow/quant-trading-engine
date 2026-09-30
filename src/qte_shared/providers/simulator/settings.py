@@ -8,6 +8,8 @@ one block in ``.env`` and both ends agree.
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 from pydantic_settings import SettingsConfigDict
 
 from qte_shared.interfaces.market_data import ProviderSettings
@@ -18,6 +20,7 @@ class SimulatorSettings(ProviderSettings):
     """Where the feed is, and how hard it tries to stay attached to it."""
 
     model_config = SettingsConfigDict(env_prefix="QTE_SIMULATOR__", extra="ignore")
+    provider_name: ClassVar[str] = "simulator"
 
     #: Defaults to the loopback address rather than a container name, because
     #: the common first run is `make sim` and `make ingestion` in two terminals.

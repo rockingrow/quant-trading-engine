@@ -1,0 +1,95 @@
+# What the MT5 provider takes from algo-trading-ingester: which symbols, at
+# which bars, and where the ingester publishes them.
+#
+#   make mt5            # writes config/mt5.toml from this template
+#
+# The engine reads `config/<QTE_MARKET_DATA__PROVIDER>.toml`, so this file is
+# the plan for the `mt5` provider (QTE_MARKET_DATA__PROVIDER=mt5). `make start`
+# refuses to bring the stack up without it while the provider is mt5.
+#
+# QTE does not talk to the MT5 terminal. algo-trading-ingester runs beside it on
+# Windows, detects every closed bar and publishes it to NATS on
+#
+#   <subject_prefix>.bar.closed.<gateway>.<SYMBOL>.<TIMEFRAME>
+#   e.g. INGESTER.bar.closed.mt5.XAUUSD.M15
+#
+# and this provider consumes those subjects. Bars arrive already closed, so
+# nothing is resampled: each one goes straight to Redis and the candle subject.
+#
+# This template is tracked; `config/mt5.toml` is git-ignored, for the same
+# reason as `config/tiingo.example.toml`: what a desk trades is position
+# information and this repository is public.
+#
+# **The NATS token is not here.** It is a secret and stays in `.env`:
+#
+#   QTE_MT5__NATS_TOKEN=<the ingester's NATS_TOKEN>
+#
+# Left blank it falls back to QTE_NATS__TOKEN, which is right whenever the
+# ingester publishes onto QTE's own NATS — the usual setup. A credential written
+# into this file (`token`, `nats_token`, …) is ignored with a warning.
+
+
+# ── Where the ingester publishes ─────────────────────────────────────────
+#
+# Every key below is a field of `qte_shared.providers.mt5.settings` and has an
+# environment override (`QTE_MT5__<KEY>`), which still wins over the file. The
+# defaults match the ingester's own `.env`; keep the two in step.
+
+[provider]
+# NATS server the ingester publishes to (its NATS_HOST:NATS_PORT). Blank = QTE's
+# own bus, QTE_NATS__URL.
+#nats_url = ""
+# The ingester's NATS_SUBJECT_PREFIX.
+subject_prefix = "INGESTER"
+# Which ingester gateway to take bars from.
+gateway = "mt5"
+# The ingester's NATS_JETSTREAM_ENABLED. true = consume the stream through a
+# durable consumer, so bars published while QTE was down are delivered when it
+# comes back. false = core NATS: whatever QTE misses is gone.
+jetstream = true
+# The ingester's NATS_STREAM_NAME. The ingester creates it; QTE only reads it
+# and never creates or reconfigures it.
+stream = "INGESTER"
+# Where a *new* durable consumer starts. "all" replays everything the stream
+# still holds (7 days by default on the ingester), which is how this provider
+# warms Redis — it has no other history. The runner only *decides* on bars
+# younger than QTE_RUNNER__CATCH_UP_MAX_AGE; older ones become history.
+# "new" starts cold. An existing consumer keeps its position whatever this says:
+# delete it on the server to start over.
+deliver_policy = "all"
+# Blank = "qte-ingestion-<env>-<mode>-mt5", one consumer per state namespace, so
+# a shadow and a live stack on one server both receive every bar.
+#durable_name = ""
+# Messages asked for in one pull, and how long a pull waits.
+#fetch_batch = 64
+#fetch_timeout = 5.0
+# Bars held between receipt and processing. Each is acknowledged the moment it
+# is held, so the ingester is never kept waiting; when this is full, QTE stops
+# pulling until there is room rather than refusing what it already took.
+#max_pending_bars = 10000
+#max_backoff_seconds = 30.0
+
+
+# ── One table per symbol ────────────────────────────────────────────────
+#
+# The symbol is the bare name the ingester was configured with (MT5_SYMBOLS).
+# The ingester finds the broker's affix itself (Exness XAUUSDm) and publishes
+# the bare name, so it is also the name in the signal a worker executes.
+
+[symbols.XAUUSD]
+# Required: "fx" or "crypto". CFDs on a broker's book are "fx".
+market = "fx"
+# Must be timeframes the ingester publishes (MT5_TIMEFRAMES). A timeframe the
+# ingester does not send never closes, and the runner waits on it forever.
+timeframes = ["M15"]
+
+[symbols.USOIL]
+market = "fx"
+timeframes = ["M15"]
+
+# `enabled = false` parks a symbol without deleting its settings, so turning it
+# back on is a one-word edit and the diff says what happened.
+[symbols.EURUSD]
+enabled = false
+market = "fx"
+timeframes = ["M15"]

@@ -5,6 +5,10 @@ replaced by a fresher one a moment later, so paying JetStream's persistence
 cost for it would buy nothing. Signals are the opposite — losing one loses a
 trade — and those go out over JetStream, which is why :meth:`publish_jetstream`
 exists alongside :meth:`publish`.
+
+Every connection is authenticated: NATS is reached over Tailscale rather than
+over a compose-private network, so :meth:`connect` refuses an empty token
+instead of falling back to anonymous access.
 """
 
 from __future__ import annotations
@@ -66,6 +70,15 @@ class NatsBus:
     async def connect(self) -> None:
         if self.is_connected:
             return
+        # Token authentication is mandatory. The bus is reached over Tailscale,
+        # where every device on the tailnet can dial the port, so an anonymous
+        # connection is not a local-development convenience any more. Refuse
+        # before dialling rather than trust a server that allows it.
+        if not self._token:
+            raise RuntimeError(
+                f"NATS at {self._url} requires a token — set QTE_NATS__TOKEN "
+                "(or ALGO_BROKER__NATS_TOKEN for the broker's own cluster)"
+            )
         options: dict[str, Any] = {
             "servers": [self._url],
             "name": self._name,
@@ -76,8 +89,7 @@ class NatsBus:
             "reconnected_cb": self._on_reconnected,
             "error_cb": self._on_error,
         }
-        if self._token:
-            options["token"] = self._token
+        options["token"] = self._token
 
         # nats-py applies ``max_reconnect_attempts`` to the *initial* connect as
         # well, so -1 (retry forever once we are up, which is what we want for a

@@ -10,7 +10,7 @@ directly. Its protocol is simulator-specific, not Tiingo's wire format; the
 provider boundary is what makes both feeds drive the same pipeline.
 
 Keep `QTE_ENV=dev`, `QTE_STATE__MODE=dev` and
-`QTE_BROKER__SHADOW_MODE=true` throughout. The server and
+`ALGO_BROKER__SHADOW_MODE=true` throughout. The server and
 provider refuse to run outside dev. Shadow signals are built, risk-sized,
 audited and mirrored on `QTE.dev.dev.simulator.signal.emitted`, but never delivered to the broker.
 
@@ -63,18 +63,20 @@ QTE_NATS_PORT=4222
 QTE_NATS_MONITOR_PORT=8222
 QTE_SIMULATOR_PORT=8901
 
-# ── QTE's own event bus ───────────────────────────────────────────────
-QTE_NATS__URL=nats://127.0.0.1:4222
-QTE_NATS__TOKEN=
+# ── QTE's NATS, on the Tailscale tailnet ──────────────────────────────
+# Same address on the host and in a container; the token is required, because
+# the port is reachable from every device on the tailnet.
+QTE_NATS__URL=nats://quanghuynhpc:4222
+QTE_NATS__TOKEN=<the token config/nats.conf is started with>
 QTE_NATS__SUBJECT_PREFIX=QTE
 
 # ── Broker delivery: built and audited, never sent ────────────────────
-QTE_BROKER__TRANSPORT=nats
-QTE_BROKER__NATS_URL=
-QTE_BROKER__NATS_TOKEN=
-QTE_BROKER__HTTP_URL=http://127.0.0.1:8080
-QTE_BROKER__TOKEN=
-QTE_BROKER__SHADOW_MODE=true
+ALGO_BROKER__TRANSPORT=nats
+ALGO_BROKER__NATS_URL=
+ALGO_BROKER__NATS_TOKEN=
+ALGO_BROKER__HTTP_URL=http://127.0.0.1:8080
+ALGO_BROKER__TOKEN=
+ALGO_BROKER__SHADOW_MODE=true
 
 # ── Hot state ─────────────────────────────────────────────────────────
 QTE_REDIS__URL=redis://127.0.0.1:6379/0

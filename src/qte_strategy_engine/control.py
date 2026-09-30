@@ -61,7 +61,7 @@ async def _set_shadow_mode(enabled: bool) -> None:
             "Paper state cannot send broker orders; select QTE_STATE__MODE=live and restart"
         )
     if not enabled and settings.broker.force_shadow_mode:
-        raise SystemExit("QTE_BROKER__FORCE_SHADOW_MODE forbids disabling shadow mode")
+        raise SystemExit("ALGO_BROKER__FORCE_SHADOW_MODE forbids disabling shadow mode")
     state = RedisState()
     try:
         await state.connect()
@@ -130,10 +130,10 @@ async def _show_shadow_mode() -> None:
     if state_scope.is_paper:
         print("Shadow mode is ON (paper), enforced by QTE_STATE__MODE.")
     elif settings.broker.force_shadow_mode:
-        print("Live delivery is PAUSED, forced by QTE_BROKER__FORCE_SHADOW_MODE.")
+        print("Live delivery is PAUSED, forced by ALGO_BROKER__FORCE_SHADOW_MODE.")
     elif stored is None:
         print(
-            f"No stored flag; runners fall back to QTE_BROKER__SHADOW_MODE="
+            f"No stored flag; runners fall back to ALGO_BROKER__SHADOW_MODE="
             f"{settings.broker.shadow_mode}."
         )
     else:

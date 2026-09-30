@@ -57,7 +57,8 @@ async def test_partial_ingestion_startup_closes_resources_already_acquired():
     events: list[str] = []
     service = object.__new__(IngestionService)
     service._scope = settings.state_scope
-    service._origin = service._scope.origin()
+    service._origins = {service._scope.provider: service._scope.origin()}
+    service._symbol_providers = {}
     service.bus = LifecycleResource("bus", events)
     service.state = LifecycleResource("state", events, fail_connect=True)
     service._feeds = []
@@ -130,7 +131,9 @@ async def test_a_raising_handler_does_not_stop_the_tiingo_feed():
 async def test_a_failed_publish_costs_one_cycle_not_the_flush_loop(monkeypatch):
     service = object.__new__(IngestionService)
     service._scope = settings.state_scope
-    service._origin = service._scope.origin()  # no Redis, NATS or provider
+    # No Redis, NATS or provider.
+    service._origins = {service._scope.provider: service._scope.origin()}
+    service._symbol_providers = {}
     service._stopping = asyncio.Event()
     service._resamplers = {"XAUUSD": Resampler("XAUUSD", ["M1"])}
 
@@ -213,7 +216,8 @@ class YieldingCandleBus(FlakyCandleBus):
 async def test_a_failed_candle_publish_remains_in_the_durable_outbox():
     service = object.__new__(IngestionService)
     service._scope = settings.state_scope
-    service._origin = service._scope.origin()
+    service._origins = {service._scope.provider: service._scope.origin()}
+    service._symbol_providers = {}
     service.state = CandleOutbox()
     service.bus = FlakyCandleBus()
     service._resamplers = {}
@@ -222,7 +226,9 @@ async def test_a_failed_candle_publish_remains_in_the_durable_outbox():
     service.subjects = type("Subjects", (), {"candle_closed": subject})()
     candle = Resampler("XAUUSD", ["M1"])
     candle.add_tick(Tick(symbol="XAUUSD", ts=MOMENT, last=2400.0))
-    closed = stamp_market_data(candle.flush(MOMENT + timedelta(minutes=1))[0], service._origin)
+    closed = stamp_market_data(
+        candle.flush(MOMENT + timedelta(minutes=1))[0], service._scope.origin()
+    )
 
     with pytest.raises(ConnectionError, match="unavailable"):
         await service._emit_candle(closed)
@@ -244,7 +250,8 @@ async def test_a_failed_candle_publish_remains_in_the_durable_outbox():
 async def test_concurrent_feeds_cannot_ack_a_candle_another_feed_has_not_published():
     service = object.__new__(IngestionService)
     service._scope = settings.state_scope
-    service._origin = service._scope.origin()
+    service._origins = {service._scope.provider: service._scope.origin()}
+    service._symbol_providers = {}
     service.state = CandleOutbox()
     service.bus = YieldingCandleBus()
     subject = staticmethod(lambda symbol, timeframe: f"{symbol}.{timeframe}")
@@ -255,8 +262,12 @@ async def test_concurrent_feeds_cannot_ack_a_candle_another_feed_has_not_publish
     second.add_tick(Tick(symbol="BTCUSDT", ts=MOMENT, last=60000.0))
     service.state.pending.extend(
         [
-            stamp_market_data(first.flush(MOMENT + timedelta(minutes=1))[0], service._origin),
-            stamp_market_data(second.flush(MOMENT + timedelta(minutes=1))[0], service._origin),
+            stamp_market_data(
+                first.flush(MOMENT + timedelta(minutes=1))[0], service._scope.origin()
+            ),
+            stamp_market_data(
+                second.flush(MOMENT + timedelta(minutes=1))[0], service._scope.origin()
+            ),
         ]
     )
 
@@ -286,7 +297,8 @@ class RecordingRepairer:
 async def test_a_partial_bar_is_repaired_after_whole_bars_have_gone_out():
     service = object.__new__(IngestionService)
     service._scope = settings.state_scope
-    service._origin = service._scope.origin()
+    service._origins = {service._scope.provider: service._scope.origin()}
+    service._symbol_providers = {}
     service.state = CandleOutbox()
     service.bus = YieldingCandleBus()
     subject = staticmethod(lambda symbol, timeframe: f"{symbol}.{timeframe}")
@@ -327,7 +339,8 @@ class FlakyStaging(CandleOutbox):
 def staging_service(failure_index):
     service = object.__new__(IngestionService)
     service._scope = settings.state_scope
-    service._origin = service._scope.origin()
+    service._origins = {service._scope.provider: service._scope.origin()}
+    service._symbol_providers = {}
     service.state = FlakyStaging(failure_index)
     service.bus = YieldingCandleBus()
     service._resamplers = {"XAUUSD": Resampler("XAUUSD", ["M1", "M5", "M15"])}
@@ -350,7 +363,7 @@ async def test_a_failed_stage_retains_every_unwritten_bar_in_the_batch(failure_i
     assert len(service._retired_candles) == 4 - failure_index
     await service._emit_candles([])
     assert service.state.staged == [
-        stamp_market_data(candle, service._origin) for candle in retired
+        stamp_market_data(candle, service._scope.origin()) for candle in retired
     ]
     assert service._retired_candles == {}
     assert len(service.bus.published) == 3
@@ -411,7 +424,7 @@ async def test_staging_backlog_prevents_unbounded_retirement_on_new_ticks():
     service.state.available = True
     await service._emit_candles([])
     assert service.state.staged == [
-        stamp_market_data(candle, service._origin) for candle in retired
+        stamp_market_data(candle, service._scope.origin()) for candle in retired
     ]
 
 

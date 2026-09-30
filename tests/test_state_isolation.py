@@ -195,7 +195,8 @@ async def test_ingestion_attributes_ticks_before_persistence_and_publication(mon
     monkeypatch.setattr(ingestion_settings, "publish_ticks", True)
     service = object.__new__(IngestionService)
     service._scope = settings.state_scope
-    service._origin = service._scope.origin()
+    service._origins = {service._scope.provider: service._scope.origin()}
+    service._symbol_providers = {}
     service._resamplers = {}
     service.state = SimpleNamespace(set_last_tick=AsyncMock())
     service.bus = SimpleNamespace(publish=AsyncMock())
@@ -203,8 +204,9 @@ async def test_ingestion_attributes_ticks_before_persistence_and_publication(mon
     tick = Tick(symbol="XAUUSD", ts=datetime.now(UTC), last=2000)
     await service._handle_tick_serialized(tick)
     assert tick.origin is None
-    assert service.state.set_last_tick.call_args.args[0].origin == service._origin
-    assert service.bus.publish.call_args.args[1]["tick"]["origin"] == service._origin.model_dump()
+    assert service.state.set_last_tick.call_args.args[0].origin == service._scope.origin()
+    published_tick = service.bus.publish.call_args.args[1]["tick"]
+    assert published_tick["origin"] == service._scope.origin().model_dump()
     with pytest.raises(ValueError, match="another"):
         await service._handle_tick_serialized(
             stamp_market_data(tick, StateScope("dev", "dev", "simulator").origin())

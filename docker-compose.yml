@@ -3,24 +3,36 @@
 # The db-migrate one-shot applies the Alembic chain before the app services
 # start. No separate schema command or database init-hook is needed.
 #
-# `nats` here is for standalone development. In production you normally point
-# QTE_BROKER__NATS_URL at the *broker's* NATS, because that is where the
-# JetStream `SIGNALS` stream its workers consume actually lives — publishing to
-# a second cluster would mean nobody ever receives the signals. Run this one
-# either way for QTE's own candle traffic, or set QTE_NATS__URL to the broker's
-# cluster and drop this service.
+# `nats` here serves QTE's own candle traffic. Host processes, the broker and
+# the MT5 ingester reach it over the Tailscale tailnet, through the port
+# published on the tailnet IP (QTE_NATS_PORT); QTE_NATS__URL in .env is that
+# address. The containers use the compose service name instead, since they
+# cannot resolve tailnet names. Same server, same token, two routes.
+#
+# In production you normally point ALGO_BROKER__NATS_URL at the *broker's* NATS,
+# because that is where the JetStream `SIGNALS` stream its workers consume
+# actually lives — publishing to a second cluster would mean nobody ever
+# receives the signals. Run this one either way, or set QTE_NATS__URL to the
+# broker's cluster and drop this service.
 
-name: qte-${QTE_ENV:-dev}-${QTE_STATE__MODE:-shadow}-${QTE_MARKET_DATA__PROVIDER:-tiingo}
+name: qte-${QTE_ENV:-dev}-${QTE_STATE__MODE:-shadow}-${QTE_STATE__PROVIDER_KEY:-${QTE_MARKET_DATA__PROVIDER:-mt5}}
 
 # Container-side network URLs. .env carries the host-side ones (127.0.0.1) so
 # alembic / qte-simulator / qte-backtest on the host work out of the box;
 # these overrides swap them for the compose service names once the process is
 # inside the network. `environment:` wins over `env_file:` in compose, so the
-# same .env drives both worlds.
+# same .env drives both worlds. NATS follows the same rule: .env carries the
+# tailnet address (what the host, the broker and the ingester dial), and the
+# containers use the `nats` service, because a container's DNS cannot resolve a
+# Tailscale name. Both reach the one server; the tailnet reaches it through the
+# port published from QTE_NATS_PORT.
 x-container-envs: &container-envs
   QTE_ENV: ${QTE_ENV:-dev}
   QTE_STATE__MODE: ${QTE_STATE__MODE:-shadow}
-  QTE_MARKET_DATA__PROVIDER: ${QTE_MARKET_DATA__PROVIDER:-tiingo}
+  QTE_MARKET_DATA__PROVIDER: ${QTE_MARKET_DATA__PROVIDER:-mt5}
+  # Checked against the provider list at start-up: the volumes this stack
+  # mounts are named with it, so a stale key would mount another set's state.
+  QTE_STATE__PROVIDER_KEY: ${QTE_STATE__PROVIDER_KEY:-}
   QTE_NATS__URL: nats://nats:4222
   QTE_REDIS__URL: redis://redis-cache:6379/0
   # Empty DSN selects URL-encoded components shared with postgres-audit.
@@ -33,10 +45,19 @@ x-container-envs: &container-envs
   QTE_POSTGRES__PASSWORD: ${POSTGRES_PASSWORD:-qte}
   QTE_POSTGRES__DATABASE: ${POSTGRES_DB:-qte_audit}
   QTE_SIMULATOR__URL: ws://market-simulator:8901/stream
+  # The broker's NATS is a separate stack published on the Docker host, and .env
+  # carries the host-side 127.0.0.1 address, which inside a container is the
+  # container itself. Reach the host through host.docker.internal instead; set
+  # ALGO_CONTAINER_BROKER_NATS_URL to override (e.g. nats://nats:4222 when the
+  # broker is this stack's own NATS).
+  ALGO_BROKER__NATS_URL: ${ALGO_CONTAINER_BROKER_NATS_URL:-nats://host.docker.internal:2701}
 
 x-app: &app
   env_file: [.env]
   environment: *container-envs
+  # host-gateway makes host.docker.internal resolve on Linux VPS hosts too;
+  # Docker Desktop already provides it.
+  extra_hosts: ["host.docker.internal:host-gateway"]
   restart: unless-stopped
   volumes:
     # The private strategy repo, mounted read-only: the engine loads it and
@@ -93,6 +114,11 @@ services:
     image: nats:2-alpine
     restart: unless-stopped
     command: ["-c", "/etc/nats/nats.conf"]
+    # nats.conf reads the token from the environment, so the server and every
+    # client authenticate with the same .env value. `:?` fails the whole stack
+    # here rather than starting a bus nothing is allowed to publish to.
+    environment:
+      QTE_NATS__TOKEN: ${QTE_NATS__TOKEN:?QTE_NATS__TOKEN is required — NATS refuses anonymous access}
     volumes:
       - ./config/nats.conf:/etc/nats/nats.conf:ro
       - nats-data:/data
@@ -109,6 +135,11 @@ services:
   db-migrate:
     env_file: [.env]
     environment: *container-envs
+    # env.py imports qte_shared.config, which validates QTE_ENGINE__* against
+    # the market-data plan. Without the plan the defaults are M15 only, and
+    # QTE_ENGINE__SIGNAL_TIMEFRAME=M1 is rejected before Alembic runs.
+    volumes:
+      - ./config:/app/config:ro
     build:
       context: .
       dockerfile: Dockerfile
@@ -126,7 +157,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      # The vendor client and the dev simulator's socket, nothing else. No
+      # The Tiingo client and the dev simulator's socket, nothing else. The MT5
+      # and Binance providers need no extra (nats-py is a core dependency). No
       # pyarrow: the boot-time warm-up cache degrades to "no cache" without it.
       args: {QTE_EXTRAS: "tiingo simulator"}
     command: ["qte-ingestion"]
@@ -201,8 +233,8 @@ services:
 
 volumes:
   redis-data:
-    name: qte-${QTE_ENV:-dev}-${QTE_STATE__MODE:-shadow}-${QTE_MARKET_DATA__PROVIDER:-tiingo}-redis
+    name: qte-${QTE_ENV:-dev}-${QTE_STATE__MODE:-shadow}-${QTE_STATE__PROVIDER_KEY:-${QTE_MARKET_DATA__PROVIDER:-mt5}}-redis
   postgres-data:
-    name: qte-${QTE_ENV:-dev}-${QTE_STATE__MODE:-shadow}-${QTE_MARKET_DATA__PROVIDER:-tiingo}-postgres
+    name: qte-${QTE_ENV:-dev}-${QTE_STATE__MODE:-shadow}-${QTE_STATE__PROVIDER_KEY:-${QTE_MARKET_DATA__PROVIDER:-mt5}}-postgres
   nats-data:
-    name: qte-${QTE_ENV:-dev}-${QTE_STATE__MODE:-shadow}-${QTE_MARKET_DATA__PROVIDER:-tiingo}-nats
+    name: qte-${QTE_ENV:-dev}-${QTE_STATE__MODE:-shadow}-${QTE_STATE__PROVIDER_KEY:-${QTE_MARKET_DATA__PROVIDER:-mt5}}-nats

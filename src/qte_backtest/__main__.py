@@ -12,8 +12,11 @@ from pathlib import Path
 from qte_backtest.downloader import DownloadRequest, HistoryDownloader
 from qte_backtest.runner import BacktestRequest, run_backtest
 from qte_backtest.visualize import render_html
-from qte_shared.config import market_data_plan, settings
+from qte_shared.config import market_data_plan, provider_market_data_plan, settings
+from qte_shared.interfaces.market_data import Capability
 from qte_shared.logging_setup import configure_logging, get_logger
+from qte_shared.market_data_plan import SymbolFeed
+from qte_shared.providers import create_provider
 
 log = get_logger(__name__)
 
@@ -42,6 +45,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["fx", "crypto"],
         default=None,
         help="Required for --symbol targets that are not in the market-data plan",
+    )
+    download.add_argument(
+        "--provider",
+        default=None,
+        help="Whose history to fetch; required when QTE_MARKET_DATA__PROVIDER lists several",
     )
     download.add_argument(
         "--replace",
@@ -151,7 +159,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 async def _download(args: argparse.Namespace) -> None:
-    downloader = HistoryDownloader()
+    provider = create_provider(_download_provider(args), capability=Capability.HISTORY)
+    downloader = HistoryDownloader(provider=provider)
     for symbol, timeframe, market in _download_targets(args):
         await downloader.download(
             DownloadRequest(
@@ -165,6 +174,35 @@ async def _download(args: argparse.Namespace) -> None:
         )
 
 
+def _download_provider(args: argparse.Namespace) -> str:
+    """``--provider``, or the only configured provider when it is omitted."""
+    requested = (getattr(args, "provider", None) or "").strip().lower()
+    if requested:
+        return requested
+    providers = settings.market_data.providers
+    if len(providers) > 1:
+        raise SystemExit(
+            f"qte-backtest download: QTE_MARKET_DATA__PROVIDER lists {len(providers)} "
+            f"providers ({', '.join(providers)}); pass --provider to pick one"
+        )
+    return providers[0]
+
+
+def _planned_feeds(plan, provider_name: str, *, configured: bool) -> list[SymbolFeed]:
+    """The plan's subscriptions that *provider_name* feeds.
+
+    A configured provider's are resolved like ingestion's, overrides included,
+    and filtered to its own symbols. A provider named on the command line but
+    not configured has only its own plan file, taken as written.
+    """
+    if not configured:
+        return list(plan.feeds)
+    subscriptions = settings.engine.resolve_subscriptions(
+        plan, settings.market_stream.market_overrides
+    )
+    return [feed for feed in subscriptions if feed.provider in ("", provider_name)]
+
+
 def _download_targets(args: argparse.Namespace) -> list[tuple[str, str, str]]:
     """Which (symbol, timeframe, market) triples to fetch.
 
@@ -175,16 +213,17 @@ def _download_targets(args: argparse.Namespace) -> list[tuple[str, str, str]]:
     because then the operator has said exactly what they want.
 
     The plan carries each symbol's market; a target off the plan has none, so
-    ``--market`` is required rather than guessed.
+    ``--market`` is required rather than guessed. With several providers the
+    plan is the downloading provider's own: another vendor's symbols are not
+    this one's to fetch.
     """
-    plan = market_data_plan()
+    provider_name = _download_provider(args)
+    configured = provider_name in settings.market_data.providers
+    plan = market_data_plan() if configured else provider_market_data_plan(provider_name)
     if not args.symbol and not args.timeframe and plan:
-        subscriptions = settings.engine.resolve_subscriptions(
-            plan, settings.market_stream.market_overrides
-        )
         return [
             (feed.symbol, timeframe, args.market or feed.market)
-            for feed in subscriptions
+            for feed in _planned_feeds(plan, provider_name, configured=configured)
             for timeframe in feed.timeframes
         ]
     if args.market is None:

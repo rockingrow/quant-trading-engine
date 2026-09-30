@@ -155,7 +155,7 @@ def test_ingestion_subscribes_to_the_plan_when_there_is_one(monkeypatch, tmp_pat
     )
     monkeypatch.setattr(service, "market_data_plan", lambda: plan)
     assert service.resolve_subscriptions() == [
-        SymbolFeed(symbol="EURUSD", market="fx", timeframes=("M5",))
+        SymbolFeed(symbol="EURUSD", market="fx", timeframes=("M5",), provider="tiingo")
     ]
 
     # And falls back to the environment when no plan is on disk, which is what
@@ -167,5 +167,5 @@ def test_ingestion_subscribes_to_the_plan_when_there_is_one(monkeypatch, tmp_pat
     monkeypatch.setattr(service.settings.engine, "timeframes", ["M15"])
     monkeypatch.setattr(service.ingestion_settings, "market_overrides", {"XAUUSD": "fx"})
     assert service.resolve_subscriptions() == [
-        SymbolFeed(symbol="XAUUSD", market="fx", timeframes=("M15",))
+        SymbolFeed(symbol="XAUUSD", market="fx", timeframes=("M15",), provider="tiingo")
     ]

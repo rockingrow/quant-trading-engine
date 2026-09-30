@@ -14,6 +14,8 @@ key is not among them -- it is inherited from
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 from pydantic_settings import SettingsConfigDict
 
 from qte_shared.interfaces.market_data import ProviderSettings
@@ -23,6 +25,7 @@ class TiingoSettings(ProviderSettings):
     """Endpoints and credentials -- REST for history, WebSocket for live."""
 
     model_config = SettingsConfigDict(env_prefix="QTE_TIINGO__", extra="ignore")
+    provider_name: ClassVar[str] = "tiingo"
 
     rest_url: str = "https://api.tiingo.com"
     fx_ws_url: str = "wss://api.tiingo.com/fx"

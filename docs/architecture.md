@@ -504,8 +504,8 @@ NATS and no service is needed to carry it.
 
 The runner reads the durable Redis flag before recovery and again before each
 delivery, including when a broadcast was lost. A delayed message cannot
-overwrite a newer flag. Missing state uses `QTE_BROKER__SHADOW_MODE`; malformed
-or unreadable state fails closed. `QTE_BROKER__FORCE_SHADOW_MODE=true` overrides
+overwrite a newer flag. Missing state uses `ALGO_BROKER__SHADOW_MODE`; malformed
+or unreadable state fails closed. `ALGO_BROKER__FORCE_SHADOW_MODE=true` overrides
 both the persisted flag and runtime controls and never permits live delivery.
 
 Relatedly, `NatsBus.connect` bounds the *initial* connect even though reconnects
@@ -640,7 +640,9 @@ Three consequences are worth naming:
 * **The engines never import a vendor.** They call `create_provider()`, which
   resolves `QTE_MARKET_DATA__PROVIDER` through a registry. Adding a vendor is a
   file under `qte_shared/providers/` and a `register_provider` call; swapping one
-  is an environment variable.
+  is an environment variable. That variable is a comma-separated list, so
+  ingestion can run several vendors at once (`mt5,binance`): each feeds the
+  symbols of its own plan and stamps them with its own `origin.provider`.
 * **The vendor's configuration lives with the vendor.** Root `Settings` carries
   the *choice* (`market_data.provider`) and no vendor block, so a second vendor
   never edits the core config. `QTE_TIINGO__*` is read by

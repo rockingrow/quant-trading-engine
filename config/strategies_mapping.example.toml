@@ -85,3 +85,27 @@ risk_percent = 0.75
 [symbols.EURUSD]
 enabled = false
 strategies = ["EXAMPLE_FX_M15_V1"]
+
+
+# Testing the broker hand-off, not trading: SIGNAL_SIMULATOR_LIFECYCLE_V1 from
+# __strategies__/qte-signal-simulator opens on every closed bar and walks each
+# cycle to TP1 → TP2, SL, or TP1 → R_SL at random. It names no symbol and no
+# timeframe of its own — list it under the symbol you want, and give it the bar
+# in `timeframe`, which must be one ingestion produces for that symbol.
+# Demo accounts only.
+#
+# [symbols.XAUUSD]
+# strategies = ["SIGNAL_SIMULATOR_LIFECYCLE_V1"]
+#
+# [symbols.XAUUSD.params.SIGNAL_SIMULATOR_LIFECYCLE_V1]
+# timeframe = "M1"
+# use_weekend_flat = false
+# # One cycle per pair re-enters on the bar after each exit; three or more
+# # lets it enter on every bar while earlier cycles are still being walked.
+# allow_multiple_cycles = true
+# max_open_cycles = 3
+# # TP1 must leave something for TP2 / R_SL to close.
+# tp1_qty_percent = 50
+# # outcome = "sl"          # force one path: tp1_tp2 | sl | tp1_rsl
+# # weights = [1, 1, 1]     # draw weights, in that order
+# # seed = 0                # a different seed, a different sequence

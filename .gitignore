@@ -246,10 +246,14 @@ __marimo__/
 
 # The market-data plan: which symbols are actually subscribed, at what size of
 # window. Same rule as the routing table — the template is tracked, the real
-# file is not. `make tiingo` and `make simulator` write them.
+# file is not. `make tiingo`, `make mt5` and `make simulator` write them.
 /config/tiingo.toml
+/config/mt5.toml
+/config/binance.toml
 /config/simulator.toml
 !/config/tiingo.example.toml
+!/config/mt5.example.toml
+!/config/binance.example.toml
 !/config/simulator.example.toml
 !/config/simulator.example.toml
 

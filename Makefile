@@ -19,6 +19,15 @@ export PATH := $(dir $(WINDOWS_BASH))../usr/bin;$(PATH)
 endif
 endif
 
+# QTE_MARKET_DATA__PROVIDER may list several providers (`mt5,binance`), and a
+# comma is not valid in a compose project or volume name. Compose names them
+# with this key instead: the providers lowercased, sorted and joined by `-`,
+# exactly as `MarketDataSettings.provider_key` computes it, which checks the two
+# agree. A shell export of the provider wins over .env, as it does for compose.
+MARKET_DATA_PROVIDERS := $(or $(QTE_MARKET_DATA__PROVIDER),$(shell sed -n 's/^QTE_MARKET_DATA__PROVIDER=//p' .env 2>/dev/null | tail -n1 | tr -d "\"'\r "))
+QTE_STATE__PROVIDER_KEY := $(shell printf '%s' '$(MARKET_DATA_PROVIDERS)' | tr ',' '\n' | tr -d ' ' | tr 'A-Z' 'a-z' | sed '/^$$/d' | sort -u | paste -sd- -)
+export QTE_STATE__PROVIDER_KEY
+
 help: ## Show this help, grouped by section
 	@awk 'BEGIN {FS = ":.*?## "} \
 		/^##@ / {printf "\n\033[1m%s\033[0m\n", substr($$0, 5); next} \
@@ -183,7 +192,8 @@ strategies: ## List what the mounted strategy repo publishes
 # the vendor's own knobs — lives in config/<provider>.toml, not in .env: it is a
 # per-symbol matrix and the flat form could not express one. The real file is
 # git-ignored like the mapping table; the template beside it is tracked.
-# The key is the exception and stays in .env as QTE_DATA_PROVIDER_API_KEY.
+# The key is the exception and stays in .env as QTE_DATA_PROVIDER_API_KEY
+# (for mt5, the NATS token as QTE_MT5__NATS_TOKEN, blank = QTE_NATS__TOKEN).
 
 tiingo: ## Copy the Tiingo market-data plan into place (never overwrites)
 	@if [ -f config/tiingo.toml ]; then \
@@ -191,6 +201,22 @@ tiingo: ## Copy the Tiingo market-data plan into place (never overwrites)
 	else \
 		sed -e '/^[ \t]*#/d' config/tiingo.example.toml | cat -s | sed -e '/./,$$!d' > config/tiingo.toml; \
 		echo "Wrote config/tiingo.toml (git-ignored, comments stripped) - list the symbols you want fed in it"; \
+	fi
+
+mt5: ## Copy the MT5 (algo-trading-ingester) market-data plan into place (never overwrites)
+	@if [ -f config/mt5.toml ]; then \
+		echo "config/mt5.toml exists - leaving it alone"; \
+	else \
+		sed -e '/^[ \t]*#/d' config/mt5.example.toml | cat -s | sed -e '/./,$$!d' > config/mt5.toml; \
+		echo "Wrote config/mt5.toml (git-ignored, comments stripped) - list the symbols the ingester publishes"; \
+	fi
+
+binance: ## Copy the Binance market-data plan into place - placeholder provider, not implemented yet
+	@if [ -f config/binance.toml ]; then \
+		echo "config/binance.toml exists - leaving it alone"; \
+	else \
+		sed -e '/^[ \t]*#/d' config/binance.example.toml | cat -s | sed -e '/./,$$!d' > config/binance.toml; \
+		echo "Wrote config/binance.toml (git-ignored, comments stripped) - the binance provider is not implemented yet"; \
 	fi
 
 simulator: ## Copy the simulator market-data plan into place (never overwrites)
@@ -206,23 +232,26 @@ simulator: ## Copy the simulator market-data plan into place (never overwrites)
 # nobody asked for, which on a live vendor is the wrong kind of surprise. The
 # simulator answers the same "what to feed" question and is held to it too — it
 # has no key, but it still needs a plan (`make simulator`).
-market-plan: ## Fail unless the configured provider has its plan file
-	@provider=$$(sed -n 's/^QTE_MARKET_DATA__PROVIDER=//p' .env 2>/dev/null | tail -n1 | tr -d '"' | tr -d "\r' "); \
-	plan=$$(sed -n 's/^QTE_MARKET_DATA__CONFIG_FILE=//p' .env 2>/dev/null | tail -n1 | tr -d '"' | tr -d "\r' "); \
-	[ -n "$$provider" ] || provider=tiingo; \
-	[ -n "$$plan" ] || plan="config/$$provider.toml"; \
-	if [ ! -f "$$plan" ]; then \
-		echo "QTE_MARKET_DATA__PROVIDER=$$provider, but $$plan does not exist." >&2; \
-		echo "Without it the engine falls back to the QTE_ENGINE__* defaults and" >&2; \
-		echo "subscribes to symbols nobody chose." >&2; \
-		if [ -f "config/$$provider.example.toml" ]; then \
-			echo "Write one:  make $$provider" >&2; \
-		else \
-			echo "There is no config/$$provider.example.toml to copy - write $$plan by hand." >&2; \
+market-plan: ## Fail unless every configured provider has its plan file
+	@providers="$(MARKET_DATA_PROVIDERS)"; \
+	override=$$(sed -n 's/^QTE_MARKET_DATA__CONFIG_FILE=//p' .env 2>/dev/null | tail -n1 | tr -d '"' | tr -d "\r' "); \
+	[ -n "$$providers" ] || providers=tiingo; \
+	for provider in $$(printf '%s' "$$providers" | tr ',' ' ' | tr 'A-Z' 'a-z'); do \
+		plan="$$override"; \
+		[ -n "$$plan" ] || plan="config/$$provider.toml"; \
+		if [ ! -f "$$plan" ]; then \
+			echo "QTE_MARKET_DATA__PROVIDER=$$providers, but $$plan does not exist." >&2; \
+			echo "Without it the engine falls back to the QTE_ENGINE__* defaults and" >&2; \
+			echo "subscribes to symbols nobody chose." >&2; \
+			if [ -f "config/$$provider.example.toml" ]; then \
+				echo "Write one:  make $$provider" >&2; \
+			else \
+				echo "There is no config/$$provider.example.toml to copy - write $$plan by hand." >&2; \
+			fi; \
+			exit 1; \
 		fi; \
-		exit 1; \
-	fi; \
-	echo "Market-data plan: $$plan"
+		echo "Market-data plan ($$provider): $$plan"; \
+	done
 
 ##@ Stack
 
@@ -275,6 +304,9 @@ dev-restart: ## Reload ingestion and runner code, preserving the simulator clock
 #   make logs SERVICE=data-ingestion   (or strategy-runner, market-simulator)
 logs: ## Tail every service, or one: make logs SERVICE=strategy-runner
 	docker compose logs -f --tail=100 $(SERVICE)
+
+logging: ## Stream the whole stack's logs live, newest lines only (SERVICE= narrows it)
+	docker compose logs -f --tail=0 --timestamps $(SERVICE)
 
 nuke: ## Stop the stack and DELETE its volumes (audit trail included)
 	docker compose down -v
@@ -409,8 +441,8 @@ shadow-off: ## Resume delivery to the broker (GOES LIVE — prompts to confirm)
 ping: ## Ask the running runners to identify themselves
 	uv run qte-control ping
 
-.PHONY: help install install-dev lock test lint format check tiingo simulator market-plan \
-	build build-prod up start stop down restart dev dev-restart logs nuke \
+.PHONY: help install install-dev lock test lint format check tiingo mt5 binance simulator market-plan \
+	build build-prod up start stop down restart dev dev-restart logs logging logging-broker nuke \
 	strategy-mount strategy-audit strategy-requirements strategy-test strategies audit audit-strict strategy-mapping \
 	db-upgrade db-downgrade db-revision db-current db-history db-check \
 	download backtest chart reports csv-import \
