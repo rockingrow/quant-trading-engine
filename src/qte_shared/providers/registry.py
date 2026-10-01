@@ -5,7 +5,9 @@ provider", or for one by name, and get back a :class:`MarketDataProvider`.
 That indirection buys three things:
 
 * **Swapping a vendor is configuration.** ``QTE_MARKET_DATA__PROVIDER=tiingo``
-  today, something else tomorrow, with no code edit anywhere in an engine.
+  today, something else tomorrow, with no code edit anywhere in an engine. A
+  comma-separated list (``mt5,binance``) runs several at once, each feeding
+  the symbols of its own plan.
 * **Running two at once is possible.** Ingestion can take its live feed from
   one vendor while the backtest downloader pulls history from another, because
   each asks for the provider it wants by name.
@@ -26,6 +28,7 @@ from qte_shared.config import settings
 from qte_shared.interfaces.market_data import (
     Capability,
     MarketDataProvider,
+    ProviderError,
     UnknownProvider,
     UnsupportedCapability,
 )
@@ -37,6 +40,10 @@ log = get_logger(__name__)
 #: until something actually asks for that vendor.
 _BUILTINS: dict[str, str] = {
     "tiingo": "qte_shared.providers.tiingo.provider:TiingoProvider",
+    # Closed bars from algo-trading-ingester's MT5 gateway, read off NATS.
+    "mt5": "qte_shared.providers.mt5.provider:Mt5Provider",
+    # Placeholder: registered so it can be named, refuses to be constructed.
+    "binance": "qte_shared.providers.binance.provider:BinanceProvider",
     # A fixture, not a vendor: it serves whatever `qte-simulator` is told to
     # send, and refuses to be constructed outside QTE_ENV=dev.
     "simulator": "qte_shared.providers.simulator.provider:SimulatorProvider",
@@ -100,20 +107,39 @@ def get_provider_class(name: str) -> type[MarketDataProvider]:
 def create_provider(
     name: str | None = None,
     *,
-    capability: Capability | None = None,
+    capability: Capability | tuple[Capability, ...] | None = None,
     **kwargs,
 ) -> MarketDataProvider:
     """Build the named provider, or the configured one when *name* is omitted.
 
+    Omitting *name* is only possible with a single configured provider: with
+    several, which one the caller means is not something to guess.
+
     Pass *capability* to state what the caller needs it for: the mismatch then
     surfaces at startup with the vendor's name in the message, rather than as
-    an empty feed or a missing method once the engine is already running.
+    an empty feed or a missing method once the engine is already running. A
+    tuple means any one of them will do -- ingestion takes ticks or bars.
     """
-    resolved = name or settings.market_data.provider
+    resolved = name or _sole_configured_provider()
     provider = get_provider_class(resolved)(**kwargs)
-    if capability is not None and not provider.supports(capability):
+    if capability is None:
+        return provider
+    wanted = (capability,) if isinstance(capability, Capability) else capability
+    if not any(provider.supports(option) for option in wanted):
+        served = " or ".join(repr(option.value) for option in wanted)
         raise UnsupportedCapability(
-            f"Market data provider {provider.name!r} does not serve {capability.value!r}; "
-            f"set QTE_MARKET_DATA__PROVIDER to one that does"
+            f"Market data provider {provider.name!r} does not serve {served}; "
+            f"list one that does in QTE_MARKET_DATA__PROVIDER"
         )
     return provider
+
+
+def _sole_configured_provider() -> str:
+    """The configured provider, when there is exactly one."""
+    providers = settings.market_data.providers
+    if len(providers) > 1:
+        raise ProviderError(
+            f"QTE_MARKET_DATA__PROVIDER lists {len(providers)} providers "
+            f"({', '.join(providers)}); name the one to create"
+        )
+    return providers[0]

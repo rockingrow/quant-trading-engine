@@ -78,11 +78,11 @@ class RecordingState:
         self.outbox = []
 
 
-async def guard(candle_state, *, provider_name="tiingo", synthetic=False) -> bool:
+async def guard(candle_state, *, provider_key="tiingo", synthetic=False) -> bool:
     return await discard_foreign_candle_state(
         candle_state,
         SUBSCRIPTIONS,
-        provider_name=provider_name,
+        provider_key=provider_key,
         synthetic=synthetic,
         moment=MOMENT,
     )
@@ -165,7 +165,7 @@ async def test_a_synthetic_provider_keeps_its_own_forward_anchored_bars(monkeypa
         open_bar=candle_at(datetime(2026, 9, 13, 20, 0, tzinfo=UTC), closed=False),
     )
 
-    assert await guard(candle_state, provider_name="simulator", synthetic=True) is False
+    assert await guard(candle_state, provider_key="simulator", synthetic=True) is False
     assert candle_state.operations == ["set_provider:simulator"]
 
 

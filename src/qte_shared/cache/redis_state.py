@@ -20,7 +20,7 @@ import redis.asyncio as redis
 from qte_shared.config import settings
 from qte_shared.logging_setup import get_logger
 from qte_shared.models import Candle, OpenPosition, Tick
-from qte_shared.state_scope import stamp_market_data
+from qte_shared.state_scope import stamp_in_scope
 from qte_shared.timeframes import CLOCK_TOLERANCE
 
 log = get_logger(__name__)
@@ -113,7 +113,7 @@ class RedisState:
     # ── Ticks ─────────────────────────────────────────────────────────
 
     async def set_last_tick(self, tick: Tick) -> None:
-        tick = stamp_market_data(tick, self._scope.origin())
+        tick = stamp_in_scope(tick, self._scope)
         await self.client.set(self.key("tick", tick.symbol), tick.model_dump_json())
 
     async def get_last_tick(self, symbol: str) -> Tick | None:
@@ -140,7 +140,7 @@ class RedisState:
         Newest is pushed on the right and the list trimmed from the left, so
         :meth:`get_candles` can return oldest-first without reversing.
         """
-        candle = stamp_market_data(candle, self._scope.origin())
+        candle = stamp_in_scope(candle, self._scope)
         limit = max_len or settings.redis.candle_history
         key = self.key("candles", candle.symbol, candle.timeframe)
         pipe = self.client.pipeline()
@@ -159,7 +159,7 @@ class RedisState:
         queue append in one transaction also prevents a restart from seeing a
         candle in one representation but not the other.
         """
-        candle = stamp_market_data(candle, self._scope.origin())
+        candle = stamp_in_scope(candle, self._scope)
         await self.client.eval(
             STAGE_CLOSED_CANDLE,
             4,
@@ -207,7 +207,7 @@ class RedisState:
         if not candles:
             return 0
         limit = max_len or settings.redis.candle_history
-        retained = [stamp_market_data(candle, self._scope.origin()) for candle in candles[-limit:]]
+        retained = [stamp_in_scope(candle, self._scope) for candle in candles[-limit:]]
         key = self.key("candles", symbol, timeframe)
         pipe = self.client.pipeline()
         pipe.delete(key)
@@ -219,7 +219,7 @@ class RedisState:
 
     async def set_open_candle(self, candle: Candle) -> None:
         """Persist the bar currently being built so a restart mid-bar resumes it."""
-        candle = stamp_market_data(candle, self._scope.origin())
+        candle = stamp_in_scope(candle, self._scope)
         await self.client.set(
             self.key("open_candle", candle.symbol, candle.timeframe),
             candle.model_dump_json(),

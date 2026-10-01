@@ -4,10 +4,18 @@ The flow is one-way and never blocks on a consumer:
 
     Live feed → Resampler → Redis (state) + NATS (event)
 
-Which vendor sits at the left-hand end is configuration
-(``QTE_MARKET_DATA__PROVIDER``): this service asks
-:func:`~qte_shared.providers.create_provider` for feeds and only ever sees
-:class:`~qte_shared.interfaces.market_data.LiveFeed` objects emitting ticks.
+Which vendors sit at the left-hand end is configuration
+(``QTE_MARKET_DATA__PROVIDER``, one name or a comma-separated list): this
+service asks :func:`~qte_shared.providers.create_provider` for each one's feeds
+and only ever sees :class:`~qte_shared.interfaces.market_data.LiveFeed` objects
+emitting ticks. Each provider feeds the symbols of its own plan, stamps them
+with its own origin, and completes and backfills them from its own history.
+
+A vendor that closes its own bars — the MT5 ingester — emits candles instead
+(``Capability.LIVE_BARS``), and those skip the resampler: each bar goes through
+the same Redis outbox and candle subject as a resampled one, so the runner
+cannot tell the two apart. Whether a bar is new is still decided in Redis, whose
+stage drops a bucket it already holds, so a replay or a redelivery is harmless.
 
 Redis is written first and NATS second on purpose. The runner rebuilds its
 warm-up window from Redis when it starts, so a candle that reached the bus but
@@ -37,7 +45,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from qte_ingestion.backfill import HistoryBackfiller, open_history_source
-from qte_ingestion.repair import PartialBarRepairer
+from qte_ingestion.repair import PartialBarRepairer, RoutedBarRepairer
 from qte_ingestion.resampler import Resampler
 from qte_ingestion.settings import ingestion_settings
 from qte_ingestion.state_guard import discard_foreign_candle_state
@@ -48,6 +56,7 @@ from qte_shared.db import EventRepository
 from qte_shared.interfaces.market_data import (
     Capability,
     LiveFeed,
+    MarketDataProvider,
     ProviderError,
     UnsupportedCapability,
 )
@@ -55,7 +64,8 @@ from qte_shared.logging_setup import get_logger
 from qte_shared.market_data_plan import SymbolFeed
 from qte_shared.models import Candle, CandleClosedEvent, Tick, TickEvent
 from qte_shared.providers import create_provider
-from qte_shared.state_scope import stamp_market_data
+from qte_shared.state_scope import MarketDataOrigin, stamp_market_data
+from qte_shared.timeframes import CLOCK_TOLERANCE, bucket_close
 
 log = get_logger(__name__)
 
@@ -99,16 +109,30 @@ class IngestionService:
         self.state = RedisState()
         self.subjects = Subjects()
         self.events = EventRepository()
-        self.provider = create_provider(capability=Capability.LIVE)
         self._scope = settings.state_scope
-        self._origin = self._scope.origin(synthetic=self.provider.synthetic)
+        #: Every configured provider, by name, in the order configured.
+        self.providers: dict[str, MarketDataProvider] = {
+            provider_name: create_provider(
+                provider_name, capability=(Capability.LIVE, Capability.LIVE_BARS)
+            )
+            for provider_name in self._scope.providers
+        }
+        #: The provenance each provider stamps on what it feeds.
+        self._origins: dict[str, MarketDataOrigin] = {
+            provider_name: self._scope.origin(provider=provider_name, synthetic=provider.synthetic)
+            for provider_name, provider in self.providers.items()
+        }
+        #: Symbol to the provider that feeds it.
+        self._symbol_providers: dict[str, str] = {
+            feed.symbol: feed.provider for feed in self.subscriptions
+        }
         self._resamplers: dict[str, Resampler] = {
             feed.symbol: Resampler(feed.symbol, list(feed.timeframes))
             for feed in self.subscriptions
         }
         self._feeds: list[LiveFeed] = []
         #: Completes partial bars from vendor history; built in :meth:`start`.
-        self._repairer: PartialBarRepairer | None = None
+        self._repairer: RoutedBarRepairer | None = None
         self._flush_task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
         self._outbox_lock = asyncio.Lock()
@@ -128,8 +152,8 @@ class IngestionService:
             await discard_foreign_candle_state(
                 self.state,
                 self.subscriptions,
-                provider_name=self.provider.name,
-                synthetic=self.provider.synthetic,
+                provider_key=self._scope.provider,
+                synthetic=any(provider.synthetic for provider in self.providers.values()),
             )
             # Drain before accepting fresh ticks so a candle delayed by a restart
             # cannot arrive after a newer close for the same strategy window.
@@ -146,25 +170,34 @@ class IngestionService:
             )
             # Before the first live tick: a bar backfilled from the vendor must
             # not land behind one this process just resampled.
-            await HistoryBackfiller(self.state, self.subscriptions).run()
+            for provider_name in self.providers:
+                await HistoryBackfiller(
+                    self.state,
+                    self._subscriptions_of(provider_name),
+                    provider_name=provider_name,
+                ).run()
 
             # Whatever bucket is under way now was not listened to from its open.
             joined_at = datetime.now(UTC)
             for resampler in self._resamplers.values():
                 resampler.mark_joined(joined_at)
 
-            started = 0
-            for feed in self.provider.live_feeds(self.specs, self._handle_tick):
+            started = dict.fromkeys(self.providers, 0)
+            for provider_name, feed in self._open_feeds():
                 # Track before start: a provider may acquire a socket and then
                 # raise, and that half-started feed still needs its stop hook.
                 self._feeds.append(feed)
                 if feed.start() is not None:
-                    started += 1
+                    started[provider_name] += 1
 
-            if not started:
+            # Each provider on its own: one quiet vendor must not hide behind
+            # another that started, or its symbols would silently never trade.
+            silent = [provider_name for provider_name, count in started.items() if not count]
+            if silent:
+                planned_in = [str(plan_path) for plan_path in market_data_plan().sources]
                 raise RuntimeError(
-                    f"Provider {self.provider.name!r} started no feeds — check the symbols "
-                    f"in {market_data_plan().source or 'QTE_ENGINE__SYMBOLS'}"
+                    f"Provider {', '.join(map(repr, silent))} started no feeds — check the "
+                    f"symbols in {', '.join(planned_in) or 'QTE_ENGINE__SYMBOLS'}"
                 )
 
             self._flush_task = asyncio.create_task(self._flush_loop(), name="candle-flush")
@@ -172,14 +205,15 @@ class IngestionService:
                 service=SERVICE_NAME,
                 event="started",
                 payload={
-                    "provider": self.provider.name,
+                    "provider": self._scope.provider,
+                    "providers": list(self.providers),
                     "symbols": [spec.symbol for spec in self.specs],
                     "timeframes": self.timeframes,
                 },
             )
             log.info(
-                "Ingestion started provider=%s symbols=%s timeframes=%s",
-                self.provider.name,
+                "Ingestion started providers=%s symbols=%s timeframes=%s",
+                ",".join(self.providers),
                 [spec.symbol for spec in self.specs],
                 self.timeframes,
             )
@@ -187,17 +221,61 @@ class IngestionService:
             await self._close_resources(record_event=False)
             raise
 
-    def _build_repairer(self) -> PartialBarRepairer:
-        """A repairer over the provider's history, or one that publishes as built."""
-        markets = {symbol_feed.symbol: symbol_feed.market for symbol_feed in self.subscriptions}
-        try:
-            source = open_history_source()
-        except UnsupportedCapability:
-            source = None
-        except ProviderError as failure:
-            log.warning("Partial bars will be published as built: %s", failure)
-            source = None
-        return PartialBarRepairer(source, markets)
+    def _subscriptions_of(self, provider_name: str) -> list[SymbolFeed]:
+        """The subscriptions *provider_name* feeds."""
+        single_provider = len(self.providers) == 1
+        return [
+            feed
+            for feed in self.subscriptions
+            if self._symbol_providers.get(feed.symbol, "") == provider_name
+            or (single_provider and not self._symbol_providers.get(feed.symbol))
+        ]
+
+    def _origin_for(self, symbol: str) -> MarketDataOrigin:
+        """The origin stamped on *symbol*'s ticks and bars: its provider's."""
+        provider_name = self._symbol_providers.get(symbol)
+        if not provider_name and len(self._origins) == 1:
+            return next(iter(self._origins.values()))
+        if not provider_name:
+            raise ValueError(f"No configured provider feeds {symbol}")
+        return self._origins[provider_name]
+
+    def _open_feeds(self) -> list[tuple[str, LiveFeed]]:
+        """Each provider's feeds over its own symbols, tagged with its name.
+
+        Bar feeds for a provider that closes its own bars, tick feeds otherwise.
+        """
+        opened: list[tuple[str, LiveFeed]] = []
+        for provider_name, provider in self.providers.items():
+            subscriptions = self._subscriptions_of(provider_name)
+            if provider.supports(Capability.LIVE_BARS):
+                feeds = provider.bar_feeds(subscriptions, self._handle_closed_bar)
+            else:
+                specs = [symbol_feed.spec for symbol_feed in subscriptions]
+                feeds = provider.live_feeds(specs, self._handle_tick)
+            opened.extend((provider_name, feed) for feed in feeds)
+        return opened
+
+    def _build_repairer(self) -> RoutedBarRepairer:
+        """Per provider, a repairer over its history, or one that publishes as built."""
+        repairers_by_symbol: dict[str, PartialBarRepairer] = {}
+        for provider_name in self.providers:
+            markets = {
+                symbol_feed.symbol: symbol_feed.market
+                for symbol_feed in self._subscriptions_of(provider_name)
+            }
+            try:
+                source = open_history_source(provider_name)
+            except UnsupportedCapability:
+                source = None
+            except ProviderError as failure:
+                log.warning(
+                    "Partial bars from %r will be published as built: %s", provider_name, failure
+                )
+                source = None
+            repairer = PartialBarRepairer(source, markets)
+            repairers_by_symbol.update(dict.fromkeys(markets, repairer))
+        return RoutedBarRepairer(repairers_by_symbol)
 
     def request_stop(self) -> None:
         """Ask :meth:`run_forever` to unwind. Safe to call from a signal handler."""
@@ -276,13 +354,37 @@ class IngestionService:
                 await self._emit_candles([])
             await self._handle_tick_serialized(tick)
 
+    async def _handle_closed_bar(self, candle: Candle) -> None:
+        """Stage a bar the vendor already closed; no resampling, no repair.
+
+        A bar whose bucket has not ended yet cannot be a close. From a live
+        vendor it means the vendor's clock is off — for MT5, almost always
+        ``MT5_SERVER_TIMEZONE`` on the ingester — and staging it would put a
+        future-dated bar in Redis, which the next start discards as foreign.
+        """
+        closes_at = bucket_close(candle.open_time, candle.timeframe)
+        if closes_at > datetime.now(UTC) + CLOCK_TOLERANCE:
+            log.warning(
+                "Dropping %s %s bar open_time=%s: its bucket ends at %s, after now. "
+                "Check the vendor's clock (MT5_SERVER_TIMEZONE on the ingester).",
+                candle.symbol,
+                candle.timeframe,
+                candle.open_time.isoformat(),
+                closes_at.isoformat(),
+            )
+            return
+        async with self._processing_guard():
+            # Retained before any await inside, so a Redis failure leaves this
+            # bar with the flush loop to retry instead of losing it.
+            await self._emit_candles([candle])
+
     def _processing_guard(self) -> asyncio.Lock:
         if not hasattr(self, "_processing_lock"):
             self._processing_lock = asyncio.Lock()
         return self._processing_lock
 
     async def _handle_tick_serialized(self, tick: Tick) -> None:
-        tick = stamp_market_data(tick, self._origin)
+        tick = stamp_market_data(tick, self._origin_for(tick.symbol))
         await self.state.set_last_tick(tick)
         if ingestion_settings.publish_ticks:
             await self.bus.publish(
@@ -353,7 +455,7 @@ class IngestionService:
         # Retain the entire batch and its partial flags before the first await.
         # A failure on any item must leave that item and all later ones intact.
         for candle in candles:
-            candle = stamp_market_data(candle, self._origin)
+            candle = stamp_market_data(candle, self._origin_for(candle.symbol))
             resampler = self._resamplers.get(candle.symbol)
             marker = (candle.symbol, candle.timeframe, candle.open_time)
             if marker not in self._retired_candles:
@@ -373,7 +475,9 @@ class IngestionService:
                 retired.candle = await self._repairer.repair(
                     retired.candle, close_is_current=retired.close_is_current
                 )
-                retired.candle = stamp_market_data(retired.candle, self._origin)
+                retired.candle = stamp_market_data(
+                    retired.candle, self._origin_for(retired.candle.symbol)
+                )
             retired.partial = False
             await self.state.stage_closed_candle(retired.candle)
             del self._retired_candles[marker]

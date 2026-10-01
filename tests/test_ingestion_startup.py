@@ -13,6 +13,7 @@ import asyncio
 
 from qte_ingestion.service import IngestionService
 from qte_shared.config import settings
+from qte_shared.interfaces.market_data import Capability
 from qte_shared.market_data_plan import SymbolFeed
 
 
@@ -58,6 +59,9 @@ class JournalledProvider:
     def __init__(self, journal: list[str]) -> None:
         self.journal = journal
 
+    def supports(self, capability: Capability) -> bool:
+        return capability is Capability.LIVE
+
     def live_feeds(self, specs, on_tick) -> list[JournalledFeed]:
         return [JournalledFeed(self.journal)]
 
@@ -71,14 +75,15 @@ async def test_start_up_guards_restores_closes_backfills_then_listens(monkeypatc
     journal: list[str] = []
     service = object.__new__(IngestionService)
     service._scope = settings.state_scope
-    service._origin = service._scope.origin()
+    service._origins = {service._scope.provider: service._scope.origin()}
+    service._symbol_providers = {}
     service.subscriptions = [SymbolFeed(symbol="XAUUSD", market="fx", timeframes=("M15",))]
     service.specs = [symbol_feed.spec for symbol_feed in service.subscriptions]
     service.timeframes = ["M15"]
     service.bus = JournalledResource("bus", journal)
     service.state = JournalledResource("state", journal)
     service.events = SilentEvents()
-    service.provider = JournalledProvider(journal)
+    service.providers = {"tiingo": JournalledProvider(journal)}
     service._resamplers = {"XAUUSD": JournalledResampler(journal)}
     service._feeds = []
     service._repairer = None
@@ -104,7 +109,7 @@ async def test_start_up_guards_restores_closes_backfills_then_listens(monkeypatc
         journal.append("repairer")
 
     class JournalledBackfiller:
-        def __init__(self, candle_state, subscriptions) -> None:
+        def __init__(self, candle_state, subscriptions, *, provider_name) -> None:
             self.subscriptions = subscriptions
 
         async def run(self) -> None:

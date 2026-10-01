@@ -5,7 +5,10 @@ QTE asks a vendor for exactly two things:
 * **history** -- completed OHLCV bars for a symbol/timeframe/date range, used
   by the backtest engine (:class:`HistorySource`);
 * **live** -- a stream of :class:`~qte_shared.models.Tick` objects, used by
-  ingestion (:class:`LiveFeed`).
+  ingestion (:class:`LiveFeed`). A vendor that already resamples -- the MT5
+  ingester publishes closed bars, not ticks -- streams
+  :class:`~qte_shared.models.Candle` objects instead
+  (:attr:`Capability.LIVE_BARS`), and ingestion skips its own resampler.
 
 A vendor is represented by one :class:`MarketDataProvider` -- a *factory* that
 knows its own credentials, endpoints and ticker spelling, and hands back those
@@ -33,12 +36,16 @@ from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, Settings
 
 from qte_shared.config import REPO_ROOT
 from qte_shared.indicators import OHLCV_COLUMNS
-from qte_shared.models import Tick
+from qte_shared.market_data_plan import SymbolFeed
+from qte_shared.models import Candle, Tick
 from qte_shared.symbols import Market, SymbolSpec
 from qte_shared.timeframes import normalize_timeframe, timeframe_seconds
 
 #: Called once per parsed tick. Async because every sink downstream is.
 TickHandler = Callable[[Tick], Awaitable[None]]
+
+#: Called once per bar a vendor has already closed. Async for the same reason.
+CandleHandler = Callable[[Candle], Awaitable[None]]
 
 
 class Capability(str, Enum):
@@ -49,7 +56,11 @@ class Capability(str, Enum):
     """
 
     HISTORY = "history"
+    #: A live stream of ticks, resampled into bars by ingestion.
     LIVE = "live"
+    #: A live stream of bars the vendor already closed. Nothing is resampled:
+    #: each bar goes to Redis and the candle subject as it arrives.
+    LIVE_BARS = "live_bars"
 
 
 # -- Errors ----------------------------------------------------------------
@@ -108,6 +119,10 @@ class ProviderSettings(BaseSettings):
     #: in, and a rename of the vendor should not invalidate a deployed secret.
     api_key: str = Field(default="", validation_alias="QTE_DATA_PROVIDER_API_KEY")
 
+    #: The registry name whose plan (``config/<provider_name>.toml``) supplies
+    #: ``[provider]``. With several providers configured, each reads its own.
+    provider_name: ClassVar[str] = ""
+
     @classmethod
     def settings_customise_sources(
         cls,
@@ -128,7 +143,7 @@ class ProviderSettings(BaseSettings):
 
 
 class _MarketDataPlanOptions(PydanticBaseSettingsSource):
-    """``[provider]`` from ``config/<provider>.toml``, as a settings source.
+    """``[provider]`` from the owning provider's plan, as a settings source.
 
     Generic on purpose: whatever a vendor's settings class declares can be
     written in that table, so a second vendor needs no wiring of its own here.
@@ -140,9 +155,12 @@ class _MarketDataPlanOptions(PydanticBaseSettingsSource):
         return None, field_name, False  # pragma: no cover
 
     def __call__(self) -> dict[str, Any]:
-        from qte_shared.config import market_data_plan
+        from qte_shared.config import market_data_plan, provider_market_data_plan
 
-        return dict(market_data_plan().options)
+        provider_name = getattr(self.settings_cls, "provider_name", "")
+        if not provider_name:
+            return dict(market_data_plan().options)
+        return dict(provider_market_data_plan(provider_name).options)
 
 
 # -- Values on the wire ----------------------------------------------------
@@ -272,6 +290,15 @@ class MarketDataProvider(ABC):  # noqa: B024
     def live_feeds(self, specs: list[SymbolSpec], on_tick: TickHandler) -> list[LiveFeed]:
         """One or more feeds covering *specs*; empty when none of them apply."""
         raise UnsupportedCapability(f"{self.name!r} does not serve a live feed")
+
+    def bar_feeds(self, subscriptions: list[SymbolFeed], on_bar: CandleHandler) -> list[LiveFeed]:
+        """Feeds of closed bars covering *subscriptions*; empty when none apply.
+
+        Takes whole subscriptions rather than specs because a bar feed has to
+        know the timeframes as well: the vendor decides which bars close, and
+        the feed drops the series nobody planned.
+        """
+        raise UnsupportedCapability(f"{self.name!r} does not serve a live bar feed")
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         served = ",".join(sorted(capability.value for capability in self.capabilities))

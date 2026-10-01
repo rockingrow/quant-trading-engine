@@ -12,12 +12,25 @@ change this identity. Restart all services to change any identity component.
 | `shadow` | `dev`, `staging`, `prod` | Paper | Always paper |
 | `live` | `staging`, `prod` | Broker, when enabled | Pauses or resumes delivery |
 
-Synthetic providers, including `simulator`, require `dev` mode. Live starts
-paused by default because `QTE_BROKER__SHADOW_MODE=true`. In live state,
+`QTE_MARKET_DATA__PROVIDER` may list several providers, separated by commas
+(`mt5,binance`). The provider component of the identity is then their names
+sorted and joined by `-`: `prod:shadow:binance-mt5`, compose project
+`qte-prod-shadow-binance-mt5`. A single provider keeps its own name. Adding a
+provider to the list, or removing one, therefore selects a fresh namespace like
+any other provider switch: open positions recorded under the old namespace are
+not visible from the new one. Compose cannot hold a comma in a name, so the
+Makefile exports that key as `QTE_STATE__PROVIDER_KEY`, and every service
+refuses to start when a set key disagrees with the provider list. Each provider
+reads its own plan, `config/<provider>.toml`, and one symbol may be planned by
+only one of them.
+
+Synthetic providers, including `simulator`, require `dev` mode and cannot share
+a namespace with another provider. Live starts
+paused by default because `ALGO_BROKER__SHADOW_MODE=true`. In live state,
 `shadow on` stops strategy decisions and new orders while retaining broker
 positions. It creates no simulated entries or exits. Confirmed broker outcomes
 can still finish their local persistence while delivery is paused. In paper
-state, `shadow off` is rejected. `QTE_BROKER__FORCE_SHADOW_MODE=true` always
+state, `shadow off` is rejected. `ALGO_BROKER__FORCE_SHADOW_MODE=true` always
 prevents broker delivery.
 
 ## Storage and routing
@@ -47,7 +60,9 @@ This also isolates repositories using the same external database or Redis.
 Namespaces are application boundaries, not database permissions or tenant ACLs.
 
 Ingestion stamps both ticks and candles with `origin.namespace`,
-`origin.provider` and `origin.synthetic` before caching or publishing. A
+`origin.provider` and `origin.synthetic` before caching or publishing.
+`origin.provider` is the one provider that produced the record, even in a
+multi-provider namespace, and must be one of the namespace's providers. A
 record with foreign provenance cannot be relabelled. Startup removes foreign
 market caches, and the runner ignores unattributed or foreign market events
 and history. Raw provider records and offline candles may omit origin until
@@ -62,7 +77,7 @@ Set these values in the deployment's `.env` before starting:
 QTE_ENV=prod
 QTE_STATE__MODE=shadow
 QTE_MARKET_DATA__PROVIDER=tiingo
-QTE_BROKER__SHADOW_MODE=true
+ALGO_BROKER__SHADOW_MODE=true
 ```
 
 `make start-prod` applies the production overlay and selects production

@@ -1,8 +1,11 @@
 """What the engine trades and how the vendor is asked for it, read from TOML.
 
-One provider, one file: ``config/<provider>.toml``, named after
-``QTE_MARKET_DATA__PROVIDER``. It answers what used to be two environment
-variables and a JSON blob:
+One provider, one file: ``config/<provider>.toml``, named after each entry of
+``QTE_MARKET_DATA__PROVIDER`` (a comma-separated list, ``mt5,binance``). With
+several providers their plans are merged by :meth:`MarketDataPlan.merge`: each
+symbol belongs to exactly one of them, and each provider keeps its own
+``[provider]`` table. A plan answers what used to be two environment variables
+and a JSON blob:
 
 .. code-block:: toml
 
@@ -45,7 +48,7 @@ to what it used to be" look identical in a log until the P&L arrives.
 from __future__ import annotations
 
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -65,8 +68,16 @@ PROVIDER_TABLE = "provider"
 DEFAULT_TIMEFRAMES = ("M15",)
 
 #: Never taken from the file, however it got written there — a key in a config
-#: file is a key in a diff. It is read from ``QTE_DATA_PROVIDER_API_KEY``.
+#: file is a key in a diff. The vendor key is read from
+#: ``QTE_DATA_PROVIDER_API_KEY``; any other credential from its provider's own
+#: environment variable. A prefixed spelling (``nats_token``) counts too.
 _SECRET_OPTIONS = ("api_key", "token", "password", "secret")
+
+
+def _is_secret_option(name: str) -> bool:
+    """Whether *name* is credential-shaped: a secret word, alone or as a suffix."""
+    return any(name == secret or name.endswith(f"_{secret}") for secret in _SECRET_OPTIONS)
+
 
 #: Keys an earlier layout put at the top of the plan. ``[feed]`` carried a
 #: default timeframe list and ``signal_timeframe``; both moved — timeframes to
@@ -82,6 +93,9 @@ class SymbolFeed:
     symbol: str
     market: Market
     timeframes: tuple[str, ...]
+    #: The provider whose plan lists the symbol, and so the one that feeds it.
+    #: Empty only for a plan read on its own, before :meth:`MarketDataPlan.merge`.
+    provider: str = ""
 
     @property
     def spec(self) -> SymbolSpec:
@@ -96,6 +110,8 @@ class MarketDataPlan:
     feeds: tuple[SymbolFeed, ...] = ()
     options: dict[str, Any] = field(default_factory=dict)
     source: Path | None = None
+    #: Every file a merged plan was read from; ``(source,)`` for a single plan.
+    sources: tuple[Path, ...] = ()
 
     def __bool__(self) -> bool:
         """Whether a file was *read*, not whether it planned anything.
@@ -104,7 +120,7 @@ class MarketDataPlan:
         deliberate state; no file at all means "nobody has written a plan yet".
         The two differ by a deploy, so they must not collapse into one answer.
         """
-        return self.source is not None
+        return self.source is not None or bool(self.sources)
 
     # ── Queries ───────────────────────────────────────────────────────
 
@@ -144,6 +160,36 @@ class MarketDataPlan:
     # ── Loading ───────────────────────────────────────────────────────
 
     @classmethod
+    def merge(cls, plans_by_provider: dict[str, MarketDataPlan]) -> MarketDataPlan:
+        """One plan over several providers, each feed tagged with its provider.
+
+        A symbol listed by two providers is refused: ingestion would publish two
+        bar series under one candle subject, and the runner cannot tell which one
+        it traded on. ``[provider]`` survives only when there is a single plan —
+        with several, each vendor reads its own table from its own plan.
+        """
+        feeds: list[SymbolFeed] = []
+        owners: dict[str, str] = {}
+        for provider_name, plan in plans_by_provider.items():
+            for feed in plan.feeds:
+                if feed.symbol in owners:
+                    raise ValueError(
+                        f"{feed.symbol} is planned by both {owners[feed.symbol]!r} and "
+                        f"{provider_name!r}; one symbol must have one provider"
+                    )
+                owners[feed.symbol] = provider_name
+                feeds.append(replace(feed, provider=provider_name))
+        read_plans = [plan for plan in plans_by_provider.values() if plan]
+        sources = tuple(path for plan in read_plans for path in plan.sources or (plan.source,))
+        single_plan = len(plans_by_provider) == 1
+        return cls(
+            feeds=tuple(feeds),
+            options=dict(read_plans[0].options) if single_plan and read_plans else {},
+            source=sources[0] if sources else None,
+            sources=sources,
+        )
+
+    @classmethod
     def load(cls, path: Path | str) -> MarketDataPlan:
         """Parse *path*, or return an empty plan when it does not exist."""
         path = Path(path)
@@ -161,16 +207,17 @@ def _parse(document: dict[str, Any], path: Path) -> MarketDataPlan:
     _warn_on_retired_keys(document, path)
 
     options = _table(document, PROVIDER_TABLE, path)
-    for name in _SECRET_OPTIONS:
-        if name in options:
+    for name in options:
+        if _is_secret_option(name):
             log.warning(
                 "Ignoring [%s].%s in %s — credentials belong in .env "
-                "(QTE_DATA_PROVIDER_API_KEY), not in a file that gets committed",
+                "(QTE_DATA_PROVIDER_API_KEY, or the provider's own variable), "
+                "not in a file that gets committed",
                 PROVIDER_TABLE,
                 name,
                 path,
             )
-    options = {key: value for key, value in options.items() if key not in _SECRET_OPTIONS}
+    options = {key: value for key, value in options.items() if not _is_secret_option(key)}
 
     symbols = _table(document, SYMBOLS_TABLE, path)
     feeds: list[SymbolFeed] = []
@@ -201,7 +248,7 @@ def _parse(document: dict[str, Any], path: Path) -> MarketDataPlan:
         log.warning(
             "Market-data plan %s lists no enabled symbol — ingestion will subscribe to none", path
         )
-    return MarketDataPlan(feeds=tuple(feeds), options=options, source=path)
+    return MarketDataPlan(feeds=tuple(feeds), options=options, source=path, sources=(path,))
 
 
 def _warn_on_retired_keys(document: dict[str, Any], path: Path) -> None:

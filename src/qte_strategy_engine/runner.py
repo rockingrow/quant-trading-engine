@@ -159,7 +159,11 @@ class StrategyRunner:
         self.positions = OpenPositionRepository()
         self.sink = sink or BrokerSink()
         self._scope = settings.state_scope
-        self._scope.origin(synthetic=self._provider_is_synthetic())
+        # Refuses a synthetic feed outside dev state before anything connects.
+        for provider_name in self._scope.providers:
+            self._scope.origin(
+                provider=provider_name, synthetic=self._provider_is_synthetic(provider_name)
+            )
         #: The zone every slot's weekend window is read in. One value for the
         #: process, resolved once — the backtest reads the same setting.
         self._market_zone = settings.engine.market_zone
@@ -607,10 +611,16 @@ class StrategyRunner:
             )
 
     @staticmethod
-    def _provider_is_synthetic() -> bool:
-        """Whether the configured feed invents its prices, as the dev simulator does."""
+    def _provider_is_synthetic(provider_name: str | None = None) -> bool:
+        """Whether *provider_name* invents its prices, as the dev simulator does.
+
+        Without a name: whether any configured provider does. A synthetic one
+        never shares a state scope with another (:class:`StateScope`), so that is
+        the answer for the whole feed.
+        """
+        names = (provider_name,) if provider_name else settings.market_data.providers
         try:
-            return get_provider_class(settings.market_data.provider).synthetic
+            return any(get_provider_class(name).synthetic for name in names)
         except (ProviderError, ImportError):
             return False
 

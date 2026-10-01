@@ -16,7 +16,8 @@ before it as after.
 
 Four limits are deliberate:
 
-* **It runs only when the configured provider serves history.** The simulator
+* **It runs only when the provider serves history.** With several providers
+  configured, each warms the symbols of its own plan from its own history. The simulator
   does not, and pointing a dev stack at it is exactly when nobody wants a
   vendor request. That stack warms itself by hand instead --
   ``make warmup-cache`` replays the parquet the last real fetch left behind.
@@ -43,7 +44,7 @@ from datetime import UTC, datetime, timedelta
 import pandas as pd
 
 from qte_ingestion.settings import ingestion_settings
-from qte_shared.config import settings
+from qte_shared.config import provider_market_data_plan, settings
 from qte_shared.history_cache import HistoryCache, fetch_history
 from qte_shared.interfaces.market_data import (
     Capability,
@@ -57,6 +58,7 @@ from qte_shared.logging_setup import get_logger
 from qte_shared.market_data_plan import SymbolFeed
 from qte_shared.models import Candle
 from qte_shared.providers import create_provider
+from qte_shared.state_scope import stamp_market_data
 from qte_shared.symbols import SymbolSpec
 from qte_shared.timeframes import floor_to_bucket, timeframe_seconds
 
@@ -69,19 +71,19 @@ _CALENDAR_TO_SESSION_RATIO = 7 / 5
 _SECONDS_PER_DAY = 86_400
 
 
-def open_history_source() -> HistorySource:
-    """The configured provider's history client.
+def open_history_source(provider_name: str | None = None) -> HistorySource:
+    """*provider_name*'s history client; the configured provider's when omitted.
 
     Raises :class:`UnsupportedCapability` when the provider serves no history,
     as the simulator does, and :class:`ProviderError` when it should but cannot
     -- a missing API key. Each caller decides which of the two deserves a
     warning.
     """
-    return create_provider(capability=Capability.HISTORY).history_source()
+    return create_provider(provider_name, capability=Capability.HISTORY).history_source()
 
 
 class HistoryBackfiller:
-    """Tops Redis up to the configured candle history from the vendor."""
+    """Tops Redis up to the configured candle history from one provider."""
 
     def __init__(
         self,
@@ -89,8 +91,12 @@ class HistoryBackfiller:
         subscriptions: list[SymbolFeed],
         cache: HistoryCache | None = None,
         utc_clock: Callable[[], datetime] | None = None,
+        provider_name: str | None = None,
     ) -> None:
         self.state = state
+        #: The provider whose history warms *subscriptions*. Omitted means the
+        #: only configured one; with several, each gets a backfiller of its own.
+        self.provider_name = provider_name or _sole_provider()
         # One list of (symbol, market, timeframes) rather than a symbol list
         # crossed with a timeframe list: warming a pair nothing resamples costs
         # a vendor request against a rate-limited plan and fills Redis with a
@@ -106,15 +112,18 @@ class HistoryBackfiller:
 
     async def run(self) -> None:
         """Warm every symbol and timeframe. Never raises."""
-        if not ingestion_settings.backfill_history:
-            log.info("History backfill disabled ([provider].backfill_history = false)")
+        if not self._enabled():
+            log.info(
+                "History backfill disabled for %r ([provider].backfill_history = false)",
+                self.provider_name,
+            )
             return
 
         source = self._history_source()
         if source is None:
             return
 
-        cache = self.cache or HistoryCache(settings.market_data.provider)
+        cache = self.cache or HistoryCache(self.provider_name)
         for feed in self.subscriptions:
             for timeframe in feed.timeframes:
                 try:
@@ -134,7 +143,7 @@ class HistoryBackfiller:
         self, source, cache: HistoryCache, spec: SymbolSpec, timeframe: str
     ) -> None:
         moment = self.utc_clock()
-        provider_name = settings.market_data.provider
+        provider_name = self.provider_name
         held_count = await self.state.count_candles(spec.symbol, timeframe)
         newest = await self._newest_held(spec.symbol, timeframe) if held_count else None
         last_completed = floor_to_bucket(moment, timeframe) - timedelta(
@@ -188,9 +197,13 @@ class HistoryBackfiller:
         history = await fetch_history(
             source, request, cache=cache, use_cache=False if topping_up else None
         )
-        fetched = _frame_to_candles(
-            drop_unfinished_bars(history, timeframe, moment), spec.symbol, timeframe
-        )
+        origin = settings.state_scope.origin(provider=provider_name)
+        fetched = [
+            stamp_market_data(candle, origin)
+            for candle in _frame_to_candles(
+                drop_unfinished_bars(history, timeframe, moment), spec.symbol, timeframe
+            )
+        ]
         if not fetched:
             if topping_up:
                 log.info(
@@ -260,6 +273,14 @@ class HistoryBackfiller:
 
     # -- Provider ----------------------------------------------------------
 
+    def _enabled(self) -> bool:
+        """``QTE_INGESTION__BACKFILL_HISTORY`` for everyone, else this provider's plan."""
+        if not ingestion_settings.backfill_history:
+            return False
+        if "backfill_history" in ingestion_settings.model_fields_set:
+            return True
+        return bool(provider_market_data_plan(self.provider_name).option("backfill_history", True))
+
     def _history_source(self):
         """The configured provider's history source, or ``None`` to skip.
 
@@ -270,14 +291,14 @@ class HistoryBackfiller:
         try:
             # Building the source is where a missing API key surfaces, so it
             # belongs inside the same guard as the capability check.
-            return open_history_source()
+            return open_history_source(self.provider_name)
         except UnsupportedCapability:
             # The expected, deliberate case: someone pointed a dev stack at the
             # simulator precisely so nothing would reach the network.
             log.info(
                 "Provider %r serves no history — skipping backfill. Warm the engine "
                 "by hand instead (make warmup-cache).",
-                settings.market_data.provider,
+                self.provider_name,
             )
             return None
         except ProviderError as error:
@@ -289,7 +310,7 @@ class HistoryBackfiller:
                 "History backfill unavailable for provider %r: %s. Redis will not be "
                 "warmed and the runner has no indicator window until enough live "
                 "bars have printed.",
-                settings.market_data.provider,
+                self.provider_name,
                 error,
             )
             return None
@@ -335,6 +356,17 @@ def _merge_candles(existing: list[Candle], fetched: list[Candle]) -> list[Candle
         if candle.tick_count > 0 or candle.open_time not in by_open_time:
             by_open_time[candle.open_time] = candle
     return [by_open_time[open_time] for open_time in sorted(by_open_time)]
+
+
+def _sole_provider() -> str:
+    """The configured provider, when there is exactly one."""
+    providers = settings.market_data.providers
+    if len(providers) > 1:
+        raise ValueError(
+            f"{len(providers)} providers are configured ({', '.join(providers)}); "
+            "name the one whose history to backfill"
+        )
+    return providers[0]
 
 
 __all__ = ["HistoryBackfiller", "open_history_source"]

@@ -179,11 +179,11 @@ inside a verified broker duplicate window, including time for publication.
 
 ### `http`
 
-`POST {QTE_BROKER__HTTP_URL}/secret/webhook` with the payload as the JSON body.
-This path *does* verify `token` (`QTE_BROKER__TOKEN`, matched against the
+`POST {ALGO_BROKER__HTTP_URL}/secret/webhook` with the payload as the JSON body.
+This path *does* verify `token` (`ALGO_BROKER__TOKEN`, matched against the
 broker's). Use it across any boundary you do not control.
 
-The sink injects the current `QTE_BROKER__TOKEN` for both transports at send
+The sink injects the current `ALGO_BROKER__TOKEN` for both transports at send
 time. Reports, persisted audit/outbox payloads and internal signal mirrors omit
 the token, including when serializing a legacy signal that still contains one.
 Trading fields remain unchanged. Existing historical files and database rows

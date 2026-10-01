@@ -107,4 +107,4 @@ def test_test_process_does_not_inherit_operator_credentials_or_deployment_mode()
     assert settings.broker.token == settings.broker.nats_token == settings.nats.token == ""
     assert settings.broker.shadow_mode is True
     assert settings.account.capital == 1000
-    assert not settings.market_data.plan_file.exists()
+    assert not any(plan.exists() for plan in settings.market_data.plan_files.values())

@@ -1,4 +1,4 @@
-name: qte-dev-dev-${QTE_MARKET_DATA__PROVIDER:-tiingo}
+name: qte-dev-dev-${QTE_STATE__PROVIDER_KEY:-${QTE_MARKET_DATA__PROVIDER:-tiingo}}
 
 # Local development overlay — `make dev` loads it with
 # `-f docker-compose.yml -f docker-compose.dev.yml`; nothing else does.
@@ -51,8 +51,8 @@ services:
 
 volumes:
   redis-data:
-    name: qte-dev-dev-${QTE_MARKET_DATA__PROVIDER:-tiingo}-redis
+    name: qte-dev-dev-${QTE_STATE__PROVIDER_KEY:-${QTE_MARKET_DATA__PROVIDER:-tiingo}}-redis
   postgres-data:
-    name: qte-dev-dev-${QTE_MARKET_DATA__PROVIDER:-tiingo}-postgres
+    name: qte-dev-dev-${QTE_STATE__PROVIDER_KEY:-${QTE_MARKET_DATA__PROVIDER:-tiingo}}-postgres
   nats-data:
-    name: qte-dev-dev-${QTE_MARKET_DATA__PROVIDER:-tiingo}-nats
+    name: qte-dev-dev-${QTE_STATE__PROVIDER_KEY:-${QTE_MARKET_DATA__PROVIDER:-tiingo}}-nats

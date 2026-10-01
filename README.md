@@ -5,8 +5,10 @@ trading strategies. The engine is public; **your alpha is not** — strategies
 live in `__strategies__/`, which is git-ignored here and cloned from your own
 private repository at deploy time.
 
-QTE ingests market data from a pluggable provider (Tiingo ships with it, plus a
-dev-only simulator you drive by hand), keeps hot state in Redis, audits every
+QTE ingests market data from a pluggable provider (Tiingo ships with it, so
+does MT5 through
+[`algo-trading-ingester`](https://github.com/rockingrow/algo-trading-ingester),
+plus a dev-only simulator you drive by hand), keeps hot state in Redis, audits every
 signal into PostgreSQL, and publishes trade signals over NATS to
 [`algo-trading-broker`](https://github.com/rockingrow/algo-trading-broker),
 which fans them out to MT5 / Binance workers.
@@ -25,6 +27,9 @@ which fans them out to MT5 / Binance workers.
   into its own process. See `pyproject.toml`.
 - [uv](https://docs.astral.sh/uv/)
 - Docker & Docker Compose
+- [Tailscale](https://tailscale.com/download) — QTE's NATS, and
+  `algo-trading-broker`'s, are only reachable over the tailnet; see
+  [Connecting to algo-trading-broker over Tailscale](#connecting-to-algo-trading-broker-over-tailscale).
 
 ### 2. Installation
 
@@ -67,7 +72,7 @@ make logs
 ```
 
 Signals are built, audited and logged but reach no broker until you point
-`QTE_BROKER__*` at
+`ALGO_BROKER__*` at
 [`algo-trading-broker`](https://github.com/rockingrow/algo-trading-broker) and
 turn shadow mode off — see
 [Sending signals to the broker](#sending-signals-to-the-broker) and
@@ -93,6 +98,7 @@ To measure a strategy rather than run one, go straight to
 flowchart TD
     subgraph providers["📈 Market data"]
         TIINGO["Tiingo<br/>live + history"]
+        INGESTER["algo-trading-ingester<br/>closed MT5 bars"]
         SIM["qte-simulator<br/>dev only, QTE_ENV=dev"]
     end
 
@@ -121,6 +127,7 @@ flowchart TD
     end
 
     TIINGO -->|websocket| ING
+    INGESTER -->|"JetStream INGESTER.bar.closed.mt5.&lt;symbol&gt;.&lt;tf&gt;"| ING
     SIM -.->|websocket, dev| ING
     TIINGO -->|"qte-backtest download"| PARQUET
 
@@ -139,8 +146,8 @@ flowchart TD
     CTL -->|"shadow flag"| REDIS
     CTL -->|"broadcast"| NATS
 
-    RUN ==>|"QTE_BROKER__TRANSPORT=nats (default)<br/>JetStream SIGNALS.&lt;strategy&gt;, Nats-Msg-Id dedupe"| SW
-    RUN -.->|"QTE_BROKER__TRANSPORT=http<br/>token-checked"| WH
+    RUN ==>|"ALGO_BROKER__TRANSPORT=nats (default)<br/>JetStream SIGNALS.&lt;strategy&gt;, Nats-Msg-Id dedupe"| SW
+    RUN -.->|"ALGO_BROKER__TRANSPORT=http<br/>token-checked"| WH
     WH -->|"same stream"| SW
     SW --> MT5
     SW --> BIN
@@ -678,18 +685,57 @@ would have two sources.
 
 ---
 
+## Taking MT5 bars from algo-trading-ingester
+
+[`algo-trading-ingester`](https://github.com/rockingrow/algo-trading-ingester)
+runs beside the MT5 terminal on Windows, detects every closed bar and publishes
+it to NATS on `INGESTER.bar.closed.mt5.<SYMBOL>.<TF>`. The `mt5` provider is
+QTE's side of that hand-off:
+
+```bash
+make mt5                              # config/mt5.toml — symbols, timeframes, stream
+QTE_MARKET_DATA__PROVIDER=mt5         # in .env
+```
+
+- **Bars, not ticks.** The ingester already closed them, so ingestion skips its
+  resampler: each bar goes through the same Redis outbox and
+  `QTE.candle.closed.<symbol>.<tf>` subject as a resampled one.
+- **The ingester is never kept waiting.** Every message is acknowledged the
+  moment it is held — a JetStream ack, or `{"code": 200}` to a core-NATS
+  request — and decoded and staged afterwards by a separate worker. When its
+  queue is full QTE stops pulling rather than refusing what it already took.
+- **The stream is the history.** A new durable consumer replays what the
+  ingester's `INGESTER` stream still holds (7 days by default), which warms
+  Redis on the first start; bars older than `QTE_RUNNER__CATCH_UP_MAX_AGE` are
+  kept as history, never decided on. After that, a restart resumes from the
+  last bar QTE acknowledged. There is no history download — for a backtest,
+  export from MT5 and `make csv-import`.
+- **Keep the two `.env` files in step.** `subject_prefix`, `stream` and
+  `jetstream` in `config/mt5.toml` mirror the ingester's `NATS_SUBJECT_PREFIX`,
+  `NATS_STREAM_NAME` and `NATS_JETSTREAM_ENABLED`; its `NATS_HOST`/`NATS_PORT`
+  normally name QTE's own NATS, so `QTE_MT5__NATS_URL`/`QTE_MT5__NATS_TOKEN`
+  stay blank and fall back to `QTE_NATS__*`. Symbols are the bare names in its
+  `MT5_SYMBOLS`, timeframes a subset of its `MT5_TIMEFRAMES`.
+- **Beside another vendor.** `QTE_MARKET_DATA__PROVIDER=mt5,binance` runs both,
+  each feeding the symbols of its own `config/<provider>.toml`; a symbol may be
+  planned by only one. The list is part of the state identity — see
+  [docs/state-isolation.md](docs/state-isolation.md). `binance` is a placeholder
+  today: listed, it stops ingestion at start-up as not implemented.
+
+---
+
 ## Sending signals to the broker
 
 QTE emits exactly the payload `algo-trading-broker` validates — its
 `WebhookPayload`: `strategy`, `symbol`, `timeframe`, `timestamp`,
 `signal_uxid`, a `position` block, `indicators`, `inputs`, `token`. Two
-transports carry it, selected with `QTE_BROKER__TRANSPORT`:
+transports carry it, selected with `ALGO_BROKER__TRANSPORT`:
 
 | | `nats` (default) | `http` |
 | --- | --- | --- |
 | Destination | JetStream `SIGNALS.<strategy>` | `POST /secret/webhook` |
 | Why | The broker's own webhook endpoint writes to that same stream, so we inherit its persistence, retry and de-duplication with no HTTP hop in the trade path. | Slower, but it is the path that verifies the `token` field. |
-| Auth | Access to the NATS cluster **is** the authentication. | `QTE_BROKER__TOKEN`, matched against the broker's. |
+| Auth | Access to the NATS cluster **is** the authentication. | `ALGO_BROKER__TOKEN`, matched against the broker's. |
 | Use when | QTE and the broker share a trusted/private NATS cluster. | Anything crosses a boundary you do not control. |
 
 Each publish carries a fresh `Nats-Msg-Id`, so a retried publish inside the
@@ -697,6 +743,50 @@ stream's duplicate window is stored once and a worker opens one position.
 
 > The engine also mirrors every emitted signal on `QTE.signal.emitted` and rows
 > it into Postgres, whether it was delivered, shadowed or failed.
+
+---
+
+## Connecting to algo-trading-broker over Tailscale
+
+`algo-trading-broker` only accepts NATS connections from services on its own
+[Tailscale](https://tailscale.com/) tailnet — it exposes no port to the open
+internet. Reach it, and reach QTE's own `nats` for candle traffic, by joining
+that tailnet, not by tunnelling or publishing the port yourself.
+
+1. **Install Tailscale** on the host that runs QTE —
+   [tailscale.com/download](https://tailscale.com/download).
+2. **Join the tailnet.**
+
+   ```bash
+   sudo tailscale up
+   ```
+
+   Authenticate into the same tailnet as `algo-trading-broker`; ask whoever
+   administers it for an invite or an auth key.
+3. **Confirm you can see the broker.**
+
+   ```bash
+   tailscale status              # the broker's machine should be listed, Online
+   tailscale ping <broker-tailnet-name>
+   ```
+
+4. **Point QTE at the tailnet name, not `localhost` or a compose service
+   name.** `QTE_NATS__URL` and `ALGO_BROKER__NATS_URL` in `.env` take the
+   tailnet hostname of whichever machine actually serves NATS — see the
+   comments above each in `.env.example`. A compose service name only
+   resolves between containers on the same compose network; the tailnet name
+   resolves the same way on the host and inside a container joined to the
+   tailnet.
+5. **Running QTE in Docker?** The containers need tailnet access too, not just
+   the host: join the tailnet inside the image, run a Tailscale sidecar, add a
+   subnet route, or run the affected services with host networking.
+   `docker-compose.yml` does not set this up for you — pick whichever fits
+   your deployment.
+
+If the tailnet connection drops, NATS becomes unreachable the same way it
+would from any other network fault; `uv run qte-control ping` says so
+explicitly instead of reporting success — see
+[Operating a running engine](#operating-a-running-engine).
 
 ---
 
@@ -811,7 +901,7 @@ deliberately in no container — replaying history is done on the host, not
 inside the live trading process.
 
 `docker-compose.yml` ships a `nats` service for standalone development. In
-production you normally point `QTE_BROKER__NATS_URL` at the **broker's** NATS,
+production you normally point `ALGO_BROKER__NATS_URL` at the **broker's** NATS,
 because that is where the `SIGNALS` stream its workers consume actually lives —
 publishing to a second cluster means nobody ever receives the signals.
 

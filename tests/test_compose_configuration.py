@@ -12,6 +12,11 @@ from qte_shared.config import REPO_ROOT, PostgresSettings
 
 APPLICATIONS = ("data-ingestion", "strategy-runner", "db-migrate")
 
+# NATS authenticates every connection, and the compose file declares the token
+# as a required variable, so rendering at all needs one. Every case that is not
+# about the token itself gets this placeholder.
+TAILNET_TOKEN = "synthetic-tailnet-token"
+
 
 @pytest.fixture(scope="module")
 def docker_command():
@@ -28,12 +33,19 @@ def docker_command():
 
 @pytest.fixture
 def render_compose(tmp_path, docker_command):
-    def render_document(environment_values=None, *, overlay=None, profiles=(), services_only=False):
+    def render_document(
+        environment_values=None,
+        *,
+        overlay=None,
+        profiles=(),
+        services_only=False,
+        expect_failure=False,
+    ):
+        settings_by_variable = {"QTE_NATS__TOKEN": TAILNET_TOKEN, **(environment_values or {})}
         environment_file = tmp_path / ".env"
         environment_file.write_text(
             "\n".join(
-                f"{variable}='{setting}'"
-                for variable, setting in (environment_values or {}).items()
+                f"{variable}='{setting}'" for variable, setting in settings_by_variable.items()
             )
             + "\n",
             encoding="utf-8",
@@ -63,6 +75,9 @@ def render_compose(tmp_path, docker_command):
         completed = subprocess.run(
             command, env=process_environment, capture_output=True, text=True, timeout=20
         )
+        if expect_failure:
+            assert completed.returncode != 0, completed.stdout
+            return completed.stderr
         assert completed.returncode == 0, completed.stderr
         return completed.stdout.splitlines() if services_only else json.loads(completed.stdout)
 
@@ -158,6 +173,25 @@ def test_modes_and_providers_use_disjoint_volumes_even_with_a_project_override(r
             assert configuration["QTE_MARKET_DATA__PROVIDER"] == provider
 
 
+def test_several_providers_name_the_stack_by_their_key(render_compose):
+    document = render_compose(
+        {
+            "QTE_ENV": "prod",
+            "QTE_STATE__MODE": "shadow",
+            "QTE_MARKET_DATA__PROVIDER": "mt5,binance",
+            "QTE_STATE__PROVIDER_KEY": "binance-mt5",
+        }
+    )
+    assert document["name"] == "qte-prod-shadow-binance-mt5"
+    assert {volume["name"] for volume in document["volumes"].values()} == {
+        f"qte-prod-shadow-binance-mt5-{store}" for store in ("redis", "postgres", "nats")
+    }
+    for application in APPLICATIONS:
+        configuration = document["services"][application]["environment"]
+        assert configuration["QTE_MARKET_DATA__PROVIDER"] == "mt5,binance"
+        assert configuration["QTE_STATE__PROVIDER_KEY"] == "binance-mt5"
+
+
 def test_dev_overlay_cannot_mount_a_production_live_volume(render_compose):
     document = render_compose(
         {"QTE_ENV": "prod", "QTE_STATE__MODE": "live"},
@@ -183,3 +217,22 @@ def test_production_overlay_uses_its_forced_environment_in_volume_names(render_c
         volume["name"].startswith("qte-prod-shadow-tiingo-")
         for volume in document["volumes"].values()
     )
+
+
+def test_nats_serves_the_tailnet_token_and_refuses_to_render_without_one(render_compose):
+    """The server reads the same token the clients send, or the stack does not start.
+
+    A bus that comes up unauthenticated is worse than one that fails: it is
+    reachable by every device on the tailnet and nothing in the logs says so.
+    Compose refuses to render instead. The applications dial the `nats` service
+    directly, since a container cannot resolve the tailnet address .env carries.
+    """
+    document = render_compose()
+    assert document["services"]["nats"]["environment"]["QTE_NATS__TOKEN"] == TAILNET_TOKEN
+    for application in APPLICATIONS:
+        assert (
+            document["services"][application]["environment"]["QTE_NATS__URL"] == "nats://nats:4222"
+        )
+
+    refusal = render_compose({"QTE_NATS__TOKEN": ""}, expect_failure=True)
+    assert "QTE_NATS__TOKEN" in refusal

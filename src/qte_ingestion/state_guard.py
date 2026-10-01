@@ -11,8 +11,10 @@ warnings.
 So before ingestion reads anything back, this module decides whether the candle
 state belongs to the market it is about to feed. It does not when:
 
-* **another provider wrote it** — the name is recorded under
-  ``qte:<namespace>:history:provider`` on every start, so a switch shows on the next one;
+* **another provider wrote it** — the provider key (one name, or several
+  joined by ``-``) is recorded under ``qte:<namespace>:history:provider`` on
+  every start, so a switch shows on the next one. With several providers each
+  symbol's bars must also carry the origin of the provider that feeds it;
 * **nobody recorded who wrote it** — state from before that key existed has no
   provenance at all, and a simulator replay placed on past buckets looks exactly
   like vendor history, so unmarked state is discarded once rather than trusted;
@@ -45,29 +47,33 @@ async def discard_foreign_candle_state(
     candle_state,
     subscriptions: list[SymbolFeed],
     *,
-    provider_name: str,
+    provider_key: str,
     synthetic: bool,
     moment: datetime | None = None,
 ) -> bool:
-    """Discard candle state *provider_name* did not write; return whether it did.
+    """Discard candle state the *provider_key* providers did not write; return whether any.
 
-    The provider is recorded as the writer afterwards in every case, so the next
+    The key is recorded as the writer afterwards in every case, so the next
     start can tell a switch from a restart.
     """
     horizon = (moment or datetime.now(UTC)) + CLOCK_TOLERANCE
     reasons: list[str] = []
     state_scope = settings.state_scope
-    expected_origin = state_scope.origin(synthetic=synthetic)
-    if expected_origin.provider != provider_name:
+    if state_scope.provider != provider_key:
         raise ValueError("Configured state provider does not match the ingestion provider")
+    expected_origins = {
+        provider_name: state_scope.origin(provider=provider_name, synthetic=synthetic)
+        for provider_name in state_scope.providers
+    }
 
     recorded = await candle_state.get_history_provider()
     if recorded is None:
         if await _holds_candle_state(candle_state, subscriptions):
             reasons.append("no provider was ever recorded as its writer")
-    elif recorded != provider_name:
+    elif recorded != provider_key:
         reasons.append(f"it was written by provider {recorded!r}")
     for symbol_feed in subscriptions:
+        expected_origin = expected_origins[_feeding_provider(symbol_feed, state_scope.providers)]
         cached_tick = await candle_state.get_last_tick(symbol_feed.symbol)
         if cached_tick is None or cached_tick.origin != expected_origin:
             await candle_state.discard_last_tick(symbol_feed.symbol)
@@ -78,7 +84,10 @@ async def discard_foreign_candle_state(
                 candles = [*candles, opened]
             if any(candle.origin != expected_origin for candle in candles):
                 reasons.append("market data has missing or foreign provenance")
-    if any(candle.origin != expected_origin for candle in await candle_state.pending_candles()):
+    accepted_origins = list(expected_origins.values())
+    if any(
+        candle.origin not in accepted_origins for candle in await candle_state.pending_candles()
+    ):
         reasons.append("the candle outbox has missing or foreign provenance")
     if not synthetic:
         future_bars = await _future_dated_bars(candle_state, subscriptions, horizon)
@@ -90,7 +99,7 @@ async def discard_foreign_candle_state(
             "Discarding candle state before ingestion starts on provider %r, because %s. "
             "The candle lists, open bars and candle outbox are rebuilt from the feed and its "
             "history; open positions are left untouched.",
-            provider_name,
+            provider_key,
             " and ".join(reasons),
         )
         for symbol_feed in subscriptions:
@@ -99,8 +108,17 @@ async def discard_foreign_candle_state(
                 await candle_state.discard_candle_state(symbol_feed.symbol, timeframe)
         await candle_state.discard_candle_outbox()
 
-    await candle_state.set_history_provider(provider_name)
+    await candle_state.set_history_provider(provider_key)
     return bool(reasons)
+
+
+def _feeding_provider(symbol_feed: SymbolFeed, providers: tuple[str, ...]) -> str:
+    """The provider whose origin *symbol_feed*'s bars must carry."""
+    if symbol_feed.provider:
+        return symbol_feed.provider
+    if len(providers) == 1:
+        return providers[0]
+    raise ValueError(f"{symbol_feed.symbol} names no provider, and {len(providers)} are configured")
 
 
 async def _holds_candle_state(candle_state, subscriptions: list[SymbolFeed]) -> bool:

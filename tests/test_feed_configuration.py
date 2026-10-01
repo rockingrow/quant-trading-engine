@@ -81,7 +81,7 @@ def test_planned_market_is_preserved_under_symbol_override(monkeypatch, market_p
     monkeypatch.setattr(settings, "engine", EngineSettings())
     monkeypatch.setattr(service.ingestion_settings, "market_overrides", {"BTCUSD": "fx"})
     assert service.resolve_subscriptions() == [
-        SymbolFeed(symbol="BTCUSD", market="crypto", timeframes=("M5", "M15"))
+        SymbolFeed(symbol="BTCUSD", market="crypto", timeframes=("M5", "M15"), provider="tiingo")
     ]
 
 
@@ -108,7 +108,7 @@ def test_missing_plan_still_uses_explicit_fallback_markets(monkeypatch):
     engine_config = EngineSettings()
     assert engine_config.symbols == ["XAUUSD"]
     assert engine_config.resolve_subscriptions(MarketDataPlan(), {"XAUUSD": "fx"}) == [
-        SymbolFeed(symbol="XAUUSD", market="fx", timeframes=("M15",))
+        SymbolFeed(symbol="XAUUSD", market="fx", timeframes=("M15",), provider="tiingo")
     ]
 
 
