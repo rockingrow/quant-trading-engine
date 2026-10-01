@@ -27,8 +27,8 @@ which fans them out to MT5 / Binance workers.
   into its own process. See `pyproject.toml`.
 - [uv](https://docs.astral.sh/uv/)
 - Docker & Docker Compose
-- [Tailscale](https://tailscale.com/download) — QTE's NATS, and
-  `algo-trading-broker`'s, are only reachable over the tailnet; see
+- Optional: a Tailscale auth key, when `algo-trading-broker` runs with
+  `TAILSCALE_ENABLED=true` — Tailscale itself runs as a container; see
   [Connecting to algo-trading-broker over Tailscale](#connecting-to-algo-trading-broker-over-tailscale).
 
 ### 2. Installation
@@ -38,7 +38,7 @@ git clone https://github.com/rockingrow/quant-trading-engine
 cd quant-trading-engine
 
 cp .env.example .env          # fill in QTE_DATA_PROVIDER_API_KEY at minimum
-make tiingo                   # config/tiingo.toml: which symbols to feed
+make tiingo                   # config/data_providers/tiingo.toml: which symbols to feed
 make install-dev              # uv sync
 ```
 
@@ -693,7 +693,7 @@ it to NATS on `INGESTER.bar.closed.mt5.<SYMBOL>.<TF>`. The `mt5` provider is
 QTE's side of that hand-off:
 
 ```bash
-make mt5                              # config/mt5.toml — symbols, timeframes, stream
+make mt5                              # config/data_providers/mt5.toml — symbols, timeframes, stream
 QTE_MARKET_DATA__PROVIDER=mt5         # in .env
 ```
 
@@ -711,13 +711,13 @@ QTE_MARKET_DATA__PROVIDER=mt5         # in .env
   last bar QTE acknowledged. There is no history download — for a backtest,
   export from MT5 and `make csv-import`.
 - **Keep the two `.env` files in step.** `subject_prefix`, `stream` and
-  `jetstream` in `config/mt5.toml` mirror the ingester's `NATS_SUBJECT_PREFIX`,
+  `jetstream` in `config/data_providers/mt5.toml` mirror the ingester's `NATS_SUBJECT_PREFIX`,
   `NATS_STREAM_NAME` and `NATS_JETSTREAM_ENABLED`; its `NATS_HOST`/`NATS_PORT`
   normally name QTE's own NATS, so `QTE_MT5__NATS_URL`/`QTE_MT5__NATS_TOKEN`
   stay blank and fall back to `QTE_NATS__*`. Symbols are the bare names in its
   `MT5_SYMBOLS`, timeframes a subset of its `MT5_TIMEFRAMES`.
 - **Beside another vendor.** `QTE_MARKET_DATA__PROVIDER=mt5,binance` runs both,
-  each feeding the symbols of its own `config/<provider>.toml`; a symbol may be
+  each feeding the symbols of its own `config/data_providers/<provider>.toml`; a symbol may be
   planned by only one. The list is part of the state identity — see
   [docs/state-isolation.md](docs/state-isolation.md). `binance` is a placeholder
   today: listed, it stops ingestion at start-up as not implemented.
@@ -748,40 +748,59 @@ stream's duplicate window is stored once and a worker opens one position.
 
 ## Connecting to algo-trading-broker over Tailscale
 
-`algo-trading-broker` only accepts NATS connections from services on its own
-[Tailscale](https://tailscale.com/) tailnet — it exposes no port to the open
-internet. Reach it, and reach QTE's own `nats` for candle traffic, by joining
-that tailnet, not by tunnelling or publishing the port yourself.
+Tailscale is optional and off by default, and it runs as a container — nothing
+is installed on the host. One `.env` switch, `TAILSCALE_ENABLED`, the same one
+`algo-trading-broker` reads, decides how the engine is reached and how it
+reaches the broker. The Makefile reads it (`make start`, `up`, `dev`,
+`start-prod`); a bare `docker compose up` ignores it.
 
-1. **Install Tailscale** on the host that runs QTE —
-   [tailscale.com/download](https://tailscale.com/download).
-2. **Join the tailnet.**
+| | `TAILSCALE_ENABLED=false` | `TAILSCALE_ENABLED=true` |
+| --- | --- | --- |
+| Redis / Postgres / NATS host ports | every interface (`0.0.0.0`) | `127.0.0.1` only |
+| MT5 ingester → engine NATS | `nats://<this host>:<QTE_NATS_PORT>` + `QTE_NATS__TOKEN` | `nats://<TAILSCALE_HOSTNAME>:4222` + `QTE_NATS__TOKEN`, from inside the tailnet |
+| Runner → broker NATS | `ALGO_CONTAINER_BROKER_NATS_URL` (default `nats://host.docker.internal:4222`) | `nats://<TAILSCALE_BROKER_HOSTNAME>:4222` over the tailnet |
+
+**Turn it on whenever the broker has it on** — its NATS is then reachable over
+the tailnet only.
+
+1. **Mint an auth key** in the Tailscale admin console (Settings → Keys),
+   tagged `tag:engine`. The tailnet policy that grants `tag:engine` the
+   broker's port 4222, and `tag:ingester` this engine's, is
+   `config/tailscale/policy.hujson` — paste it into the admin console's
+   Access controls. `algo-trading-broker` keeps the same file and a tailnet
+   has one policy, so keep the two copies identical. The key is used
+   for the first login only; the node identity is then kept in the stack's
+   `*-tailscale` volume. Each book (`QTE_ENV` / `QTE_STATE__MODE` / provider)
+   is its own stack and its own node, so a reusable key saves minting one per
+   book.
+2. **Fill in `.env`:**
 
    ```bash
-   sudo tailscale up
+   TAILSCALE_ENABLED=true
+   TAILSCALE_AUTHKEY=tskey-auth-...
+   TAILSCALE_HOSTNAME=qte-engine                 # this engine's tailnet name
+   TAILSCALE_BROKER_HOSTNAME=algo-trading-broker # the broker's TAILSCALE_HOSTNAME
+   ALGO_BROKER__NATS_TOKEN=...                   # the broker's NATS_TOKEN
    ```
 
-   Authenticate into the same tailnet as `algo-trading-broker`; ask whoever
-   administers it for an invite or an auth key.
-3. **Confirm you can see the broker.**
+   The `QTE_*_PORT` variables stay bare port numbers — the bind address comes
+   from the switch.
+3. **Start the stack** (`make start` / `make start-prod`) and check the node:
 
    ```bash
-   tailscale status              # the broker's machine should be listed, Online
-   tailscale ping <broker-tailnet-name>
+   make tailscale-status   # tailnet peers (the broker should be listed), Serve forwards,
+                           # or the login URL if the node has not logged in
    ```
 
-4. **Point QTE at the tailnet name, not `localhost` or a compose service
-   name.** `QTE_NATS__URL` and `ALGO_BROKER__NATS_URL` in `.env` take the
-   tailnet hostname of whichever machine actually serves NATS — see the
-   comments above each in `.env.example`. A compose service name only
-   resolves between containers on the same compose network; the tailnet name
-   resolves the same way on the host and inside a container joined to the
-   tailnet.
-5. **Running QTE in Docker?** The containers need tailnet access too, not just
-   the host: join the tailnet inside the image, run a Tailscale sidecar, add a
-   subnet route, or run the affected services with host networking.
-   `docker-compose.yml` does not set this up for you — pick whichever fits
-   your deployment.
+How it works: the `tailscale` service (userspace networking, profile
+`tailscale`) forwards its tailnet ports 4222/8222/5432 to `nats` and
+`postgres-audit` through Tailscale Serve (`config/tailscale/serve.json`). For
+the outbound direction it also runs Tailscale's SOCKS5 proxy on the compose
+network, and `broker-nats-relay` — a socat container — turns that into a plain
+TCP port, because a NATS client cannot speak SOCKS. The Makefile points the
+runner's `ALGO_BROKER__NATS_URL` at `nats://broker-nats-relay:4222`; the token,
+the NATS protocol and the runner's reconnect behaviour pass through unchanged.
+Host-side `ALGO_BROKER__NATS_URL` in `.env` is not routed over the tailnet.
 
 If the tailnet connection drops, NATS becomes unreachable the same way it
 would from any other network fault; `uv run qte-control ping` says so
@@ -880,7 +899,7 @@ make strategy-mount STRATEGY=my-strategies
 make strategies                      # confirm the engine can see them
 
 # 4. Say what to feed and what trades it, then check the whole thing
-make tiingo                          # config/tiingo.toml — symbols, timeframes, vendor knobs
+make tiingo                          # config/data_providers/tiingo.toml — symbols, timeframes, vendor knobs
 make strategy-mapping                # config/strategies_mapping.toml, git-ignored — edit it
 make audit-strict                    # fails on anything the runner would skip
 

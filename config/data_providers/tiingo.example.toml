@@ -1,7 +1,7 @@
 # What Tiingo is asked to feed: which symbols, at which bars, and how its
 # history is fetched.
 #
-#   make tiingo         # writes config/tiingo.toml from this template
+#   make tiingo         # writes config/data_providers/tiingo.toml from this template
 #
 # The engine reads `config/<QTE_MARKET_DATA__PROVIDER>.toml`, so this file is
 # the plan for the `tiingo` provider and a second vendor gets its own beside
@@ -9,7 +9,7 @@
 # is tiingo, because a missing plan does not fail loudly at runtime — it
 # quietly subscribes to the built-in defaults instead.
 #
-# This template is tracked; `config/tiingo.toml` is git-ignored, for the same
+# This template is tracked; `config/data_providers/tiingo.toml` is git-ignored, for the same
 # reason as `config/strategies_mapping.example.toml`: what a desk trades is
 # position information and this repository is public. Keep the two in step —
 # a key added here is a key an operator can use, and a key only in the real

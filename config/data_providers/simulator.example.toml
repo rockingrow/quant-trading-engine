@@ -1,16 +1,16 @@
 # What the dev simulator is asked to feed: which symbols, and at which bars.
 #
-#   make simulator     # writes config/simulator.toml from this template
+#   make simulator     # writes config/data_providers/simulator.toml from this template
 #
 # The engine reads `config/<QTE_MARKET_DATA__PROVIDER>.toml`, so this file is
-# the plan for the `simulator` provider, exactly as `config/tiingo.toml` is the
+# the plan for the `simulator` provider, exactly as `config/data_providers/tiingo.toml` is the
 # plan for `tiingo`. `make start` refuses to bring the stack up without it: a
 # missing plan does not fail loudly at runtime, it quietly falls back to the
 # built-in `QTE_ENGINE__*` defaults, and "subscribed to what it used to be"
 # looks identical to "subscribed to what I asked for" in a log.
 #
-# This template is tracked; `config/simulator.toml` is git-ignored, for the
-# same reason as `config/tiingo.toml` and the routing table: what a desk
+# This template is tracked; `config/data_providers/simulator.toml` is git-ignored, for the
+# same reason as `config/data_providers/tiingo.toml` and the routing table: what a desk
 # subscribes to is position information and this repository is public.
 #
 # **No API key.** The simulator invents its own prices; there is nothing to

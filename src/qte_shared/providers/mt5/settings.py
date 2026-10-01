@@ -7,7 +7,7 @@ the subject prefix, the JetStream stream — and how QTE consumes from it.
 
 Three places can set a field here, highest first: the environment
 (``QTE_MT5__STREAM=...``, for a one-run override), the ``[provider]`` table of
-``config/mt5.toml``, and the defaults below. The defaults mirror the ingester's
+``config/data_providers/mt5.toml``, and the defaults below. The defaults mirror the ingester's
 own ``.env`` (``NATS_SUBJECT_PREFIX=INGESTER``, ``NATS_STREAM_NAME=INGESTER``,
 ``NATS_JETSTREAM_ENABLED=true``), so the two sides agree out of the box.
 

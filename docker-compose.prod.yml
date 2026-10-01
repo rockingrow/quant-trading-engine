@@ -23,3 +23,5 @@ volumes:
     name: qte-prod-${QTE_STATE__MODE:-shadow}-${QTE_STATE__PROVIDER_KEY:-${QTE_MARKET_DATA__PROVIDER:-tiingo}}-postgres
   nats-data:
     name: qte-prod-${QTE_STATE__MODE:-shadow}-${QTE_STATE__PROVIDER_KEY:-${QTE_MARKET_DATA__PROVIDER:-tiingo}}-nats
+  tailscale-data:
+    name: qte-prod-${QTE_STATE__MODE:-shadow}-${QTE_STATE__PROVIDER_KEY:-${QTE_MARKET_DATA__PROVIDER:-tiingo}}-tailscale

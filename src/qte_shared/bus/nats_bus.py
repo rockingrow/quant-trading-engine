@@ -6,9 +6,10 @@ cost for it would buy nothing. Signals are the opposite — losing one loses a
 trade — and those go out over JetStream, which is why :meth:`publish_jetstream`
 exists alongside :meth:`publish`.
 
-Every connection is authenticated: NATS is reached over Tailscale rather than
-over a compose-private network, so :meth:`connect` refuses an empty token
-instead of falling back to anonymous access.
+Every connection is authenticated: NATS is reached from other machines —
+over the tailnet or a published port — rather than only over a compose-private
+network, so :meth:`connect` refuses an empty token instead of falling back to
+anonymous access.
 """
 
 from __future__ import annotations
@@ -70,8 +71,8 @@ class NatsBus:
     async def connect(self) -> None:
         if self.is_connected:
             return
-        # Token authentication is mandatory. The bus is reached over Tailscale,
-        # where every device on the tailnet can dial the port, so an anonymous
+        # Token authentication is mandatory. The bus is reached from other
+        # machines, over the tailnet or a published port, so an anonymous
         # connection is not a local-development convenience any more. Refuse
         # before dialling rather than trust a server that allows it.
         if not self._token:

@@ -130,3 +130,27 @@ async def test_runner_claim_is_exclusive_nonexpiring_and_owner_checked():
     finally:
         await first_state.close()
         await second_state.close()
+
+
+async def test_only_the_same_container_instance_reclaims_a_held_claim(candle_state):
+    owner_key = candle_state.key("runner", "owner")
+    assert await candle_state.runner_owner() is None
+    # Nothing held: reclaiming is not a way to claim.
+    assert not await candle_state.reclaim_runner("instance-one", "instance-one:second")
+    assert await candle_state.claim_runner("instance-one:first")
+
+    assert not await candle_state.reclaim_runner("instance-two", "instance-two:first")
+    # A token that is only a prefix of the holder's token is another container.
+    assert not await candle_state.reclaim_runner("instance", "instance:first")
+    assert await candle_state.runner_owner() == "instance-one:first"
+
+    assert await candle_state.reclaim_runner("instance-one", "instance-one:second")
+    assert await candle_state.owns_runner("instance-one:second")
+    assert not await candle_state.owns_runner("instance-one:first")
+    assert await candle_state.client.ttl(owner_key) == -1
+
+
+async def test_a_claim_without_an_instance_token_is_never_reclaimed(candle_state):
+    assert await candle_state.claim_runner("9d0c5c1e-plain-host-process")
+    assert not await candle_state.reclaim_runner("9d0c5c1e", "9d0c5c1e:replacement")
+    assert await candle_state.runner_owner() == "9d0c5c1e-plain-host-process"

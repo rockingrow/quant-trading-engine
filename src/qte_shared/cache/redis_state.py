@@ -95,6 +95,30 @@ class RedisState:
         """
         return bool(await self.client.set(self.key("runner", "owner"), owner_id, nx=True))
 
+    async def reclaim_runner(self, instance_token: str, owner_id: str) -> bool:
+        """Replace a claim left by an earlier process of the same container.
+
+        The caller must be that container's PID 1: its PID namespace died with
+        the previous PID 1, so a holder carrying this instance token cannot
+        still be running. Any other holder is left alone, and the claim still
+        never expires.
+        """
+        return bool(
+            await self.client.eval(
+                "local holder = redis.call('GET', KEYS[1]) "
+                "if holder and string.sub(holder, 1, string.len(ARGV[1])) == ARGV[1] then "
+                "redis.call('SET', KEYS[1], ARGV[2]) return 1 else return 0 end",
+                1,
+                self.key("runner", "owner"),
+                f"{instance_token}:",
+                owner_id,
+            )
+        )
+
+    async def runner_owner(self) -> str | None:
+        """The current claim's holder, for the operator and the refusal message."""
+        return await self.client.get(self.key("runner", "owner"))
+
     async def owns_runner(self, owner_id: str) -> bool:
         return await self.client.get(self.key("runner", "owner")) == owner_id
 

@@ -183,6 +183,15 @@ class FakeState:
         self.owner_id = owner_id
         return True
 
+    async def reclaim_runner(self, instance_token, owner_id):
+        if self.owner_id is None or not self.owner_id.startswith(f"{instance_token}:"):
+            return False
+        self.owner_id = owner_id
+        return True
+
+    async def runner_owner(self):
+        return self.owner_id
+
     async def owns_runner(self, owner_id):
         return self.owner_id == owner_id
 

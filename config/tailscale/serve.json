@@ -1,0 +1,7 @@
+{
+  "TCP": {
+    "4222": { "TCPForward": "nats:4222" },
+    "8222": { "TCPForward": "nats:8222" },
+    "5432": { "TCPForward": "postgres-audit:5432" }
+  }
+}

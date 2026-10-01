@@ -133,6 +133,87 @@ async def test_a_second_runner_cannot_restore_or_subscribe_to_the_same_book(monk
     await next_runner.stop()
 
 
+class RecordedEvents:
+    def __init__(self):
+        self.recorded = []
+
+    async def record_event(self, **event_fields):
+        self.recorded.append(event_fields)
+
+    def names(self):
+        return [event_fields["event"] for event_fields in self.recorded]
+
+
+def as_container_main_process(runner, instance_token):
+    """What ``__init__`` sets up when the runner is a container's PID 1."""
+    runner._instance_token = instance_token
+    runner._owner_id = f"{instance_token}:{uuid4()}"
+    runner.events = RecordedEvents()
+
+
+async def test_a_restarted_container_reclaims_the_claim_its_crash_left_behind(monkeypatch):
+    candle_store = CandleStore(completed_bars(2))
+    candle_store.owner_id = "container-one:crashed-process"
+    runner, _, _ = build_runner(monkeypatch, candle_store)
+    as_container_main_process(runner, "container-one")
+    await runner.start()
+    try:
+        assert candle_store.owner_id == runner._owner_id
+        assert "ownership_reclaimed" in runner.events.names()
+        assert runner.bus.handlers
+    finally:
+        await runner.stop()
+    assert candle_store.owner_id is None
+
+
+@pytest.mark.parametrize(
+    "stale_holder", ["container-two:crashed-process", "9d0c5c1e-a-host-process"]
+)
+async def test_another_holder_is_still_refused_and_the_refusal_is_audited(
+    monkeypatch, stale_holder
+):
+    candle_store = CandleStore(completed_bars(2))
+    candle_store.owner_id = stale_holder
+    runner, _, _ = build_runner(monkeypatch, candle_store)
+    as_container_main_process(runner, "container-one")
+    with pytest.raises(RuntimeError, match="ownership is already held") as refusal:
+        await runner.start()
+    assert stale_holder in str(refusal.value)
+    assert candle_store.owner_id == stale_holder
+    assert runner.bus.handlers == {}
+    refused = [event for event in runner.events.recorded if event["event"] == "ownership_refused"]
+    assert refused[0]["level"] == "ERROR"
+    assert refused[0]["payload"]["holder"] == stale_holder
+
+
+async def test_a_runner_without_an_instance_token_never_reclaims(monkeypatch):
+    # A host process cannot prove the holder is dead, whatever the holder is.
+    candle_store = CandleStore(completed_bars(2))
+    candle_store.owner_id = "container-one:crashed-process"
+    runner, _, _ = build_runner(monkeypatch, candle_store)
+    assert runner._instance_token is None
+    with pytest.raises(RuntimeError, match="ownership is already held"):
+        await runner.start()
+    assert candle_store.owner_id == "container-one:crashed-process"
+
+
+@pytest.mark.parametrize("reclaim_enabled", [True, False])
+async def test_the_instance_token_is_read_only_when_reclaiming_is_enabled(
+    monkeypatch, reclaim_enabled
+):
+    monkeypatch.setattr(runner_settings, "reclaim_own_claim", reclaim_enabled)
+    monkeypatch.setattr(
+        "qte_strategy_engine.runner.container_instance_token", lambda instance_file: "container-one"
+    )
+    runner, _, _ = build_runner(monkeypatch, CandleStore([]))
+    if reclaim_enabled:
+        assert runner._instance_token == "container-one"
+        assert runner._owner_id.startswith("container-one:")
+    else:
+        assert runner._instance_token is None
+        assert ":" not in runner._owner_id
+
+
 async def test_ownership_loss_blocks_the_next_order_and_requests_shutdown():
     runner, strategy_slot = _runner(), _slot()
     runner.state.owner_id = "OTHER_RUNNER"

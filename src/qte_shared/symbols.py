@@ -9,7 +9,7 @@ because that decides *which* feed or endpoint the provider reaches for.
 
 The market is always stated, never guessed: ``BTCUSD`` is a crypto pair on an
 exchange and an FX CFD on a broker's book, and only the operator knows which.
-It comes from ``market`` beside the symbol in ``config/<provider>.toml``, or
+It comes from ``market`` beside the symbol in ``config/data_providers/<provider>.toml``, or
 from ``QTE_INGESTION__MARKET_OVERRIDES`` on the no-plan fallback path.
 """
 
@@ -45,7 +45,8 @@ def build_specs(symbols: list[str], overrides: dict[str, str] | None = None) -> 
         if market is None:
             raise ValueError(
                 f"No market for {symbol!r}: name it in QTE_INGESTION__MARKET_OVERRIDES, "
-                "or move the symbol into config/<provider>.toml where it sits beside one"
+                "or move the symbol into config/data_providers/<provider>.toml "
+                "where it sits beside one"
             )
         if market not in ("fx", "crypto"):
             raise ValueError(f"Unknown market {market!r} for symbol {symbol!r}")

@@ -1,7 +1,7 @@
 # What the MT5 provider takes from algo-trading-ingester: which symbols, at
 # which bars, and where the ingester publishes them.
 #
-#   make mt5            # writes config/mt5.toml from this template
+#   make mt5            # writes config/data_providers/mt5.toml from this template
 #
 # The engine reads `config/<QTE_MARKET_DATA__PROVIDER>.toml`, so this file is
 # the plan for the `mt5` provider (QTE_MARKET_DATA__PROVIDER=mt5). `make start`
@@ -16,8 +16,8 @@
 # and this provider consumes those subjects. Bars arrive already closed, so
 # nothing is resampled: each one goes straight to Redis and the candle subject.
 #
-# This template is tracked; `config/mt5.toml` is git-ignored, for the same
-# reason as `config/tiingo.example.toml`: what a desk trades is position
+# This template is tracked; `config/data_providers/mt5.toml` is git-ignored, for the same
+# reason as `config/data_providers/tiingo.example.toml`: what a desk trades is position
 # information and this repository is public.
 #
 # **The NATS token is not here.** It is a secret and stays in `.env`:

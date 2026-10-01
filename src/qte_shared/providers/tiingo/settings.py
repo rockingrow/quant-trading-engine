@@ -6,7 +6,7 @@ of a field.
 
 Three places can set a field here, highest first: the environment
 (``QTE_TIINGO__MAX_ROWS_PER_REQUEST``, for a one-run override), the
-``[provider]`` table of ``config/tiingo.toml``, and the defaults below. The API
+``[provider]`` table of ``config/data_providers/tiingo.toml``, and the defaults below. The API
 key is not among them -- it is inherited from
 :class:`~qte_shared.interfaces.market_data.ProviderSettings` and read from
 ``QTE_DATA_PROVIDER_API_KEY``, one name whichever vendor is switched on.
@@ -35,7 +35,7 @@ class TiingoSettings(ProviderSettings):
     crypto_threshold: int = 2
     request_timeout: float = 30.0
     #: Bars asked for in a single REST call, normally set in ``[provider]`` of
-    #: ``config/tiingo.toml``. Tiingo caps an intraday response
+    #: ``config/data_providers/tiingo.toml``. Tiingo caps an intraday response
     #: at a few thousand rows and signals it with a *200 and fewer bars* -- not
     #: an error -- so a range wider than the cap comes back quietly short. The
     #: history source pages under this budget instead; measured truncation on a

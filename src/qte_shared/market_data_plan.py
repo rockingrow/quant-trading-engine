@@ -1,6 +1,6 @@
 """What the engine trades and how the vendor is asked for it, read from TOML.
 
-One provider, one file: ``config/<provider>.toml``, named after each entry of
+One provider, one file: ``config/data_providers/<provider>.toml``, named after each entry of
 ``QTE_MARKET_DATA__PROVIDER`` (a comma-separated list, ``mt5,binance``). With
 several providers their plans are merged by :meth:`MarketDataPlan.merge`: each
 symbol belongs to exactly one of them, and each provider keeps its own
@@ -32,7 +32,7 @@ to start when it names a bar no symbol is resampled to.
 **The real file is git-ignored; the template beside it is not**, for the same
 reason as :mod:`qte_shared.strategies.mapping`: what a desk trades is position
 information and this repository is public. ``make tiingo`` writes
-``config/tiingo.toml`` from ``config/tiingo.example.toml``.
+``config/data_providers/tiingo.toml`` from ``config/data_providers/tiingo.example.toml``.
 
 **Credentials never appear here.** The vendor key is a secret and stays in
 ``.env`` as ``QTE_DATA_PROVIDER_API_KEY`` — one name whatever the vendor, which

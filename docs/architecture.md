@@ -130,6 +130,42 @@ ownership key before restarting. Never clear it while an owner may still run.
 Redis persistence and retention of this key are required; do not flush or evict
 the trading namespace while runners are active.
 
+Three things keep that rule from turning every unclean exit into an outage:
+
+- **A shutdown that is allowed to finish.** `strategy-runner` sets
+  `stop_grace_period: 60s`. Docker's default kills ten seconds after SIGTERM,
+  before the runner has drained NATS and released the claim.
+- **The same container takes its own claim back.** A container's PID namespace
+  dies with its PID 1, so a runner that *is* PID 1 knows every earlier process
+  of that container is gone. Its owner id carries a random token kept on the
+  container's writable layer (`QTE_RUNNER__INSTANCE_FILE`), and a held claim
+  with that token is replaced atomically instead of refused. This is not a
+  lease and not failover: a recreated container has a new token, another host
+  has another token, and a host process or `docker exec` has none, so all of
+  them are refused as before. Recovery then runs as on any start — an ambiguous
+  delivery still blocks its pair. Running the runner under an init wrapper
+  (`init: true`) makes Python something other than PID 1 and so turns this off;
+  `QTE_RUNNER__RECLAIM_OWN_CLAIM=false` does the same deliberately.
+- **A checked way to clear it.** `qte-control owner status` shows the key and
+  its holder. `qte-control owner clear` refuses while any runner answers a ping
+  or while NATS cannot be reached, asks for the namespace to be typed back, and
+  deletes only the holder it displayed. A paused or hung runner does not answer
+  a ping, so the operator still has to know that none is left. Run it where the
+  namespace is the running stack's — in production `QTE_ENV=prod` comes from the
+  compose overlay, not from `.env`:
+
+  ```bash
+  docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+    run --rm --no-deps strategy-runner qte-control owner clear
+  ```
+
+A refused start logs `Runner ownership is already held` with the namespace and
+the holder, and records an `ownership_refused` event at `ERROR`; the container
+then restarts into the same refusal about once a minute. Alert on either — the
+log line, or `SELECT ... WHERE event = 'ownership_refused'` on the audit event
+table. `ownership_reclaimed` and `runner_owner_cleared` are recorded at
+`WARNING`.
+
 Ingestion keeps each retired candle, including its partial-bar repair state,
 until Redis acknowledges staging. It retries that batch before retiring more
 bars, bounding the backlog by configured series. Redis stages history and the
@@ -647,7 +683,7 @@ Three consequences are worth naming:
   the *choice* (`market_data.provider`) and no vendor block, so a second vendor
   never edits the core config. `QTE_TIINGO__*` is read by
   `qte_shared.providers.tiingo`, its standing values come from the `[provider]`
-  table of `config/<provider>.toml` (`qte_shared.market_data_plan`), and its key comes
+  table of `config/data_providers/<provider>.toml` (`qte_shared.market_data_plan`), and its key comes
   from one generic `QTE_DATA_PROVIDER_API_KEY` — a credential is the one
   setting that must not be invalidated by changing vendor.
 * **Images stay split.** Built-ins are registered as import-path strings and

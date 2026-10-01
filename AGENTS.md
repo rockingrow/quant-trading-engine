@@ -59,8 +59,8 @@ make check          # Ruff + pytest — what CI runs; the gate before any commit
 make test           # uv run pytest -q   (one file: uv run pytest tests/test_replay.py -q)
 make lint / format  # ruff check / ruff format + --fix
 make audit          # validate __strategies__/ against the signal contract
-make tiingo         # write config/tiingo.toml — what the vendor is asked to feed
-make mt5            # write config/mt5.toml — what the MT5 ingester's bars feed
+make tiingo         # write config/data_providers/tiingo.toml — what the vendor is asked to feed
+make mt5            # write config/data_providers/mt5.toml — what the MT5 ingester's bars feed
 make db-check       # fail if the models drifted from the migrations
 make db-upgrade     # Alembic; there is no init script
 make backtest STRATEGY=QTE_EXAMPLE_EMA_ATR SYMBOL=XAUUSD TF=M15 FILE=data/parquet/tiingo/XAUUSD_M15.parquet
@@ -92,13 +92,14 @@ package; never scan from the repository root.
 | Indicators (pure, arrays in and out) | `src/qte_shared/indicators.py` |
 | Timeframes, candle buckets, symbol markets | `src/qte_shared/{timeframes,symbols}.py` |
 | Symbol to strategy mapping | `src/qte_shared/strategies/mapping.py`, `config/strategies_mapping.example.toml` |
-| What the vendor feeds: symbols, markets, timeframes, vendor knobs | `src/qte_shared/market_data_plan.py`, `config/{tiingo,mt5}.example.toml` |
+| What the vendor feeds: symbols, markets, timeframes, vendor knobs | `src/qte_shared/market_data_plan.py`, `config/data_providers/{tiingo,mt5}.example.toml` |
 | Settings and `QTE_*` environment variables | `src/qte_shared/config.py`, each service's `settings.py`, `.env.example` |
 | NATS subjects and publishing | `src/qte_shared/bus/{subjects,nats_bus}.py` |
 | Redis state and the candle outbox | `src/qte_shared/cache/redis_state.py` |
 | Postgres models and repositories | `src/qte_shared/db/`, each engine's `db/`, `migrations/versions/` |
 | Market data interface and vendors | `src/qte_shared/interfaces/market_data.py`, `providers/` (`registry.py`, `tiingo/`, `mt5/`, `simulator/`) |
-| Closed MT5 bars from `algo-trading-ingester` over NATS | `src/qte_shared/providers/mt5/` (`feed.py`, `protocol.py`), `config/mt5.example.toml` |
+| Closed MT5 bars from `algo-trading-ingester` over NATS | `src/qte_shared/providers/mt5/` (`feed.py`, `protocol.py`), `config/data_providers/mt5.example.toml` |
+| Optional Tailscale node: tailnet forwards, signals to the broker over the tailnet | `docker-compose.yml` (`tailscale`, `broker-nats-relay`), `config/tailscale/{serve.json,policy.hujson}`, `TAILSCALE_ENABLED` in the `Makefile` |
 | Live feed, resampling, Redis and NATS | `src/qte_ingestion/{service,resampler}.py` |
 | Live loop, broker delivery, control CLI | `src/qte_strategy_engine/{runner,broker_sink,preflight,control}.py` |
 | Backtest replay, fills, metrics, reports | `src/qte_backtest/{replay,execution,metrics,report,diagnostics}.py` |
