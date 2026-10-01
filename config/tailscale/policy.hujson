@@ -1,0 +1,91 @@
+// Tailscale tailnet policy for the algo-trading deployment, as seen from the
+// engine (quant-trading-engine).
+//
+// One tailnet has exactly one policy. algo-trading-broker keeps the same file
+// (its config/tailscale/policy.hujson); whichever copy is pasted last replaces
+// the whole policy, so the two must stay identical in tagOwners and grants. A
+// rule added here and not there disappears the next time the broker's copy is
+// applied, and the other way round.
+//
+// Tailscale does not read this file from the repository: paste it into the
+// admin console (https://login.tailscale.com/admin/acls/file) or push it with
+// tailscale/gitops-acl-action. The console validates it and runs the `tests`
+// block below on every save, so a rule that would cut off a live data path is
+// refused before it takes effect.
+//
+// Topology — one node per server, each joined with a tagged auth key:
+//
+//   MT5 VPS (Windows)   tag:ingester + tag:worker   ingester publishes bars to
+//                                                   the engine's NATS; worker
+//                                                   subscribes to the broker's
+//                                                   NATS and reports TRADE back
+//   Engine server       tag:engine                  this repository; its
+//                                                   `tailscale` container
+//                                                   forwards 4222/8222/5432
+//                                                   (config/tailscale/serve.json)
+//                                                   and `broker-nats-relay`
+//                                                   publishes SIGNALS to the
+//                                                   broker through it
+//   Broker server       tag:broker                  algo-trading-broker; its
+//                                                   `tailscale` container
+//                                                   forwards 4222/8222/5432
+//
+// Every flow is a NATS client opening a TCP connection to a NATS server, so a
+// grant only ever needs the server's port: replies and subscriptions ride the
+// connection the client opened. Anything not granted here is denied, which is
+// the point — a compromised MT5 VPS (RDP, a broker terminal) can reach the two
+// NATS ports it needs and nothing else, never the engine's Postgres audit
+// trail or either monitoring port.
+//
+// Tagged nodes never have their key expire, so a server does not silently
+// drop off the tailnet 180 days after it joined.
+{
+  "tagOwners": {
+    "tag:broker":   ["autogroup:admin"],
+    "tag:engine":   ["autogroup:admin"],
+    "tag:ingester": ["autogroup:admin"],
+    "tag:worker":   ["autogroup:admin"],
+  },
+
+  "grants": [
+    // Ingester → engine NATS: closed bars on INGEST.bar.closed.>
+    {"src": ["tag:ingester"], "dst": ["tag:engine"], "ip": ["tcp:4222"]},
+
+    // Engine → broker NATS: SIGNALS.<strategy> onto the broker's JetStream,
+    // dialled by the engine's broker-nats-relay through its tailscale node.
+    // Worker → broker NATS: subscribe to per-strategy subjects, publish TRADE
+    // and the SYSTEM handshake. Same port, same reason.
+    {"src": ["tag:engine", "tag:worker"], "dst": ["tag:broker"], "ip": ["tcp:4222"]},
+
+    // Worker → broker HTTP API (WEBHOOK_PORT, 80 by default; the `tailscale`
+    // container forwards it to the broker service). Only the worker gets it:
+    // the engine talks to the broker over NATS, not HTTP.
+    {"src": ["tag:worker"], "dst": ["tag:broker"], "ip": ["tcp:80"]},
+
+    // Operators' own devices: everything, including the NATS monitoring ports
+    // (8222) and both Postgres databases (5432) for a DB client.
+    {"src": ["autogroup:admin"], "dst": ["tag:broker", "tag:engine", "tag:ingester", "tag:worker"], "ip": ["*"]},
+  ],
+
+  "tests": [
+    {
+      "src":    "tag:ingester",
+      "accept": ["tag:engine:4222"],
+      "deny":   ["tag:broker:4222", "tag:broker:5432", "tag:engine:8222", "tag:engine:5432"],
+    },
+    {
+      "src":    "tag:worker",
+      "accept": ["tag:broker:4222"],
+      "deny":   ["tag:broker:5432", "tag:broker:8222", "tag:engine:4222", "tag:engine:5432"],
+    },
+    {
+      "src":    "tag:engine",
+      "accept": ["tag:broker:4222"],
+      "deny":   ["tag:broker:5432", "tag:broker:8222", "tag:ingester:8090", "tag:worker:8000"],
+    },
+    {
+      "src":    "tag:broker",
+      "deny":   ["tag:engine:4222", "tag:engine:5432", "tag:ingester:8090", "tag:worker:8000"],
+    },
+  ],
+}

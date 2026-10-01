@@ -2,7 +2,8 @@
 
 This is what is left of the control plane after the HTTP gateway was removed,
 and it is smaller for a reason: the only control that genuinely needed to reach
-a *running* process is shadow mode. Everything else the API used to serve —
+a *running* process is shadow mode — plus ``owner``, for the one piece of state
+a runner that is no longer running can leave behind. Everything else the API used to serve —
 listing strategies, reading the audit trail, running a backtest — is either a
 CLI command already or a SQL query, and neither of those needs a web service
 kept alive to answer it.
@@ -22,6 +23,9 @@ import argparse
 import asyncio
 import json
 import sys
+
+from nats.errors import NoRespondersError
+from nats.errors import TimeoutError as NatsTimeoutError
 
 from qte_shared.bus import NatsBus, Subjects
 from qte_shared.cache import RedisState
@@ -51,6 +55,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     subparsers.add_parser("ping", help="Ask the running runners to identify themselves")
+
+    owner = subparsers.add_parser(
+        "owner", help="Inspect or clear the runner ownership claim left by an unclean exit"
+    )
+    owner.add_argument(
+        "operation",
+        choices=["status", "clear"],
+        help="status = show who holds the claim; clear = remove a stale claim",
+    )
+    owner.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the confirmation prompt when clearing",
+    )
     return parser
 
 
@@ -156,6 +174,111 @@ async def _ping() -> None:
         await bus.close()
 
 
+async def _read_runner_owner(redis_state: RedisState) -> str | None:
+    try:
+        await redis_state.connect()
+        return await redis_state.runner_owner()
+    except Exception as exc:
+        _die(f"Could not reach Redis at {settings.redis.url} — nothing was changed.", exc)
+
+
+async def _show_runner_owner() -> None:
+    redis_state = RedisState()
+    try:
+        holder = await _read_runner_owner(redis_state)
+    finally:
+        await redis_state.close()
+    print(f"State namespace: {settings.state_scope.namespace}")
+    print(f"Ownership key:   {redis_state.key('runner', 'owner')}")
+    print(f"Holder:          {holder if holder is not None else 'none — no runner claim'}")
+
+
+async def _answering_runner() -> dict | None:
+    """The runner that answers a ping, or ``None`` when none does.
+
+    An unreachable NATS is not "no runner": nothing can be verified through a
+    bus that is down, so that case refuses instead of returning ``None``.
+    """
+    control_bus = NatsBus(name="qte-control")
+    try:
+        await control_bus.connect()
+    except Exception as exc:
+        _die(
+            f"Could not reach NATS at {settings.nats.url}, so no runner could be ruled out "
+            "— nothing was changed.",
+            exc,
+        )
+    try:
+        return await control_bus.request(
+            Subjects().engine_control(), {"action": "ping"}, timeout=2.0
+        )
+    except (NoRespondersError, NatsTimeoutError):
+        return None
+    except Exception as exc:
+        # Anything else is a broken request, not an absent runner.
+        _die("The runner ping failed, so no runner could be ruled out — nothing was changed.", exc)
+    finally:
+        await control_bus.close()
+
+
+async def _clear_runner_owner(*, assume_yes: bool) -> None:
+    """Remove a stale claim, and only a stale one.
+
+    The claim never expires on purpose: a paused runner that outlived a lease
+    would resume beside its replacement. So this refuses while any runner
+    answers, asks before it deletes, and deletes only the holder it showed.
+    """
+    namespace = settings.state_scope.namespace
+    redis_state = RedisState()
+    try:
+        holder = await _read_runner_owner(redis_state)
+        print(f"State namespace: {namespace}")
+        print(f"Ownership key:   {redis_state.key('runner', 'owner')}")
+        if holder is None:
+            print("No runner claim is held; nothing to clear.")
+            return
+        print(f"Holder:          {holder}")
+
+        runner_reply = await _answering_runner()
+        if runner_reply is not None:
+            print(json.dumps(runner_reply, indent=2), file=sys.stderr)
+            raise SystemExit(
+                "A runner answered the ping, so the claim is not stale. Stop it first; "
+                "nothing was changed."
+            )
+
+        if not assume_yes:
+            print(
+                "No runner answered the ping. A paused or hung runner does not answer "
+                "either: confirm yourself that no runner process for this namespace is "
+                "left on any host before continuing."
+            )
+            answer = input(f"Type the namespace ({namespace}) to clear its claim: ")
+            if answer.strip() != namespace:
+                print("Aborted; the claim is unchanged.")
+                raise SystemExit(1)
+
+        try:
+            cleared = await redis_state.release_runner(holder)
+        except Exception as exc:
+            _die(f"Could not reach Redis at {settings.redis.url}.", exc)
+        if not cleared:
+            raise SystemExit(
+                "The claim changed while this command ran — another runner took it. "
+                "Nothing was removed."
+            )
+    finally:
+        await redis_state.close()
+
+    await EventRepository().record_event(
+        service="qte-control",
+        event="runner_owner_cleared",
+        level="WARNING",
+        payload={"holder": holder},
+    )
+    print("Cleared. The next runner to start will claim the namespace.")
+
+
 def _die(message: str, exc: Exception) -> None:
     """Fail the way a CLI should: one line of what went wrong, no traceback.
 
@@ -172,6 +295,13 @@ def main() -> None:
 
     if args.command == "ping":
         asyncio.run(_ping())
+        return
+
+    if args.command == "owner":
+        if args.operation == "status":
+            asyncio.run(_show_runner_owner())
+        else:
+            asyncio.run(_clear_runner_owner(assume_yes=args.yes))
         return
 
     if args.state == "status":

@@ -1,9 +1,10 @@
-"""NATS is on the tailnet, so every connection has to carry a token.
+"""NATS is reached from other machines, so every connection has to carry a token.
 
 The bus used to treat the token as optional: a blank one simply produced an
 anonymous connection, which was harmless while the port only existed inside the
-compose network. Over Tailscale every device can dial it, so an empty token is
-a misconfiguration to refuse rather than a default to accept. These tests pin
+compose network. Now the MT5 ingester dials it from another machine — over the
+tailnet or a published port — so an empty token is a misconfiguration to refuse
+rather than a default to accept. These tests pin
 the refusal and the pass-through, because both are one `if` away from silently
 regressing.
 """
@@ -28,7 +29,7 @@ async def test_connecting_without_a_token_is_refused_before_dialling(monkeypatch
         raise AssertionError("connect() dialled NATS without a token")
 
     monkeypatch.setattr(nats_module.nats, "connect", refuse_to_be_called)
-    bus = NatsBus(url="nats://quanghuynhpc:4222", token="")
+    bus = NatsBus(url="nats://engine-node:4222", token="")
 
     with pytest.raises(RuntimeError, match="QTE_NATS__TOKEN"):
         await bus.connect()
@@ -42,13 +43,13 @@ async def test_the_token_reaches_the_client_options(monkeypatch):
         return RecordingClient()
 
     monkeypatch.setattr(nats_module.nats, "connect", capture)
-    bus = NatsBus(url="nats://quanghuynhpc:4222", token="tailnet-secret")
+    bus = NatsBus(url="nats://engine-node:4222", token="tailnet-secret")
 
     await bus.connect()
 
     assert captured["token"] == "tailnet-secret"
-    assert captured["servers"] == ["nats://quanghuynhpc:4222"]
+    assert captured["servers"] == ["nats://engine-node:4222"]
 
 
-def test_the_default_url_is_the_tailnet_host_not_localhost():
-    assert NatsSettings(_env_file=None).url == "nats://quanghuynhpc:4222"
+def test_the_default_url_is_the_host_side_published_port():
+    assert NatsSettings(_env_file=None).url == "nats://localhost:4222"

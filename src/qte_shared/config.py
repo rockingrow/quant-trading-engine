@@ -61,19 +61,19 @@ load_dotenv(REPO_ROOT / ".env", override=False)
 class NatsSettings(BaseSettings):
     """QTE's own internal event bus (candles, ticks, engine control).
 
-    The bus runs on the Tailscale tailnet, so the default host is the tailnet
-    name of the machine that serves it rather than ``localhost``: every service,
-    on the host or in a container, dials the same address and no compose-private
-    hostname has to be kept in sync with it.
+    ``url`` is the host-side address (the published port on ``localhost``);
+    the compose containers override it with the ``nats`` service name. Remote
+    clients — the MT5 ingester — reach the same server through this host's
+    address, or through the tailnet when ``TAILSCALE_ENABLED`` is on.
 
-    ``token`` has no usable default. Because the port is reachable from every
-    device on the tailnet, ``NatsBus.connect`` refuses to dial without one —
-    see ``qte_shared.bus.nats_bus``.
+    ``token`` has no usable default. Because the port is reachable from
+    another machine either way, ``NatsBus.connect`` refuses to dial without
+    one — see ``qte_shared.bus.nats_bus``.
     """
 
     model_config = SettingsConfigDict(env_prefix="QTE_NATS__", extra="ignore")
 
-    url: str = "nats://quanghuynhpc:4222"
+    url: str = "nats://localhost:4222"
     token: str = ""
     subject_prefix: str = "QTE"
     connect_timeout: float = 5.0
@@ -232,7 +232,8 @@ class MarketDataSettings(BaseSettings):
         if self.config_file is not None and len(providers) > 1:
             raise ValueError(
                 "QTE_MARKET_DATA__CONFIG_FILE names one plan, but QTE_MARKET_DATA__PROVIDER "
-                f"lists {len(providers)} providers; each reads config/<provider>.toml instead"
+                f"lists {len(providers)} providers; each reads "
+                "config/data_providers/<provider>.toml instead"
             )
         return self
 
@@ -267,7 +268,7 @@ class MarketDataSettings(BaseSettings):
 
     def plan_file_for(self, provider_name: str) -> Path:
         """The plan *provider_name* reads. Named after it, unless overridden."""
-        return self.config_file or REPO_ROOT / "config" / f"{provider_name}.toml"
+        return self.config_file or REPO_ROOT / "config" / "data_providers" / f"{provider_name}.toml"
 
     @property
     def plan_files(self) -> dict[str, Path]:
@@ -308,7 +309,7 @@ class EngineSettings(BaseSettings):
     """What the running engine trades and how much history it keeps warm.
 
     ``symbols`` and ``timeframes`` are the market-data plan's, not this block's:
-    ``config/<provider>.toml`` states them per symbol, and these read whatever
+    ``config/data_providers/<provider>.toml`` states them per symbol, and these read whatever
     it says. The environment variables still exist and still win — a
     ``default_factory`` only runs when the variable is unset — so a one-off
     ``QTE_ENGINE__SYMBOLS='["EURUSD"]' make backtest`` overrides the file

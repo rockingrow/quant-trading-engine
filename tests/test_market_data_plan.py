@@ -16,7 +16,7 @@ import pytest
 
 from qte_shared.market_data_plan import MarketDataPlan, SymbolFeed
 
-EXAMPLE = "config/tiingo.example.toml"
+EXAMPLE = "config/data_providers/tiingo.example.toml"
 
 
 def write_plan(tmp_path, body: str):
@@ -121,7 +121,7 @@ def test_the_shipped_template_parses_and_documents_the_schema():
 
 def test_the_simulator_template_parses_and_pins_one_symbol():
     """`make simulator` copies this file; the guard now requires it like Tiingo's."""
-    plan = MarketDataPlan.load("config/simulator.example.toml")
+    plan = MarketDataPlan.load("config/data_providers/simulator.example.toml")
     assert plan.symbols == ["XAUUSD"]
     assert plan.timeframes == ["M15"]
     # The [provider] table is kept for shape but the simulator has no knobs.

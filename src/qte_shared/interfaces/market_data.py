@@ -97,7 +97,7 @@ class ProviderSettings(BaseSettings):
     * the **key** in ``.env`` as ``QTE_DATA_PROVIDER_API_KEY`` -- one name for
       whichever vendor is switched on, because a secret is the one thing that
       must not move file when the vendor changes;
-    * the **knobs** in ``[provider]`` of ``config/<provider>.toml``, beside the
+    * the **knobs** in ``[provider]`` of ``config/data_providers/<provider>.toml``, beside the
       symbols they are fetched for (:mod:`qte_shared.market_data_plan`).
 
     Environment still wins over the file, so ``QTE_TIINGO__MAX_ROWS_PER_REQUEST``

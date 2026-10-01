@@ -102,6 +102,7 @@ from qte_shared.timeframes import (
 )
 from qte_strategy_engine.broker_sink import BrokerSink, DeliveryResult
 from qte_strategy_engine.db import OpenPositionRepository, SignalRepository
+from qte_strategy_engine.instance import container_instance_token
 from qte_strategy_engine.preflight import run_preflight_audit
 from qte_strategy_engine.settings import runner_settings
 
@@ -169,7 +170,15 @@ class StrategyRunner:
         self._market_zone = settings.engine.market_zone
         self._configured_shadow_mode = self.sink.shadow_mode
         self._history_started_at = datetime.now(UTC)
-        self._owner_id = str(uuid4())
+        #: Set only for a container's PID 1, whose stale claim is provably dead.
+        self._instance_token = (
+            container_instance_token(runner_settings.instance_file)
+            if runner_settings.reclaim_own_claim
+            else None
+        )
+        self._owner_id = (
+            f"{self._instance_token}:{uuid4()}" if self._instance_token else str(uuid4())
+        )
         self._ownership_acquired = False
         self.slots: list[StrategySlot] = []
         self._by_subject: dict[tuple[str, str], list[StrategySlot]] = defaultdict(list)
@@ -194,13 +203,7 @@ class StrategyRunner:
         try:
             await self.bus.connect()
             await self.state.connect()
-            if not await self.state.claim_runner(self._owner_id):
-                raise RuntimeError(
-                    "Runner ownership is already held in this Redis namespace. Stop the "
-                    "other runner; after an unclean exit verify it is gone before clearing "
-                    "the runner:owner key. Automatic failover is disabled."
-                )
-            self._ownership_acquired = True
+            await self._acquire_ownership()
             await self._refresh_shadow_mode()
             await self.sink.start()
 
@@ -259,6 +262,54 @@ class StrategyRunner:
         except BaseException:
             await self._close_resources(record_event=False)
             raise
+
+    async def _acquire_ownership(self) -> None:
+        """Claim the namespace, or take back this container's own stale claim.
+
+        A held claim is refused, with one exception: a holder that carries this
+        container's instance token is an earlier process of the container we
+        are PID 1 of, so it is gone. Recovery after that runs exactly as on any
+        other start — an ambiguous delivery still blocks its pair.
+        """
+        if await self.state.claim_runner(self._owner_id):
+            self._ownership_acquired = True
+            return
+        if self._instance_token is not None and await self.state.reclaim_runner(
+            self._instance_token, self._owner_id
+        ):
+            self._ownership_acquired = True
+            log.warning(
+                "Reclaimed the runner ownership left by an earlier process of this "
+                "container owner_id=%s",
+                self._owner_id,
+            )
+            with contextlib.suppress(Exception):
+                await self.events.record_event(
+                    service=SERVICE_NAME,
+                    event="ownership_reclaimed",
+                    level="WARNING",
+                    payload={"owner_id": self._owner_id},
+                )
+            return
+        holder = None
+        with contextlib.suppress(Exception):
+            holder = await self.state.runner_owner()
+        # The audit trail is what an operator can alert on; never let it mask
+        # the refusal itself.
+        with contextlib.suppress(Exception):
+            await self.events.record_event(
+                service=SERVICE_NAME,
+                event="ownership_refused",
+                level="ERROR",
+                payload={"holder": holder, "namespace": self._scope.namespace},
+            )
+        raise RuntimeError(
+            "Runner ownership is already held in this Redis namespace "
+            f"(namespace={self._scope.namespace}, holder={holder}). Stop the other runner; "
+            "after an unclean exit verify it is gone, then run `qte-control owner clear` "
+            "(make owner-clear) to remove the stale runner:owner key. Automatic failover "
+            "is disabled."
+        )
 
     async def _refresh_shadow_mode(self) -> None:
         """Read the durable control before recovery and every new delivery.
@@ -1167,6 +1218,7 @@ class StrategyRunner:
                     _encode(
                         {
                             "service": SERVICE_NAME,
+                            "owner_id": self._owner_id,
                             "slots": len(self.slots),
                             "namespace": self._scope.namespace,
                             "execution_mode": self._scope.execution_mode,

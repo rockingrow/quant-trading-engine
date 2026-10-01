@@ -173,6 +173,154 @@ class DeadRedis(FakeRedis):
         raise ConnectionError("Error 111 connecting to localhost:6379")
 
 
+# ── owner: the claim an unclean exit leaves behind ──────────────────────
+
+
+class OwnedRedis(FakeRedis):
+    def __init__(self, holder=None, *, replaced_by=None):
+        super().__init__()
+        self.holder = holder
+        self.replaced_by = replaced_by
+
+    def key(self, *parts):
+        return ":".join(("qte", "test", *parts))
+
+    async def runner_owner(self):
+        return self.holder
+
+    async def release_runner(self, owner_id):
+        if self.replaced_by is not None:
+            self.holder = self.replaced_by
+        if self.holder != owner_id:
+            return False
+        self.holder = None
+        return True
+
+
+class PingBus(FakeBus):
+    def __init__(self, *, runner_reply=None, failure=None, fail=False):
+        super().__init__(fail=fail)
+        self.runner_reply = runner_reply
+        self.failure = failure
+
+    async def request(self, subject, payload, timeout=5.0):
+        if self.runner_reply is not None:
+            return self.runner_reply
+        raise self.failure or control.NatsTimeoutError()
+
+
+def wire_owner(monkeypatch, redis, bus):
+    audit = FakeEvents()
+    monkeypatch.setattr(control, "RedisState", lambda *a, **k: redis)
+    monkeypatch.setattr(control, "NatsBus", lambda *a, **k: bus)
+    monkeypatch.setattr(control, "EventRepository", lambda *a, **k: audit)
+    return audit
+
+
+def test_the_parser_accepts_the_owner_commands():
+    parser = control.build_parser()
+    assert parser.parse_args(["owner", "status"]).operation == "status"
+    assert parser.parse_args(["owner", "clear", "--yes"]).yes is True
+    with pytest.raises(SystemExit):
+        parser.parse_args(["owner", "delete"])
+
+
+async def test_owner_status_names_the_key_and_its_holder(monkeypatch, capsys):
+    wire_owner(monkeypatch, OwnedRedis("stale-owner"), PingBus())
+    await control._show_runner_owner()
+    output = capsys.readouterr().out
+    assert "qte:test:runner:owner" in output and "stale-owner" in output
+
+
+async def test_clearing_without_a_claim_changes_nothing(monkeypatch, capsys):
+    redis = OwnedRedis()
+    audit = wire_owner(monkeypatch, redis, PingBus(fail=True))
+    await control._clear_runner_owner(assume_yes=True)
+    assert "nothing to clear" in capsys.readouterr().out
+    assert audit.events == []
+
+
+async def test_a_stale_claim_is_cleared_and_audited(monkeypatch, capsys):
+    redis = OwnedRedis("stale-owner")
+    audit = wire_owner(monkeypatch, redis, PingBus())
+    await control._clear_runner_owner(assume_yes=True)
+    assert redis.holder is None
+    assert redis.closed
+    assert audit.events[0]["event"] == "runner_owner_cleared"
+    assert audit.events[0]["payload"] == {"holder": "stale-owner"}
+    assert "Cleared" in capsys.readouterr().out
+
+
+async def test_no_responders_counts_as_no_runner(monkeypatch):
+    redis = OwnedRedis("stale-owner")
+    wire_owner(monkeypatch, redis, PingBus(failure=control.NoRespondersError()))
+    await control._clear_runner_owner(assume_yes=True)
+    assert redis.holder is None
+
+
+async def test_a_runner_that_answers_keeps_its_claim(monkeypatch, capsys):
+    redis = OwnedRedis("live-owner")
+    audit = wire_owner(monkeypatch, redis, PingBus(runner_reply={"owner_id": "live-owner"}))
+    with pytest.raises(SystemExit, match="not stale"):
+        await control._clear_runner_owner(assume_yes=True)
+    assert redis.holder == "live-owner"
+    assert audit.events == []
+    assert "live-owner" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "bus", [PingBus(fail=True), PingBus(failure=ConnectionError("connection lost mid-request"))]
+)
+async def test_an_unverifiable_runner_keeps_its_claim(monkeypatch, capsys, bus):
+    # A bus that is down cannot say that no runner is alive.
+    redis = OwnedRedis("stale-owner")
+    audit = wire_owner(monkeypatch, redis, bus)
+    with pytest.raises(SystemExit) as exit_info:
+        await control._clear_runner_owner(assume_yes=True)
+    assert exit_info.value.code == 2
+    assert redis.holder == "stale-owner"
+    assert audit.events == []
+    assert "nothing was changed" in capsys.readouterr().err
+
+
+async def test_a_claim_that_changed_meanwhile_is_not_removed(monkeypatch):
+    redis = OwnedRedis("stale-owner", replaced_by="new-runner")
+    audit = wire_owner(monkeypatch, redis, PingBus())
+    with pytest.raises(SystemExit, match="claim changed"):
+        await control._clear_runner_owner(assume_yes=True)
+    assert redis.holder == "new-runner"
+    assert audit.events == []
+
+
+def test_clearing_requires_typing_the_namespace(monkeypatch):
+    redis = OwnedRedis("stale-owner")
+    audit = wire_owner(monkeypatch, redis, PingBus())
+    monkeypatch.setattr("builtins.input", lambda _: "yes")
+    monkeypatch.setattr("sys.argv", ["qte-control", "owner", "clear"])
+    with pytest.raises(SystemExit) as exit_info:
+        control.main()
+    assert exit_info.value.code == 1
+    assert redis.holder == "stale-owner"
+    assert audit.events == []
+
+
+def test_typing_the_namespace_clears_the_claim(monkeypatch):
+    redis = OwnedRedis("stale-owner")
+    wire_owner(monkeypatch, redis, PingBus())
+    monkeypatch.setattr("builtins.input", lambda _: control.settings.state_scope.namespace)
+    monkeypatch.setattr("sys.argv", ["qte-control", "owner", "clear"])
+    control.main()
+    assert redis.holder is None
+
+
+async def test_an_unreachable_redis_reports_one_line_for_the_owner_commands(monkeypatch, capsys):
+    monkeypatch.setattr(control, "RedisState", lambda *a, **k: DeadRedis())
+    with pytest.raises(SystemExit) as exit_info:
+        await control._clear_runner_owner(assume_yes=True)
+    assert exit_info.value.code == 2
+    assert "Could not reach Redis" in capsys.readouterr().err
+
+
 async def test_an_unreachable_redis_changes_nothing_rather_than_half_applying(monkeypatch, capsys):
     """The dangerous case: broadcasting a flag that was never stored.
 

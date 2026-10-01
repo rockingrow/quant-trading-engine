@@ -56,3 +56,5 @@ volumes:
     name: qte-dev-dev-${QTE_STATE__PROVIDER_KEY:-${QTE_MARKET_DATA__PROVIDER:-tiingo}}-postgres
   nats-data:
     name: qte-dev-dev-${QTE_STATE__PROVIDER_KEY:-${QTE_MARKET_DATA__PROVIDER:-tiingo}}-nats
+  tailscale-data:
+    name: qte-dev-dev-${QTE_STATE__PROVIDER_KEY:-${QTE_MARKET_DATA__PROVIDER:-tiingo}}-tailscale

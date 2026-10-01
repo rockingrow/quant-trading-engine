@@ -21,6 +21,14 @@ class RunnerSettings(BaseSettings):
     #: Subscription label. A Redis ownership claim enforces one active runner;
     #: queue distribution alone cannot share its candle or position state.
     queue_group: str = "qte-runners"
+    #: Let a restart of the *same container* take back the claim its crashed
+    #: predecessor left in Redis. Only the container's PID 1 qualifies; a
+    #: recreated container, another host or a host process is still refused.
+    #: See :mod:`qte_strategy_engine.instance`.
+    reclaim_own_claim: bool = True
+    #: Where that container keeps its identity. It must stay on the container's
+    #: own writable layer — never on a mounted volume another container shares.
+    instance_file: str = "/tmp/qte-runner.instance"
     #: Subscribe to ticks. Only worth it when a strategy overrides ``on_tick``;
     #: the runner turns it on automatically when one does.
     subscribe_ticks: bool = False

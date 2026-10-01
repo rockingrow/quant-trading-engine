@@ -21,7 +21,7 @@ any other provider switch: open positions recorded under the old namespace are
 not visible from the new one. Compose cannot hold a comma in a name, so the
 Makefile exports that key as `QTE_STATE__PROVIDER_KEY`, and every service
 refuses to start when a set key disagrees with the provider list. Each provider
-reads its own plan, `config/<provider>.toml`, and one symbol may be planned by
+reads its own plan, `config/data_providers/<provider>.toml`, and one symbol may be planned by
 only one of them.
 
 Synthetic providers, including `simulator`, require `dev` mode and cannot share

@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Recovery from a stale runner ownership claim** — the non-expiring
+  `runner:owner` claim still refuses a second runner and still never fails
+  over, but an unclean exit no longer has to end in a crash loop and a manual
+  `redis-cli DEL`. `strategy-runner` gets `stop_grace_period: 60s`, so a deploy
+  or `docker compose stop` is no longer killed ten seconds into the shutdown
+  that releases the claim. A restart of the **same container** takes back the
+  claim its crashed predecessor left (`QTE_RUNNER__RECLAIM_OWN_CLAIM`, default
+  `true`): only the container's PID 1 qualifies, because that process knows
+  every earlier one in its PID namespace is gone; a recreated container, another
+  host and a host process are refused as before. New `qte-control owner
+  status|clear` (`make owner-status`, `make owner-clear`) removes a stale claim
+  only when no runner answers a ping, after the namespace is typed back, and
+  only if the holder is still the one it showed. A refused start now names the
+  namespace and the holder and records an `ownership_refused` audit event;
+  `ownership_reclaimed` and `runner_owner_cleared` are recorded too, and the
+  runner's ping reply carries its `owner_id`.
+
+- **Optional Tailscale node, as a container** — the same design as
+  `algo-trading-broker`, behind the same `.env` switch, `TAILSCALE_ENABLED`
+  (default **`false`**). Turned on, `make start`/`up`/`dev`/`start-prod` also
+  start a `tailscale` container (`tailscale/tailscale`, userspace networking,
+  profile `tailscale`) that joins the tailnet as `TAILSCALE_HOSTNAME`, tagged
+  `tag:engine`, and through Tailscale Serve (`config/tailscale/serve.json`)
+  forwards its tailnet ports 4222 (NATS), 8222 (NATS monitoring) and 5432
+  (Postgres); the Redis, Postgres and NATS host ports are then published on
+  `127.0.0.1` only, so the MT5 ingester has to join the tailnet and connect to
+  `nats://<TAILSCALE_HOSTNAME>:4222`. Signals go the other way through a new
+  `broker-nats-relay` container (socat over the node's SOCKS5 proxy) to
+  `nats://<TAILSCALE_BROKER_HOSTNAME>:4222`, and the Makefile points the
+  runner's `ALGO_BROKER__NATS_URL` at it. New `TAILSCALE_AUTHKEY` (first login
+  only — the identity is kept in a per-stack `*-tailscale` volume),
+  `TAILSCALE_HOSTNAME`, `TAILSCALE_BROKER_HOSTNAME`, and `make
+  tailscale-status`. New `config/tailscale/policy.hujson`, the tailnet policy
+  shared with `algo-trading-broker` (keep both copies identical), with tests
+  pinning it to the engine's tag, Serve forwards and relay port; `make stop`/`down`/`nuke` now include the `tailscale`
+  profile. Turned off, neither container is pulled and every port binds
+  `0.0.0.0` as before.
+
 - **Backtest dashboard** (`qte-backtest chart`) — A report rendered as one
   self-contained HTML page, laid out like a strategy tester: cumulative P&L
   against buy-and-hold with the per-trade excursion and underwater band as
@@ -65,6 +103,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Market-data plans moved to `config/data_providers/`.** The templates
+  (`<provider>.example.toml`) and the git-ignored plans `make tiingo` / `mt5` /
+  `binance` / `simulator` write from them now live there, and the engine reads
+  `config/data_providers/<provider>.toml` by default. Move an existing
+  `config/<provider>.toml` into the new folder; `QTE_MARKET_DATA__CONFIG_FILE`
+  still overrides the path.
+- **Host ports take a bare number; the bind address follows
+  `TAILSCALE_ENABLED`.** Redis, Postgres and NATS publish on
+  `${PRIVATE_BIND_ADDRESS}` — `0.0.0.0` with Tailscale off, `127.0.0.1` with it
+  on. A `.env` that prefixed an address (`QTE_REDIS_PORT=localhost:2690`) no
+  longer renders: drop the prefix.
+- **The runner's container dials the broker at
+  `nats://host.docker.internal:4222` by default** (was `:2701`, one
+  deployment's port). Set `ALGO_CONTAINER_BROKER_NATS_URL` when the broker
+  publishes another port; with `TAILSCALE_ENABLED=true` the tailnet relay is
+  used instead.
+- **`QTE_NATS__URL` defaults to `nats://localhost:4222`**, the host-side
+  published port, instead of one machine's tailnet name — nothing is installed
+  on the host any more, so that name no longer resolves there.
 - **The price chart carries the run's own bars, however long the history.**
   `market.rows` no longer climbs to a coarser timeframe above 20,000 rows, so a
   five-year M15 run is drawn at M15 — ~120k rows, a report and dashboard of

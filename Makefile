@@ -28,6 +28,33 @@ MARKET_DATA_PROVIDERS := $(or $(QTE_MARKET_DATA__PROVIDER),$(shell sed -n 's/^QT
 QTE_STATE__PROVIDER_KEY := $(shell printf '%s' '$(MARKET_DATA_PROVIDERS)' | tr ',' '\n' | tr -d ' ' | tr 'A-Z' 'a-z' | sed '/^$$/d' | sort -u | paste -sd- -)
 export QTE_STATE__PROVIDER_KEY
 
+# Tailscale is opt-in: .env sets TAILSCALE_ENABLED=true (default false), the
+# same switch algo-trading-broker reads. It decides every half of the setup, so
+# .env never has to spell them out:
+#   - the `tailscale` and `broker-nats-relay` containers (docker-compose.yml,
+#     profile `tailscale`) are started: the node joins the tailnet, forwards
+#     NATS/Postgres onto it, and carries the runner's signals to the broker;
+#   - the Redis, Postgres and NATS host ports are published on 127.0.0.1 only,
+#     so another machine — the MT5 ingester — can reach them through the
+#     tailnet and nothing else;
+#   - the runner's container dials the broker through that relay.
+# With it off, neither container is pulled, those ports bind every interface
+# (0.0.0.0) and the runner dials the broker as before.
+TAILSCALE_ENABLED := $(shell sed -n 's/^TAILSCALE_ENABLED=//p' .env 2>/dev/null | tail -n1 | sed 's/[[:space:]]*\#.*//' | tr -d '\r"' | tr -d "' " | tr '[:upper:]' '[:lower:]')
+TAILSCALE_ACTIVE := $(if $(filter true 1 yes on,$(TAILSCALE_ENABLED)),1,)
+
+COMPOSE_PROFILE := $(if $(TAILSCALE_ACTIVE),--profile tailscale,)
+# Named explicitly where a target lists its services (`start-prod`): naming a
+# service is what enables its profile there.
+TAILSCALE_SERVICES := $(if $(TAILSCALE_ACTIVE),tailscale broker-nats-relay,)
+
+# Passed explicitly so the switch is authoritative over whatever the shell
+# happens to export.
+PRIVATE_BIND_ADDRESS := $(if $(TAILSCALE_ACTIVE),127.0.0.1,0.0.0.0)
+export PRIVATE_BIND_ADDRESS
+TAILNET_BROKER_NATS_URL := $(if $(TAILSCALE_ACTIVE),nats://broker-nats-relay:4222,)
+export TAILNET_BROKER_NATS_URL
+
 help: ## Show this help, grouped by section
 	@awk 'BEGIN {FS = ":.*?## "} \
 		/^##@ / {printf "\n\033[1m%s\033[0m\n", substr($$0, 5); next} \
@@ -189,42 +216,42 @@ strategies: ## List what the mounted strategy repo publishes
 ##@ Market data
 
 # What a provider is asked to feed — symbols, their markets and timeframes, and
-# the vendor's own knobs — lives in config/<provider>.toml, not in .env: it is a
+# the vendor's own knobs — lives in config/data_providers/<provider>.toml, not in .env: it is a
 # per-symbol matrix and the flat form could not express one. The real file is
 # git-ignored like the mapping table; the template beside it is tracked.
 # The key is the exception and stays in .env as QTE_DATA_PROVIDER_API_KEY
 # (for mt5, the NATS token as QTE_MT5__NATS_TOKEN, blank = QTE_NATS__TOKEN).
 
 tiingo: ## Copy the Tiingo market-data plan into place (never overwrites)
-	@if [ -f config/tiingo.toml ]; then \
-		echo "config/tiingo.toml exists - leaving it alone"; \
+	@if [ -f config/data_providers/tiingo.toml ]; then \
+		echo "config/data_providers/tiingo.toml exists - leaving it alone"; \
 	else \
-		sed -e '/^[ \t]*#/d' config/tiingo.example.toml | cat -s | sed -e '/./,$$!d' > config/tiingo.toml; \
-		echo "Wrote config/tiingo.toml (git-ignored, comments stripped) - list the symbols you want fed in it"; \
+		sed -e '/^[ \t]*#/d' config/data_providers/tiingo.example.toml | cat -s | sed -e '/./,$$!d' > config/data_providers/tiingo.toml; \
+		echo "Wrote config/data_providers/tiingo.toml (git-ignored, comments stripped) - list the symbols you want fed in it"; \
 	fi
 
 mt5: ## Copy the MT5 (algo-trading-ingester) market-data plan into place (never overwrites)
-	@if [ -f config/mt5.toml ]; then \
-		echo "config/mt5.toml exists - leaving it alone"; \
+	@if [ -f config/data_providers/mt5.toml ]; then \
+		echo "config/data_providers/mt5.toml exists - leaving it alone"; \
 	else \
-		sed -e '/^[ \t]*#/d' config/mt5.example.toml | cat -s | sed -e '/./,$$!d' > config/mt5.toml; \
-		echo "Wrote config/mt5.toml (git-ignored, comments stripped) - list the symbols the ingester publishes"; \
+		sed -e '/^[ \t]*#/d' config/data_providers/mt5.example.toml | cat -s | sed -e '/./,$$!d' > config/data_providers/mt5.toml; \
+		echo "Wrote config/data_providers/mt5.toml (git-ignored, comments stripped) - list the symbols the ingester publishes"; \
 	fi
 
 binance: ## Copy the Binance market-data plan into place - placeholder provider, not implemented yet
-	@if [ -f config/binance.toml ]; then \
-		echo "config/binance.toml exists - leaving it alone"; \
+	@if [ -f config/data_providers/binance.toml ]; then \
+		echo "config/data_providers/binance.toml exists - leaving it alone"; \
 	else \
-		sed -e '/^[ \t]*#/d' config/binance.example.toml | cat -s | sed -e '/./,$$!d' > config/binance.toml; \
-		echo "Wrote config/binance.toml (git-ignored, comments stripped) - the binance provider is not implemented yet"; \
+		sed -e '/^[ \t]*#/d' config/data_providers/binance.example.toml | cat -s | sed -e '/./,$$!d' > config/data_providers/binance.toml; \
+		echo "Wrote config/data_providers/binance.toml (git-ignored, comments stripped) - the binance provider is not implemented yet"; \
 	fi
 
 simulator: ## Copy the simulator market-data plan into place (never overwrites)
-	@if [ -f config/simulator.toml ]; then \
-		echo "config/simulator.toml exists - leaving it alone"; \
+	@if [ -f config/data_providers/simulator.toml ]; then \
+		echo "config/data_providers/simulator.toml exists - leaving it alone"; \
 	else \
-		sed -e '/^[ \t]*#/d' config/simulator.example.toml | cat -s | sed -e '/./,$$!d' > config/simulator.toml; \
-		echo "Wrote config/simulator.toml (git-ignored, comments stripped) - list the symbols you want fed in it"; \
+		sed -e '/^[ \t]*#/d' config/data_providers/simulator.example.toml | cat -s | sed -e '/./,$$!d' > config/data_providers/simulator.toml; \
+		echo "Wrote config/data_providers/simulator.toml (git-ignored, comments stripped) - list the symbols you want fed in it"; \
 	fi
 
 # Guards `up` and `start`. A missing plan does not fail at runtime: the engine
@@ -238,15 +265,15 @@ market-plan: ## Fail unless every configured provider has its plan file
 	[ -n "$$providers" ] || providers=tiingo; \
 	for provider in $$(printf '%s' "$$providers" | tr ',' ' ' | tr 'A-Z' 'a-z'); do \
 		plan="$$override"; \
-		[ -n "$$plan" ] || plan="config/$$provider.toml"; \
+		[ -n "$$plan" ] || plan="config/data_providers/$$provider.toml"; \
 		if [ ! -f "$$plan" ]; then \
 			echo "QTE_MARKET_DATA__PROVIDER=$$providers, but $$plan does not exist." >&2; \
 			echo "Without it the engine falls back to the QTE_ENGINE__* defaults and" >&2; \
 			echo "subscribes to symbols nobody chose." >&2; \
-			if [ -f "config/$$provider.example.toml" ]; then \
+			if [ -f "config/data_providers/$$provider.example.toml" ]; then \
 				echo "Write one:  make $$provider" >&2; \
 			else \
-				echo "There is no config/$$provider.example.toml to copy - write $$plan by hand." >&2; \
+				echo "There is no config/data_providers/$$provider.example.toml to copy - write $$plan by hand." >&2; \
 			fi; \
 			exit 1; \
 		fi; \
@@ -265,21 +292,23 @@ build-prod: strategy-requirements ## Rebuild every service image except the dev 
 	docker compose build db-migrate data-ingestion strategy-runner
 
 up: market-plan strategy-requirements ## Start the application stack without the dev simulator
-	docker compose up -d --build
+	docker compose $(COMPOSE_PROFILE) up -d --build
 
 start: market-plan strategy-requirements ## Start app images; migration completes before apps boot
-	docker compose up -d --build
+	docker compose $(COMPOSE_PROFILE) up -d --build
 	@echo "Stack is up. Data-ingestion / strategy-runner block until db-migrate exits 0."
 	@echo "For the simulator and source mounts, use make dev."
 
 start-prod: market-plan strategy-requirements ## Build and start production services with QTE_ENV=prod
-	docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build db-migrate data-ingestion strategy-runner
+	docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build db-migrate data-ingestion strategy-runner $(TAILSCALE_SERVICES)
 
+# `--profile tailscale` whatever the switch says: a stack started with it on
+# and stopped after it was turned off still has its tailnet containers.
 stop: ## Stop the stack (volumes survive) — alias of `down`
-	docker compose down
+	docker compose --profile tailscale down
 
 down: ## Stop the stack (volumes survive)
-	docker compose down
+	docker compose --profile tailscale down
 
 restart: market-plan strategy-requirements ## Recreate ingestion and runner, preserving the simulator clock
 	docker compose up -d --build --no-deps --force-recreate data-ingestion strategy-runner
@@ -291,7 +320,7 @@ restart: market-plan strategy-requirements ## Recreate ingestion and runner, pre
 # live in the container, so the loop is: edit -> `make dev-restart` (seconds,
 # no rebuild) -> `make logs`. A dependency change still needs `make dev` again.
 
-DEV_COMPOSE := -f docker-compose.yml -f docker-compose.dev.yml --profile dev
+DEV_COMPOSE := -f docker-compose.yml -f docker-compose.dev.yml --profile dev $(COMPOSE_PROFILE)
 
 dev: market-plan strategy-requirements ## `start` with src/ bind-mounted for live editing
 	docker compose $(DEV_COMPOSE) up -d --build
@@ -309,7 +338,22 @@ logging: ## Stream the whole stack's logs live, newest lines only (SERVICE= narr
 	docker compose logs -f --tail=0 --timestamps $(SERVICE)
 
 nuke: ## Stop the stack and DELETE its volumes (audit trail included)
-	docker compose down -v
+	docker compose --profile tailscale down -v
+
+# The image's containerboot puts tailscaled's socket at /tmp/tailscaled.sock,
+# not where the CLI looks by default. A node that has not logged in yet fails
+# `status`; its container log then carries the login URL. MSYS_NO_PATHCONV stops
+# Git Bash on Windows from rewriting that path into C:/Users/.../Temp/...; it is
+# ignored everywhere else.
+TS_CLI = MSYS_NO_PATHCONV=1 docker compose $(COMPOSE_PROFILE) exec tailscale tailscale --socket=/tmp/tailscaled.sock
+
+tailscale-status: ## Show the tailscale container's tailnet status, Serve forwards and login URL
+ifeq ($(TAILSCALE_ACTIVE),1)
+	@$(TS_CLI) status || docker compose $(COMPOSE_PROFILE) logs --tail=30 tailscale
+	@$(TS_CLI) serve status
+else
+	@echo "Tailscale is disabled (TAILSCALE_ENABLED is not true in .env) — nothing to show."
+endif
 
 ##@ Database
 
@@ -441,10 +485,16 @@ shadow-off: ## Resume delivery to the broker (GOES LIVE — prompts to confirm)
 ping: ## Ask the running runners to identify themselves
 	uv run qte-control ping
 
+owner-status: ## Show which runner holds the ownership claim for this namespace
+	uv run qte-control owner status
+
+owner-clear: ## Remove a stale runner claim after an unclean exit (refuses while a runner answers)
+	uv run qte-control owner clear
+
 .PHONY: help install install-dev lock test lint format check tiingo mt5 binance simulator market-plan \
-	build build-prod up start stop down restart dev dev-restart logs logging logging-broker nuke \
+	build build-prod up start stop down restart dev dev-restart logs logging logging-broker nuke tailscale-status \
 	strategy-mount strategy-audit strategy-requirements strategy-test strategies audit audit-strict strategy-mapping \
 	db-upgrade db-downgrade db-revision db-current db-history db-check \
 	download backtest chart reports csv-import \
 	sim sim-status sim-replay warmup warmup-cache sim-bar bar signal sim-walk sim-stop sim-reset sim-watch \
-	shadow-status shadow-on shadow-off ping
+	shadow-status shadow-on shadow-off ping owner-status owner-clear

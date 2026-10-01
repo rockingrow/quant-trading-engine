@@ -63,10 +63,10 @@ QTE_NATS_PORT=4222
 QTE_NATS_MONITOR_PORT=8222
 QTE_SIMULATOR_PORT=8901
 
-# ── QTE's NATS, on the Tailscale tailnet ──────────────────────────────
-# Same address on the host and in a container; the token is required, because
-# the port is reachable from every device on the tailnet.
-QTE_NATS__URL=nats://quanghuynhpc:4222
+# ── QTE's NATS ────────────────────────────────────────────────────────
+# Host-side address; the containers dial the `nats` service. The token is
+# required, because the port is reachable from another machine.
+QTE_NATS__URL=nats://localhost:4222
 QTE_NATS__TOKEN=<the token config/nats.conf is started with>
 QTE_NATS__SUBJECT_PREFIX=QTE
 
@@ -95,7 +95,7 @@ QTE_RUNNER__DEFAULT_QUANTITY=0.01
 
 # ── Market data: the dev simulator, not a vendor ──────────────────────
 # The simulator needs no key and no plan file. Point this at `tiingo` and the
-# symbols, timeframes and vendor knobs come from config/tiingo.toml
+# symbols, timeframes and vendor knobs come from config/data_providers/tiingo.toml
 # (`make tiingo`) — `make dev` checks it is there.
 QTE_MARKET_DATA__PROVIDER=simulator
 QTE_DATA_PROVIDER_API_KEY=
@@ -142,16 +142,16 @@ that port**, including both simulator URLs. Keep the internal simulator port
 separate volumes; stop the previous project first if it uses the same ports.
 
 The simulator needs no key, but it does need a market-data plan — the same
-`config/<provider>.toml` mechanism Tiingo uses to say *what* to feed. Write it:
+`config/data_providers/<provider>.toml` mechanism Tiingo uses to say *what* to feed. Write it:
 
 ```bash
 make simulator
 ```
 
-That copies `config/simulator.example.toml` to the git-ignored
-`config/simulator.toml` (comments stripped), pinning one symbol: `XAUUSD` at
+That copies `config/data_providers/simulator.example.toml` to the git-ignored
+`config/data_providers/simulator.toml` (comments stripped), pinning one symbol: `XAUUSD` at
 `M15`. `make dev` refuses to come up without it. To test another pair, edit
-`config/simulator.toml`, the strategy and the mapping together.
+`config/data_providers/simulator.toml`, the strategy and the mapping together.
 
 ## 2. Install and map the example strategy
 
@@ -282,7 +282,7 @@ uv run qte-simulator bar --symbol XAUUSD --timeframe M15 \
 
 It reaches `XAUUSD M15` without naming either: `--symbol` falls back to the
 first of `QTE_ENGINE__SYMBOLS` and `--timeframe` to the engine signal
-timeframe, and the symbol list is read from `config/simulator.toml` — the same
+timeframe, and the symbol list is read from `config/data_providers/simulator.toml` — the same
 plan ingestion subscribed to. `make bar SYMBOL=EURUSD TF=M5` overrides both,
 but a symbol outside the plan is accepted by the simulator and then ignored
 downstream, because ingestion subscribed to that list and nothing else.

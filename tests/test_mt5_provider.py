@@ -29,12 +29,12 @@ from qte_shared.providers.mt5 import Mt5Provider, Mt5Settings
 from qte_shared.providers.mt5.feed import ACCEPTED_REPLY, BUSY_REPLY, IngesterBarFeed
 from qte_shared.providers.mt5.protocol import IngesterPayloadError, decode_bar_closed
 
-EXAMPLE_PLAN = "config/mt5.example.toml"
+EXAMPLE_PLAN = "config/data_providers/mt5.example.toml"
 
 
 @pytest.fixture(autouse=True)
 def no_plan_on_disk(monkeypatch):
-    """Settings built here must not read whatever config/<provider>.toml exists."""
+    """Settings built here must not read whatever config/data_providers/<provider>.toml exists."""
     monkeypatch.setattr("qte_shared.config.market_data_plan", lambda: MarketDataPlan())
 
 
