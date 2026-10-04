@@ -252,7 +252,7 @@ class IngesterBarFeed(LiveFeed):
 
     async def _handle_raw(self, raw: bytes) -> None:
         try:
-            bar = decode_bar_closed(raw)
+            bar = decode_bar_closed(raw, self._config.schema_versions)
         except IngesterPayloadError as exc:
             log.warning("MT5 ingester sent an unusable message: %s — %.160r", exc, raw)
             return

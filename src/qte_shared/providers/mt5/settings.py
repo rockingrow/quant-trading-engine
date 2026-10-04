@@ -21,13 +21,17 @@ server should not need its token written down twice.
 from __future__ import annotations
 
 import re
-from typing import ClassVar, Literal
+from typing import Annotated, ClassVar, Literal
 
-from pydantic import Field
-from pydantic_settings import SettingsConfigDict
+from pydantic import Field, field_validator
+from pydantic_settings import NoDecode, SettingsConfigDict
 
 from qte_shared.config import settings
 from qte_shared.interfaces.market_data import ProviderSettings
+from qte_shared.providers.mt5.protocol import (
+    DEFAULT_SCHEMA_VERSIONS,
+    normalize_schema_versions,
+)
 
 #: A JetStream consumer name may not contain ``.``, ``*``, ``>`` or whitespace.
 _UNSAFE_CONSUMER_CHARS = re.compile(r"[^A-Za-z0-9_-]")
@@ -49,6 +53,16 @@ class Mt5Settings(ProviderSettings):
     subject_prefix: str = "INGESTER"
     #: The ingester gateway whose bars this provider takes.
     gateway: str = "mt5"
+    #: Which of the ingester's ``schema_version`` values this gateway decodes.
+    #: Each is a full ``major.minor.patch`` and matches that version alone, so
+    #: reading two (``["1.0.0", "2.0.0"]``) is how one QTE follows a fleet
+    #: through an upgrade. Compare it with the ingester's ``SCHEMA_VERSION``
+    #: (``ContractSettings.VERSION``, ``1.0.0`` by default); a shortened
+    #: ``"1.0"`` on the wire reads as the same version. Bars on any other
+    #: version are refused with their version in the log, never decoded on a
+    #: guess, so an ingester upgrade needs this list edited with it.
+    #: ``NoDecode``: the environment hands this over as ``1,2``, not as JSON.
+    schema_versions: Annotated[tuple[str, ...], NoDecode] = DEFAULT_SCHEMA_VERSIONS
     #: Mirror of the ingester's ``NATS_JETSTREAM_ENABLED``. JetStream lets a QTE
     #: that was down replay what it missed; core NATS drops it.
     jetstream: bool = True
@@ -76,6 +90,16 @@ class Mt5Settings(ProviderSettings):
     max_pending_bars: int = Field(default=10_000, ge=1)
     #: Cap on the reconnect backoff when the server or the stream is missing.
     max_backoff_seconds: float = Field(default=30.0, gt=0)
+
+    @field_validator("schema_versions", mode="before")
+    @classmethod
+    def _read_schema_versions(cls, value: object) -> object:
+        """A TOML list, or ``QTE_MT5__SCHEMA_VERSIONS=1.0.0,2.0.0`` for one run."""
+        if isinstance(value, str):
+            value = value.split(",")
+        if isinstance(value, list | tuple):
+            return normalize_schema_versions(value)
+        return value
 
     @property
     def server_url(self) -> str:

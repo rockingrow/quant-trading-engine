@@ -18,6 +18,7 @@ from datetime import UTC, datetime, timedelta
 import nats.errors
 import pytest
 from nats.js.errors import NotFoundError
+from pydantic import ValidationError
 
 from qte_ingestion.service import IngestionService
 from qte_shared.config import settings
@@ -36,6 +37,9 @@ EXAMPLE_PLAN = "config/data_providers/mt5.example.toml"
 def no_plan_on_disk(monkeypatch):
     """Settings built here must not read whatever config/data_providers/<provider>.toml exists."""
     monkeypatch.setattr("qte_shared.config.market_data_plan", lambda: MarketDataPlan())
+    monkeypatch.setattr(
+        "qte_shared.config.provider_market_data_plan", lambda provider_name: MarketDataPlan()
+    )
 
 
 def bar_payload(
@@ -49,7 +53,7 @@ def bar_payload(
     minutes = {"M1": 1, "M15": 15, "H1": 60}[timeframe]
     close_time = open_time + timedelta(minutes=minutes)
     payload = {
-        "schema_version": "2.0",
+        "schema_version": "1.0",
         "event_id": f"mt5:{symbol}:{timeframe}:{int(open_time.timestamp())}",
         "event_type": "bar.closed",
         "source": {
@@ -112,6 +116,25 @@ def test_defaults_match_the_ingesters_own_env():
     assert config.jetstream is True
     assert config.stream == "INGESTER"
     assert config.deliver_policy == "all"
+
+
+def test_the_accepted_versions_are_configuration_not_a_constant(monkeypatch):
+    assert Mt5Settings().schema_versions == ("1.0.0",)
+    # What a [provider] table hands over: a TOML list, duplicates and all.
+    listed = ["1.0.0", "2.0.0", " 1.0.0 "]
+    assert Mt5Settings(schema_versions=listed).schema_versions == ("1.0.0", "2.0.0")
+    monkeypatch.setenv("QTE_MT5__SCHEMA_VERSIONS", "1.0.0, 2.0.0")
+    assert Mt5Settings().schema_versions == ("1.0.0", "2.0.0")
+
+
+@pytest.mark.parametrize(
+    "configured", [[], [""], ["1"], ["1.0"], ["1.0.0.0"], ["1.x"], ["v1.0.0"], ["1.0.0-beta"]]
+)
+def test_a_version_not_written_in_full_is_refused_at_start_up(configured):
+    """A shortened entry would have to be guessed at, and nothing at all would
+    refuse every bar with no reason given."""
+    with pytest.raises(ValidationError, match="major.minor.patch|at least one"):
+        Mt5Settings(schema_versions=configured)
 
 
 def test_a_blank_server_falls_back_to_qtes_own_bus(monkeypatch):
@@ -180,15 +203,33 @@ def test_unknown_counts_are_zero_and_symbols_are_upper_case():
     assert (candle.symbol, candle.volume, candle.tick_count) == ("XAUUSD", 0.0, 0)
 
 
-def test_an_added_field_under_the_same_major_is_ignored():
-    payload = bar_payload(schema_version="2.1", something_new={"a": 1})
+def test_a_field_this_decoder_never_reads_is_ignored():
+    payload = bar_payload(something_new={"a": 1})
     assert decode_bar_closed(encoded(payload)).candle.symbol == "XAUUSD"
+
+
+def test_the_ingesters_shortened_version_is_read_as_semver():
+    """It publishes ``SCHEMA_VERSION = "1.0"``; the accept-list says ``1.0.0``."""
+    for version in ("1", "1.0", "1.0.0"):
+        payload = bar_payload(schema_version=version)
+        assert decode_bar_closed(encoded(payload), ("1.0.0",)).candle.symbol == "XAUUSD"
+
+
+def test_a_gateway_reads_exactly_the_versions_it_was_given():
+    """Two listed versions, a fleet mid-upgrade — and nothing either side."""
+    accepted = ("1.0.0", "2.0.0")
+    for version in ("1.0", "2.0.0"):
+        payload = bar_payload(schema_version=version)
+        assert decode_bar_closed(encoded(payload), accepted).candle.symbol == "XAUUSD"
+    for refused in ("1.1.0", "1.0.1", "2.1.0", "3.0.0"):
+        with pytest.raises(IngesterPayloadError, match="is not accepted"):
+            decode_bar_closed(encoded(bar_payload(schema_version=refused)), accepted)
 
 
 @pytest.mark.parametrize(
     ("mutate", "reason"),
     [
-        (lambda payload: payload.update(schema_version="3.0"), "schema_version"),
+        (lambda payload: payload.update(schema_version="2.0"), "schema_version"),
         (lambda payload: payload.update(event_type="tick"), "event_type"),
         (lambda payload: payload.pop("symbol"), "symbol"),
         (lambda payload: payload.update(timeframe="M7"), "M7"),
