@@ -14,11 +14,13 @@
 
 [provider]
 backfill_history = true
-# Which of the ingester's `schema_version` values this gateway would decode —
-# the same knob as `config/data_providers/mt5.example.toml`, because the Binance
-# gateway publishes the same `bar.closed` envelope. Read only once the provider
-# is implemented; see that file for what an entry means.
-schema_versions = ["1.0.0"]
+# Commented out because nothing reads it yet: this placeholder provider talks to
+# Binance directly (live + history), not through the ingester, so it declares no
+# settings class and no `[provider]` table of its own. Should it instead consume
+# the ingester's Binance gateway — which publishes the same `bar.closed`
+# envelope — it accepts schema versions the way the MT5 provider does, and
+# `config/data_providers/mt5.example.toml` documents what an entry means.
+#schema_versions = ["1.0.0"]
 
 # [symbols.BTCUSDT]
 # market = "crypto"

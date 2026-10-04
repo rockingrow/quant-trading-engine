@@ -56,9 +56,11 @@ class Mt5Settings(ProviderSettings):
     #: Which of the ingester's ``schema_version`` values this gateway decodes.
     #: Each is a full ``major.minor.patch`` and matches that version alone, so
     #: reading two (``["1.0.0", "2.0.0"]``) is how one QTE follows a fleet
-    #: through an upgrade. The ingester's shorter ``"1.0"`` on the wire reads as
-    #: ``1.0.0``. Bars on any other version are refused with their version in
-    #: the log, never decoded on a guess.
+    #: through an upgrade. Compare it with the ingester's ``SCHEMA_VERSION``
+    #: (``ContractSettings.VERSION``, ``1.0.0`` by default); a shortened
+    #: ``"1.0"`` on the wire reads as the same version. Bars on any other
+    #: version are refused with their version in the log, never decoded on a
+    #: guess, so an ingester upgrade needs this list edited with it.
     #: ``NoDecode``: the environment hands this over as ``1,2``, not as JSON.
     schema_versions: Annotated[tuple[str, ...], NoDecode] = DEFAULT_SCHEMA_VERSIONS
     #: Mirror of the ingester's ``NATS_JETSTREAM_ENABLED``. JetStream lets a QTE

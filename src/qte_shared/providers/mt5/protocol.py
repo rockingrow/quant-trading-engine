@@ -3,11 +3,11 @@
 ``algo-trading-ingester`` publishes one ``BarClosedEvent`` per completed bar on
 ``<prefix>.bar.closed.<gateway>.<symbol>.<timeframe>``. Its schema lives in that
 repository (``ingester/schemas/market_event_schema.py``, sample in
-``examples/nats/bar.closed.mt5.json``); this module is the only place in QTE
-that knows its shape::
+``examples/nats/bar.closed.mt5.json`` — which still shows the older ``"1.0"``);
+this module is the only place in QTE that knows its shape::
 
     {
-      "schema_version": "1.0",
+      "schema_version": "1.0.0",
       "event_id": "mt5:XAUUSD:M15:1790589600",
       "event_type": "bar.closed",
       "source": {"gateway": "mt5", "market": "forex", ...},
@@ -28,10 +28,13 @@ config edit rather than a release.
 
 Every entry is a full ``major.minor.patch`` version and matches that version
 and no other — which is why it is a list: reading ``1.0.0`` and ``1.1.0`` at
-once means naming both. The wire is read as semver, so the ingester's shorter
-``"1.0"`` is the version ``1.0.0`` and the entry that takes it says so in full.
-A version nobody listed is refused rather than half-understood, because a
-payload this code would misread is worse than a missing bar.
+once means naming both. The version on the wire is the ingester's
+``ContractSettings.VERSION`` (``ingester/settings.py``, ``SCHEMA_VERSION`` in
+its environment, ``1.0.0`` by default), and it is read as semver: a publisher
+that leaves the tail off sends ``"1.0"`` for the same version, which the entry
+``"1.0.0"`` takes. A version nobody listed is refused rather than
+half-understood, because a payload this code would misread is worse than a
+missing bar — and the warning names both sides, so the fix is one config edit.
 """
 
 from __future__ import annotations
@@ -48,8 +51,8 @@ from pydantic import ValidationError
 from qte_shared.models import Candle
 from qte_shared.timeframes import normalize_timeframe, timeframe_seconds
 
-#: What a gateway accepts when its plan says nothing: the ingester's contract as
-#: of its ``SCHEMA_VERSION = "1.0"``, written in full.
+#: What a gateway accepts when its plan says nothing: the ingester's own
+#: default (``ContractSettings.VERSION``), written in full.
 DEFAULT_SCHEMA_VERSIONS: tuple[str, ...] = ("1.0.0",)
 
 #: A configured entry: ``major.minor.patch``, nothing shortened.
@@ -105,10 +108,11 @@ def normalize_schema_versions(values: Iterable[str]) -> tuple[str, ...]:
 def accepts_schema_version(version: str, accepted: Sequence[str]) -> bool:
     """Whether *version* is one of *accepted*, read as semver.
 
-    A publisher may leave the tail off — the ingester's ``SCHEMA_VERSION`` is
-    ``"1.0"`` — so a missing component on the wire reads as ``0`` and ``"1.0"``
-    matches the entry ``"1.0.0"``. Nothing else matches: an accept-list is the
-    exact set of payload shapes this decoder has been checked against.
+    A publisher may leave the tail off — the ingester's own
+    ``examples/nats/bar.closed.mt5.json`` still shows ``"1.0"`` — so a missing
+    component reads as ``0`` and ``"1.0"`` matches the entry ``"1.0.0"``.
+    Nothing else matches: an accept-list is the exact set of payload shapes this
+    decoder has been checked against.
     """
     if not _WIRE_VERSION_SPEC.fullmatch(version):
         return False

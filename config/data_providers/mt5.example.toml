@@ -46,10 +46,11 @@ gateway = "mt5"
 # Which of the ingester's `schema_version` values this provider decodes. Each
 # one is a full major.minor.patch and matches that version alone, so list every
 # version to accept: ["1.0.0", "2.0.0"] keeps bars flowing while a fleet of
-# ingesters is upgraded one host at a time. The ingester publishes "1.0", which
-# reads as 1.0.0. A bar on any other version is refused with its version in the
-# log rather than decoded on a guess, so compare this with the ingester's own
-# SCHEMA_VERSION (`ingester/schemas/market_event_schema.py`) whenever it moves.
+# ingesters is upgraded one host at a time. A shortened "1.0" on the wire reads
+# as the same version. A bar on any other version is refused with its version in
+# the log rather than decoded on a guess, so compare this with the ingester's
+# own SCHEMA_VERSION (`ContractSettings.VERSION` in its `ingester/settings.py`,
+# "1.0.0" by default) whenever that moves — including a patch bump.
 schema_versions = ["1.0.0"]
 # The ingester's NATS_JETSTREAM_ENABLED. true = consume the stream through a
 # durable consumer, so bars published while QTE was down are delivered when it

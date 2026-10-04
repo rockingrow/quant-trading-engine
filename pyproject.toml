@@ -14,7 +14,7 @@ requires-python = ">=3.13,<3.14"
 # so an image installs the sockets and file formats it actually uses.
 dependencies = [
     "pydantic>=2.7",
-    "pydantic-settings>=2.3",
+    "pydantic-settings>=2.7",  # NoDecode, for the schema_versions env form
     "pandas>=2.2",
     "numpy>=1.26",
     "nats-py>=2.7",
