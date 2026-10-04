@@ -716,6 +716,16 @@ QTE_MARKET_DATA__PROVIDER=mt5         # in .env
   normally name QTE's own NATS, so `QTE_MT5__NATS_URL`/`QTE_MT5__NATS_TOKEN`
   stay blank and fall back to `QTE_NATS__*`. Symbols are the bare names in its
   `MT5_SYMBOLS`, timeframes a subset of its `MT5_TIMEFRAMES`.
+- **The wire contract is a list, not a constant.** `schema_versions` in
+  `config/data_providers/mt5.toml` is which of the ingester's `schema_version`
+  values QTE decodes. Each is a full `major.minor.patch` and matches that
+  version alone, so every version to accept is named: the default `["1.0.0"]`
+  is the ingester's `SCHEMA_VERSION = "1.0"` (a shortened version on the wire
+  reads as semver, so `1.0` is `1.0.0`), and `["1.0.0", "2.0.0"]` keeps bars
+  flowing while a fleet of ingesters is upgraded host by host. A bar on any
+  other version is logged with its version and dropped, never decoded on a
+  guess — so when the ingester bumps the version, this list is the one edit
+  that lets its bars in.
 - **Beside another vendor.** `QTE_MARKET_DATA__PROVIDER=mt5,binance` runs both,
   each feeding the symbols of its own `config/data_providers/<provider>.toml`; a symbol may be
   planned by only one. The list is part of the state identity — see

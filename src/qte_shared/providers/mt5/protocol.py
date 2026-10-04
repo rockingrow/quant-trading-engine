@@ -7,7 +7,7 @@ repository (``ingester/schemas/market_event_schema.py``, sample in
 that knows its shape::
 
     {
-      "schema_version": "2.0",
+      "schema_version": "1.0",
       "event_id": "mt5:XAUUSD:M15:1790589600",
       "event_type": "bar.closed",
       "source": {"gateway": "mt5", "market": "forex", ...},
@@ -20,14 +20,25 @@ that knows its shape::
               "spread": 12.0}
     }
 
-Only the major version is checked. The ingester bumps it on a breaking change,
-and a payload this code would misread is refused rather than half-understood;
-an added field under the same major is ignored.
+Which ``schema_version`` values are read is **configuration, not a constant**:
+each gateway lists them in the ``[provider]`` table of its own plan
+(``schema_versions``, :class:`~qte_shared.providers.mt5.settings.Mt5Settings`),
+so one QTE can read two ingesters while a fleet is upgraded, and a rollout is a
+config edit rather than a release.
+
+Every entry is a full ``major.minor.patch`` version and matches that version
+and no other — which is why it is a list: reading ``1.0.0`` and ``1.1.0`` at
+once means naming both. The wire is read as semver, so the ingester's shorter
+``"1.0"`` is the version ``1.0.0`` and the entry that takes it says so in full.
+A version nobody listed is refused rather than half-understood, because a
+payload this code would misread is worse than a missing bar.
 """
 
 from __future__ import annotations
 
 import json
+import re
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -37,8 +48,15 @@ from pydantic import ValidationError
 from qte_shared.models import Candle
 from qte_shared.timeframes import normalize_timeframe, timeframe_seconds
 
-#: The ingester's ``SCHEMA_VERSION`` major this decoder understands.
-SUPPORTED_SCHEMA_MAJOR = "2"
+#: What a gateway accepts when its plan says nothing: the ingester's contract as
+#: of its ``SCHEMA_VERSION = "1.0"``, written in full.
+DEFAULT_SCHEMA_VERSIONS: tuple[str, ...] = ("1.0.0",)
+
+#: A configured entry: ``major.minor.patch``, nothing shortened.
+_VERSION_SPEC = re.compile(r"\d+\.\d+\.\d+")
+
+#: A version on the wire, where a publisher may leave the tail off (``"1.0"``).
+_WIRE_VERSION_SPEC = re.compile(r"\d+(?:\.\d+){0,2}")
 
 #: The ingester's ``EventTypeEnum.BAR_CLOSED``.
 BAR_CLOSED_EVENT = "bar.closed"
@@ -56,8 +74,61 @@ class IngestedBar:
     candle: Candle
 
 
-def decode_bar_closed(raw: bytes | str) -> IngestedBar:
-    """Read one ``bar.closed`` message; raise :class:`IngesterPayloadError` otherwise."""
+def normalize_schema_versions(values: Iterable[str]) -> tuple[str, ...]:
+    """Clean one gateway's accept-list: stripped, deduplicated, shape-checked.
+
+    Every entry must be a full ``major.minor.patch``. A shortened one is a
+    configuration error rather than a guess, because ``"1.0"`` could mean the
+    one version or the whole minor and the two differ by every later release.
+
+    Raises :class:`ValueError`, so a gateway's settings class can hand its
+    ``[provider].schema_versions`` straight here and a typo surfaces as a
+    configuration error at start-up instead of as a feed that refuses every bar.
+    """
+    accepted: list[str] = []
+    for value in values:
+        wanted = str(value).strip()
+        if not wanted:
+            continue
+        if not _VERSION_SPEC.fullmatch(wanted):
+            raise ValueError(
+                f"schema version {wanted!r} is not a major.minor.patch version — "
+                "write it in full, as '1.0.0', and list every version to accept"
+            )
+        if wanted not in accepted:
+            accepted.append(wanted)
+    if not accepted:
+        raise ValueError("schema_versions needs at least one accepted version")
+    return tuple(accepted)
+
+
+def accepts_schema_version(version: str, accepted: Sequence[str]) -> bool:
+    """Whether *version* is one of *accepted*, read as semver.
+
+    A publisher may leave the tail off — the ingester's ``SCHEMA_VERSION`` is
+    ``"1.0"`` — so a missing component on the wire reads as ``0`` and ``"1.0"``
+    matches the entry ``"1.0.0"``. Nothing else matches: an accept-list is the
+    exact set of payload shapes this decoder has been checked against.
+    """
+    if not _WIRE_VERSION_SPEC.fullmatch(version):
+        return False
+    return _full_version(version) in accepted
+
+
+def _full_version(version: str) -> str:
+    """``"1"`` and ``"1.0"`` both as ``"1.0.0"`` — semver's own default."""
+    parts = version.split(".")
+    return ".".join(parts + ["0"] * (3 - len(parts)))
+
+
+def decode_bar_closed(
+    raw: bytes | str, schema_versions: Sequence[str] = DEFAULT_SCHEMA_VERSIONS
+) -> IngestedBar:
+    """Read one ``bar.closed`` message; raise :class:`IngesterPayloadError` otherwise.
+
+    *schema_versions* is the calling gateway's accept-list, normally straight
+    from its ``[provider]`` table.
+    """
     try:
         document = json.loads(raw)
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
@@ -66,10 +137,12 @@ def decode_bar_closed(raw: bytes | str) -> IngestedBar:
         raise IngesterPayloadError(f"expected a JSON object, got {type(document).__name__}")
 
     version = str(document.get("schema_version", ""))
-    if version.split(".")[0] != SUPPORTED_SCHEMA_MAJOR:
+    if not accepts_schema_version(version, schema_versions):
         raise IngesterPayloadError(
-            f"schema_version {version!r} is not {SUPPORTED_SCHEMA_MAJOR}.x — "
-            "the ingester's contract changed; update qte_shared.providers.mt5.protocol"
+            f"schema_version {version!r} is not accepted "
+            f"(configured: {', '.join(schema_versions) or 'none'}) — compare the ingester's "
+            "SCHEMA_VERSION, then add it in full to [provider].schema_versions once "
+            "qte_shared.providers.mt5.protocol can read that shape"
         )
     if document.get("event_type") != BAR_CLOSED_EVENT:
         raise IngesterPayloadError(f"event_type {document.get('event_type')!r} is not a bar")
