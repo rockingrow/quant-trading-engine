@@ -51,6 +51,12 @@ gateway = "mt5"
 # the log rather than decoded on a guess, so compare this with the ingester's
 # own SCHEMA_VERSION (`ContractSettings.VERSION` in its `ingester/settings.py`,
 # "1.0.0" by default) whenever that moves — including a patch bump.
+#
+# The warm-up fields (`warmup_bar`, `warmup_index`, `warmup_total`) are read on
+# 1.0.0: they are additive, so they needed no new version and nothing has to be
+# added here for the indicator window to be merged. Only a version the ingester
+# actually publishes belongs in this list — an entry is a claim that QTE has
+# been checked against that shape.
 schema_versions = ["1.0.0"]
 # The ingester's NATS_JETSTREAM_ENABLED. true = consume the stream through a
 # durable consumer, so bars published while QTE was down are delivered when it

@@ -201,7 +201,7 @@ class BarVendor(MarketDataProvider):
     def __init__(self) -> None:
         self.asked: list[list[SymbolFeed]] = []
 
-    def bar_feeds(self, subscriptions, on_bar):
+    def bar_feeds(self, subscriptions, on_bar, on_warmup=None):
         self.asked.append(list(subscriptions))
         return ["alpha-feed"]
 
@@ -280,7 +280,9 @@ async def test_a_provider_that_starts_no_feed_fails_the_start(two_vendors, monke
         async def stop(self):
             return None
 
-    service.providers["alpha"].bar_feeds = lambda subscriptions, on_bar: [StartedFeed()]
+    service.providers["alpha"].bar_feeds = lambda subscriptions, on_bar, on_warmup=None: [
+        StartedFeed()
+    ]
 
     with pytest.raises(RuntimeError, match="'beta' started no feeds"):
         await service.start()

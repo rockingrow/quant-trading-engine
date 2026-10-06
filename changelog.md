@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A replayed warm-up batch now fills the indicator window** — the MT5
+  ingester serves no history, so a stack whose Redis window was part-filled
+  could only climb one bar per close: days, on M15. Replaying the missing bars
+  did not help, because the per-series staging watermark reads any bar at or
+  below it as a duplicate redelivery, and the bars a part-filled window is
+  missing are precisely the old ones. The ingester now marks such bars
+  `warmup_bar: true` and numbers them within their batch (`warmup_index`,
+  1-based, and `warmup_total`, per symbol and timeframe); ingestion buffers the
+  batch and merges it into the stored window in one compare-and-swap against
+  that watermark, raising the watermark but never lowering it. Merged by open
+  time with the replayed bar winning a tie, so a batch that ends behind the live
+  stream cannot cost a newer close. Such bars are history and not events — never
+  staged, published or decided on — and the runner picks the window up when it
+  re-reads Redis on the next live close, with no restart. A `warmup_bar: true`
+  carrying no usable batch position is refused rather than read as a batch of
+  one, since a merge rewrites the whole window and doing that per bar is the
+  cost the counters avoid. The three fields are additive and read on
+  `schema_version` `1.0.0`, so no `schema_versions` entry and no ingester
+  version bump is needed: a build that does not read them sees the bars it
+  always did, and a live bar carries them as `false`/`null`. See
+  `examples/nats/bar.closed.mt5.warmup.json`.
+
+- **`warmup` is now a mapping-table setting** — how many closed candles a pair
+  collects before it may decide is no longer only a class attribute inside a
+  private strategy repository. State `warmup` under
+  `[strategies.<NAME>]` to move it everywhere that strategy runs, or under
+  `[symbols.<SYMBOL>.params.<NAME>]` for one pair; omit it and the count the
+  strategy declares stands, exactly as before. The runner and the replay
+  resolve it from the same pair params (`resolve_warmup`), and `--param
+  warmup=` works on a backtest, so a replay still starts deciding on the same
+  bar the runner would — the report's `warmup_bars` records the number actually
+  used. A count below the declaration is the operator's call and logs a warning
+  naming both numbers, because what a strategy really needs is a property of
+  its slowest indicator and the engine cannot measure it; a count that is not a
+  positive whole number, or one above the strategy's `max_history`, stops the
+  start instead, the latter because the runner's buffer could never reach it.
+  The key configures the port rather than the edge, so it is kept out of a
+  payload's `inputs` block and the broker contract is unchanged.
+
 - **Recovery from a stale runner ownership claim** — the non-expiring
   `runner:owner` claim still refuses a second runner and still never fails
   over, but an unclean exit no longer has to end in a crash loop and a manual

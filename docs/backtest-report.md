@@ -61,6 +61,9 @@ Live and replay may first decide on the closed bar that completes `warmup`
 bars of history (zero-based index `warmup - 1`). Exactly `warmup` input bars
 therefore allow one decision. The benchmark starts on that same bar, and
 `data.bars_after_warmup` includes it. Older reports used the following bar.
+`run.warmup_bars` is the count the run actually used, which is the strategy's
+own `warmup` unless the mapping table or `--param warmup=` set another — read
+it rather than the strategy source when reproducing a result.
 Cash and percentage maximum drawdown are tracked independently over realised
 equity; their worst points need not be the same trade.
 

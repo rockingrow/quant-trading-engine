@@ -91,7 +91,9 @@ from qte_shared.strategies.strategy_base import (
 from qte_shared.strategies.strategy_settings import (
     NO_WEEKEND_FLAT,
     WeekendFlatPolicy,
+    describe_warmup,
     resolve_cycle_policy,
+    resolve_warmup,
     resolve_weekend_flat,
 )
 from qte_shared.timeframes import (
@@ -120,10 +122,16 @@ class StrategySlot:
         symbol: str,
         factory: SignalFactory,
         weekend_flat: WeekendFlatPolicy = NO_WEEKEND_FLAT,
+        warmup: int | None = None,
     ) -> None:
         self.strategy = strategy
         self.symbol = symbol
         self.factory = factory
+        # What this pair's mapping entry asked for, if it asked for anything.
+        # Kept beside the strategy's own count rather than replacing it, so
+        # `warmup` below still reads the declaration when nothing overrode it
+        # and one strategy can run at two counts on two symbols.
+        self._warmup_override = warmup
         # The market calendar this pair trades on, as its repository declared
         # it. It sits on the slot rather than on the strategy because going
         # flat before the market shuts is the engine's decision — a strategy
@@ -144,8 +152,15 @@ class StrategySlot:
         return (self.strategy.name, self.symbol)
 
     @property
+    def warmup(self) -> int:
+        """Bars this pair collects before it may decide — the mapping's, or the strategy's."""
+        if self._warmup_override is not None:
+            return self._warmup_override
+        return self.strategy.warmup
+
+    @property
     def is_warm(self) -> bool:
-        return len(self.buffer) >= self.strategy.warmup
+        return len(self.buffer) >= self.warmup
 
 
 class StrategyRunner:
@@ -392,6 +407,19 @@ class StrategyRunner:
                 except ValueError as error:
                     raise ValueError(f"{entry.name} on {symbol}: {error}") from None
                 strategy = entry.instantiate(params)
+                # The strategy declares the bars its indicators need; this pair's
+                # `warmup` may ask for a different count. Resolved from the same
+                # params the backtest resolves it from, so a replay starts
+                # deciding on the same bar this slot will.
+                try:
+                    warmup = resolve_warmup(
+                        strategy.warmup,
+                        strategy.history_window(),
+                        params,
+                        subject=f"{entry.name} on {symbol}",
+                    )
+                except ValueError as error:
+                    raise ValueError(f"{entry.name} on {symbol}: {error}") from None
                 # Size against the account, at the risk this pair is mapped at.
                 # The strategy is never told either — see qte_shared.strategies.sizing.
                 sizer = PositionSizer.from_settings(params)
@@ -404,17 +432,19 @@ class StrategyRunner:
                     default_quantity=runner_settings.default_quantity,
                     cycle_policy=cycle_policy,
                 )
-                slot = StrategySlot(strategy, symbol, factory, weekend_flat=weekend_flat)
+                slot = StrategySlot(
+                    strategy, symbol, factory, weekend_flat=weekend_flat, warmup=warmup
+                )
                 self._warn_if_history_exceeds_redis(slot)
                 self.slots.append(slot)
                 self._by_subject[(symbol, slot.timeframe)].append(slot)
                 log.info(
-                    "Slot ready strategy=%s symbol=%s tf=%s warmup=%d risk=%.3f%% of %.2f "
+                    "Slot ready strategy=%s symbol=%s tf=%s warmup=%s risk=%.3f%% of %.2f "
                     "weekend_flat=%s (%s) cycles=%s",
                     strategy.name,
                     symbol,
                     slot.timeframe,
-                    strategy.warmup,
+                    describe_warmup(slot.warmup, strategy.warmup),
                     sizer.risk_percent,
                     sizer.capital,
                     slot.weekend_flat.describe(),
@@ -511,7 +541,7 @@ class StrategyRunner:
                 strategy_slot.symbol,
                 strategy_slot.timeframe,
                 len(strategy_slot.buffer),
-                strategy_slot.strategy.warmup,
+                strategy_slot.warmup,
             )
 
     async def _stored_history(
@@ -993,7 +1023,7 @@ class StrategyRunner:
                 slot.strategy.name,
                 slot.symbol,
                 len(slot.buffer),
-                slot.strategy.warmup,
+                slot.warmup,
             )
             return
 

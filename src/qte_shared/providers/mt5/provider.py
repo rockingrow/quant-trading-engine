@@ -22,6 +22,7 @@ from qte_shared.interfaces.market_data import (
     Capability,
     LiveFeed,
     MarketDataProvider,
+    WarmupBarHandler,
 )
 from qte_shared.market_data_plan import SymbolFeed
 from qte_shared.providers.mt5.settings import Mt5Settings
@@ -47,7 +48,12 @@ class Mt5Provider(MarketDataProvider):
         """
         return spec.symbol.upper()
 
-    def bar_feeds(self, subscriptions: list[SymbolFeed], on_bar: CandleHandler) -> list[LiveFeed]:
+    def bar_feeds(
+        self,
+        subscriptions: list[SymbolFeed],
+        on_bar: CandleHandler,
+        on_warmup: WarmupBarHandler | None = None,
+    ) -> list[LiveFeed]:
         """One subscription for every planned series — the feed filters by payload."""
         from qte_shared.providers.mt5.feed import IngesterBarFeed
 
@@ -58,4 +64,4 @@ class Mt5Provider(MarketDataProvider):
         }
         if not series:
             return []
-        return [IngesterBarFeed(series, on_bar, self.config)]
+        return [IngesterBarFeed(series, on_bar, self.config, on_warmup=on_warmup)]

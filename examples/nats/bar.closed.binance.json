@@ -1,0 +1,29 @@
+{
+  "schema_version": "1.0.0",
+  "event_id": "binance:BTCUSDT:M15:1790589600",
+  "event_type": "bar.closed",
+  "source": {
+    "gateway": "binance",
+    "market": "crypto",
+    "ingester_id": "vps-crypto-01",
+    "venue": "stream.binance.com"
+  },
+  "emitted_at": "2026-09-28T10:15:00.318000Z",
+  "warmup_bar": false,
+  "warmup_index": null,
+  "warmup_total": null,
+  "symbol": "BTCUSDT",
+  "timeframe": "M15",
+  "bar": {
+    "open_time": "2026-09-28T10:00:00Z",
+    "close_time": "2026-09-28T10:15:00Z",
+    "open": 112450.1,
+    "high": 112880.0,
+    "low": 112310.55,
+    "close": 112701.45,
+    "volume": 184.31052,
+    "tick_count": 41273,
+    "quote_volume": 20760184.37,
+    "spread": null
+  }
+}

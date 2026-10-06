@@ -403,6 +403,10 @@ strategies = ["MT5_GOLD_M5_SCALP"]
 [strategies.MT5_GOLD_M5_SCALP]
 risk_percent = 1.0
 
+# Read by the engine, not the strategy: the candles this pair collects before
+# it may decide. Omit it to keep the count the strategy declares.
+warmup = 150
+
 # Per-pair overrides beat the [strategies.*] defaults above, so one strategy
 # can run tighter on gold than it does on everything else.
 [symbols.XAUUSD.params.MT5_GOLD_M5_SCALP]
@@ -428,6 +432,15 @@ With no file at all nothing breaks: each strategy falls back to its own
 `symbols` attribute, or to `QTE_ENGINE__SYMBOLS` when it declares none. A file
 that exists but maps nothing means *trade nothing*, which is a different thing
 and is treated as one.
+
+`warmup` is the one setting there that decides *when* a pair starts trading
+rather than how. A strategy declares the candles its slowest indicator needs;
+the mapping may ask for another number, and both the runner and the backtest
+honour it, so a replay still starts deciding on the same bar. Asking for fewer
+than the strategy declares is allowed and logged — what it really needs is a
+property of its indicators, which the engine cannot check — while asking for
+more than its `max_history` is refused, because the runner's buffer could never
+reach that count.
 
 The runner builds one instance per `(symbol, strategy)` pair, so a strategy
 carrying state between bars never has gold's last bar deciding what happens on

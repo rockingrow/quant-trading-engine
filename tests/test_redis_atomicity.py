@@ -8,7 +8,7 @@ from fakeredis import FakeServer
 from fakeredis.aioredis import FakeRedis
 from redis.exceptions import ResponseError
 
-from qte_shared.cache.redis_state import RedisState
+from qte_shared.cache.redis_state import MERGE_HISTORY_CANDLES, RedisState
 from qte_shared.config import settings
 from qte_shared.models import Candle
 
@@ -154,3 +154,129 @@ async def test_a_claim_without_an_instance_token_is_never_reclaimed(candle_state
     assert await candle_state.claim_runner("9d0c5c1e-plain-host-process")
     assert not await candle_state.reclaim_runner("9d0c5c1e", "9d0c5c1e:replacement")
     assert await candle_state.runner_owner() == "9d0c5c1e-plain-host-process"
+
+
+# ── Warm-up history: the one write allowed behind the watermark ───────────
+#
+# `stage_closed_candle` reads any bar at or below the staging watermark as a
+# duplicate replay, which is correct for a forward-only feed and wrong for a
+# vendor replaying the history a half-filled window is missing — those bars are
+# precisely the old ones. `merge_history_candles` is that second path.
+
+
+def history_candle(index, close=2000.0):
+    """A bar on its M15 bucket; *index* may be negative for older history."""
+    return Candle(
+        origin=settings.state_scope.origin(),
+        symbol="XAUUSD",
+        timeframe="M15",
+        open_time=datetime(2026, 9, 28, 10, 0, tzinfo=UTC) + timedelta(minutes=15 * index),
+        open=2000,
+        high=2001,
+        low=1999,
+        close=close,
+    )
+
+
+async def staged_watermark(candle_state):
+    return await candle_state.client.get(candle_state.key("staged", "XAUUSD", "M15"))
+
+
+async def test_bars_older_than_the_watermark_merge_although_staging_refuses_them(candle_state):
+    """The regression this path exists for: a window stuck part-filled."""
+    for index in range(35):
+        await candle_state.stage_closed_candle(history_candle(index))
+    assert await candle_state.count_candles("XAUUSD", "M15") == 35
+    missing = [history_candle(index) for index in range(-115, 0)]
+
+    # The live path cannot take them: to it they are a redelivery.
+    await candle_state.stage_closed_candle(missing[-1])
+    assert await candle_state.count_candles("XAUUSD", "M15") == 35
+
+    assert await candle_state.merge_history_candles("XAUUSD", "M15", missing) == 150
+    stored = await candle_state.get_candles("XAUUSD", "M15")
+    assert len(stored) == 150
+    assert stored[0].open_time == history_candle(-115).open_time
+    assert stored[-1].open_time == history_candle(34).open_time
+    assert all(
+        earlier.open_time < later.open_time
+        for earlier, later in zip(stored, stored[1:], strict=False)
+    )
+
+
+async def test_the_watermark_rises_for_newer_history_and_never_falls(candle_state):
+    """Lowering it would reopen the duplicate window it exists to close."""
+    await candle_state.stage_closed_candle(history_candle(10))
+    ahead = await staged_watermark(candle_state)
+
+    await candle_state.merge_history_candles(
+        "XAUUSD", "M15", [history_candle(index) for index in range(5)]
+    )
+    assert await staged_watermark(candle_state) == ahead
+
+    await candle_state.merge_history_candles("XAUUSD", "M15", [history_candle(20)])
+    assert float(await staged_watermark(candle_state)) == history_candle(20).open_time.timestamp()
+
+
+async def test_a_close_staged_mid_merge_is_not_lost(candle_state):
+    """The window and the watermark are read together, and the swap re-checks it."""
+    for index in range(3):
+        await candle_state.stage_closed_candle(history_candle(index))
+    original_eval = candle_state._client.eval
+    raced = []
+
+    async def stage_a_close_between_the_read_and_the_swap(script, number_keys, *arguments):
+        if script is MERGE_HISTORY_CANDLES and not raced:
+            raced.append(True)
+            await candle_state.stage_closed_candle(history_candle(3))
+        return await original_eval(script, number_keys, *arguments)
+
+    candle_state._client.eval = stage_a_close_between_the_read_and_the_swap
+    written = await candle_state.merge_history_candles(
+        "XAUUSD", "M15", [history_candle(-2), history_candle(-1)]
+    )
+    assert raced, "the race this guards against never happened"
+    assert written == 6
+    open_times = [candle.open_time for candle in await candle_state.get_candles("XAUUSD", "M15")]
+    assert history_candle(3).open_time in open_times
+
+
+async def test_a_warmup_bar_wins_the_same_open_time(candle_state):
+    """A vendor replaying its own history is the completer record of that bucket."""
+    await candle_state.stage_closed_candle(history_candle(0, close=1111.0))
+    await candle_state.merge_history_candles("XAUUSD", "M15", [history_candle(0, close=2222.0)])
+    stored = await candle_state.get_candles("XAUUSD", "M15")
+    assert len(stored) == 1
+    assert stored[0].close == 2222.0
+
+
+async def test_a_batch_larger_than_the_window_keeps_its_newest_bars(candle_state):
+    batch = [history_candle(index) for index in range(10)]
+    written = await candle_state.merge_history_candles("XAUUSD", "M15", batch, max_len=4)
+    assert written == 4
+    stored = await candle_state.get_candles("XAUUSD", "M15")
+    assert [candle.open_time for candle in stored] == [
+        history_candle(index).open_time for index in range(6, 10)
+    ]
+
+
+async def test_an_empty_batch_touches_nothing(candle_state):
+    await candle_state.stage_closed_candle(history_candle(0))
+    assert await candle_state.merge_history_candles("XAUUSD", "M15", []) == 0
+    assert await candle_state.count_candles("XAUUSD", "M15") == 1
+
+
+async def test_a_window_that_keeps_changing_is_left_alone_rather_than_half_written(
+    candle_state, monkeypatch, caplog
+):
+    """Losing the race every time is reported, not retried for ever."""
+    await candle_state.stage_closed_candle(history_candle(0))
+
+    async def always_lose(script, number_keys, *arguments):
+        return -1
+
+    monkeypatch.setattr(candle_state._client, "eval", always_lose)
+    with caplog.at_level("WARNING"):
+        assert await candle_state.merge_history_candles("XAUUSD", "M15", [history_candle(-1)]) == 0
+    assert "Gave up merging" in caplog.text
+    assert await candle_state.count_candles("XAUUSD", "M15") == 1

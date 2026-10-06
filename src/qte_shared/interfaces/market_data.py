@@ -48,6 +48,41 @@ TickHandler = Callable[[Tick], Awaitable[None]]
 CandleHandler = Callable[[Candle], Awaitable[None]]
 
 
+@dataclass(frozen=True, slots=True)
+class WarmupBatch:
+    """Where one replayed bar sits in the batch it belongs to.
+
+    A vendor that can replay its own history into QTE's indicator window sends
+    that window as a batch of bars rather than as one request, so the receiver
+    has to know when the batch is whole: it buffers the bars and writes them in
+    one transaction, because merging each one separately rewrites the whole
+    stored window once per bar.
+
+    *index* is 1-based, which is the ingester's convention on the wire and keeps
+    "bar 7 of 150" readable in a log line.
+    """
+
+    index: int
+    total: int
+
+    @property
+    def is_last(self) -> bool:
+        """Whether this bar completes the batch.
+
+        ``>=`` rather than ``==``: a batch whose counters disagree must still be
+        written, because the alternative is a window that waits in memory for a
+        bar that never comes.
+        """
+        return self.index >= self.total
+
+
+#: Called once per bar a vendor is replaying as warm-up history rather than
+#: publishing as a close. Separate from :data:`CandleHandler` because the two
+#: are not the same event: a warm-up bar carries no decision and must not be
+#: staged or published, only merged into the stored window.
+WarmupBarHandler = Callable[[Candle, WarmupBatch], Awaitable[None]]
+
+
 class Capability(str, Enum):
     """What a provider can actually serve.
 
@@ -291,12 +326,22 @@ class MarketDataProvider(ABC):  # noqa: B024
         """One or more feeds covering *specs*; empty when none of them apply."""
         raise UnsupportedCapability(f"{self.name!r} does not serve a live feed")
 
-    def bar_feeds(self, subscriptions: list[SymbolFeed], on_bar: CandleHandler) -> list[LiveFeed]:
+    def bar_feeds(
+        self,
+        subscriptions: list[SymbolFeed],
+        on_bar: CandleHandler,
+        on_warmup: WarmupBarHandler | None = None,
+    ) -> list[LiveFeed]:
         """Feeds of closed bars covering *subscriptions*; empty when none apply.
 
         Takes whole subscriptions rather than specs because a bar feed has to
         know the timeframes as well: the vendor decides which bars close, and
         the feed drops the series nobody planned.
+
+        *on_warmup* receives the bars a vendor replays to fill the indicator
+        window, which are history rather than closes. It is optional so that a
+        provider which never replays, and a caller that does not want the
+        window warmed, both stay unchanged: left out, such bars are dropped.
         """
         raise UnsupportedCapability(f"{self.name!r} does not serve a live bar feed")
 

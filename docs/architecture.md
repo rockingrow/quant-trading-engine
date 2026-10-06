@@ -172,6 +172,16 @@ bars, bounding the backlog by configured series. Redis stages history and the
 candle outbox with an atomic per-series watermark, so a lost response can be
 retried without duplicate history/events or deletion of a newer open candle.
 
+That watermark reads any bar at or below it as a duplicate, which is correct for
+a forward-only feed and wrong for a vendor replaying the history a part-filled
+window is missing — those bars are precisely the old ones. So a replayed
+warm-up batch takes the one write that is allowed behind the watermark:
+`merge_history_candles` buffers the batch, merges it into the stored window by
+open time in a single compare-and-swap against that same watermark, and raises
+the watermark without ever lowering it. Such bars are history and not events —
+never staged, published or decided on — and the runner picks the merged window
+up when it re-reads Redis on the next live close.
+
 **The open position is the exception, and is written to both.** It is the one
 piece of hot state whose loss is not merely slow to recover from: a runner that
 forgets a live cycle mints a fresh one on the next entry, and the position the
@@ -581,6 +591,16 @@ Both drivers first decide when the closed history contains `warmup` bars,
 including the bar just closed. Replay starts at index `warmup - 1`, and its
 buy-and-hold benchmark starts at that same close. Exactly `warmup` input bars
 are enough for one decision; a shorter history is rejected.
+
+`warmup` is the strategy's declaration and the deployment's decision. A pair
+may restate it in the mapping table — `warmup` under `[strategies.<name>]` or
+`[symbols.<symbol>.params.<name>]` — and `resolve_warmup` applies it in both
+drivers from the same pair params, so a replay still starts on the bar the
+runner will. The engine does not police whether the number is big enough,
+because that is a property of the strategy's slowest indicator and only the
+strategy's author knows it: a count below the declaration logs a warning and
+runs. What it does refuse is a count above `history_window()`, since the
+runner's deque is capped there and the pair could never finish warming up.
 
 `StrategyBase.history_window()` is read by *both* drivers, and that is the whole
 point of it existing. Before it did, the live runner kept a deque of

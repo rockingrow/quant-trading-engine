@@ -27,6 +27,18 @@ it -- see :mod:`qte_ingestion.backfill`. Without it a cold Redis means the
 runner has no indicator window until enough bars have printed live, which on
 M15 is days.
 
+A bar feed that cannot serve history can still fill that window by *replaying*
+it: the MT5 ingester marks such bars ``warmup_bar`` and sends them as a counted
+batch, which arrives here on a separate handler
+(:meth:`IngestionService._handle_warmup_bar`). Those bars are history, not
+events — they are buffered until the batch is whole, then merged into the
+stored window in one transaction, and they are never staged, published or
+decided on. Staging them would not work: the watermark that makes a redelivery
+harmless reads any older bar as a duplicate, and the bars a half-filled window
+is missing are the old ones. Because the runner re-reads Redis on every live
+close, a merged window reaches its indicator buffer on the next bar without a
+restart.
+
 Start-up guards that cache in a fixed order. Candle state another provider
 wrote, or dated after now, is discarded before anything reads it back
 (:mod:`qte_ingestion.state_guard`). A bar restored from before a restart whose
@@ -59,6 +71,7 @@ from qte_shared.interfaces.market_data import (
     MarketDataProvider,
     ProviderError,
     UnsupportedCapability,
+    WarmupBatch,
 )
 from qte_shared.logging_setup import get_logger
 from qte_shared.market_data_plan import SymbolFeed
@@ -138,6 +151,9 @@ class IngestionService:
         self._outbox_lock = asyncio.Lock()
         self._processing_lock = asyncio.Lock()
         self._retired_candles: dict[tuple[str, str, datetime], RetiredCandle] = {}
+        #: Replayed warm-up bars per (symbol, timeframe), keyed by open time so
+        #: a redelivered bar collapses, held until the batch is whole.
+        self._warmup_batches: dict[tuple[str, str], dict[datetime, Candle]] = {}
         self._cleaned = False
 
     # ── Lifecycle ─────────────────────────────────────────────────────
@@ -249,7 +265,9 @@ class IngestionService:
         for provider_name, provider in self.providers.items():
             subscriptions = self._subscriptions_of(provider_name)
             if provider.supports(Capability.LIVE_BARS):
-                feeds = provider.bar_feeds(subscriptions, self._handle_closed_bar)
+                feeds = provider.bar_feeds(
+                    subscriptions, self._handle_closed_bar, self._handle_warmup_bar
+                )
             else:
                 specs = [symbol_feed.spec for symbol_feed in subscriptions]
                 feeds = provider.live_feeds(specs, self._handle_tick)
@@ -377,6 +395,66 @@ class IngestionService:
             # Retained before any await inside, so a Redis failure leaves this
             # bar with the flush loop to retry instead of losing it.
             await self._emit_candles([candle])
+
+    async def _handle_warmup_bar(self, candle: Candle, batch: WarmupBatch) -> None:
+        """Buffer a replayed bar, merging the window once its batch is whole.
+
+        The batch is held in memory rather than written bar by bar because a
+        merge rewrites the whole stored window: a 150-bar batch applied one bar
+        at a time would rewrite it 150 times. A crash mid-batch therefore loses
+        the partial batch, which is the right trade — a warm-up batch is
+        re-sendable, and nothing has been published from it.
+
+        Nothing here goes through :meth:`_emit_candles`. A replayed bar is not a
+        close: no partial-bar repair, no outbox, no NATS event, no decision.
+        """
+        closes_at = bucket_close(candle.open_time, candle.timeframe)
+        if closes_at > datetime.now(UTC) + CLOCK_TOLERANCE:
+            log.warning(
+                "Dropping %s %s warm-up bar open_time=%s: its bucket ends at %s, after now. "
+                "Check the vendor's clock (MT5_SERVER_TIMEZONE on the ingester).",
+                candle.symbol,
+                candle.timeframe,
+                candle.open_time.isoformat(),
+                closes_at.isoformat(),
+            )
+            return
+        candle = stamp_market_data(candle, self._origin_for(candle.symbol))
+        series = (candle.symbol, candle.timeframe)
+        async with self._processing_guard():
+            buffered = self._warmup_batches.setdefault(series, {})
+            buffered[candle.open_time] = candle
+            if len(buffered) == 1 and batch.total > settings.redis.candle_history:
+                # Not an error: the batch is simply larger than the window kept
+                # for it, and the merge trims to the newest. Said once a batch.
+                log.info(
+                    "%s %s warm-up batch is %d bars but QTE_REDIS__CANDLE_HISTORY is %d; "
+                    "the oldest will be trimmed",
+                    candle.symbol,
+                    candle.timeframe,
+                    batch.total,
+                    settings.redis.candle_history,
+                )
+            # The cap is a safety valve, not the normal path: an ingester that
+            # never sends its last bar would otherwise buffer without bound.
+            # Flushing at the window size loses nothing, since the merge trims
+            # to it anyway.
+            overflowing = len(buffered) >= settings.redis.candle_history
+            if not batch.is_last and not overflowing:
+                return
+            if overflowing and not batch.is_last:
+                log.warning(
+                    "Flushing the %s %s warm-up batch at %d bars without its last bar "
+                    "(expected %d) — the window size is the cap",
+                    candle.symbol,
+                    candle.timeframe,
+                    len(buffered),
+                    batch.total,
+                )
+            pending = self._warmup_batches.pop(series, {})
+            await self.state.merge_history_candles(
+                candle.symbol, candle.timeframe, [pending[moment] for moment in sorted(pending)]
+            )
 
     def _processing_guard(self) -> asyncio.Lock:
         if not hasattr(self, "_processing_lock"):

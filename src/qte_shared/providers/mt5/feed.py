@@ -39,7 +39,12 @@ from nats.js import api as js_api
 from nats.js.errors import NotFoundError
 
 from qte_shared.bus.nats_bus import NatsBus
-from qte_shared.interfaces.market_data import CandleHandler, LiveFeed, ProviderError
+from qte_shared.interfaces.market_data import (
+    CandleHandler,
+    LiveFeed,
+    ProviderError,
+    WarmupBarHandler,
+)
 from qte_shared.logging_setup import get_logger
 from qte_shared.providers.mt5.protocol import IngesterPayloadError, decode_bar_closed
 from qte_shared.providers.mt5.settings import Mt5Settings
@@ -65,6 +70,7 @@ class IngesterBarFeed(LiveFeed):
         on_bar: CandleHandler,
         config: Mt5Settings,
         bus_factory: Callable[[], NatsBus] | None = None,
+        on_warmup: WarmupBarHandler | None = None,
     ) -> None:
         """*series* maps each planned symbol to the timeframes it is fed."""
         self.name = f"{config.gateway}-ingester"
@@ -72,6 +78,7 @@ class IngesterBarFeed(LiveFeed):
             symbol.upper(): frozenset(timeframes) for symbol, timeframes in series.items()
         }
         self._on_bar = on_bar
+        self._on_warmup = on_warmup
         self._config = config
         self._bus_factory = bus_factory or self._default_bus
         self._bus: NatsBus | None = None
@@ -84,6 +91,10 @@ class IngesterBarFeed(LiveFeed):
         #: between the two is unplanned series or payloads that did not decode.
         self.messages_received = 0
         self.bars_delivered = 0
+        #: Replayed bars handed to the warm-up handler, counted apart from
+        #: ``bars_delivered`` because they are history and not closes: a stack
+        #: whose window never fills is diagnosed by comparing the two.
+        self.warmup_bars_delivered = 0
 
     # ── Lifecycle ─────────────────────────────────────────────────────
 
@@ -260,20 +271,39 @@ class IngesterBarFeed(LiveFeed):
         if candle.timeframe not in self._series.get(candle.symbol, ()):
             log.debug("Ignoring unplanned series %s %s", candle.symbol, candle.timeframe)
             return
+        if bar.warmup is not None and self._on_warmup is None:
+            # Nothing is wrong with the bar; this feed was simply built without
+            # a warm-up sink. Said once per batch rather than once per bar.
+            if bar.warmup.is_last:
+                log.info(
+                    "Dropped a %d-bar warm-up batch for %s %s: this feed has no warm-up "
+                    "handler, so the window fills from live closes only",
+                    bar.warmup.total,
+                    candle.symbol,
+                    candle.timeframe,
+                )
+            return
         # The handler's failures are the handler's: letting one escape would end
         # the worker, and every bar after it would sit acknowledged in a queue
         # nothing reads.
         try:
-            await self._on_bar(candle)
+            if bar.warmup is not None:
+                await self._on_warmup(candle, bar.warmup)
+            else:
+                await self._on_bar(candle)
         except asyncio.CancelledError:
             raise
         except Exception:
             log.exception(
-                "Bar handler failed event_id=%s symbol=%s tf=%s open_time=%s",
+                "%s handler failed event_id=%s symbol=%s tf=%s open_time=%s",
+                "Warm-up bar" if bar.warmup is not None else "Bar",
                 bar.event_id,
                 candle.symbol,
                 candle.timeframe,
                 candle.open_time.isoformat(),
             )
             return
-        self.bars_delivered += 1
+        if bar.warmup is not None:
+            self.warmup_bars_delivered += 1
+        else:
+            self.bars_delivered += 1

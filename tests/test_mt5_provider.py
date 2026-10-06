@@ -21,8 +21,13 @@ from nats.js.errors import NotFoundError
 from pydantic import ValidationError
 
 from qte_ingestion.service import IngestionService
-from qte_shared.config import settings
-from qte_shared.interfaces.market_data import Capability, ProviderError, UnsupportedCapability
+from qte_shared.config import REPO_ROOT, settings
+from qte_shared.interfaces.market_data import (
+    Capability,
+    ProviderError,
+    UnsupportedCapability,
+    WarmupBatch,
+)
 from qte_shared.market_data_plan import MarketDataPlan, SymbolFeed
 from qte_shared.models import Candle
 from qte_shared.providers import create_provider, get_provider_class
@@ -248,6 +253,88 @@ def test_a_payload_this_code_would_misread_is_refused(mutate, reason):
 def test_something_that_is_not_json_is_refused():
     with pytest.raises(IngesterPayloadError, match="not JSON"):
         decode_bar_closed(b"\xff not json")
+
+
+# ── Protocol: a replayed bar is not a close ───────────────────────────────
+
+
+def test_a_bar_is_a_live_close_unless_it_says_otherwise():
+    """An older ingester omits the field, so absent cannot mean warm-up."""
+    assert decode_bar_closed(encoded(bar_payload())).warmup is None
+    assert decode_bar_closed(encoded(bar_payload(warmup_bar=False))).warmup is None
+    assert decode_bar_closed(encoded(bar_payload(warmup_bar=None))).warmup is None
+
+
+def test_a_live_bar_may_carry_the_warmup_fields_as_nulls():
+    """What the ingester actually publishes: the keys are always present.
+
+    A live close sends ``warmup_bar: false`` with both counters null rather than
+    leaving them out, so "null" and "absent" have to mean the same thing here —
+    and the counters must not be read at all when the marker is false, or every
+    live bar would be refused for a missing index.
+    """
+    payload = bar_payload(warmup_bar=False, warmup_index=None, warmup_total=None)
+    assert decode_bar_closed(encoded(payload)).warmup is None
+
+
+def test_a_replayed_bar_carries_its_place_in_the_batch():
+    payload = bar_payload(warmup_bar=True, warmup_index=7, warmup_total=150)
+    batch = decode_bar_closed(encoded(payload)).warmup
+    assert (batch.index, batch.total) == (7, 150)
+    assert not batch.is_last
+    last = bar_payload(warmup_bar=True, warmup_index=150, warmup_total=150)
+    assert decode_bar_closed(encoded(last)).warmup.is_last
+
+
+def test_a_batch_that_overruns_its_own_count_still_completes():
+    """The wire refuses it, but a batch built past its total must not hang a window.
+
+    ``is_last`` is ``>=`` rather than ``==`` so that a miscount writes the
+    window early instead of waiting for a bar that never comes.
+    """
+    with pytest.raises(IngesterPayloadError, match="outside its batch"):
+        decode_bar_closed(encoded(bar_payload(warmup_bar=True, warmup_index=12, warmup_total=10)))
+    assert WarmupBatch(index=12, total=10).is_last
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason"),
+    [
+        ({"warmup_bar": True}, "warmup_index is missing"),
+        ({"warmup_bar": True, "warmup_index": 7}, "warmup_total is missing"),
+        ({"warmup_bar": True, "warmup_total": 150}, "warmup_index is missing"),
+        ({"warmup_bar": True, "warmup_index": 0, "warmup_total": 150}, "at least 1"),
+        ({"warmup_bar": True, "warmup_index": 151, "warmup_total": 150}, "outside its batch"),
+        ({"warmup_bar": "true", "warmup_index": 1, "warmup_total": 1}, "JSON boolean"),
+        ({"warmup_bar": True, "warmup_index": True, "warmup_total": 1}, "whole number"),
+        ({"warmup_bar": True, "warmup_index": 1.5, "warmup_total": 2}, "whole number"),
+    ],
+)
+def test_a_warmup_bar_without_a_usable_batch_position_is_refused(overrides, reason):
+    """Read as a batch of one, each bar would rewrite the whole stored window."""
+    with pytest.raises(IngesterPayloadError, match=reason):
+        decode_bar_closed(encoded(bar_payload(**overrides)))
+
+
+def test_the_committed_examples_are_the_shape_not_a_sketch_of_it():
+    """Both files under ``examples/nats/`` decode, and mean opposite things."""
+    live = decode_bar_closed((REPO_ROOT / "examples/nats/bar.closed.mt5.json").read_bytes())
+    assert live.candle.symbol == "XAUUSD"
+    assert live.candle.timeframe == "M15"
+    assert live.warmup is None
+
+    replayed = decode_bar_closed(
+        (REPO_ROOT / "examples/nats/bar.closed.mt5.warmup.json").read_bytes()
+    )
+    assert (replayed.warmup.index, replayed.warmup.total) == (7, 150)
+    assert not replayed.warmup.is_last
+    # Both are 1.0.0: the warm-up fields needed no version of their own.
+    assert (
+        decode_bar_closed(
+            (REPO_ROOT / "examples/nats/bar.closed.mt5.warmup.json").read_bytes(), ("1.0.0",)
+        ).warmup
+        is not None
+    )
 
 
 # ── Provider ──────────────────────────────────────────────────────────────
@@ -519,8 +606,8 @@ class BarProvider:
     def supports(self, capability: Capability) -> bool:
         return capability is Capability.LIVE_BARS
 
-    def bar_feeds(self, subscriptions, on_bar):
-        self.asked.append((subscriptions, on_bar))
+    def bar_feeds(self, subscriptions, on_bar, on_warmup=None):
+        self.asked.append((subscriptions, on_bar, on_warmup))
         return ["bar-feed"]
 
     def live_feeds(self, specs, on_tick):  # pragma: no cover - must not be reached
@@ -540,9 +627,12 @@ def bare_service() -> IngestionService:
 def test_a_bar_provider_is_asked_for_bar_feeds_with_whole_subscriptions():
     service = bare_service()
     assert service._open_feeds() == [("mt5", "bar-feed")]
-    subscriptions, on_bar = service.providers["mt5"].asked[0]
+    subscriptions, on_bar, on_warmup = service.providers["mt5"].asked[0]
     assert subscriptions == service.subscriptions
     assert on_bar == service._handle_closed_bar
+    # The warm-up sink is wired at the same time: a provider that replays its
+    # window has somewhere to put it without a second round of configuration.
+    assert on_warmup == service._handle_warmup_bar
 
 
 async def test_a_closed_bar_is_staged_as_it_arrives(monkeypatch):
