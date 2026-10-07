@@ -716,6 +716,71 @@ Three consequences are worth naming:
 symbol trades on, since that decides which endpoint a provider reaches for — and
 lost `tiingo_ticker`, which is now `MarketDataProvider.ticker_for()`.
 
+## Why the indicator window is asked for, not pushed
+
+A vendor that closes its own bars (`Capability.LIVE_BARS`) has no history
+endpoint to backfill from, so a QTE starting on a cold Redis used to have no
+indicator window at all: the runner climbed one bar per close, which on M15 is
+a day and a half for 150 bars. The MT5 ingester runs beside the terminal and
+could read those bars in a millisecond. The question was only how to get them
+across.
+
+The first answer was to push them. The ingester replayed its start-up window
+onto the same subject it publishes closes on, flagged `warmup_bar` and numbered
+`warmup_index` of `warmup_total` so the subscriber knew when the batch was
+whole. It does not work, for two reasons that are worth keeping written down:
+
+* **The transport de-duplicates the payload.** Bars ride JetStream with
+  `Nats-Msg-Id` set to the bar's own `event_id`, which is what makes a
+  redelivery harmless. A replayed window is the *same bars again*, so inside
+  the stream's duplicate window the stream drops them — silently, with an ack
+  that reads like a success. A restart minutes after the last one delivered
+  nothing; a restart hours after it delivered the old bars but dropped the
+  newest, including the one carrying `warmup_index == warmup_total`, which left
+  the subscriber buffering a batch that could never complete. Both failures
+  were observed on a running pair of services, not reasoned about: a restart ten
+  minutes after the previous one had all 300 of its replayed bars dropped as
+  duplicates while the stream reported every publish as stored.
+* **The trigger sat on the wrong side.** The ingester knows when *it* restarted.
+  It does not know when QTE's window is short — which is the condition that
+  actually matters, and which also arises from a flushed Redis, a new symbol in
+  the plan, or a state namespace that has never been warmed.
+
+So the direction is inverted. QTE asks: one core-NATS request per planned
+series on `<rpc_prefix>.history.<gateway>.<SYMBOL>.<TF>`, answered with every
+bar in a single reply. The consequences are the reason it is better rather than
+merely different:
+
+* **A window arrives whole or not at all.** There is no series to reassemble and
+  no message of it that can be lost on its own, so there is no half-filled
+  state to represent. A reply that does not come is a timeout, and a timeout is
+  retried.
+* **Requests stay out of the stream.** The request prefix may not sit under the
+  publish prefix — both sides refuse that configuration — because the stream
+  captures its whole subject tree and would store a request as market data and
+  answer it with its own acknowledgement before the ingester could.
+* **The vendor holds no policy.** Which series are warmed and how deep is
+  `history_bars` and the `[symbols.*]` tables on QTE's side. The ingester has no
+  warm-up setting left to disagree with them.
+* **It is a window, not an archive.** The reply is "the newest *n* closed bars",
+  which is why this is `Capability.RECENT_BARS` and not `HISTORY`: a backtest
+  download still refuses the provider, and nothing it returns is written to the
+  parquet history cache, where it would shadow a real archive at the same path.
+
+QTE does not wait for the vendor and does not poll for it. It starts on
+whatever Redis holds; the ingester publishes an announcement once it is
+answering requests, and again after every reconnect, and only then does
+ingestion compare each planned window against Redis and request the short ones.
+A full, current window costs one Redis read. The single announcement that could
+go unheard is one made while QTE's own NATS connection was down, and that is
+covered by checking once when the connection returns — which is why there is no
+timer anywhere in this path.
+
+The replayed-batch reader is still in `qte_ingestion.service`, so an older
+ingester that pushes a numbered window is understood and merged. It is kept for
+compatibility, not as a second mechanism: nothing in the current pair of
+services emits one.
+
 ## Why the simulator is a provider and not a test mode
 
 The provider seam above bought something that was not the point of building it:

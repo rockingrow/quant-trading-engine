@@ -297,11 +297,20 @@ async def _guard_passes(*arguments, **keywords) -> bool:
 
 
 class _SilentBackfiller:
+    retryable = False
+    offline = False
+
+    async def watch_online(self, on_online) -> bool:
+        return False
+
+    async def close(self) -> None:
+        return None
+
     def __init__(self, *arguments, **keywords) -> None:
         pass
 
-    async def run(self) -> None:
-        return None
+    async def run(self) -> list:
+        return []
 
 
 async def test_partial_bars_are_repaired_by_their_own_provider():

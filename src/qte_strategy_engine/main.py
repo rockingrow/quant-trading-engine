@@ -7,14 +7,17 @@ import logging
 import signal
 
 from qte_shared.logging_setup import configure_logging, get_logger
-from qte_strategy_engine.runner import StrategyRunner
+from qte_strategy_engine.runner import SERVICE_NAME, StrategyRunner
 from qte_strategy_engine.settings import runner_settings
 
 log = get_logger(__name__)
 
 
 async def main() -> None:
-    configure_logging()
+    # Named, so this run also lands in QTE_LOG_DIR/<date>-strategy-runner.log:
+    # `docker logs` keeps only what the current container wrote, and a decision
+    # has to be readable after the container has been recreated.
+    configure_logging(service=SERVICE_NAME)
     logging.getLogger("numba").setLevel(runner_settings.numba_log_level.upper())
     runner = StrategyRunner()
     loop = asyncio.get_running_loop()

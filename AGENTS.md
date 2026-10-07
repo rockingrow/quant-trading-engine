@@ -94,11 +94,13 @@ package; never scan from the repository root.
 | Symbol to strategy mapping | `src/qte_shared/strategies/mapping.py`, `config/strategies_mapping.example.toml` |
 | What the vendor feeds: symbols, markets, timeframes, vendor knobs | `src/qte_shared/market_data_plan.py`, `config/data_providers/{tiingo,mt5}.example.toml` |
 | Settings and `QTE_*` environment variables | `src/qte_shared/config.py`, each service's `settings.py`, `.env.example` |
+| Console logging, and each service's daily log file (`QTE_LOG_DIR`, `logs/<date>-<service>.log`) | `src/qte_shared/logging_setup.py`, `configure_logging(service=…)` in each service's `main.py` |
 | NATS subjects and publishing | `src/qte_shared/bus/{subjects,nats_bus}.py` |
 | Redis state and the candle outbox | `src/qte_shared/cache/redis_state.py` |
 | Postgres models and repositories | `src/qte_shared/db/`, each engine's `db/`, `migrations/versions/` |
 | Market data interface and vendors | `src/qte_shared/interfaces/market_data.py`, `providers/` (`registry.py`, `tiingo/`, `mt5/`, `simulator/`) |
 | Closed MT5 bars from `algo-trading-ingester` over NATS | `src/qte_shared/providers/mt5/` (`feed.py`, `protocol.py`), `config/data_providers/mt5.example.toml` |
+| The indicator window asked of the ingester (request/reply): on its `online` announcement, retry, gap top-up | `src/qte_shared/providers/mt5/history.py`, `src/qte_ingestion/{backfill,service}.py`, `tests/test_mt5_history.py` |
 | Optional Tailscale node: tailnet forwards, signals to the broker over the tailnet | `docker-compose.yml` (`tailscale`, `broker-nats-relay`), `config/tailscale/{serve.json,policy.hujson}`, `TAILSCALE_ENABLED` in the `Makefile` |
 | Live feed, resampling, Redis and NATS | `src/qte_ingestion/{service,resampler}.py` |
 | Live loop, broker delivery, control CLI | `src/qte_strategy_engine/{runner,broker_sink,preflight,control}.py` |

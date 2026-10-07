@@ -27,8 +27,22 @@ it -- see :mod:`qte_ingestion.backfill`. Without it a cold Redis means the
 runner has no indicator window until enough bars have printed live, which on
 M15 is days.
 
-A bar feed that cannot serve history can still fill that window by *replaying*
-it: the MT5 ingester marks such bars ``warmup_bar`` and sends them as a counted
+A bar feed whose vendor is another process is warmed the same way, by asking:
+the MT5 ingester answers one request per series with the newest closed bars,
+and this service decides which series and how many. Three things follow from
+the vendor being a process that can be down. **This service starts without
+it**: a boot that finds nobody to ask carries on with what Redis holds. It then
+does not ask on a timer — it waits for the ingester to say it has connected
+(:meth:`IngestionService._handle_vendor_online`), and only then checks every
+planned window against Redis and requests the ones that are short
+(:meth:`IngestionService._history_loop`). And a live bar that does not follow
+the newest stored one — the ingester restarted and skipped the closes in
+between — has the bars before it fetched
+*before* it is staged (:meth:`IngestionService._fill_gap_before`), so the
+runner never decides on a window with a hole in it.
+
+An ingester from before that change fills the window by *replaying* it instead:
+it marks such bars ``warmup_bar`` and sends them as a counted
 batch, which arrives here on a separate handler
 (:meth:`IngestionService._handle_warmup_bar`). Those bars are history, not
 events — they are buffered until the batch is whole, then merged into the
@@ -53,8 +67,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from qte_ingestion.backfill import HistoryBackfiller, open_history_source
 from qte_ingestion.repair import PartialBarRepairer, RoutedBarRepairer
@@ -67,6 +82,8 @@ from qte_shared.config import market_data_plan, settings
 from qte_shared.db import EventRepository
 from qte_shared.interfaces.market_data import (
     Capability,
+    HistoryNotServed,
+    HistoryOffline,
     LiveFeed,
     MarketDataProvider,
     ProviderError,
@@ -78,7 +95,8 @@ from qte_shared.market_data_plan import SymbolFeed
 from qte_shared.models import Candle, CandleClosedEvent, Tick, TickEvent
 from qte_shared.providers import create_provider
 from qte_shared.state_scope import MarketDataOrigin, stamp_market_data
-from qte_shared.timeframes import CLOCK_TOLERANCE, bucket_close
+from qte_shared.symbols import SymbolSpec
+from qte_shared.timeframes import CLOCK_TOLERANCE, bucket_close, timeframe_seconds
 
 log = get_logger(__name__)
 
@@ -154,6 +172,17 @@ class IngestionService:
         #: Replayed warm-up bars per (symbol, timeframe), keyed by open time so
         #: a redelivered bar collapses, held until the batch is whole.
         self._warmup_batches: dict[tuple[str, str], dict[datetime, Candle]] = {}
+        #: The backfiller that warms each provider's series; built in :meth:`start`.
+        self._backfillers: dict[str, HistoryBackfiller] = {}
+        #: Series whose history has been asked for and not answered yet.
+        self._history_owed: dict[tuple[str, str], SymbolSpec] = {}
+        self._history_task: asyncio.Task[None] | None = None
+        self._history_wake = asyncio.Event()
+        #: True from a request that found no vendor to the vendor's next
+        #: announcement: while it is set nothing is asked on a timer.
+        self._vendor_offline = False
+        #: When each series last had a gap topped up inline.
+        self._gap_asked_at: dict[tuple[str, str], datetime] = {}
         self._cleaned = False
 
     # ── Lifecycle ─────────────────────────────────────────────────────
@@ -186,12 +215,25 @@ class IngestionService:
             )
             # Before the first live tick: a bar backfilled from the vendor must
             # not land behind one this process just resampled.
+            self._backfillers = {}
+            self._history_owed = {}
+            self._history_wake = asyncio.Event()
+            self._vendor_offline = False
+            self._gap_asked_at = {}
             for provider_name in self.providers:
-                await HistoryBackfiller(
+                backfiller = HistoryBackfiller(
                     self.state,
                     self._subscriptions_of(provider_name),
                     provider_name=provider_name,
-                ).run()
+                )
+                self._backfillers[provider_name] = backfiller
+                # Listening before the first request: a vendor that connects
+                # between the two is then heard, not missed.
+                await self._watch_vendor(provider_name, backfiller)
+                for spec, timeframe in await backfiller.run():
+                    self._history_owed[(spec.symbol, timeframe)] = spec
+                if backfiller.offline:
+                    self._vendor_offline = True
 
             # Whatever bucket is under way now was not listened to from its open.
             joined_at = datetime.now(UTC)
@@ -217,6 +259,23 @@ class IngestionService:
                 )
 
             self._flush_task = asyncio.create_task(self._flush_loop(), name="candle-flush")
+            if any(backfiller.retryable for backfiller in self._backfillers.values()):
+                # Started even with nothing owed: the vendor's announcement and
+                # a gap found later are both handed to this loop.
+                if self._history_owed and self._vendor_offline:
+                    log.warning(
+                        "Started without history for %s: the vendor is not connected. "
+                        "Carrying on with what Redis holds; the windows are checked and "
+                        "requested as soon as it announces itself.",
+                        ", ".join(
+                            f"{symbol} {timeframe}" for symbol, timeframe in self._history_owed
+                        ),
+                    )
+                elif self._history_owed:
+                    self._history_wake.set()
+                self._history_task = asyncio.create_task(
+                    self._history_loop(), name="history-requests"
+                )
             await self.events.record_event(
                 service=SERVICE_NAME,
                 event="started",
@@ -318,6 +377,22 @@ class IngestionService:
                 cleanup_failed = True
                 log.exception("Flush task cleanup failed during ingestion shutdown")
             self._flush_task = None
+        history_task, self._history_task = getattr(self, "_history_task", None), None
+        if history_task is not None:
+            history_task.cancel()
+            try:
+                await history_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                cleanup_failed = True
+                log.exception("History task cleanup failed during ingestion shutdown")
+        for backfiller in getattr(self, "_backfillers", {}).values():
+            try:
+                await backfiller.close()
+            except Exception:
+                cleanup_failed = True
+                log.exception("Closing a history source failed during ingestion shutdown")
         failed_feeds: list[LiveFeed] = []
         for feed in reversed(self._feeds):
             try:
@@ -391,10 +466,201 @@ class IngestionService:
                 closes_at.isoformat(),
             )
             return
+        await self._fill_gap_before(candle)
         async with self._processing_guard():
             # Retained before any await inside, so a Redis failure leaves this
             # bar with the flush loop to retry instead of losing it.
             await self._emit_candles([candle])
+
+    # ── History from a vendor that is another process ─────────────────
+
+    def _backfiller_for(self, symbol: str) -> HistoryBackfiller | None:
+        """The backfiller that can re-ask *symbol*'s history, if any can."""
+        backfillers = getattr(self, "_backfillers", None)
+        if not backfillers:
+            return None
+        provider_name = self._symbol_providers.get(symbol)
+        if not provider_name and len(backfillers) == 1:
+            provider_name = next(iter(backfillers))
+        backfiller = backfillers.get(provider_name or "")
+        return backfiller if backfiller is not None and backfiller.retryable else None
+
+    def _spec_for(self, symbol: str) -> SymbolSpec | None:
+        return next((feed.spec for feed in self.subscriptions if feed.symbol == symbol), None)
+
+    async def _watch_vendor(self, provider_name: str, backfiller: HistoryBackfiller) -> None:
+        """Have *provider_name*'s vendor wake the history loop when it connects."""
+
+        async def vendor_online() -> None:
+            await self._handle_vendor_online(provider_name)
+
+        try:
+            watching = await backfiller.watch_online(vendor_online)
+        except Exception as failure:
+            log.warning(
+                "Cannot listen for %r announcing itself (%s) — its windows are checked "
+                "again only when a live bar arrives, or by the probe if one is configured",
+                provider_name,
+                failure,
+            )
+            return
+        if watching:
+            log.info("Listening for %r to announce that it is connected", provider_name)
+
+    async def _handle_vendor_online(self, provider_name: str) -> None:
+        """The vendor says it is connected: check every one of its windows.
+
+        Every planned series is queued, not only the ones owed from boot. The
+        vendor may have been down across closes it will never publish, and the
+        check itself is one Redis read per series: a window that is full and
+        current is left alone without a request being sent.
+        """
+        self._vendor_offline = False
+        queued = []
+        for feed in self._subscriptions_of(provider_name):
+            for timeframe in feed.timeframes:
+                self._history_owed[(feed.symbol, timeframe)] = feed.spec
+                queued.append(f"{feed.symbol} {timeframe}")
+        log.info(
+            "%r is connected — checking Redis for %s and requesting the windows that are short",
+            provider_name,
+            ", ".join(queued) or "nothing planned",
+        )
+        self._history_wake.set()
+
+    async def _warm_series(
+        self, spec: SymbolSpec, timeframe: str, *, before: datetime | None = None
+    ) -> bool:
+        """Check one series against Redis and ask for it if short.
+
+        True when there is nothing left to ask. That covers a final refusal as
+        well as an answer: a symbol the vendor does not carry is settled, and
+        asking again would only repeat the log.
+        """
+        series = (spec.symbol, timeframe)
+        backfiller = self._backfiller_for(spec.symbol)
+        if backfiller is None:
+            self._history_owed.pop(series, None)
+            return True
+        try:
+            await backfiller.backfill_series(spec, timeframe, before=before)
+        except asyncio.CancelledError:
+            raise
+        except HistoryOffline as silence:
+            self._vendor_offline = True
+            log.warning(
+                "History for %s %s cannot be asked for: %s. Waiting for the vendor to "
+                "announce itself.",
+                spec.symbol,
+                timeframe,
+                silence,
+            )
+            return False
+        except HistoryNotServed as refusal:
+            log.warning(
+                "No history for %s %s: %s. Its window fills from live closes only.",
+                spec.symbol,
+                timeframe,
+                refusal,
+            )
+        except Exception as failure:
+            log.warning(
+                "History for %s %s is still not available: %s", spec.symbol, timeframe, failure
+            )
+            return False
+        self._history_owed.pop(series, None)
+        return True
+
+    async def _history_loop(self) -> None:
+        """Check and request every series that is owed its history.
+
+        Three waits, for three situations. Nothing owed: sleep until something
+        is. The vendor not connected: sleep until it announces itself, with no
+        timer (``history_offline_probe_interval`` adds one for a vendor that
+        cannot announce). The vendor connected but not ready (a terminal still
+        logging in): ask again shortly, backing off.
+
+        The merge each request ends in is checked against the staging
+        watermark, so it is safe beside the live path.
+        """
+        delay = ingestion_settings.history_retry_interval
+        while True:
+            if not self._history_owed:
+                self._history_wake.clear()
+                await self._history_wake.wait()
+                delay = ingestion_settings.history_retry_interval
+            elif self._vendor_offline:
+                self._history_wake.clear()
+                probe = ingestion_settings.history_offline_probe_interval
+                try:
+                    await asyncio.wait_for(self._history_wake.wait(), timeout=probe or None)
+                except TimeoutError:
+                    log.info("Probing for the history vendor (no announcement heard)")
+                delay = ingestion_settings.history_retry_interval
+            elif self._history_wake.is_set():
+                # Woken on purpose — an announcement, a gap: act now.
+                self._history_wake.clear()
+            else:
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, ingestion_settings.history_retry_max_interval)
+            for (_, timeframe), spec in list(self._history_owed.items()):
+                settled = await self._warm_series(spec, timeframe)
+                if self._vendor_offline:
+                    # Nobody to ask: the rest would hear the same silence.
+                    break
+                if settled:
+                    log.info(
+                        "History for %s %s settled; %d series still owed",
+                        spec.symbol,
+                        timeframe,
+                        len(self._history_owed),
+                    )
+
+    async def _fill_gap_before(self, candle: Candle) -> None:
+        """Fetch the bars a live close does not follow, before it is staged.
+
+        The ingester publishes nothing it found already closed when it started,
+        so after it has been down the next bar arrives with the closes in
+        between missing — and nothing else would ever fetch them. Asked for
+        here, ahead of staging, the runner reads a whole window when this
+        bar's event reaches it. Only bars older than *candle* are merged: the
+        merge raises the staging watermark to its newest bar, and one that
+        included *candle* would have it dropped as its own duplicate.
+
+        A market's session break looks the same and costs one request, which
+        comes back with nothing new. A failure never holds the bar back: it is
+        staged as it is and the series is left with the retry loop.
+        """
+        backfiller = self._backfiller_for(candle.symbol)
+        if backfiller is None:
+            return
+        newest = await self.state.get_candles(candle.symbol, candle.timeframe, count=1)
+        step = timedelta(seconds=timeframe_seconds(candle.timeframe))
+        if newest and candle.open_time - newest[-1].open_time <= step:
+            # The next bucket, or one already held: nothing is missing.
+            return
+        series = (candle.symbol, candle.timeframe)
+        moment = datetime.now(UTC)
+        asked_at = self._gap_asked_at.get(series)
+        cooldown = ingestion_settings.history_gap_cooldown
+        if asked_at is not None and (moment - asked_at).total_seconds() < cooldown:
+            return
+        self._gap_asked_at[series] = moment
+        spec = self._spec_for(candle.symbol)
+        if spec is None:
+            return
+        log.info(
+            "%s %s bar open_time=%s does not follow the newest stored bar (%s) — asking for "
+            "the bars in between before it is staged",
+            candle.symbol,
+            candle.timeframe,
+            candle.open_time.isoformat(),
+            newest[-1].open_time.isoformat() if newest else "none held",
+        )
+        if not await self._warm_series(spec, candle.timeframe, before=candle.open_time):
+            self._history_owed[series] = spec
+            if not self._vendor_offline:
+                self._history_wake.set()
 
     async def _handle_warmup_bar(self, candle: Candle, batch: WarmupBatch) -> None:
         """Buffer a replayed bar, merging the window once its batch is whole.
@@ -422,8 +688,22 @@ class IngestionService:
         candle = stamp_market_data(candle, self._origin_for(candle.symbol))
         series = (candle.symbol, candle.timeframe)
         async with self._processing_guard():
+            opens_batch = series not in self._warmup_batches
             buffered = self._warmup_batches.setdefault(series, {})
             buffered[candle.open_time] = candle
+            if opens_batch:
+                log.info(
+                    "Warm-up batch opened %s %s: first bar is %d/%d, open_time=%s; Redis "
+                    "holds %d bar(s) now. Buffering in memory until bar %d/%d arrives",
+                    candle.symbol,
+                    candle.timeframe,
+                    batch.index,
+                    batch.total,
+                    candle.open_time.isoformat(),
+                    await self.state.count_candles(candle.symbol, candle.timeframe),
+                    batch.total,
+                    batch.total,
+                )
             if len(buffered) == 1 and batch.total > settings.redis.candle_history:
                 # Not an error: the batch is simply larger than the window kept
                 # for it, and the merge trims to the newest. Said once a batch.
@@ -452,8 +732,38 @@ class IngestionService:
                     batch.total,
                 )
             pending = self._warmup_batches.pop(series, {})
-            await self.state.merge_history_candles(
-                candle.symbol, candle.timeframe, [pending[moment] for moment in sorted(pending)]
+            ordered = sorted(pending)
+            held_before = await self.state.count_candles(candle.symbol, candle.timeframe)
+            log.log(
+                logging.INFO if len(pending) >= batch.total else logging.WARNING,
+                "Warm-up batch closed %s %s on bar %d/%d: %d of %d open time(s) buffered%s, span "
+                "%s..%s. Merging into Redis by open time (window held %d)",
+                candle.symbol,
+                candle.timeframe,
+                batch.index,
+                batch.total,
+                len(pending),
+                batch.total,
+                "" if len(pending) >= batch.total else " — FEWER THAN ANNOUNCED",
+                ordered[0].isoformat(),
+                ordered[-1].isoformat(),
+                held_before,
+            )
+            held_after = await self.state.merge_history_candles(
+                candle.symbol, candle.timeframe, [pending[moment] for moment in ordered]
+            )
+            if not held_after:
+                # The merge gave up and said why; the window is as it was.
+                return
+            log.info(
+                "Warm-up merge done %s %s: Redis window %d -> %d bar(s) (%+d new open "
+                "times, %d overwritten in place)",
+                candle.symbol,
+                candle.timeframe,
+                held_before,
+                held_after,
+                held_after - held_before,
+                len(pending) - (held_after - held_before),
             )
 
     def _processing_guard(self) -> asyncio.Lock:

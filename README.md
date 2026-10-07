@@ -717,18 +717,47 @@ QTE_MARKET_DATA__PROVIDER=mt5         # in .env
   moment it is held — a JetStream ack, or `{"code": 200}` to a core-NATS
   request — and decoded and staged afterwards by a separate worker. When its
   queue is full QTE stops pulling rather than refusing what it already took.
-- **The stream is the history.** A new durable consumer replays what the
-  ingester's `INGESTER` stream still holds (7 days by default), which warms
-  Redis on the first start; bars older than `QTE_RUNNER__CATCH_UP_MAX_AGE` are
-  kept as history, never decided on. After that, a restart resumes from the
-  last bar QTE acknowledged. There is no history download — for a backtest,
-  export from MT5 and `make csv-import`.
-- **Keep the two `.env` files in step.** `subject_prefix`, `stream` and
-  `jetstream` in `config/data_providers/mt5.toml` mirror the ingester's `NATS_SUBJECT_PREFIX`,
-  `NATS_STREAM_NAME` and `NATS_JETSTREAM_ENABLED`; its `NATS_HOST`/`NATS_PORT`
-  normally name QTE's own NATS, so `QTE_MT5__NATS_URL`/`QTE_MT5__NATS_TOKEN`
-  stay blank and fall back to `QTE_NATS__*`. Symbols are the bare names in its
-  `MT5_SYMBOLS`, timeframes a subset of its `MT5_TIMEFRAMES`.
+- **QTE asks for its indicator window; the ingester never pushes one.** At
+  start-up ingestion sends one request per planned series on
+  `INGESTER_RPC.history.mt5.<SYMBOL>.<TF>` and gets the newest `history_bars`
+  closed bars back in a single reply, merged into Redis behind the staging
+  watermark. QTE decides which series and how many bars — the ingester holds no
+  warm-up setting. A symbol the ingester is not configured for is refused once
+  and not asked for again.
+- **QTE starts without the ingester and does not poll for it.** A boot that
+  finds nobody to ask carries on with what Redis holds. The ingester announces
+  itself on `INGESTER_RPC.online.mt5` once it is connected and answering — and
+  again after every reconnect — and only then does ingestion check each planned
+  window against Redis and request the ones that are short or stale; a full,
+  current window costs one Redis read and no request. Nothing is asked on a
+  timer in between (the one announcement that could go unheard, made while
+  QTE's own NATS connection was down, is covered by checking once when that
+  connection returns). An ingester that is connected but not ready — its
+  terminal still logging in — is asked again after
+  `QTE_INGESTION__HISTORY_RETRY_INTERVAL`, doubling to `..._MAX_INTERVAL`.
+- **The request never touches the stream.** It is core NATS request/reply on a
+  prefix of its own (`rpc_prefix`, default `<subject_prefix>_RPC`). Under
+  `subject_prefix` it would be stored as market data and answered by the
+  stream's own acknowledgement, so both sides refuse that configuration.
+- **A hole is filled before the bar after it is staged.** The ingester
+  publishes nothing it found already closed when it started, so a live bar
+  that does not follow the newest stored one has the bars in between fetched
+  first; the runner never decides on a window with a gap in it.
+- **The stream is the fallback, not the history.** A new durable consumer still
+  replays what `INGESTER` holds (`deliver_policy`), but inside a filled window
+  those bars are duplicates and are dropped; bars older than
+  `QTE_RUNNER__CATCH_UP_MAX_AGE` are kept as history, never decided on. A
+  restart resumes from the last bar QTE acknowledged. "The newest bars" is not
+  an archive: for a backtest, export from MT5 and `make csv-import`.
+- **Keep the two `.env` files in step.** `subject_prefix`, `jetstream` and
+  `rpc_prefix` in `config/data_providers/mt5.toml` mirror the ingester's
+  `NATS_SUBJECT_PREFIX`, `NATS_JETSTREAM_ENABLED` and
+  `NATS_RPC_SUBJECT_PREFIX`; `stream` mirrors nothing it can set, because the
+  ingester names the stream after that prefix's first token. Its
+  `NATS_HOST`/`NATS_PORT` normally name QTE's own NATS, so
+  `QTE_MT5__NATS_URL`/`QTE_MT5__NATS_TOKEN` stay blank and fall back to
+  `QTE_NATS__*`. Symbols are the bare names in its `MT5_SYMBOLS`, timeframes a
+  subset of its `MT5_TIMEFRAMES`.
 - **The wire contract is a list, not a constant.** `schema_versions` in
   `config/data_providers/mt5.toml` is which of the ingester's `schema_version`
   values QTE decodes. Each is a full `major.minor.patch` and matches that
@@ -932,6 +961,17 @@ make audit-strict                    # fails on anything the runner would skip
 make start-prod
 make logs
 ```
+
+`make logs` streams what the *current* containers have written, so a recreate
+takes that history with it. Each long-running service therefore also writes its
+own daily file on the host: `logs/<YYYYMMDD>-data-ingestion.log` and
+`logs/<YYYYMMDD>-strategy-runner.log`, at `QTE_LOG_LEVEL`, mounted from
+`./logs` and rolling at midnight without a restart. One file per service, never
+a shared one — both containers append to the same mounted directory, and a
+shared file would tear their lines. Nothing is pruned; `QTE_LOG_DIR` moves them
+and an empty value turns them off. Only these services write files: a CLI
+(`qte-control`, `qte-backtest`, the audit) prints to the console and leaves no
+dated file behind.
 
 Each service builds its **own image**: `QTE_EXTRAS` selects which
 `[project.optional-dependencies]` get installed, so the ingestion container

@@ -13,6 +13,8 @@ from __future__ import annotations
 from qte_shared.interfaces.market_data import (
     OHLCV_COLUMNS,
     Capability,
+    HistoryNotServed,
+    HistoryOffline,
     HistoryRequest,
     HistorySource,
     LiveFeed,
@@ -31,6 +33,8 @@ from qte_shared.interfaces.market_data import (
 __all__ = [
     "OHLCV_COLUMNS",
     "Capability",
+    "HistoryNotServed",
+    "HistoryOffline",
     "HistoryRequest",
     "HistorySource",
     "LiveFeed",

@@ -1,0 +1,5 @@
+# Each long-running service writes <YYYYMMDD>-<service>.log here (QTE_LOG_DIR),
+# and docker-compose mounts this directory into them. Tracked so a fresh clone
+# already owns it: a bind mount of a missing directory is created by the Docker
+# daemon, and on a Linux host that leaves it root-owned and unwritable by the
+# container's own user. The .log files themselves are git-ignored.

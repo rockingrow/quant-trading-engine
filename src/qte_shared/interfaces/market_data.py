@@ -91,6 +91,12 @@ class Capability(str, Enum):
     """
 
     HISTORY = "history"
+    #: The newest bars of a series, on request: enough to fill an indicator
+    #: window at boot, and not an archive. Kept apart from :attr:`HISTORY` so a
+    #: backtest download still refuses a vendor that can only say what happened
+    #: lately — a date range it answers with whatever recent bars it has would
+    #: be a silently short file.
+    RECENT_BARS = "recent_bars"
     #: A live stream of ticks, resampled into bars by ingestion.
     LIVE = "live"
     #: A live stream of bars the vendor already closed. Nothing is resampled:
@@ -115,6 +121,24 @@ class ProviderNotConfigured(ProviderError):
 
 class UnsupportedCapability(ProviderError):
     """Raised when a provider is asked for something it does not serve."""
+
+
+class HistoryOffline(ProviderError):
+    """Nobody is there to answer a history request.
+
+    Not an error to retry on a timer: the vendor is another process and it is
+    not connected. A caller waits for it to announce itself
+    (:meth:`HistorySource.watch_online`) and asks then.
+    """
+
+
+class HistoryNotServed(ProviderError):
+    """The vendor answered a history request, and the answer is a final no.
+
+    A symbol it does not carry, a request it cannot read. Distinct from every
+    other :class:`ProviderError` on a fetch, which may be an outage: this one
+    is not worth asking again, so a caller that retries stops here.
+    """
 
 
 # -- Configuration ---------------------------------------------------------
@@ -232,6 +256,34 @@ class HistoryRequest:
 
 class HistorySource(ABC):
     """Completed bars, already shaped the way the rest of QTE reads them."""
+
+    #: Whether a fetch may be answered from, and written to, the parquet history
+    #: cache. False for a source that only ever serves "the newest bars": what
+    #: it returns for a date range changes by the minute, and a file of it
+    #: would shadow the archive a backtest reads from the same path.
+    cacheable: ClassVar[bool] = True
+
+    @property
+    def max_bars(self) -> int | None:
+        """The most bars one fetch returns, or ``None`` when a range decides.
+
+        A caller sizing a window reads this as the ceiling: asking a source
+        that serves 500 bars to fill 6000 would leave it "short" forever.
+        """
+        return None
+
+    async def watch_online(self, on_online: Callable[[], Awaitable[None]]) -> bool:
+        """Call *on_online* whenever the vendor says it has (re)connected.
+
+        Only a source whose vendor is another process has anything to watch;
+        the default says so by returning False. True means the watch is in
+        place and :meth:`close` ends it.
+        """
+        return False
+
+    async def close(self) -> None:
+        """Release whatever :meth:`watch_online` opened. Idempotent."""
+        return None
 
     @abstractmethod
     async def fetch(self, request: HistoryRequest) -> pd.DataFrame:

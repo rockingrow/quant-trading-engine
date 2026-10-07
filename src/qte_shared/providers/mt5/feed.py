@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import random
 from collections.abc import Callable
 
@@ -46,7 +47,11 @@ from qte_shared.interfaces.market_data import (
     WarmupBarHandler,
 )
 from qte_shared.logging_setup import get_logger
-from qte_shared.providers.mt5.protocol import IngesterPayloadError, decode_bar_closed
+from qte_shared.providers.mt5.protocol import (
+    IngestedBar,
+    IngesterPayloadError,
+    decode_bar_closed,
+)
 from qte_shared.providers.mt5.settings import Mt5Settings
 
 log = get_logger(__name__)
@@ -95,6 +100,9 @@ class IngesterBarFeed(LiveFeed):
         #: ``bars_delivered`` because they are history and not closes: a stack
         #: whose window never fills is diagnosed by comparing the two.
         self.warmup_bars_delivered = 0
+        #: The last warm-up index seen per (symbol, timeframe), ``None`` between
+        #: batches. Only read to report a gap in the numbering.
+        self._warmup_positions: dict[tuple[str, str], int | None] = {}
 
     # ── Lifecycle ─────────────────────────────────────────────────────
 
@@ -180,7 +188,8 @@ class IngesterBarFeed(LiveFeed):
             raise ProviderError(
                 f"JetStream stream {stream!r} does not exist on {self._config.server_url} — "
                 "start algo-trading-ingester with NATS_JETSTREAM_ENABLED=true, or check "
-                "QTE_MT5__STREAM against its NATS_STREAM_NAME"
+                "QTE_MT5__STREAM against the name it derives from its "
+                "NATS_SUBJECT_PREFIX (that prefix's first token)"
             ) from exc
 
         subscription = await bus.js.pull_subscribe(
@@ -283,6 +292,7 @@ class IngesterBarFeed(LiveFeed):
                     candle.timeframe,
                 )
             return
+        self._log_received(bar)
         # The handler's failures are the handler's: letting one escape would end
         # the worker, and every bar after it would sit acknowledged in a queue
         # nothing reads.
@@ -307,3 +317,52 @@ class IngesterBarFeed(LiveFeed):
             self.warmup_bars_delivered += 1
         else:
             self.bars_delivered += 1
+
+    def _log_received(self, bar: IngestedBar) -> None:
+        """Say which of the two streams a message belongs to, before it is handled.
+
+        A warm-up batch is announced at INFO on its first and last bar and at
+        DEBUG in between, so a 150-bar replay reads as two lines unless someone
+        is looking for the gap in it. A batch whose first message is not bar 1
+        is the one worth noticing: the bars before it never arrived.
+        """
+        candle = bar.candle
+        if bar.warmup is None:
+            log.info(
+                "LIVE bar received event_id=%s %s %s open_time=%s (warmup_bar=false) — "
+                "staging it as a close",
+                bar.event_id,
+                candle.symbol,
+                candle.timeframe,
+                candle.open_time.isoformat(),
+            )
+            return
+        series = (candle.symbol, candle.timeframe)
+        previous = self._warmup_positions.get(series)
+        opens_batch = previous is None or bar.warmup.index <= previous
+        expected = 1 if opens_batch else previous + 1
+        if bar.warmup.index != expected:
+            log.warning(
+                "WARM-UP gap on %s %s: received bar %d/%d but expected %d — %d bar(s) "
+                "never arrived (JetStream drops a Nats-Msg-Id it saw inside the "
+                "stream's duplicate window)",
+                candle.symbol,
+                candle.timeframe,
+                bar.warmup.index,
+                bar.warmup.total,
+                expected,
+                bar.warmup.index - expected,
+            )
+        self._warmup_positions[series] = None if bar.warmup.is_last else bar.warmup.index
+        edge = opens_batch or bar.warmup.is_last
+        log.log(
+            logging.INFO if edge else logging.DEBUG,
+            "WARM-UP bar %d/%d received event_id=%s %s %s open_time=%s (warmup_bar=true)%s",
+            bar.warmup.index,
+            bar.warmup.total,
+            bar.event_id,
+            candle.symbol,
+            candle.timeframe,
+            candle.open_time.isoformat(),
+            " — batch complete" if bar.warmup.is_last else "",
+        )

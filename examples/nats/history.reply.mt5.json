@@ -1,0 +1,43 @@
+{
+  "schema_version": "1.0.0",
+  "request_id": "qte-ingestion-7f3a",
+  "status": "ok",
+  "served_at": "2026-09-28T10:15:03.120000Z",
+  "source": {
+    "gateway": "mt5",
+    "market": "forex",
+    "ingester_id": "vps-mt5-01",
+    "venue": "Broker-Server-Demo"
+  },
+  "symbol": "XAUUSD",
+  "timeframe": "M15",
+  "requested": 150,
+  "truncated": false,
+  "bars": [
+    {
+      "open_time": "2026-09-28T09:45:00Z",
+      "close_time": "2026-09-28T10:00:00Z",
+      "open": 2649.4,
+      "high": 2651.9,
+      "low": 2648.7,
+      "close": 2651.1,
+      "volume": 1602.0,
+      "tick_count": 1602,
+      "quote_volume": null,
+      "spread": 12.0
+    },
+    {
+      "open_time": "2026-09-28T10:00:00Z",
+      "close_time": "2026-09-28T10:15:00Z",
+      "open": 2651.12,
+      "high": 2654.8,
+      "low": 2649.95,
+      "close": 2653.4,
+      "volume": 1843.0,
+      "tick_count": 1843,
+      "quote_volume": null,
+      "spread": 12.0
+    }
+  ],
+  "error": null
+}

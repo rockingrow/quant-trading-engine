@@ -1,8 +1,10 @@
 """The ingester's wire format, read into QTE's own :class:`~qte_shared.models.Candle`.
 
 ``algo-trading-ingester`` publishes one ``BarClosedEvent`` per completed bar on
-``<prefix>.bar.closed.<gateway>.<symbol>.<timeframe>``. Its schema lives in that
-repository (``ingester/schemas/market_event_schema.py``); a sample of what QTE
+``<prefix>.bar.closed.<gateway>.<symbol>.<timeframe>``, and answers a history
+request with the same ``Bar`` objects in a list (:func:`decode_history_reply`).
+Its schema lives in that repository
+(``ingester/schemas/market_event_schema.py``); a sample of what QTE
 reads is kept here in ``examples/nats/bar.closed.mt5.json``, and this module is
 the only place in QTE that knows its shape::
 
@@ -20,6 +22,10 @@ the only place in QTE that knows its shape::
               "volume": 1843.0, "tick_count": 1843, "quote_volume": null,
               "spread": 12.0}
     }
+
+**The ingester no longer sends ``warmup_bar``.** History is asked for, not
+replayed onto the bar subject, so every bar it publishes today is a close. The
+fields are still read, for an ingester from before that change:
 
 **``warmup_bar`` splits the stream in two.** False or absent is a live close:
 the bar the vendor has just finished, which ingestion stages and publishes. True
@@ -60,7 +66,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from qte_shared.interfaces.market_data import WarmupBatch
+from qte_shared.interfaces.market_data import HistoryNotServed, ProviderError, WarmupBatch
 from qte_shared.models import Candle
 from qte_shared.timeframes import normalize_timeframe, timeframe_seconds
 
@@ -226,16 +232,24 @@ def decode_bar_closed(
 
     warmup = _warmup_batch(document)
     symbol = document.get("symbol")
-    bar = document.get("bar")
     if not isinstance(symbol, str) or not symbol.strip():
         raise IngesterPayloadError("missing symbol")
-    if not isinstance(bar, dict):
-        raise IngesterPayloadError("missing bar")
     try:
         timeframe = normalize_timeframe(str(document.get("timeframe", "")))
     except ValueError as exc:
         raise IngesterPayloadError(str(exc)) from exc
+    candle = _candle_from_bar(symbol, timeframe, document.get("bar"))
+    return IngestedBar(event_id=str(document.get("event_id", "")), candle=candle, warmup=warmup)
 
+
+def _candle_from_bar(symbol: str, timeframe: str, bar: Any) -> Candle:
+    """One ``Bar`` object off the wire as a closed candle.
+
+    The same shape arrives two ways — inside a ``bar.closed`` event and as an
+    element of a history reply — so it is read in one place.
+    """
+    if not isinstance(bar, dict):
+        raise IngesterPayloadError("missing bar")
     open_time = _utc_timestamp(bar.get("open_time"), "open_time")
     close_time = _utc_timestamp(bar.get("close_time"), "close_time")
     if close_time - open_time != timedelta(seconds=timeframe_seconds(timeframe)):
@@ -243,9 +257,8 @@ def decode_bar_closed(
             f"bar spans {open_time.isoformat()} → {close_time.isoformat()}, "
             f"which is not one {timeframe} bucket"
         )
-
     try:
-        candle = Candle(
+        return Candle(
             symbol=symbol.strip().upper(),
             timeframe=timeframe,
             open_time=open_time,
@@ -260,7 +273,110 @@ def decode_bar_closed(
         )
     except ValidationError as exc:
         raise IngesterPayloadError(f"unusable bar: {exc.errors()[0]['msg']}") from exc
-    return IngestedBar(event_id=str(document.get("event_id", "")), candle=candle, warmup=warmup)
+
+
+# -- History, on request ----------------------------------------------------
+
+#: The error codes after which asking again cannot help: the ingester read the
+#: request and will give the same answer every time.
+_FINAL_HISTORY_ERRORS = frozenset({"unknown_symbol", "bad_request"})
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryAnswer:
+    """What the ingester returned for one history request."""
+
+    candles: list[Candle]
+    #: The ingester held bars back: the request was over its limit, or the
+    #: reply would not have fitted in one message. Fewer bars because the
+    #: broker has no more history is not truncation.
+    truncated: bool
+    #: The ingester that answered, for the log.
+    ingester_id: str
+
+
+def encode_history_request(symbol: str, timeframe: str, count: int, request_id: str) -> bytes:
+    """The body of a "newest *count* closed bars of this series" request.
+
+    Stamped with the oldest version this decoder reads, so an ingester that
+    checks it sees one it knows.
+    """
+    return json.dumps(
+        {
+            "schema_version": DEFAULT_SCHEMA_VERSIONS[0],
+            "request_id": request_id,
+            "symbol": symbol.strip().upper(),
+            "timeframe": normalize_timeframe(timeframe),
+            "count": count,
+        },
+        separators=(",", ":"),
+    ).encode()
+
+
+def decode_history_reply(
+    raw: bytes | str,
+    symbol: str,
+    timeframe: str,
+    schema_versions: Sequence[str] = DEFAULT_SCHEMA_VERSIONS,
+) -> HistoryAnswer:
+    """Read the reply to a history request for *symbol* and *timeframe*.
+
+    Raises :class:`~qte_shared.interfaces.market_data.HistoryNotServed` when the
+    ingester refuses for good, :class:`~qte_shared.interfaces.market_data.ProviderError`
+    when it refuses for now, and :class:`IngesterPayloadError` when the reply is
+    not one this decoder can use. A reply for a different series than the one
+    asked for is refused: merged, it would put one instrument's bars in
+    another's window.
+    """
+    try:
+        document = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise IngesterPayloadError(f"history reply is not JSON: {exc}") from exc
+    if not isinstance(document, dict):
+        raise IngesterPayloadError(
+            f"history reply: expected a JSON object, got {type(document).__name__}"
+        )
+    version = str(document.get("schema_version", ""))
+    if not accepts_schema_version(version, schema_versions):
+        raise IngesterPayloadError(
+            f"history reply schema_version {version!r} is not accepted "
+            f"(configured: {', '.join(schema_versions) or 'none'})"
+        )
+
+    status = document.get("status")
+    if status == "error":
+        error = document.get("error") if isinstance(document.get("error"), dict) else {}
+        code = str(error.get("code", "unknown"))
+        message = f"the ingester refused ({code}): {error.get('message', 'no reason given')}"
+        if code in _FINAL_HISTORY_ERRORS:
+            raise HistoryNotServed(message)
+        raise ProviderError(message)
+    if status != "ok":
+        raise IngesterPayloadError(f"history reply status {status!r} is neither ok nor error")
+
+    wanted_timeframe = normalize_timeframe(timeframe)
+    answered_symbol = str(document.get("symbol", "")).strip().upper()
+    answered_timeframe = str(document.get("timeframe", ""))
+    if answered_symbol != symbol.strip().upper() or answered_timeframe != wanted_timeframe:
+        raise IngesterPayloadError(
+            f"history reply is for {answered_symbol or '?'} {answered_timeframe or '?'}, "
+            f"not the {symbol.upper()} {wanted_timeframe} that was asked for"
+        )
+    bars = document.get("bars")
+    if not isinstance(bars, list):
+        raise IngesterPayloadError("history reply carries no bars list")
+    # Keyed by open time and sorted here rather than trusted: a merge that
+    # assumed order would write a window the runner reads back to front.
+    by_open_time = {
+        candle.open_time: candle
+        for candle in (_candle_from_bar(symbol, wanted_timeframe, bar) for bar in bars)
+    }
+    source = document.get("source") if isinstance(document.get("source"), dict) else {}
+    return HistoryAnswer(
+        candles=[by_open_time[moment] for moment in sorted(by_open_time)],
+        truncated=bool(document.get("truncated", False)),
+        ingester_id=str(source.get("ingester_id", "")),
+    )
 
 
 def _utc_timestamp(value: Any, field_name: str) -> datetime:
