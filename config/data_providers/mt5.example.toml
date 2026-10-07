@@ -39,7 +39,9 @@
 # NATS server the ingester publishes to (its NATS_HOST:NATS_PORT). Blank = QTE's
 # own bus, QTE_NATS__URL.
 #nats_url = ""
-# The ingester's NATS_SUBJECT_PREFIX.
+# The ingester's NATS_SUBJECT_PREFIX, which has to match: the two repositories
+# ship different values (the ingester's own .env.example says INGEST), and until
+# they agree the feed finds no stream and no history request is answered.
 subject_prefix = "INGESTER"
 # Which ingester gateway to take bars from.
 gateway = "mt5"
@@ -51,21 +53,65 @@ gateway = "mt5"
 # the log rather than decoded on a guess, so compare this with the ingester's
 # own SCHEMA_VERSION (`ContractSettings.VERSION` in its `ingester/settings.py`,
 # "1.0.0" by default) whenever that moves — including a patch bump.
+#
+# The history request and its reply are read on 1.0.0 as well — they are a
+# second message type, not a change to the bar. Only a version the ingester
+# actually publishes belongs in this list — an entry is a claim that QTE has
+# been checked against that shape.
 schema_versions = ["1.0.0"]
 # The ingester's NATS_JETSTREAM_ENABLED. true = consume the stream through a
 # durable consumer, so bars published while QTE was down are delivered when it
 # comes back. false = core NATS: whatever QTE misses is gone.
 jetstream = true
-# The ingester's NATS_STREAM_NAME. The ingester creates it; QTE only reads it
-# and never creates or reconfigures it.
+# The stream the ingester creates, named after the first token of its
+# NATS_SUBJECT_PREFIX — it has no separate setting for the name. QTE only reads
+# the stream and never creates or reconfigures it.
 stream = "INGESTER"
 # Where a *new* durable consumer starts. "all" replays everything the stream
-# still holds (7 days by default on the ingester), which is how this provider
-# warms Redis — it has no other history. The runner only *decides* on bars
-# younger than QTE_RUNNER__CATCH_UP_MAX_AGE; older ones become history.
-# "new" starts cold. An existing consumer keeps its position whatever this says:
-# delete it on the server to start over.
+# still holds (7 days by default on the ingester); "new" takes only what is
+# published from now on. The indicator window does not depend on either — it is
+# asked for, see `history_bars` below — so the replay is a fallback for a boot
+# where the ingester was down: inside a filled window its bars are dropped as
+# duplicates, and the runner only *decides* on bars younger than
+# QTE_RUNNER__CATCH_UP_MAX_AGE. An existing consumer keeps its position whatever
+# this says: delete it on the server to start over.
 deliver_policy = "all"
+
+# ── The indicator window: QTE asks, the ingester answers ────────────────
+#
+# The ingester publishes a bar when it closes and pushes nothing else. The bars
+# from before QTE was listening are requested — one request per series in the
+# [symbols.*] tables below, answered in one reply — on
+#
+#   <rpc_prefix>.history.<gateway>.<SYMBOL>.<TIMEFRAME>
+#   e.g. INGESTER_RPC.history.mt5.XAUUSD.M15
+#
+# QTE decides which series and how many bars. The ingester has no warm-up
+# setting: whatever is listed below is what gets warmed.
+#
+# QTE does not wait for the ingester and does not poll for it. It starts on
+# what Redis holds; the ingester says when it is connected, on
+# <rpc_prefix>.online.<gateway>, and only then is each window below checked
+# against Redis and requested if it is short or stale. A live bar that arrives
+# with closes missing before it (the ingester restarted) has them fetched first.
+#
+# Closed bars asked for per series. Keep it at or above the longest `warmup` a
+# mapped strategy declares, or the runner sits at x/<warmup> until live closes
+# fill the rest. The ingester answers with at most its NATS_HISTORY_MAX_BARS
+# (5000) and with fewer when the broker's archive is shorter.
+history_bars = 500
+# The ingester's NATS_RPC_SUBJECT_PREFIX. Blank = "<subject_prefix>_RPC", which
+# is what the ingester derives when its own is blank. It may not sit under
+# subject_prefix: the stream captures that tree and would answer a request with
+# its own acknowledgement.
+#rpc_prefix = ""
+# Seconds one request waits for its reply, and how many are sent when replies
+# time out. An ingester that is not running at all is reported at once and
+# not retried: its announcement is what gets the window asked for.
+#history_timeout = 25.0
+#history_attempts = 2
+# false = never ask; the window fills from live closes only.
+#backfill_history = true
 # Blank = "qte-ingestion-<env>-<mode>-mt5", one consumer per state namespace, so
 # a shadow and a live stack on one server both receive every bar.
 #durable_name = ""

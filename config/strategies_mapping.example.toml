@@ -52,6 +52,15 @@ use_weekend_flat = true
 # either key under [symbols.<symbol>.params.<strategy>].
 allow_multiple_cycles = false
 max_open_cycles = 1
+# Read by the engine, not the strategy: how many closed candles this strategy
+# collects before it may decide anything. Omit it to keep the count the
+# strategy's own code declares, which is the safe default — what it really
+# needs is a property of its slowest indicator, and below that it reads NaN and
+# silently takes no entry. A number under the declared one starts the pair
+# earlier and logs a warning saying so; a number above the strategy's
+# max_history is refused, because the runner's buffer could never reach it.
+# Applies to the backtest too, so a replay still predicts the runner.
+#warmup = 150
 
 
 # ── One table per symbol ────────────────────────────────────────────────

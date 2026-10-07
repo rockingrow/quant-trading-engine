@@ -49,7 +49,11 @@ from qte_shared.strategies.strategy_base import (
     StrategyLike,
     as_intents,
 )
-from qte_shared.strategies.strategy_settings import NO_WEEKEND_FLAT, WeekendFlatPolicy
+from qte_shared.strategies.strategy_settings import (
+    NO_WEEKEND_FLAT,
+    WeekendFlatPolicy,
+    resolve_warmup,
+)
 from qte_shared.timeframes import TIMEFRAME_SECONDS, timeframe_seconds
 
 log = get_logger(__name__)
@@ -227,16 +231,28 @@ class BacktestEngine:
         if frame.empty:
             raise ValueError(f"No history to replay for {self.symbol} {self.timeframe}")
 
-        warmup = max(self.strategy.warmup, 1)
-        if len(frame) < warmup:
-            raise ValueError(
-                f"{len(frame)} bars is not enough for a strategy needing {warmup} of warm-up"
-            )
-
         # The same bound the live runner keeps its deque at. Passing the whole
         # file instead would be both quadratic and a lie: a strategy would see
         # history in the backtest that it can never see in production.
         window_size = self.strategy.history_window()
+
+        # The strategy's declared warm-up unless this pair's mapping entry — or
+        # `--param warmup=` — asks for another count. Resolved from the params
+        # the strategy was instantiated with, which is the same dict the runner
+        # resolves from, so both drivers start deciding on the same bar.
+        warmup = max(
+            resolve_warmup(
+                self.strategy.warmup,
+                window_size,
+                self.strategy.params,
+                subject=f"{self.strategy.name} on {self.symbol}",
+            ),
+            1,
+        )
+        if len(frame) < warmup:
+            raise ValueError(
+                f"{len(frame)} bars is not enough for a strategy needing {warmup} of warm-up"
+            )
 
         context = StrategyContext(
             symbol=self.symbol,

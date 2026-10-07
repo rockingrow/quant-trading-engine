@@ -14,6 +14,21 @@ ingestion was down across one or more closes -- is topped up from that newest
 bar instead. Counting alone cannot see an outage: the list is just as long
 before it as after.
 
+A provider that closes its own bars and can only say what happened lately —
+the MT5 ingester, asked over NATS — is warmed through the same path, with three
+differences that follow from what it is. Its window is sized by what one
+request returns (:attr:`~qte_shared.interfaces.market_data.HistorySource.max_bars`)
+rather than by ``QTE_REDIS__CANDLE_HISTORY``; nothing it returns goes near the
+parquet cache; and what it returns is merged *behind* the staging watermark
+(:meth:`~qte_shared.cache.redis_state.RedisState.merge_history_candles`), so a
+bar its stream then replays is dropped as the duplicate it is instead of being
+appended after the history it belongs inside.
+
+That provider can also be down when QTE boots, so :meth:`HistoryBackfiller.run`
+reports the series it could not warm and
+:meth:`HistoryBackfiller.backfill_series` warms one of them later — ingestion
+asks again until each has been answered.
+
 Four limits are deliberate:
 
 * **It runs only when the provider serves history.** With several providers
@@ -48,6 +63,8 @@ from qte_shared.config import provider_market_data_plan, settings
 from qte_shared.history_cache import HistoryCache, fetch_history
 from qte_shared.interfaces.market_data import (
     Capability,
+    HistoryNotServed,
+    HistoryOffline,
     HistoryRequest,
     HistorySource,
     ProviderError,
@@ -71,15 +88,24 @@ _CALENDAR_TO_SESSION_RATIO = 7 / 5
 _SECONDS_PER_DAY = 86_400
 
 
-def open_history_source(provider_name: str | None = None) -> HistorySource:
+def open_history_source(
+    provider_name: str | None = None, *, recent_bars_will_do: bool = False
+) -> HistorySource:
     """*provider_name*'s history client; the configured provider's when omitted.
 
     Raises :class:`UnsupportedCapability` when the provider serves no history,
     as the simulator does, and :class:`ProviderError` when it should but cannot
     -- a missing API key. Each caller decides which of the two deserves a
     warning.
+
+    *recent_bars_will_do* also accepts a provider that can only return the
+    newest bars of a series. That is enough to fill a window and not enough to
+    look up one particular bucket, so only the backfill asks for it.
     """
-    return create_provider(provider_name, capability=Capability.HISTORY).history_source()
+    wanted: Capability | tuple[Capability, ...] = Capability.HISTORY
+    if recent_bars_will_do:
+        wanted = (Capability.HISTORY, Capability.RECENT_BARS)
+    return create_provider(provider_name, capability=wanted).history_source()
 
 
 class HistoryBackfiller:
@@ -109,25 +135,97 @@ class HistoryBackfiller:
         #: What "now" is when deciding which buckets have completed. Injectable
         #: so a test can pin it.
         self.utc_clock = utc_clock or (lambda: datetime.now(UTC))
+        #: Opened on first use and kept, so a retry does not rebuild it.
+        self._source: HistorySource | None = None
+        #: Whether the last :meth:`run` found nobody to ask at all.
+        self.offline = False
 
-    async def run(self) -> None:
-        """Warm every symbol and timeframe. Never raises."""
+    async def watch_online(self, on_online) -> bool:
+        """Have the vendor's "I am connected" call *on_online*. False if it has none."""
+        source = self._history_source() if self._enabled() else None
+        if source is None:
+            return False
+        return await source.watch_online(on_online)
+
+    async def close(self) -> None:
+        """End the watch, if one was started."""
+        if self._source is not None:
+            await self._source.close()
+
+    @property
+    def retryable(self) -> bool:
+        """Whether a series this could not warm is worth asking for again.
+
+        True for a source that is another process, which may simply not be up
+        yet. A vendor API that failed at boot is left alone: its windows are
+        thousands of bars, and re-requesting them on a timer against a
+        rate-limited plan costs more than the restart that would do it once.
+        """
+        source = self._source
+        return source is not None and not source.cacheable
+
+    async def run(self) -> list[tuple[SymbolSpec, str]]:
+        """Warm every symbol and timeframe. Never raises.
+
+        Returns the series that could not be warmed and may be later — empty
+        unless :attr:`retryable`.
+        """
         if not self._enabled():
             log.info(
                 "History backfill disabled for %r ([provider].backfill_history = false)",
                 self.provider_name,
             )
-            return
+            return []
 
-        source = self._history_source()
-        if source is None:
-            return
+        if self._history_source() is None:
+            return []
 
-        cache = self.cache or HistoryCache(self.provider_name)
+        unwarmed: list[tuple[SymbolSpec, str]] = []
+        self.offline = False
         for feed in self.subscriptions:
             for timeframe in feed.timeframes:
+                if self.offline:
+                    # Nobody answered the first request; the rest would hear
+                    # the same silence. They are owed, and asked for when the
+                    # vendor announces itself.
+                    unwarmed.append((feed.spec, timeframe))
+                    continue
                 try:
-                    await self._backfill_one(source, cache, feed.spec, timeframe)
+                    await self.backfill_series(feed.spec, timeframe)
+                except HistoryOffline as silence:
+                    self.offline = True
+                    log.warning(
+                        "History from %s cannot be asked for yet: %s",
+                        self.provider_name,
+                        silence,
+                    )
+                    unwarmed.append((feed.spec, timeframe))
+                except HistoryNotServed as refusal:
+                    # A final answer, so not an error and not retried: the
+                    # vendor does not carry this series.
+                    log.warning(
+                        "No history for %s %s from %s: %s. Its window fills from live closes only.",
+                        feed.symbol,
+                        timeframe,
+                        self.provider_name,
+                        refusal,
+                    )
+                except ProviderError as failure:
+                    if not self.retryable:
+                        log.exception(
+                            "History backfill failed for %s %s — starting on what Redis has",
+                            feed.symbol,
+                            timeframe,
+                        )
+                        continue
+                    log.warning(
+                        "History for %s %s is not available from %s yet: %s",
+                        feed.symbol,
+                        timeframe,
+                        self.provider_name,
+                        failure,
+                    )
+                    unwarmed.append((feed.spec, timeframe))
                 except Exception:
                     # One bad symbol must not cost the others their warm-up,
                     # and none of them may cost the service its start.
@@ -136,20 +234,52 @@ class HistoryBackfiller:
                         feed.symbol,
                         timeframe,
                     )
+        return unwarmed
+
+    async def backfill_series(
+        self, spec: SymbolSpec, timeframe: str, *, before: datetime | None = None
+    ) -> None:
+        """Warm one series now. Raises what the fetch raises.
+
+        *before* keeps only the bars that opened earlier than it. A caller that
+        is about to stage a live close passes that close's open time: a merge
+        that included the bar itself would raise the staging watermark to it,
+        and the close would then be dropped as a duplicate of its own history
+        without ever being published.
+        """
+        source = self._history_source()
+        if source is None:
+            raise UnsupportedCapability(f"{self.provider_name!r} serves no history")
+        cache = None
+        if source.cacheable:
+            cache = self.cache or HistoryCache(self.provider_name)
+        await self._backfill_one(source, cache, spec, timeframe, before=before)
+
+    def _target_for(self, source: HistorySource) -> int:
+        """Bars a window is full at: the configured history, or what one fetch returns."""
+        ceiling = source.max_bars
+        return self.target if ceiling is None else min(self.target, ceiling)
 
     # -- One symbol / timeframe -------------------------------------------
 
     async def _backfill_one(
-        self, source, cache: HistoryCache, spec: SymbolSpec, timeframe: str
+        self,
+        source: HistorySource,
+        cache: HistoryCache | None,
+        spec: SymbolSpec,
+        timeframe: str,
+        *,
+        before: datetime | None = None,
     ) -> None:
         moment = self.utc_clock()
         provider_name = self.provider_name
+        target = self._target_for(source)
         held_count = await self.state.count_candles(spec.symbol, timeframe)
         newest = await self._newest_held(spec.symbol, timeframe) if held_count else None
         last_completed = floor_to_bucket(moment, timeframe) - timedelta(
             seconds=timeframe_seconds(timeframe)
         )
-        topping_up = held_count >= self.target and newest is not None
+        topping_up = held_count >= target and newest is not None
 
         if topping_up and newest.open_time >= last_completed:
             log.info(
@@ -157,7 +287,7 @@ class HistoryBackfiller:
                 spec.symbol,
                 timeframe,
                 held_count,
-                self.target,
+                target,
                 newest.open_time.isoformat(),
             )
             return
@@ -170,7 +300,7 @@ class HistoryBackfiller:
                 timeframe,
                 provider_name,
                 held_count,
-                self.target,
+                target,
                 newest.open_time.isoformat(),
                 last_completed.isoformat(),
             )
@@ -188,14 +318,17 @@ class HistoryBackfiller:
                 timeframe,
                 provider_name,
                 held_count,
-                self.target,
+                target,
             )
-            request = self._request_for(spec, timeframe, moment)
+            request = self._request_for(spec, timeframe, moment, target)
 
         # A top-up asks for exactly the bars a cached file cannot hold yet, and
         # the cache's coverage tolerance would answer it with none of them.
         history = await fetch_history(
-            source, request, cache=cache, use_cache=False if topping_up else None
+            source,
+            request,
+            cache=cache,
+            use_cache=False if topping_up or cache is None else None,
         )
         origin = settings.state_scope.origin(provider=provider_name)
         fetched = [
@@ -203,6 +336,7 @@ class HistoryBackfiller:
             for candle in _frame_to_candles(
                 drop_unfinished_bars(history, timeframe, moment), spec.symbol, timeframe
             )
+            if before is None or candle.open_time < before
         ]
         if not fetched:
             if topping_up:
@@ -234,9 +368,27 @@ class HistoryBackfiller:
                 provider_name,
             )
             return
-        written = await self.state.replace_candles(
-            spec.symbol, timeframe, merged, max_len=self.target
-        )
+        if source.cacheable:
+            written = await self.state.replace_candles(
+                spec.symbol, timeframe, merged, max_len=self.target
+            )
+        else:
+            # A bar feed replays its stream after this, and the staging
+            # watermark is what turns those replayed bars into duplicates. So
+            # the bars that changed go in behind it, in the one transaction
+            # that also moves it; the window keeps the configured history.
+            held_by_open_time = {candle.open_time: candle for candle in existing}
+            changed = [
+                candle for candle in merged if held_by_open_time.get(candle.open_time) != candle
+            ]
+            written = await self.state.merge_history_candles(
+                spec.symbol, timeframe, changed, max_len=self.target
+            )
+            if not written:
+                raise ProviderError(
+                    f"the {spec.symbol} {timeframe} window kept changing while its history "
+                    "was merged; it will be asked for again"
+                )
         log.info(
             "Warmed %s %s: %d bars in Redis (%d fetched, %d already held), span %s..%s",
             spec.symbol,
@@ -252,20 +404,22 @@ class HistoryBackfiller:
         newest_bars = await self.state.get_candles(symbol, timeframe, count=1)
         return newest_bars[-1] if newest_bars else None
 
-    def _request_for(self, spec: SymbolSpec, timeframe: str, moment: datetime) -> HistoryRequest:
-        """A range wide enough to yield ``target`` bars on a part-time market."""
+    def _request_for(
+        self, spec: SymbolSpec, timeframe: str, moment: datetime, target: int | None = None
+    ) -> HistoryRequest:
+        """A range wide enough to yield *target* bars on a part-time market."""
         last_day = moment.date()
         return HistoryRequest(
             symbol=spec.symbol,
             timeframe=timeframe,
-            start=last_day - self._span_for(timeframe, spec.market),
+            start=last_day - self._span_for(timeframe, spec.market, target or self.target),
             end=last_day,
             market=spec.market,
         ).normalized()
 
-    def _span_for(self, timeframe: str, market: str) -> timedelta:
+    def _span_for(self, timeframe: str, market: str, target: int | None = None) -> timedelta:
         bars_per_session_day = _SECONDS_PER_DAY / timeframe_seconds(timeframe)
-        days = self.target / bars_per_session_day
+        days = (target or self.target) / bars_per_session_day
         if market != "crypto":
             days *= _CALENDAR_TO_SESSION_RATIO
         # A whole extra week absorbs public holidays at either end of the span.
@@ -281,17 +435,20 @@ class HistoryBackfiller:
             return True
         return bool(provider_market_data_plan(self.provider_name).option("backfill_history", True))
 
-    def _history_source(self):
+    def _history_source(self) -> HistorySource | None:
         """The configured provider's history source, or ``None`` to skip.
 
         Gated on the capability rather than on the vendor's name: any provider
         that can serve history should warm the cache, and the one that cannot
         is exactly the one a developer chose to avoid the network.
         """
+        if self._source is not None:
+            return self._source
         try:
             # Building the source is where a missing API key surfaces, so it
             # belongs inside the same guard as the capability check.
-            return open_history_source(self.provider_name)
+            self._source = open_history_source(self.provider_name, recent_bars_will_do=True)
+            return self._source
         except UnsupportedCapability:
             # The expected, deliberate case: someone pointed a dev stack at the
             # simulator precisely so nothing would reach the network.

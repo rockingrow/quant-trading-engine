@@ -201,7 +201,7 @@ class BarVendor(MarketDataProvider):
     def __init__(self) -> None:
         self.asked: list[list[SymbolFeed]] = []
 
-    def bar_feeds(self, subscriptions, on_bar):
+    def bar_feeds(self, subscriptions, on_bar, on_warmup=None):
         self.asked.append(list(subscriptions))
         return ["alpha-feed"]
 
@@ -280,7 +280,9 @@ async def test_a_provider_that_starts_no_feed_fails_the_start(two_vendors, monke
         async def stop(self):
             return None
 
-    service.providers["alpha"].bar_feeds = lambda subscriptions, on_bar: [StartedFeed()]
+    service.providers["alpha"].bar_feeds = lambda subscriptions, on_bar, on_warmup=None: [
+        StartedFeed()
+    ]
 
     with pytest.raises(RuntimeError, match="'beta' started no feeds"):
         await service.start()
@@ -295,11 +297,20 @@ async def _guard_passes(*arguments, **keywords) -> bool:
 
 
 class _SilentBackfiller:
+    retryable = False
+    offline = False
+
+    async def watch_online(self, on_online) -> bool:
+        return False
+
+    async def close(self) -> None:
+        return None
+
     def __init__(self, *arguments, **keywords) -> None:
         pass
 
-    async def run(self) -> None:
-        return None
+    async def run(self) -> list:
+        return []
 
 
 async def test_partial_bars_are_repaired_by_their_own_provider():

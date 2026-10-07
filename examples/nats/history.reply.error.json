@@ -1,0 +1,21 @@
+{
+  "schema_version": "1.0.0",
+  "request_id": "qte-ingestion-7f3b",
+  "status": "error",
+  "served_at": "2026-09-28T10:15:03.120000Z",
+  "source": {
+    "gateway": "mt5",
+    "market": "forex",
+    "ingester_id": "vps-mt5-01",
+    "venue": "Broker-Server-Demo"
+  },
+  "symbol": "EURUSD",
+  "timeframe": "M15",
+  "requested": 150,
+  "truncated": false,
+  "bars": [],
+  "error": {
+    "code": "unknown_symbol",
+    "message": "mt5 is not configured for 'EURUSD' (configured: XAUUSD, USOIL)"
+  }
+}

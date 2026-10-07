@@ -59,6 +59,10 @@ from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from qte_shared.logging_setup import get_logger
+
+log = get_logger(__name__)
+
 #: The optional manifest hook, beside ``load_all``. A repo that does not define
 #: it declares no settings, which is not an error — it is every strategy that
 #: existed before this file, and every loose ``.py`` the directory scan picks up.
@@ -421,6 +425,80 @@ def resolve_cycle_policy(params: Mapping[str, Any]) -> CyclePolicy:
     return CyclePolicy(allow_multiple_cycles=True, max_open_cycles=maximum)
 
 
+#: The pair param that overrides how many bars a pair collects before it may
+#: trade. A mapping-table setting like ``use_weekend_flat``: the strategy
+#: declares what its indicators need, the deployment decides what it runs on.
+WARMUP_PARAM = "warmup"
+
+#: Mapping-table keys the *engine* consumes. They configure the port rather than
+#: the edge, so :class:`~qte_shared.strategies.signal_factory.SignalFactory`
+#: keeps them out of a payload's ``inputs`` block — a worker has no use for the
+#: bar count a signal was gated behind, and the broker contract stays as
+#: ``docs/broker-contract.md`` documents it.
+PORT_ONLY_PARAMS = frozenset({WARMUP_PARAM})
+
+
+def resolve_warmup(
+    declared: int,
+    history_window: int | None,
+    params: Mapping[str, Any],
+    *,
+    subject: str = "",
+) -> int:
+    """The bars one pair warms up over: the declaration, or the mapping's number.
+
+    *declared* is the strategy's own ``warmup``, *history_window* its
+    :meth:`~qte_shared.strategies.strategy_base.StrategyBase.history_window`
+    (``None`` for unbounded), and *params* the pair's resolved params — the same
+    dict both drivers instantiate the strategy with, so a replay warms up over
+    exactly as many bars as the runner would.
+
+    **The engine cannot check the number is large enough**, and does not
+    pretend to. What a strategy actually needs is a property of its slowest
+    indicator: the live gold and oil ports read NaN below 34 bars and their
+    readings stop moving around 120, while the gold V2 ports cannot compute at
+    all below 113 — see ``data/audits/2026-10-06-strategy-warmup-requirements.md``
+    for how those were measured. A value under the declaration is therefore the
+    operator's call, taken with a warning rather than refused.
+
+    What *is* refused, because neither is a judgement call:
+
+    * anything that is not a whole number of at least 1 — a limit that did not
+      parse must stop the start, never silently leave the declaration standing;
+    * a value above *history_window*, because the runner's buffer is a deque
+      capped there. The pair could never reach that count, so it would warm up
+      forever and trade nothing, which is worse than refusing to start.
+    """
+    wanted = params.get(WARMUP_PARAM)
+    if wanted is None:
+        return declared
+    if isinstance(wanted, bool) or not isinstance(wanted, int) or wanted < 1:
+        raise ValueError(f"{WARMUP_PARAM} must be a whole number of at least 1, not {wanted!r}")
+    if history_window is not None and wanted > history_window:
+        raise ValueError(
+            f"{WARMUP_PARAM} = {wanted} is more than the {history_window} bars the strategy "
+            "keeps, so the pair could never finish warming up — lower it, or raise the "
+            "strategy's max_history"
+        )
+    if wanted < declared:
+        log.warning(
+            "%s%s = %d overrides the %d bars the strategy declares. It will start deciding "
+            "earlier, on indicators that have had less history to settle.",
+            f"{subject}: " if subject else "",
+            WARMUP_PARAM,
+            wanted,
+            declared,
+        )
+    return wanted
+
+
+def describe_warmup(effective: int, declared: int) -> str:
+    """One field for a log line: the number in force, and the declaration it replaced."""
+    if effective == declared:
+        return str(effective)
+    return f"{effective} (declared {declared})"
+
+
 @dataclass(frozen=True, slots=True)
 class StrategySettings:
     """Everything one strategy declared, parsed and validated.
@@ -518,8 +596,12 @@ __all__ = [
     "DEFAULT_SETTINGS",
     "MAX_OPEN_CYCLES_PARAM",
     "MULTIPLE_CYCLES_PARAM",
+    "PORT_ONLY_PARAMS",
     "SINGLE_CYCLE",
+    "WARMUP_PARAM",
+    "describe_warmup",
     "resolve_cycle_policy",
+    "resolve_warmup",
     "DatedFlatWindow",
     "NO_WEEKEND_FLAT",
     "STRATEGY_SETTINGS_HOOK",

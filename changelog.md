@@ -9,6 +9,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The indicator window is requested from the MT5 ingester, not replayed by
+  it** — that vendor serves no history endpoint, so a stack on a cold or
+  part-filled Redis used to climb one bar per close: a day and a half for 150
+  bars of M15. Ingestion now sends one core-NATS request per planned series on
+  `<rpc_prefix>.history.<gateway>.<SYMBOL>.<TF>` and gets every bar back in a
+  single reply, merged into the stored window in one compare-and-swap against
+  the per-series staging watermark — raised to the newest bar merged, never
+  lowered, so a bar the stream replays afterwards is still read as the duplicate
+  it is. Merged by open time with the held bar winning a tie, so a reply that
+  ends behind the live stream cannot cost a newer close, and nothing it returns
+  is staged, published or decided on. QTE decides which series and how many
+  bars (`history_bars`, default 500); the ingester holds no warm-up setting.
+  New: `qte_shared.providers.mt5.history.IngesterHistorySource`, reached through
+  `Capability.RECENT_BARS` — deliberately *not* `HISTORY`, because "the newest n
+  closed bars" is a window and not an archive: a backtest download still
+  refuses the provider and nothing it returns reaches the parquet history cache.
+  A reply for another series, or on a `schema_version` nobody listed, is refused
+  rather than merged. See `examples/nats/history.{request,reply}*.json` and
+  "Why the indicator window is asked for, not pushed" in `docs/architecture.md`.
+
+- **Ingestion starts without the ingester and never polls for it** — a boot that
+  finds nobody to ask logs it once and carries on with what Redis holds, rather
+  than failing or retrying on a timer. The ingester announces itself on
+  `<rpc_prefix>.online.<gateway>` when it is connected and answering, and again
+  after every reconnect; only then does ingestion compare each planned window
+  against Redis and request the ones that are short or stale, so a full, current
+  window costs one Redis read and no request. The one announcement that can go
+  unheard is one made while QTE's own NATS connection was down, and that is
+  covered by re-checking when the connection returns — which is why
+  `QTE_INGESTION__HISTORY_OFFLINE_PROBE_INTERVAL` defaults to `0`, no probe at
+  all. A vendor that answers "not ready" (an MT5 terminal still logging in) is a
+  different case and *is* retried, after
+  `QTE_INGESTION__HISTORY_RETRY_INTERVAL`, doubling to `..._MAX_INTERVAL`. A
+  symbol the vendor does not carry is refused once (`HistoryNotServed`) and not
+  asked for again.
+
+- **A gap in front of a live bar is filled before that bar is staged** — the
+  ingester publishes nothing it found already closed when it started, so after
+  it has been down the next close arrives with the bars in between missing and
+  nothing else would ever fetch them. Ingestion now requests them first, so the
+  runner never decides on a window with a hole in it. Only bars older than the
+  live one are merged: including it would raise the watermark to it and the
+  close would then be dropped as a duplicate of its own history. A market's own
+  session break looks identical and costs one request per
+  `QTE_INGESTION__HISTORY_GAP_COOLDOWN`.
+
+- **Each long-running service writes its own daily log file** —
+  `<QTE_LOG_DIR>/<YYYYMMDD>-data-ingestion.log` and `-strategy-runner.log`, at
+  `QTE_LOG_LEVEL`, mounted from `./logs` by Compose and rolling at midnight
+  without a restart. `docker compose logs` keeps only what the *current*
+  container wrote, so recreating a service used to take the history of every
+  decision with it. One file per service rather than a shared one, because both
+  containers append to the same mounted directory and a shared file would tear
+  their lines. Only an entry point names a service, so importing anything from
+  the package — a test, a backtest, `qte-control` — still writes no file and
+  creates no directory, and an unwritable directory is reported once on the
+  console and otherwise ignored rather than stopping a service that is ready to
+  trade. Nothing is pruned; an empty `QTE_LOG_DIR` turns the files off.
+
+- **The `warmup_bar` reader is kept for an older ingester** — a numbered,
+  replayed batch is still buffered and merged
+  (`IngestionService._handle_warmup_bar`), so a gateway from before the change
+  above is understood. Nothing in the current pair of services emits one.
+
+- **`warmup` is now a mapping-table setting** — how many closed candles a pair
+  collects before it may decide is no longer only a class attribute inside a
+  private strategy repository. State `warmup` under
+  `[strategies.<NAME>]` to move it everywhere that strategy runs, or under
+  `[symbols.<SYMBOL>.params.<NAME>]` for one pair; omit it and the count the
+  strategy declares stands, exactly as before. The runner and the replay
+  resolve it from the same pair params (`resolve_warmup`), and `--param
+  warmup=` works on a backtest, so a replay still starts deciding on the same
+  bar the runner would — the report's `warmup_bars` records the number actually
+  used. A count below the declaration is the operator's call and logs a warning
+  naming both numbers, because what a strategy really needs is a property of
+  its slowest indicator and the engine cannot measure it; a count that is not a
+  positive whole number, or one above the strategy's `max_history`, stops the
+  start instead, the latter because the runner's buffer could never reach it.
+  The key configures the port rather than the edge, so it is kept out of a
+  payload's `inputs` block and the broker contract is unchanged.
+
 - **Recovery from a stale runner ownership claim** — the non-expiring
   `runner:owner` claim still refuses a second runner and still never fails
   over, but an unclean exit no longer has to end in a crash loop and a manual

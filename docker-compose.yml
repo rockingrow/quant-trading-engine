@@ -75,6 +75,11 @@ x-app: &app
     - ./config:/app/config:ro
     - ./data/parquet:/app/data/parquet
     - ./data/reports:/app/data/reports
+    # Each service's daily log file, on the host: `docker logs` keeps only what
+    # the current container wrote, so a recreate would otherwise take the
+    # history of every decision with it. One file per service per day
+    # (QTE_LOG_DIR), writable because both services append to their own.
+    - ./logs:/app/logs
   depends_on:
     redis-cache: {condition: service_healthy}
     postgres-audit: {condition: service_healthy}

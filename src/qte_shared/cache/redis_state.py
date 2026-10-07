@@ -54,6 +54,40 @@ return 1
 """
 
 
+#: Swap a merged candle window in, but only if the live path has not staged a
+#: close since it was read.
+#:
+#: The ordering is decided in Python, where ``open_time`` is a real datetime;
+#: Lua only swaps. That split is deliberate — stored bars carry their open time
+#: as an ISO-8601 string, and sorting those lexicographically inside Redis would
+#: be a guess about the serialiser's width, not a comparison.
+#:
+#: What it guards against is the one other writer of this list: a live close
+#: landing between the read and the rewrite, which a blind rewrite would drop.
+#: The staging watermark is the right token to check, because that writer always
+#: moves it. Checking the list's length instead would not work — pushing a bar
+#: onto an already-trimmed list leaves the length unchanged.
+MERGE_HISTORY_CANDLES = """
+local history_type = redis.call('TYPE', KEYS[1]).ok
+if history_type ~= 'none' and history_type ~= 'list' then
+    return redis.error_reply('Candle history must be a list')
+end
+local staged = redis.call('GET', KEYS[2])
+if staged == false then staged = '' end
+if staged ~= ARGV[1] then return -1 end
+redis.call('DEL', KEYS[1])
+-- One RPUSH per bar rather than `unpack(ARGV, 5)`: a full window is thousands
+-- of entries and Lua's stack is not.
+for index = 5, #ARGV do
+    redis.call('RPUSH', KEYS[1], ARGV[index])
+end
+redis.call('LTRIM', KEYS[1], -tonumber(ARGV[2]), -1)
+if tonumber(ARGV[3]) > 0 then redis.call('EXPIRE', KEYS[1], ARGV[3]) end
+redis.call('SET', KEYS[2], ARGV[4])
+return redis.call('LLEN', KEYS[1])
+"""
+
+
 class RedisState:
     """Namespaced async Redis accessor. One instance per service."""
 
@@ -240,6 +274,101 @@ class RedisState:
             pipe.expire(key, settings.redis.ttl_seconds)
         await pipe.execute()
         return len(retained)
+
+    async def merge_history_candles(
+        self,
+        symbol: str,
+        timeframe: str,
+        candles: list[Candle],
+        max_len: int | None = None,
+        attempts: int = 3,
+    ) -> int:
+        """Merge warm-up history into the stored window by open time.
+
+        This is the one write that is allowed to place a bar *behind* the
+        staging watermark, and it exists because :meth:`stage_closed_candle`
+        cannot. That watermark is a single number, so to the live path any bar
+        at or below it is a duplicate replay — which is the correct reading of a
+        forward-only feed, and the wrong one for a vendor replaying the history
+        a window is missing. The bars missing from a half-filled window are
+        precisely the old ones, so staging would reject exactly what is needed.
+
+        Merging rather than replacing: a batch may end before the newest bar
+        Redis already holds, when the vendor's replay is a moment behind the
+        live stream. Keyed by open time, with the incoming bar winning a tie,
+        no live close is ever lost to a warm-up that arrived after it.
+
+        The watermark is then raised to the newest bar merged, but never
+        lowered — dropping it back would reopen the duplicate window it is there
+        to close. Returns how many bars the window holds afterwards.
+        """
+        if not candles:
+            return 0
+        limit = max_len or settings.redis.candle_history
+        incoming = {
+            candle.open_time: stamp_in_scope(candle, self._scope).model_dump_json()
+            for candle in candles
+        }
+        history_key = self.key("candles", symbol, timeframe)
+        staged_key = self.key("staged", symbol, timeframe)
+        newest_incoming = max(incoming).timestamp()
+        for attempt in range(1, attempts + 1):
+            # One transaction, so the window and the watermark cannot disagree:
+            # the watermark read here is what the swap below is checked against.
+            reader = self.client.pipeline(transaction=True)
+            reader.lrange(history_key, 0, -1)
+            reader.get(staged_key)
+            stored_raw, staged = await reader.execute()
+            # Stored payloads are carried over byte for byte rather than
+            # re-serialised, so a merge never rewrites a bar it did not change.
+            merged = {Candle.model_validate_json(item).open_time: item for item in stored_raw}
+            merged.update(incoming)
+            ordered = [merged[open_time] for open_time in sorted(merged)][-limit:]
+            watermark = max(float(staged or 0.0), newest_incoming)
+            written = int(
+                await self.client.eval(
+                    MERGE_HISTORY_CANDLES,
+                    2,
+                    history_key,
+                    staged_key,
+                    staged or "",
+                    limit,
+                    settings.redis.ttl_seconds,
+                    repr(watermark),
+                    *ordered,
+                )
+            )
+            if written >= 0:
+                log.info(
+                    "Merged %d warm-up bar(s) into %s %s: the window now holds %d, newest "
+                    "staged %s",
+                    len(incoming),
+                    symbol,
+                    timeframe,
+                    written,
+                    watermark,
+                )
+                return written
+            log.info(
+                "A close was staged for %s %s while its warm-up batch was being merged; "
+                "retrying (attempt %d of %d)",
+                symbol,
+                timeframe,
+                attempt,
+                attempts,
+            )
+        # Losing the race `attempts` times means the feed is staging closes
+        # faster than a window can be merged, which no retry count fixes. The
+        # batch is re-sendable, so say so and let the caller carry on.
+        log.warning(
+            "Gave up merging %d warm-up bar(s) into %s %s after %d attempts — the window "
+            "keeps changing underneath. It stays as it is; resend the batch.",
+            len(incoming),
+            symbol,
+            timeframe,
+            attempts,
+        )
+        return 0
 
     async def set_open_candle(self, candle: Candle) -> None:
         """Persist the bar currently being built so a restart mid-bar resumes it."""

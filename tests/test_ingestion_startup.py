@@ -109,11 +109,21 @@ async def test_start_up_guards_restores_closes_backfills_then_listens(monkeypatc
         journal.append("repairer")
 
     class JournalledBackfiller:
+        retryable = False
+        offline = False
+
+        async def watch_online(self, on_online) -> bool:
+            return False
+
+        async def close(self) -> None:
+            return None
+
         def __init__(self, candle_state, subscriptions, *, provider_name) -> None:
             self.subscriptions = subscriptions
 
-        async def run(self) -> None:
+        async def run(self) -> list:
             journal.append("backfill")
+            return []
 
     monkeypatch.setattr("qte_ingestion.service.discard_foreign_candle_state", record_guard)
     monkeypatch.setattr("qte_ingestion.service.HistoryBackfiller", JournalledBackfiller)

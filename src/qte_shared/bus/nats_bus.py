@@ -48,6 +48,11 @@ class NatsBus:
         self._nc: NATSClient | None = None
         self._js: JetStreamContext | None = None
         self._subscriptions: list[Any] = []
+        # Set while closing on purpose, so the drain's own disconnect callback
+        # is not logged as an outage.
+        self._closing = False
+        #: Called after every re-established connection, in registration order.
+        self._reconnect_hooks: list[Callable[[], Awaitable[None]]] = []
 
     # ── Lifecycle ─────────────────────────────────────────────────────
 
@@ -112,6 +117,7 @@ class NatsBus:
     async def close(self) -> None:
         if self._nc is None:
             return
+        self._closing = True
         try:
             # Drain rather than close: in-flight publishes and queued messages
             # for our subscriptions get flushed instead of dropped on shutdown.
@@ -123,13 +129,31 @@ class NatsBus:
             self._nc = None
             self._js = None
             self._subscriptions.clear()
+            self._closing = False
             log.info("NATS closed name=%s", self._name)
 
     async def _on_disconnected(self) -> None:
+        if self._closing:
+            return
         log.warning("NATS disconnected name=%s", self._name)
+
+    def on_reconnect(self, hook: Callable[[], Awaitable[None]]) -> None:
+        """Run *hook* each time the connection comes back after a drop.
+
+        Core NATS delivers nothing published while a subscriber was away, so
+        whoever depends on hearing something says here what to do about the
+        part it may have missed.
+        """
+        self._reconnect_hooks.append(hook)
 
     async def _on_reconnected(self) -> None:
         log.info("NATS reconnected name=%s url=%s", self._name, self._url)
+        for hook in self._reconnect_hooks:
+            try:
+                await hook()
+            except Exception:
+                # One hook failing must not cost the others, nor nats-py its callback.
+                log.exception("A reconnect hook failed name=%s", self._name)
 
     async def _on_error(self, exc: Exception) -> None:
         log.error("NATS error name=%s: %s", self._name, exc)
