@@ -60,6 +60,7 @@ from uuid import uuid4
 
 from nats.aio.msg import Msg
 
+from qte_shared.bar_gate import BAR_GATE_FLAG, BarGate
 from qte_shared.bus import NatsBus, Subjects
 from qte_shared.cache import RedisState
 from qte_shared.config import settings
@@ -74,6 +75,7 @@ from qte_shared.models import (
     SignalAction,
     TickEvent,
 )
+from qte_shared.notifications import ServiceStatusNotifier, TelegramErrorNotifier
 from qte_shared.providers import get_provider_class
 from qte_shared.strategies.mapping import SymbolMapping
 from qte_shared.strategies.plugin_loader import load_strategies
@@ -107,6 +109,7 @@ from qte_strategy_engine.db import OpenPositionRepository, SignalRepository
 from qte_strategy_engine.instance import container_instance_token
 from qte_strategy_engine.preflight import run_preflight_audit
 from qte_strategy_engine.settings import runner_settings
+from qte_strategy_engine.telegram_notify import TelegramLifecycleNotifier
 
 log = get_logger(__name__)
 
@@ -174,6 +177,15 @@ class StrategyRunner:
         self.signals = SignalRepository()
         self.positions = OpenPositionRepository()
         self.sink = sink or BrokerSink()
+        #: Position-lifecycle notifications. A no-op unless a bot token and at
+        #: least one chat id are configured, and never on the trade path: the
+        #: emit path only queues an update for its background worker.
+        self.telegram = TelegramLifecycleNotifier()
+        #: ERROR logs forwarded to the same bot, de-duplicated. Also a no-op
+        #: unless QTE_TELEGRAM__LOG_ERRORS_ENABLED is on.
+        self.telegram_errors = TelegramErrorNotifier()
+        #: The 'UP' / 'DOWN' message `make start` and `make stop` produce.
+        self.status = ServiceStatusNotifier(SERVICE_NAME)
         self._scope = settings.state_scope
         # Refuses a synthetic feed outside dev state before anything connects.
         for provider_name in self._scope.providers:
@@ -202,6 +214,10 @@ class StrategyRunner:
         self._uncertain_pairs: set[tuple[str, str]] = set()
         self._unconfirmed_staging: set[tuple[str, str]] = set()
         self._pending_results: dict[str, DeliveryResult] = {}
+        #: Which pairs may not be decided on. Read from Redis, so a restart
+        #: during a pause comes back paused.
+        self._bar_gate = BarGate()
+        self._started_at = datetime.now(UTC)
         self._cleaned = False
 
     # ── Startup ───────────────────────────────────────────────────────
@@ -216,11 +232,17 @@ class StrategyRunner:
         self._history_started_at = datetime.now(UTC)
 
         try:
+            # First of all, so everything below is covered: a refused ownership
+            # claim or an unreachable Redis is exactly the error worth a message,
+            # and it is logged long before this method returns.
+            await self.telegram_errors.start(SERVICE_NAME)
             await self.bus.connect()
             await self.state.connect()
             await self._acquire_ownership()
             await self._refresh_shadow_mode()
+            await self._refresh_bar_gate()
             await self.sink.start()
+            await self.telegram.start()
 
             self._build_slots()
             if not self.slots:
@@ -269,10 +291,24 @@ class StrategyRunner:
                 },
             )
             log.info(
-                "Runner started slots=%d shadow_mode=%s transport=%s",
+                "Runner started slots=%d shadow_mode=%s transport=%s telegram status=%s",
                 len(self.slots),
                 self.sink.shadow_mode,
                 self.sink.transport,
+                self.status.describe(),
+            )
+            # Last, so "UP" means every dependency answered and the book is
+            # loaded — the announcement is worth exactly what it implies.
+            await self.status.announce_started(
+                {
+                    "Book": self._scope.namespace,
+                    "Strategies": [
+                        f"{slot.symbol} {slot.timeframe} {slot.strategy.name}"
+                        for slot in self.slots
+                    ],
+                    "Transport": self.sink.transport,
+                    "Shadow mode": "ON" if self.sink.shadow_mode else "OFF — trading live",
+                }
             )
         except BaseException:
             await self._close_resources(record_event=False)
@@ -1027,6 +1063,12 @@ class StrategyRunner:
             )
             return
 
+        # After the window was stored and the bar recorded, before the strategy
+        # is consulted: a paused pair keeps a window it can trade on the moment
+        # it is allowed again. See :mod:`qte_strategy_engine.bar_gate`.
+        if await self._bar_is_gated(slot):
+            return
+
         if slot.key in self._uncertain_pairs or await self._live_delivery_paused():
             return
 
@@ -1077,6 +1119,34 @@ class StrategyRunner:
             # the stop stopped out, and the flat is what is left over.
             await self._flatten_for_the_weekend(slot, candle.close, context.now)
 
+    async def _bar_is_gated(self, slot: StrategySlot) -> bool:
+        """Whether this pair is paused, re-read from Redis for this bar.
+
+        One GET per closed bar per pair, which on an M15 book is a handful an
+        hour — cheap enough to buy the property that matters: a ``/prevent``
+        takes effect on the next bar even if the NATS broadcast was missed.
+        """
+        await self._refresh_bar_gate()
+        if not self._bar_gate.blocks(symbol=slot.symbol, strategy=slot.strategy.name):
+            return False
+        log.info(
+            "Paused: not deciding %s on %s %s (gate: %s)",
+            slot.strategy.name,
+            slot.symbol,
+            slot.timeframe,
+            self._bar_gate.describe(),
+        )
+        return True
+
+    async def _refresh_bar_gate(self) -> None:
+        """Re-read the stored gate. A Redis failure keeps the last known one."""
+        try:
+            stored = await self.state.get_flag(BAR_GATE_FLAG, None)
+        except Exception:
+            log.warning("Could not read the bar gate; keeping %s", self._bar_gate.describe())
+            return
+        self._bar_gate = BarGate.from_payload(stored)
+
     @staticmethod
     def _strategy_context(slot: StrategySlot, moment: datetime) -> StrategyContext:
         """What the strategy is told on one decision: the pair, the clock and its cycles."""
@@ -1095,17 +1165,7 @@ class StrategyRunner:
     async def _flatten_for_the_weekend(
         self, slot: StrategySlot, price: float, moment: datetime
     ) -> None:
-        """Close whatever is open on *slot*, because its market is shutting.
-
-        Emitted as an ordinary intent on the ordinary path, so it is staged in
-        the outbox, sized, delivered and audited exactly like a strategy's own
-        exit — there is no second delivery route to keep correct.
-
-        A pair that is already flat produces nothing, which is what makes this
-        safe to call on every bar inside the window and from the sweep.
-        """
-        # One FLAT per cycle, each naming its own: with several open, an
-        # unnamed close would be ambiguous and the factory refuses it.
+        """Close whatever is open on *slot*, because its market is shutting."""
         for uxid in slot.factory.open_cycles(slot.symbol):
             log.warning(
                 "Weekend flat: closing %s on %s uxid=%s at %s — window %s (%s)",
@@ -1116,18 +1176,35 @@ class StrategyRunner:
                 slot.weekend_flat.describe(),
                 self._market_zone.key,
             )
-            await self._emit(
-                slot,
-                SignalIntent(
-                    action=SignalAction.FLAT,
-                    symbol=slot.symbol,
-                    price=price,
-                    reason="WEEKEND_FLAT",
-                    signal_uxid=uxid,
-                ),
-                price,
-                moment,
-            )
+            await self._flatten_cycle(slot, uxid, price, moment, reason="WEEKEND_FLAT")
+
+    async def _flatten_cycle(
+        self, slot: StrategySlot, uxid: str, price: float, moment: datetime, *, reason: str
+    ) -> None:
+        """Close one open cycle with a ``FLAT``, whatever asked for it.
+
+        Emitted as an ordinary intent on the ordinary path, so it is staged in
+        the outbox, sized, delivered and audited exactly like a strategy's own
+        exit — there is no second delivery route to keep correct. One FLAT per
+        cycle, each naming its own: with several open, an unnamed close would be
+        ambiguous and the factory refuses it.
+
+        A pair that is already flat produces nothing, which is what makes the
+        callers safe to run on every bar, from the sweep and from an operator's
+        ``/flat``.
+        """
+        await self._emit(
+            slot,
+            SignalIntent(
+                action=SignalAction.FLAT,
+                symbol=slot.symbol,
+                price=price,
+                reason=reason,
+                signal_uxid=uxid,
+            ),
+            price,
+            moment,
+        )
 
     async def _weekend_flat_loop(self) -> None:
         """Flatten a shut market even when no candle closes to prompt it.
@@ -1223,7 +1300,13 @@ class StrategyRunner:
                     await self._emit(slot, intent, price, event.tick.ts)
 
     async def _on_control_message(self, msg: Msg) -> None:
-        """Control plane: today, the shadow-mode switch from the API."""
+        """Control plane: the shadow-mode switch, the bar gate, status, FLAT.
+
+        Request/reply over NATS rather than an HTTP endpoint, because this
+        repository has no control-plane service to hang one on and does not
+        want one -- see :mod:`qte_strategy_engine.control`. The Telegram bot
+        and ``qte-control`` are both clients of exactly these actions.
+        """
         try:
             command = json.loads(msg.data)
         except json.JSONDecodeError:
@@ -1241,26 +1324,133 @@ class StrategyRunner:
                 level="WARNING",
                 payload={"enabled": self.sink.shadow_mode},
             )
+        elif action == "set_bar_gate":
+            # Same contract as shadow mode: the caller stored it, and this only
+            # makes the running process pick it up without waiting for a bar.
+            await self._refresh_bar_gate()
+            log.warning("Bar gate changed - now blocking %s", self._bar_gate.describe())
+            await self.events.record_event(
+                service=SERVICE_NAME,
+                event="bar_gate_changed",
+                level="WARNING",
+                payload=self._bar_gate.to_payload(),
+            )
+            await self._reply(msg, {"gate": self._bar_gate.to_payload()})
         elif action == "ping":
-            if msg.reply:
-                await self.bus.nc.publish(
-                    msg.reply,
-                    _encode(
-                        {
-                            "service": SERVICE_NAME,
-                            "owner_id": self._owner_id,
-                            "slots": len(self.slots),
-                            "namespace": self._scope.namespace,
-                            "execution_mode": self._scope.execution_mode,
-                            "delivery_paused": not self._scope.is_paper and self.sink.shadow_mode,
-                            "shadow_mode": self.sink.shadow_mode,
-                            "ready": all(slot.is_warm for slot in self.slots)
-                            and not self._uncertain_pairs,
-                        }
-                    ),
-                )
+            await self._reply(msg, self._ping_payload())
+        elif action == "status":
+            await self._reply(msg, await self._status_payload())
+        elif action == "flat":
+            await self._reply(msg, await self._flat_on_request(command.get("scope") or {}))
         else:
             log.warning("Unknown control action: %r", action)
+
+    async def _reply(self, msg: Msg, payload: dict[str, Any]) -> None:
+        """Answer a request, if it was one. A broadcast has no reply subject."""
+        if msg.reply:
+            await self.bus.nc.publish(msg.reply, _encode(payload))
+
+    def _ping_payload(self) -> dict[str, Any]:
+        return {
+            "service": SERVICE_NAME,
+            "owner_id": self._owner_id,
+            "slots": len(self.slots),
+            "namespace": self._scope.namespace,
+            "execution_mode": self._scope.execution_mode,
+            "delivery_paused": not self._scope.is_paper and self.sink.shadow_mode,
+            "shadow_mode": self.sink.shadow_mode,
+            "ready": all(slot.is_warm for slot in self.slots) and not self._uncertain_pairs,
+        }
+
+    async def _status_payload(self) -> dict[str, Any]:
+        """Every slot, and whether it could decide on the next bar.
+
+        Answered from memory, which is the point of asking the *running*
+        process: how full a window is, and whether a pair is blocked by an
+        unreconciled delivery, are not things Redis or Postgres can be queried
+        for.
+        """
+        await self._refresh_shadow_mode()
+        await self._refresh_bar_gate()
+        delivery_paused = not self._scope.is_paper and self.sink.shadow_mode
+        strategies = []
+        for slot in self.slots:
+            gated = self._bar_gate.blocks(symbol=slot.symbol, strategy=slot.strategy.name)
+            uncertain = slot.key in self._uncertain_pairs
+            strategies.append(
+                {
+                    "strategy": slot.strategy.name,
+                    "symbol": slot.symbol,
+                    "timeframe": slot.timeframe,
+                    "bars": len(slot.buffer),
+                    "warmup": slot.warmup,
+                    "warm": slot.is_warm,
+                    "newest_bar": slot.buffer[-1].open_time.isoformat() if slot.buffer else None,
+                    "open_cycles": list(slot.factory.open_cycles(slot.symbol)),
+                    "gated": gated,
+                    "uncertain": uncertain,
+                    # What the chat actually asks: can this pair produce a
+                    # signal on its next closed bar, or is something holding it?
+                    "ready": slot.is_warm and not gated and not uncertain and not delivery_paused,
+                }
+            )
+        return {
+            **self._ping_payload(),
+            "started_at": self._started_at.isoformat(),
+            "gate": self._bar_gate.to_payload(),
+            "transport": self.sink.transport,
+            "strategies": strategies,
+        }
+
+    async def _flat_on_request(self, scope: dict[str, Any]) -> dict[str, Any]:
+        """Close every open cycle the scope names, through the ordinary path.
+
+        The scope is the one the bot offers: everything, one symbol, or one
+        strategy. A pair already flat contributes nothing, and a refusal is
+        reported per pair rather than failing the whole request -- an operator
+        asking for everything wants whatever can be closed to be closed, and to
+        be told plainly about the rest.
+        """
+        everything = bool(scope.get("everything"))
+        symbol = (scope.get("symbol") or "").upper() or None
+        strategy = scope.get("strategy") or None
+        if not (everything or symbol or strategy):
+            return {"error": "the scope must name everything, a symbol or a strategy"}
+
+        closed: list[dict[str, str]] = []
+        refused: list[dict[str, str]] = []
+        moment = datetime.now(UTC)
+        for slot in self.slots:
+            if not everything and slot.symbol != symbol and slot.strategy.name != strategy:
+                continue
+            if not slot.factory.open_cycles(slot.symbol):
+                continue
+            refusal = _flat_refusal(slot, self._uncertain_pairs, self.sink.shadow_mode, self._scope)
+            if refusal is not None:
+                refused.append(
+                    {"strategy": slot.strategy.name, "symbol": slot.symbol, "reason": refusal}
+                )
+                continue
+            price = slot.buffer[-1].close
+            async with slot.lock:
+                for uxid in list(slot.factory.open_cycles(slot.symbol)):
+                    log.warning(
+                        "Operator FLAT: closing %s on %s uxid=%s",
+                        slot.strategy.name,
+                        slot.symbol,
+                        uxid,
+                    )
+                    await self._flatten_cycle(slot, uxid, price, moment, reason="MANUAL_FLAT")
+                    record = {
+                        "strategy": slot.strategy.name,
+                        "symbol": slot.symbol,
+                        "signal_uxid": uxid,
+                    }
+                    if uxid in slot.factory.open_cycles(slot.symbol):
+                        refused.append({**record, "reason": "the close was not delivered"})
+                    else:
+                        closed.append(record)
+        return {"closed": closed, "refused": refused}
 
     # ── Emission ──────────────────────────────────────────────────────
 
@@ -1383,7 +1573,20 @@ class StrategyRunner:
         A known result stays in memory if its checkpoint fails. After a crash,
         the pre-send unknown marker prevents blind resends outside a configured
         deduplication horizon. Accepted checkpoints only retry local writes.
+
+        Also where the chat is told about the action, for both callers at once:
+        the emit path and the outbox recovery both land here with the same
+        delivery id, so a send that was first reported as ambiguous and later
+        confirmed updates its own line in the message instead of appending a
+        second one. Queuing only, so Telegram is never in front of the next bar.
         """
+        self.telegram.note_signal(
+            signal,
+            delivery_id=delivery_id,
+            delivery_status=outcome.status,
+            transport=outcome.transport,
+            detail=outcome.detail or None,
+        )
         if outcome.status != "unknown":
             self._pending_results[delivery_id] = outcome
         try:
@@ -1573,9 +1776,22 @@ class StrategyRunner:
         if record_event:
             with contextlib.suppress(Exception):
                 await self.events.record_event(service=SERVICE_NAME, event="stopped")
+        # Announced here rather than in `stop`, so a shutdown that began with a
+        # failed start is reported too — that is the one an operator is least
+        # likely to be watching a terminal for. Before the notifiers below
+        # close their clients, and awaited rather than queued: a worker that is
+        # about to be cancelled would never send it.
+        with contextlib.suppress(Exception):
+            await self.status.announce_stopped()
         # Drain callbacks before releasing ownership: a queued close must not
         # run alongside the next owner. Uncertain cleanup retains the claim.
-        for close in (self.bus.close, self.sink.stop):
+        for close in (
+            self.bus.close,
+            self.telegram.stop,
+            self.telegram_errors.stop,
+            self.status.aclose,
+            self.sink.stop,
+        ):
             try:
                 await close()
             except Exception:
@@ -1655,6 +1871,24 @@ def _as_aware(moment: datetime) -> datetime:
     if moment.tzinfo is None:
         return moment.replace(tzinfo=UTC)
     return moment
+
+
+def _flat_refusal(
+    slot: StrategySlot,
+    uncertain_pairs: set[tuple[str, str]],
+    shadow_mode: bool,
+    state_scope: Any,
+) -> str | None:
+    """Why this pair cannot be flattened right now, or ``None`` when it can."""
+    if not slot.buffer:
+        # A FLAT carries no level to the broker, but the intent still has to be
+        # built and audited, and the last close is the only price there is.
+        return "no bar has been seen yet, so there is no price to report"
+    if slot.key in uncertain_pairs:
+        return "an unreconciled delivery is blocking the pair"
+    if not state_scope.is_paper and shadow_mode:
+        return "live delivery is paused (shadow mode)"
+    return None
 
 
 def _encode(payload: dict[str, Any]) -> bytes:

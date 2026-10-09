@@ -104,6 +104,11 @@ package; never scan from the repository root.
 | Optional Tailscale node: tailnet forwards, signals to the broker over the tailnet | `docker-compose.yml` (`tailscale`, `broker-nats-relay`), `config/tailscale/{serve.json,policy.hujson}`, `TAILSCALE_ENABLED` in the `Makefile` |
 | Live feed, resampling, Redis and NATS | `src/qte_ingestion/{service,resampler}.py` |
 | Live loop, broker delivery, control CLI | `src/qte_strategy_engine/{runner,broker_sink,preflight,control}.py` |
+| Operator's Telegram bot: the nine commands, tables, paging | `src/qte_bot/`, `QTE_BOT__*` |
+| Control plane the bot and `qte-control` both call (NATS request/reply) | `_on_control_message` in `src/qte_strategy_engine/runner.py` and `src/qte_ingestion/service.py`, `Subjects.{engine,ingestion}_control` |
+| Pausing decisions per symbol/strategy (`/prevent`, `/allow`) | `src/qte_shared/bar_gate.py` |
+| Telegram position-lifecycle message: one per cycle, edited in place | `src/qte_strategy_engine/telegram_notify.py` |
+| Telegram Bot API calls, chat/topic ids, ERROR forwarding, service UP/DOWN | `src/qte_shared/notifications/`, `TelegramSettings` in `src/qte_shared/config.py`, `QTE_TELEGRAM__*` in `.env.example` |
 | Backtest replay, fills, metrics, reports | `src/qte_backtest/{replay,execution,metrics,report,diagnostics}.py` |
 | Parquet history: download to `data/parquet/<source>/`, read one file | `src/qte_backtest/{downloader,data_store}.py` |
 | Backtest HTML dashboard | `src/qte_backtest/visualize/` |
@@ -115,7 +120,8 @@ package; never scan from the repository root.
 | Simulator walkthrough, and running the whole stack locally with no vendor | `docs/simulator.md` |
 
 CLI entry points: `qte-backtest`, `qte-ingestion`, `qte-strategy-runner`,
-`qte-control`, `qte-strategy-audit`, `qte-strategy-mount`, `qte-simulator`.
+`qte-control`, `qte-strategy-audit`, `qte-strategy-mount`, `qte-simulator`,
+`qte-bot`.
 
 `README.md` is ~46KB — never read it whole. Run `rg -n '^#{1,3} ' README.md` for
 the section index, then read only that range.

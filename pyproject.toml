@@ -41,8 +41,20 @@ tiingo = [
 simulator = [
     "websockets>=12.0",
 ]
-# The runner's HTTP client for algo-trading-broker. See qte_strategy_engine.broker_sink.
+# The services' HTTP client: algo-trading-broker on the http transport, and the
+# Telegram Bot API. See qte_strategy_engine.broker_sink and
+# qte_shared.notifications.telegram_sink, which degrades to sending nothing when
+# httpx is absent rather than refusing to import.
 broker = [
+    "httpx>=0.27",
+]
+# The operator's Telegram bot (./src/qte_bot). aiogram is a production
+# dependency and a new one: the bot is a long-poll client of the Bot API, which
+# is exactly what this library is for, and writing that loop by hand would be
+# more code with worse retry behaviour. httpx comes with it for the sink the
+# bot shares with the notifications.
+bot = [
+    "aiogram>=3.13",
     "httpx>=0.27",
 ]
 # 84 MB, and only two callers touch parquet: the backtest history store, which
@@ -61,6 +73,7 @@ qte-control = "qte_strategy_engine.control:main"
 qte-strategy-audit = "qte_strategy_audit.main:run"
 qte-strategy-mount = "qte_strategy_audit.mount:run"
 qte-simulator = "qte_simulator.cli:main"
+qte-bot = "qte_bot.main:run"
 
 [dependency-groups]
 dev = [
@@ -86,6 +99,7 @@ packages = [
     "src/qte_strategy_engine",
     "src/qte_strategy_audit",
     "src/qte_simulator",
+    "src/qte_bot",
 ]
 
 # Marks this file as the repository root for `qte_shared.config._find_repo_root()`,

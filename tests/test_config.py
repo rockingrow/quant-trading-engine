@@ -60,6 +60,7 @@ def test_src_holds_the_services_and_nothing_else():
     members = sorted(path.name for path in (REPO_ROOT / "src").iterdir() if path.is_dir())
     assert members == [
         "qte_backtest",
+        "qte_bot",
         "qte_ingestion",
         "qte_shared",
         "qte_simulator",

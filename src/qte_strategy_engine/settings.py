@@ -1,4 +1,8 @@
-"""Strategy-runner configuration (prefix ``QTE_RUNNER__``)."""
+"""Strategy-runner configuration (prefix ``QTE_RUNNER__``).
+
+Telegram lives in :class:`qte_shared.config.TelegramSettings` (``QTE_TELEGRAM__``)
+instead: ingestion announces itself and forwards its errors through the same
+chats, and a setting two services read belongs in ``qte_shared``."""
 
 from __future__ import annotations
 

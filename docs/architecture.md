@@ -483,6 +483,155 @@ model in the code path that is supposed to be reacting to a candle close. The
 runner does reach for it once, at start-up, and that is the single exception
 `tests/test_packaging.py` records by name.
 
+## Why one Telegram message per position, edited in place
+
+A trade is not one signal. The runner emits an entry, then its TP1, maybe a
+TP2, a stop or a weekend `FLAT` — posted one notification each, a chat shows
+four unrelated messages and whoever reads them has to stitch the position back
+together by eye, usually on a phone. So a cycle owns **one** message per chat:
+the entry sends it, every later action edits it and appends to its Actions
+block, and the header flips from `RUNNING` to `CLOSED` when a terminal action
+arrives. `algo-trading-broker` already does this for its own broadcast, and the
+body here is deliberately shaped like
+`broker/helpers/message_formatter.py` so the same trade reads the same way
+whichever service posted it.
+
+The body is re-rendered from the cycle's stored events every time rather than
+appended to a string. The header has to change with the cycle, and the message
+is the only copy a chat holds: one Telegram rejected has to come back
+*complete* on the next action, not missing the action in between.
+
+What identifies a cycle is `strategy` + `symbol` + `signal_uxid`, the triple
+the broker groups a broadcast by, plus the state namespace so a paper book and
+a live one never edit each other's messages. It is kept in Postgres
+(`telegram_cycle_messages`) and not in Redis, for the reason
+[Why Redis holds state that Postgres does not](#why-redis-holds-state-that-postgres-does-not)
+gives from the other side: a flushed cache would lose both the message id and
+the events, and the next action would post a second message for a position
+already on screen.
+
+No reply is posted under the message. Telegram notifies nobody about an edit,
+which is why the broker also sends a two-line reply under each update — that is
+a channel with an audience. Here the chat is the operator's own, the broker's
+reply already covers the audience case, and a notification per action would
+undo the thing this design is for.
+
+Nothing about it is on the trade path. `note_signal` is synchronous and only
+queues; one background worker drains the queue, which also keeps a cycle's
+edits in the order its actions happened. `api.telegram.org` is throttled or
+silently dropped on plenty of networks, and a send that sits there for the full
+HTTP timeout must not stand in front of the next bar. A full queue drops the
+newest update with a warning: the signal outbox, not a chat, is the record of
+what was sent.
+
+## Why forwarded errors are de-duplicated and filtered
+
+Forwarding `ERROR` logs to a chat is one switch
+(`QTE_TELEGRAM__LOG_ERRORS_ENABLED`) and two failure modes, both of which turn
+the feature against the incident it exists to report.
+
+The first is recursion. The send path logs its own failures — that is what
+makes a misconfigured bot visible at all — so a handler that forwards every
+error would answer a dead Bot API by sending another message through it, and
+answer that failure the same way. Records from the Telegram modules, and from
+the HTTP client underneath them, are filtered out of forwarding for that
+reason. The second is the storm: a reconnect loop writes the same line every
+second, and a chat that shows it sixty times a minute is a chat nobody reads by
+the time the next, different error arrives. Identical errors are suppressed for
+a window (60 seconds by default), keyed on the logger, the level and the
+interpolated message rather than on the whole formatted text, so two
+occurrences of one error collapse even when their tracebacks differ.
+
+The bridge between `logging` and the Bot API is the same one the broker uses: a
+`logging.Handler` cannot await anything and may be called from any thread,
+while the send must be awaited, so `emit` only formats, de-duplicates and hands
+the text to the loop with `call_soon_threadsafe`, and one worker task does the
+sending. The handler is attached to the *root* logger, which is where this
+repository's console and daily-file handlers already live — one attachment then
+covers every module, including whatever a mounted strategy repo logs under its
+own name.
+
+Errors default to the **private** chat list and never fall back to the
+broadcast one. A stack trace carries file paths, symbols and internal state;
+publishing that to a signal channel because an operator filled in only one of
+the two lists would be a configuration mistake the code should not make
+possible.
+
+## Why only two services announce themselves
+
+`make start` brings up Redis, Postgres, NATS, ingestion, the runner and
+sometimes a Tailscale node, and the chat hears from exactly two of them. The
+other four are images this repository does not control: adding a sidecar whose
+only job is to watch containers and post about them would be a second health
+system to maintain, running beside the one Docker already has.
+
+It is also unnecessary, because of the order things start in. Neither service
+finishes starting until the infrastructure it depends on has answered — the
+runner's announcement comes after Redis gave up the ownership claim, after
+Postgres reconciled the outbox, after NATS accepted the subscriptions and after
+the strategies loaded. "🟢 strategy-runner UP" is therefore not a claim about
+the runner alone; it is the only line in the chat that is evidence about the
+whole stack. Its absence says the same thing in reverse, which is why a service
+that dies on the way up still sends a DOWN message rather than going quiet.
+
+These two sends are the only ones on the Telegram path that are **awaited**
+rather than queued. Everything else here is deliberately fire-and-forget, so
+that a throttled `api.telegram.org` can never stand in front of a bar or an
+order. The stop message is the one case where that reasoning inverts: a queued
+message would sit in a worker that is about to be cancelled, and the event loop
+it needs is seconds from ending. So it is sent in line, bounded by the HTTP
+timeout and wrapped so a dead Bot API cannot stop a service from stopping —
+which the container's 60-second stop grace period leaves ample room for.
+
+## Why the bot talks over NATS and not to an HTTP API
+
+The broker's bot calls the broker's HTTP API, and copying that here would mean
+bringing back the control-plane service this repository deliberately removed
+(see `qte_strategy_engine.control`). The actions an operator needs already
+exist as NATS request/reply on the two services' control subjects, because that
+is how `qte-control` has always reached a running runner: a subject, an
+`action`, and a reply. The bot is one more client of exactly those.
+
+What that buys is that a command cannot do more than the CLI can. There is no
+second code path into the runner to keep correct, no endpoint to authenticate
+separately, and nothing listening on a port that was not already there. The
+bot's own authorisation is the operator id list, checked before a handler runs.
+
+Three commands deliberately do *not* go through NATS. `/redis`, `/positions`
+and `/closed` read Redis and Postgres directly, because the moment an operator
+most wants to know what the book holds is the moment the runner is not
+answering. The ones that must reach a live process — `/runner`, which reports
+in-memory window state, and everything that changes something — have nowhere
+else to go, and say so plainly when nobody answers.
+
+`/warmup` and `/flush` reach *ingestion* rather than the runner, and are served
+there rather than by the bot writing Redis itself. A warm-up window is three
+pieces of state that have to move together: the stored bars, the staging
+watermark that decides whether a replayed bar is a duplicate, and the
+resampler's half-built bucket. Only ingestion holds all three, so only
+ingestion can drop them consistently — a flush from outside would leave a
+watermark pointing at bars that no longer exist, and the next close would be
+read as a duplicate of its own history.
+
+## Why a paused pair still fills its window
+
+`/prevent` could have dropped the bar. It does not, and the reason is what
+happens on `/allow`: a window with a hole in it exactly as wide as the pause
+produces indicators that silently disagree with the market, so the first
+decision after resuming would be computed on data the market never traded. The
+close is therefore fed into the window and recorded as seen, and only the call
+into the strategy is skipped.
+
+The gate lives in Redis rather than in the runner's memory for the same reason
+shadow mode does: a runner that restarts during a pause must come back paused.
+The NATS broadcast that follows a change only decides whether it takes effect
+now or on the next bar, which is why the bot reports "stored, but no runner
+answered" rather than claiming either.
+
+It is also why `/prevent` is not a substitute for `/flat`. It stops new
+decisions; it does nothing to a position that is already open, and a position
+nobody is deciding on is a position nobody is managing either.
+
 ## Why symbol → strategy pairing lives in a file
 
 A strategy declaring `symbols = ("XAUUSD",)` is fine for one strategy and wrong
