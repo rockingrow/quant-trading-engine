@@ -37,6 +37,7 @@ SERVICES = (
     "qte_strategy_engine",
     "qte_strategy_audit",
     "qte_simulator",
+    "qte_bot",
 )
 
 #: The leaves. ``qte_shared`` is the hub every one of them depends on.
@@ -49,7 +50,19 @@ LEAF_SERVICES = tuple(name for name in SERVICES if name != "qte_shared")
 #: The rule exists so a service does not grow a private line to another; the
 #: auditor reaches for nothing but ``qte_shared``, which the check below keeps
 #: true. Any other pair of leaves still has to meet in shared.
-ALLOWED_LEAF_EDGES = {("qte_strategy_engine", "qte_strategy_audit")}
+#:
+#: The second edge is the Telegram bot reading the runner's own tables. The bot
+#: is a *client* of the other services rather than a peer of them: it asks the
+#: running processes over NATS for anything only they know, and reads
+#: ``signals`` and ``open_positions`` for the two questions that must still be
+#: answerable when the runner is down -- what is open, and what closed. Those
+#: tables belong to the runner (``tests/test_db_layout.py``), so reading them
+#: means importing its repository; the alternative is a bot that answers "no
+#: runner" exactly when an operator needs an answer most.
+ALLOWED_LEAF_EDGES = {
+    ("qte_strategy_engine", "qte_strategy_audit"),
+    ("qte_bot", "qte_strategy_engine"),
+}
 
 #: Standard-library roots the auditor is allowed to import. Everything outside
 #: this set and outside SERVICES is a third-party dependency, which is what

@@ -21,9 +21,10 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from qte_ingestion.resampler import Resampler
-from qte_ingestion.service import IngestionService
+from qte_ingestion.service import SERVICE_NAME, IngestionService
 from qte_shared.config import settings
 from qte_shared.models import Tick
+from qte_shared.notifications import ServiceStatusNotifier, TelegramErrorNotifier
 from qte_shared.providers.simulator.feed import SimulatorLiveFeed
 from qte_shared.providers.simulator.protocol import encode_tick
 from qte_shared.providers.tiingo.settings import TiingoSettings
@@ -47,6 +48,9 @@ class LifecycleResource:
     async def close(self) -> None:
         self.events.append(f"close:{self.name}")
 
+    async def subscribe(self, subject, handler, queue: str = "") -> None:
+        self.events.append(f"subscribe:{self.name}")
+
 
 def _frame(price: float) -> str:
     tick = Tick(symbol="XAUUSD", ts=MOMENT, last=price, volume=1.0)
@@ -60,6 +64,8 @@ async def test_partial_ingestion_startup_closes_resources_already_acquired():
     service._origins = {service._scope.provider: service._scope.origin()}
     service._symbol_providers = {}
     service.bus = LifecycleResource("bus", events)
+    service.status = ServiceStatusNotifier(SERVICE_NAME)
+    service.telegram_errors = TelegramErrorNotifier()
     service.state = LifecycleResource("state", events, fail_connect=True)
     service._feeds = []
     service._flush_task = None

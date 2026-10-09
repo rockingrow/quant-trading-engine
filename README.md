@@ -798,6 +798,171 @@ stream's duplicate window is stored once and a worker opens one position.
 
 ---
 
+## Telegram notifications for a position's lifecycle
+
+One Telegram message per trade cycle, **edited in place** as the position
+progresses: the entry posts it, and every `TP1`/`TP2`/`R_SL`/`SL`/`FLAT` that
+follows appends to its Actions block until the header flips to `CLOSED`. It is
+the same message shape `algo-trading-broker` broadcasts, so a trade reads the
+same way whichever service posted it, and it is keyed by the same triple —
+`strategy` + `symbol` + `signal_uxid`.
+
+```
+[⏳RUNNING]
+📈 LONG XAUUSD (M15)
+-----------
+Price: 2340
+Quantity: 0.05 | Risk: 1%
+SL: 2330 | TP1: 2350 | TP2: 2360
+2026-10-08 12:00:00 UTC
+-----------
+Actions:
+-----------
+🎯 TP1
+Price: 2350 | Quantity: 0.025
+2026-10-08 12:30:00 UTC
+-----------
+```
+
+Create a send-only bot with @BotFather (the broker's own bot works too), add it
+to the chats, and fill in `.env`:
+
+| Variable | What it does |
+| --- | --- |
+| `QTE_TELEGRAM__BOT_TOKEN` | The bot. Empty switches the whole feature off. |
+| `QTE_TELEGRAM__BROADCAST_CHAT_IDS` | The position: side, symbol, price, levels, action timeline. |
+| `QTE_TELEGRAM__PRIVATE_CHAT_IDS` | The above plus the strategy name, the cycle id and how delivery went. |
+| `QTE_TELEGRAM__TIMEZONE` | Display zone for the timestamps. Moves nothing about trading. |
+
+**An empty chat list sends nothing to that audience** — which is how you run
+broadcast-only, private-only or neither. Each is a comma-separated list, so one
+audience can fan out to several chats, and a `<chat id>_<topic id>` entry
+addresses a single topic inside a supergroup that has Topics enabled:
+
+```ini
+QTE_TELEGRAM__PRIVATE_CHAT_IDS="-1002173777783_924584,-1001111111111"
+```
+
+A shadow-mode signal is notified too, labelled `[🧪SHADOW]`, and an action the
+broker never took is marked `⚠️ NOT DELIVERED` rather than quietly omitted.
+Nothing here is on the trade path: the runner only queues the update, a
+background worker does the sending, and a Telegram outage costs the chat its
+update, never a signal. See
+[docs/architecture.md](docs/architecture.md) — *Why one Telegram message per
+position, edited in place*.
+
+### Errors in the same chat
+
+`QTE_TELEGRAM__LOG_ERRORS_ENABLED=true` forwards every `ERROR` log line the
+runner writes to Telegram — the same switch `algo-trading-broker` spells
+`TELEGRAM_LOG_ERRORS_ENABLED`, and off by default.
+
+| Variable | What it does |
+| --- | --- |
+| `QTE_TELEGRAM__LOG_ERRORS_ENABLED` | Forward `ERROR` and `CRITICAL` records. |
+| `QTE_TELEGRAM__LOG_DEDUP_WINDOW` | Seconds an identical error is suppressed for. Default `60`; `0` forwards the whole storm. |
+| `QTE_TELEGRAM__LOG_CHAT_IDS` | Where errors go. Empty falls back to the **private** chats, never the broadcast ones. |
+| `QTE_TELEGRAM__LOG_BOT_TOKEN` | A second bot for errors, so a ban on one channel does not take the other with it. Empty falls back to the main token. |
+
+Dedup is keyed on the logger, the level and the message, so a reconnect loop
+logging the same line every second is one message a minute, while a different
+error on the same logger still gets through immediately. The Telegram modules
+and the HTTP client underneath them are filtered out of forwarding, so a failing
+send cannot log an error that triggers another send.
+
+### Start and stop in the same chat
+
+Every `make start` and `make stop` announces itself, on by default once a token
+and a chat are set (`QTE_TELEGRAM__SERVICE_STATUS_ENABLED`):
+
+```
+🟢 strategy-runner UP
+-----------
+Book: dev.shadow.mt5
+Strategies: XAUUSD M15 QTE_EXAMPLE_EMA_ATR
+Transport: nats
+Shadow mode: ON
+-----------
+2026-10-09 07:12:33 UTC
+```
+
+```
+🛑 data-ingestion DOWN
+-----------
+Uptime: 4h 12m
+-----------
+2026-10-09 11:24:05 UTC
+```
+
+Two services speak: `data-ingestion` and `strategy-runner`. Redis, Postgres,
+NATS and the Tailscale node are images this repository does not control, and
+they do not need to announce themselves — neither service finishes starting
+without them, so an UP message is itself proof that its dependencies answered.
+A service that dies on the way up still sends a DOWN message, marked `did not
+finish starting`, which is the case nobody is watching a terminal for.
+
+Both announcements are awaited rather than queued: there are two per process
+lifetime, and the DOWN one has to leave before the event loop does. Like
+everything else here they go to `QTE_TELEGRAM__LOG_CHAT_IDS` (falling back to
+the private chats), never to the broadcast audience, and a Telegram outage
+never stops a service from stopping.
+
+---
+
+## Steering the engine from Telegram
+
+The notifications above are one-way. The bot is the other half: nine commands
+for looking at a running engine and steering it, shaped after
+`algo-trading-broker`'s own bot so the two read alike — the same monospace
+tables, the same Prev/Next paging, the same confirmation in front of anything
+that closes a position.
+
+It is its own service (`src/qte_bot`, `qte-bot`), off by default:
+
+```ini
+QTE_BOT__ENABLED=true
+QTE_BOT__TELEGRAM_TOKEN=   # its own BotFather bot, not the notification one
+QTE_BOT__ADMIN_IDS=        # your Telegram user id; an empty list answers nobody
+```
+
+`make start` then brings it up with everything else. It needs its own token
+because only one process may poll `getUpdates` for a token at a time.
+
+| Command | What it answers |
+| --- | --- |
+| `/redis` | Bars held per symbol and timeframe, and the newest one |
+| `/runner` | Every strategy, its window, and whether it can decide on the next bar |
+| `/positions` | What is open: symbol, timeframe, strategy, `signal_uxid`, opened |
+| `/closed` | Positions that are over, newest first, paged |
+| `/flat all \| SYMBOL \| STRATEGY` | Closes positions, after a confirmation |
+| `/prevent all \| SYMBOL \| STRATEGY` | Stops deciding on closed bars |
+| `/allow all \| SYMBOL \| STRATEGY` | Resumes deciding |
+| `/warmup all \| SYMBOL` | Asks the vendor for the warm-up window again |
+| `/flush all \| SYMBOL` | Drops the warm-up bars Redis holds |
+
+Three things are worth knowing before you use the last five:
+
+* **`/prevent` does not drop bars.** They keep arriving and keep filling the
+  window; only the decision is skipped, so `/allow` resumes on the next bar
+  with no hole behind it. It is stored in Redis, so it survives a runner
+  restart, and it does not touch a position that is already open — that is what
+  `/flat` is for.
+* **`/flat` is an ordinary exit.** It goes out as a `FLAT` through the outbox,
+  sized and audited like a strategy's own close, labelled `MANUAL_FLAT`. The
+  reply says what it closed and what it refused, per cycle.
+* **`/warmup` and `/flush` are served by ingestion**, not by the bot reaching
+  into Redis. The stored bars, the staging watermark and the resampler's
+  in-flight bucket are one piece of state; dropping the bars from outside would
+  leave the other two pointing at bars that no longer exist. Their symbol list
+  comes from the data-provider file, so it is the list you edited.
+
+There is no HTTP control plane and this adds none: the bot asks the running
+services over NATS request/reply — the same actions `qte-control` uses — and
+reads Redis and Postgres directly for `/redis`, `/positions` and `/closed`, so
+those three still answer when the runner is down.
+
+---
+
 ## Connecting to algo-trading-broker over Tailscale
 
 Tailscale is optional and off by default, and it runs as a container — nothing

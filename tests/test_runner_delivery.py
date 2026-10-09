@@ -108,6 +108,15 @@ class RecordingSignals:
     async def get_delivery(self, delivery_id):
         return next((record for record in self.pending if str(record.id) == delivery_id), None)
 
+    async def cycle_timeframes(self, cycle_ids):
+        """The timeframe each staged signal was published on, by cycle id."""
+        wanted = set(cycle_ids)
+        return {
+            signal.signal_uxid: signal.timeframe
+            for signal, _ in self.rows
+            if signal.signal_uxid in wanted and signal.timeframe
+        }
+
 
 class RecordingBus:
     def __init__(self):
@@ -381,6 +390,43 @@ async def test_a_signal_is_not_sent_when_the_durable_outbox_cannot_be_written():
     assert slot.factory.open_cycle("XAUUSD") is None
 
 
+class RecordingTelegram:
+    """Stands in for the lifecycle notifier: records, sends nothing."""
+
+    def __init__(self) -> None:
+        self.noted = []
+
+    def note_signal(self, signal, *, delivery_id, delivery_status, transport, detail=None):
+        self.noted.append((signal.position.action, delivery_status, delivery_id, detail))
+
+
+async def test_every_delivered_action_is_handed_to_the_telegram_notifier():
+    """One queued update per action, so the cycle's message can be edited."""
+    runner, slot = _runner(), _slot()
+    runner.telegram = RecordingTelegram()
+
+    await _enter(runner, slot)
+    await _close(runner, slot, SignalAction.TP2, 2350.0)
+
+    assert [(action, status) for action, status, _, _ in runner.telegram.noted] == [
+        (SignalAction.LONG, "sent"),
+        (SignalAction.TP2, "sent"),
+    ]
+    delivery_ids = [delivery_id for _, _, delivery_id, _ in runner.telegram.noted]
+    assert len(set(delivery_ids)) == 2, "each action carries its own outbox id"
+
+
+async def test_a_failed_delivery_is_reported_to_the_chat_with_its_reason():
+    """The chat must show the action the broker refused, not hide it."""
+    runner, slot = _runner(sink=FailedSink()), _slot()
+    runner.telegram = RecordingTelegram()
+
+    await _enter(runner, slot)
+
+    [(action, status, _, detail)] = runner.telegram.noted
+    assert (action, status, detail) == (SignalAction.LONG, "failed", "no ack")
+
+
 # ── Restoring after a restart ────────────────────────────────────────────
 
 
@@ -540,3 +586,89 @@ def live_state_scope(monkeypatch):
 
     monkeypatch.setattr(settings, "env", "prod")
     monkeypatch.setattr(settings.state_config, "execution_mode", "live")
+
+
+class RecordingStatus:
+    """Stands in for the service UP/DOWN announcement."""
+
+    def __init__(self) -> None:
+        self.announced: list[str] = []
+
+    async def announce_started(self, details=None):
+        self.announced.append("UP")
+
+    async def announce_stopped(self, details=None, *, reason=None):
+        self.announced.append("DOWN")
+
+    async def aclose(self):
+        pass
+
+    def describe(self) -> str:
+        return "test"
+
+
+class RecordingEvents:
+    """The audit trail, without a database behind it."""
+
+    def __init__(self) -> None:
+        self.recorded: list[str] = []
+
+    async def record_event(self, *, service, event, payload=None):
+        self.recorded.append(event)
+
+
+class ClosingStub:
+    """Anything the shutdown path only closes."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def close(self):
+        self.closed = True
+
+    async def stop(self, **keywords):
+        self.closed = True
+
+    async def aclose(self):
+        self.closed = True
+
+
+async def test_a_shutdown_tells_the_chat_the_service_went_down():
+    """`make stop` has to produce a message, not just a quiet container exit."""
+    runner = _runner()
+    runner._ownership_acquired = False
+    runner.events = RecordingEvents()
+    runner.status = RecordingStatus()
+    runner.bus = ClosingStub()
+    runner.sink = ClosingStub()
+    runner.telegram = ClosingStub()
+    runner.telegram_errors = ClosingStub()
+    runner.state = ClosingStub()
+
+    await runner._close_resources(record_event=True)
+
+    assert runner.events.recorded == ["stopped"]
+    assert runner.status.announced == ["DOWN"]
+    assert runner.telegram.closed and runner.telegram_errors.closed and runner.sink.closed
+
+
+async def test_the_announcement_survives_a_chat_that_cannot_be_reached():
+    """A Telegram outage must not stop a runner from shutting down."""
+
+    class FailingStatus(RecordingStatus):
+        async def announce_stopped(self, details=None, *, reason=None):
+            raise RuntimeError("Bot API is unreachable")
+
+    runner = _runner()
+    runner._ownership_acquired = False
+    runner.events = RecordingEvents()
+    runner.status = FailingStatus()
+    runner.bus = ClosingStub()
+    runner.sink = ClosingStub()
+    runner.telegram = ClosingStub()
+    runner.telegram_errors = ClosingStub()
+    runner.state = ClosingStub()
+
+    await runner._close_resources(record_event=False)
+
+    assert runner.sink.closed, "shutdown carried on past the failed announcement"

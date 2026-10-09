@@ -7,6 +7,7 @@ overridden wholesale in compose without touching the rest.
 
 from __future__ import annotations
 
+import logging
 import re
 from functools import cache, lru_cache
 from pathlib import Path
@@ -434,6 +435,85 @@ class EngineSettings(BaseSettings):
         return self
 
 
+class TelegramSettings(BaseSettings):
+    """Telegram notifications (prefix ``QTE_TELEGRAM__``).
+
+    Three independent uses, one bot: the position-lifecycle message the runner
+    edits per trade cycle, the forwarded ERROR logs, and the service start/stop
+    announcements both long-running services send.
+
+    Mirrors the chat-id handling of ``algo-trading-broker``'s
+    ``notification_service``: each audience is a comma-separated list, so one
+    audience can fan out to several groups, and an entry of the form
+    ``<chat id>_<topic id>`` addresses a topic inside a supergroup.
+
+    An audience with no chat id is simply not delivered to — that is the
+    documented way to run broadcast-only or private-only. Both empty (or no
+    token) makes the whole notifier a no-op, which is what a deployment that
+    does not want Telegram leaves in place.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="QTE_TELEGRAM__", extra="ignore")
+
+    enabled: bool = True
+    bot_token: str = ""
+    #: The public audience: price, levels and the action timeline, nothing else.
+    broadcast_chat_ids: str = ""
+    #: The private audience: the above plus strategy, cycle id and delivery state.
+    private_chat_ids: str = ""
+    #: Seconds a single Bot API call may take. Notifications are off the trade
+    #: path, but an unbounded wait would still pin the worker task forever.
+    http_timeout: float = Field(default=5.0, gt=0)
+    #: Lifecycle events held while the worker is sending. A full queue drops the
+    #: newest event with a warning rather than slowing the runner down: the
+    #: broker's own audit trail, not Telegram, is the record of what was sent.
+    queue_capacity: int = Field(default=500, gt=0)
+    #: Include the entry's indicator/input dump in the private message.
+    include_signal_raw: bool = False
+    #: Forward every ERROR+ log record to Telegram, the way
+    #: ``TELEGRAM_LOG_ERRORS_ENABLED`` does in ``algo-trading-broker``. Off by
+    #: default: a chat full of stack traces is a decision, not a side effect of
+    #: turning notifications on.
+    log_errors_enabled: bool = False
+    #: Seconds an identical error is suppressed for. A reconnect loop logging
+    #: the same line every second becomes one message a minute. ``0`` forwards
+    #: every record, including the storm.
+    log_dedup_window: float = Field(default=60.0, ge=0)
+    #: Where errors go. Empty falls back to :attr:`private_chat_ids` — never to
+    #: the broadcast audience, since an error carries internal state that has
+    #: no business in a signal channel.
+    log_chat_ids: str = ""
+    #: A separate bot for errors, so a ban or an outage on one channel does not
+    #: take the other with it. Empty falls back to :attr:`bot_token`.
+    log_bot_token: str = ""
+    #: Announce each service coming up and going down — what `make start` and
+    #: `make stop` produce in the chat. On by default: a stack that is up or
+    #: down is the one thing an operator wants without having to ask, and it
+    #: is two messages per service per deploy, not a stream.
+    service_status_enabled: bool = True
+    #: Zone the timestamps in a message are *displayed* in. Display only: it
+    #: decides nothing about trading, which is why it is not the engine's
+    #: ``QTE_ENGINE__WEEKEND_FLAT_TIMEZONE`` — a reader wanting Vietnam time in
+    #: the chat must not move a strategy's weekend window with it.
+    timezone: str = "UTC"
+
+    @property
+    def display_zone(self) -> ZoneInfo:
+        """:attr:`timezone` as a tzinfo, or UTC when the name is unknown.
+
+        A typo must not stop the runner: the trade is already placed by the
+        time a message is rendered, so an unreadable zone degrades to UTC with
+        a warning rather than raising on the notification path.
+        """
+        try:
+            return ZoneInfo(self.timezone)
+        except (ZoneInfoNotFoundError, ValueError):
+            logging.getLogger(__name__).warning(
+                "Unknown QTE_TELEGRAM__TIMEZONE=%r; showing UTC", self.timezone
+            )
+            return ZoneInfo("UTC")
+
+
 class StateSettings(BaseSettings):
     """Execution mode is explicit and independent of the hot delivery pause."""
 
@@ -467,6 +547,7 @@ class Settings(BaseSettings):
     market_data: MarketDataSettings = Field(default_factory=MarketDataSettings)
     market_stream: MarketStreamSettings = Field(default_factory=MarketStreamSettings)
     engine: EngineSettings = Field(default_factory=EngineSettings)
+    telegram: TelegramSettings = Field(default_factory=TelegramSettings)
 
     @property
     def state_scope(self) -> StateScope:

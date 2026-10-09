@@ -43,10 +43,18 @@ export QTE_STATE__PROVIDER_KEY
 TAILSCALE_ENABLED := $(shell sed -n 's/^TAILSCALE_ENABLED=//p' .env 2>/dev/null | tail -n1 | sed 's/[[:space:]]*\#.*//' | tr -d '\r"' | tr -d "' " | tr '[:upper:]' '[:lower:]')
 TAILSCALE_ACTIVE := $(if $(filter true 1 yes on,$(TAILSCALE_ENABLED)),1,)
 
-COMPOSE_PROFILE := $(if $(TAILSCALE_ACTIVE),--profile tailscale,)
+# The Telegram bot is opt-in the same way: .env sets QTE_BOT__ENABLED=true
+# (default false) and the `bot` profile follows. It is its own switch rather
+# than "a token is set" so that an operator can keep the token in .env and
+# still choose whether the container runs.
+TELEGRAM_BOT_ENABLED := $(shell sed -n 's/^QTE_BOT__ENABLED=//p' .env 2>/dev/null | tail -n1 | sed 's/[[:space:]]*\#.*//' | tr -d '\r"' | tr -d "' " | tr '[:upper:]' '[:lower:]')
+TELEGRAM_BOT_ACTIVE := $(if $(filter true 1 yes on,$(TELEGRAM_BOT_ENABLED)),1,)
+
+COMPOSE_PROFILE := $(if $(TAILSCALE_ACTIVE),--profile tailscale,)$(if $(TELEGRAM_BOT_ACTIVE), --profile bot,)
 # Named explicitly where a target lists its services (`start-prod`): naming a
 # service is what enables its profile there.
 TAILSCALE_SERVICES := $(if $(TAILSCALE_ACTIVE),tailscale broker-nats-relay,)
+TELEGRAM_BOT_SERVICES := $(if $(TELEGRAM_BOT_ACTIVE),telegram-bot,)
 
 # Passed explicitly so the switch is authoritative over whatever the shell
 # happens to export.
@@ -283,13 +291,18 @@ market-plan: ## Fail unless every configured provider has its plan file
 ##@ Stack
 
 # `up`, `start`, `restart` and `dev` build before they boot; these two only
-# build. `build-prod` names its services because compose has no "all but one"
-# flag — the list is every buildable service except the dev-only simulator.
-build: strategy-requirements ## Rebuild every service image
-	docker compose build
+# build. `--profile "*"` is what makes `build` mean every image: a bare
+# `docker compose build` enables no profile, so it silently skipped the
+# telegram bot, the dev simulator and the audit tool — a changed bot would
+# then still run from a stale image. `build-prod` names its services because
+# compose has no "all but one" flag — the list is every buildable service a
+# production stack runs, which is everything except the dev-only simulator and
+# the one-shot audit tool.
+build: strategy-requirements ## Rebuild every service image, in every profile
+	docker compose --profile "*" build
 
-build-prod: strategy-requirements ## Rebuild every service image except the dev simulator
-	docker compose build db-migrate data-ingestion strategy-runner
+build-prod: strategy-requirements ## Rebuild every production service image (no dev simulator)
+	docker compose build db-migrate data-ingestion strategy-runner telegram-bot
 
 up: market-plan strategy-requirements ## Start the application stack without the dev simulator
 	docker compose $(COMPOSE_PROFILE) up -d --build
@@ -300,7 +313,7 @@ start: market-plan strategy-requirements ## Start app images; migration complete
 	@echo "For the simulator and source mounts, use make dev."
 
 start-prod: market-plan strategy-requirements ## Build and start production services with QTE_ENV=prod
-	docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build db-migrate data-ingestion strategy-runner $(TAILSCALE_SERVICES)
+	docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build db-migrate data-ingestion strategy-runner $(TAILSCALE_SERVICES) $(TELEGRAM_BOT_SERVICES)
 
 # `--profile tailscale` whatever the switch says: a stack started with it on
 # and stopped after it was turned off still has its tailnet containers.

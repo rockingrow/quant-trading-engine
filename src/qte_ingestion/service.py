@@ -67,6 +67,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -93,6 +94,7 @@ from qte_shared.interfaces.market_data import (
 from qte_shared.logging_setup import get_logger
 from qte_shared.market_data_plan import SymbolFeed
 from qte_shared.models import Candle, CandleClosedEvent, Tick, TickEvent
+from qte_shared.notifications import ServiceStatusNotifier, TelegramErrorNotifier
 from qte_shared.providers import create_provider
 from qte_shared.state_scope import MarketDataOrigin, stamp_market_data
 from qte_shared.symbols import SymbolSpec
@@ -140,6 +142,11 @@ class IngestionService:
         self.state = RedisState()
         self.subjects = Subjects()
         self.events = EventRepository()
+        #: Telegram, if it is configured: the service's own UP/DOWN message and
+        #: its ERROR logs. Both are no-ops without a token and a chat, and
+        #: neither is ever on the bar path.
+        self.status = ServiceStatusNotifier(SERVICE_NAME)
+        self.telegram_errors = TelegramErrorNotifier()
         self._scope = settings.state_scope
         #: Every configured provider, by name, in the order configured.
         self.providers: dict[str, MarketDataProvider] = {
@@ -190,6 +197,10 @@ class IngestionService:
     async def start(self) -> None:
         self._cleaned = False
         try:
+            # First of all, so everything below is covered: a boot that fails on
+            # the very next line is exactly the error worth a message. Inside the
+            # try, so its own failure still unwinds through _close_resources.
+            await self.telegram_errors.start(SERVICE_NAME)
             await self.bus.connect()
             await self.state.connect()
             # Before anything reads the cache back: bars another provider wrote,
@@ -258,6 +269,11 @@ class IngestionService:
                     f"symbols in {', '.join(planned_in) or 'QTE_ENGINE__SYMBOLS'}"
                 )
 
+            # The operator's plane, once the feeds are actually open: what a
+            # status, a warm-up or a flush answers about is the running service,
+            # so it is subscribed where the service starts being one.
+            await self.bus.subscribe(self.subjects.ingestion_control(), self._on_control_message)
+
             self._flush_task = asyncio.create_task(self._flush_loop(), name="candle-flush")
             if any(backfiller.retryable for backfiller in self._backfillers.values()):
                 # Started even with nothing owed: the vendor's announcement and
@@ -287,10 +303,21 @@ class IngestionService:
                 },
             )
             log.info(
-                "Ingestion started providers=%s symbols=%s timeframes=%s",
+                "Ingestion started providers=%s symbols=%s timeframes=%s telegram status=%s",
                 ",".join(self.providers),
                 [spec.symbol for spec in self.specs],
                 self.timeframes,
+                self.status.describe(),
+            )
+            # Last, so "UP" means the feeds are actually subscribed and Redis,
+            # Postgres and NATS all answered.
+            await self.status.announce_started(
+                {
+                    "Book": self._scope.namespace,
+                    "Providers": list(self.providers),
+                    "Symbols": [spec.symbol for spec in self.specs],
+                    "Timeframes": self.timeframes,
+                }
             )
         except BaseException:
             await self._close_resources(record_event=False)
@@ -354,6 +381,164 @@ class IngestionService:
             repairers_by_symbol.update(dict.fromkeys(markets, repairer))
         return RoutedBarRepairer(repairers_by_symbol)
 
+    # -- Control plane ------------------------------------------------
+
+    async def _on_control_message(self, msg) -> None:
+        """Answer the operator: what is feeding, warm this up, flush that.
+
+        Request/reply over NATS, the same shape the runner answers on its own
+        subject. These three actions have to be served *here* rather than by
+        whoever asked, because ingestion owns both halves of the state they
+        touch: the vendor request protocol, and the staging watermark that
+        decides whether a replayed bar counts as a duplicate.
+        """
+        try:
+            command = json.loads(msg.data)
+        except json.JSONDecodeError:
+            log.warning("Unparseable control message: %.120r", msg.data)
+            return
+
+        action = command.get("action")
+        if action in {"ping", "status"}:
+            await self._reply(msg, await self._status_payload())
+        elif action == "warmup":
+            await self._reply(msg, await self._warmup_on_request(command.get("symbols")))
+        elif action == "flush":
+            await self._reply(msg, await self._flush_on_request(command.get("symbols")))
+        else:
+            log.warning("Unknown ingestion control action: %r", action)
+
+    async def _reply(self, msg, payload: dict) -> None:
+        if msg.reply:
+            await self.bus.nc.publish(msg.reply, json.dumps(payload, default=str).encode())
+
+    async def _status_payload(self) -> dict:
+        """What is subscribed, and how full each series' window is in Redis."""
+        series = []
+        for feed in self.subscriptions:
+            for timeframe in feed.timeframes:
+                held = await self.state.count_candles(feed.symbol, timeframe)
+                newest = await self._newest_bar(feed.symbol, timeframe)
+                series.append(
+                    {
+                        "symbol": feed.symbol,
+                        "timeframe": timeframe,
+                        "provider": feed.provider or self._scope.provider,
+                        "market": feed.market,
+                        "bars": held,
+                        # What a full window is: the same figure the
+                        # backfiller fills to.
+                        "target": settings.redis.candle_history,
+                        "newest_bar": newest.open_time.isoformat() if newest else None,
+                        "owed": (feed.symbol, timeframe) in self._history_owed,
+                    }
+                )
+        return {
+            "service": SERVICE_NAME,
+            "namespace": self._scope.namespace,
+            "providers": list(self.providers),
+            "vendor_offline": self._vendor_offline,
+            "series": series,
+        }
+
+    async def _newest_bar(self, symbol: str, timeframe: str) -> Candle | None:
+        held = await self.state.get_candles(symbol, timeframe, count=1)
+        return held[-1] if held else None
+
+    def _requested_series(self, symbols) -> tuple[list[tuple[SymbolSpec, str]], list[str]]:
+        """Resolve a symbol list against what is actually subscribed.
+
+        ``None`` or an empty list means every subscribed series -- the ``all``
+        the bot offers. A name nothing feeds is reported back rather than
+        silently ignored: it is almost always a typo, and pretending to have
+        warmed it would be worse than saying so.
+        """
+        wanted = {str(name).upper() for name in symbols} if symbols else None
+        resolved: list[tuple[SymbolSpec, str]] = []
+        for feed in self.subscriptions:
+            if wanted is not None and feed.symbol.upper() not in wanted:
+                continue
+            for timeframe in feed.timeframes:
+                resolved.append((feed.spec, timeframe))
+        known = {feed.symbol.upper() for feed in self.subscriptions}
+        unknown = sorted(wanted - known) if wanted else []
+        return resolved, unknown
+
+    async def _warmup_on_request(self, symbols) -> dict:
+        """Ask the vendor for these windows again, now, and report what came back.
+
+        Forced: an operator asking by hand wants the request to go out even
+        when Redis looks full, because what they are usually checking is
+        whether what it holds is right.
+        """
+        resolved, unknown = self._requested_series(symbols)
+        warmed: list[dict] = []
+        for spec, timeframe in resolved:
+            backfiller = self._backfiller_for(spec.symbol)
+            if backfiller is None:
+                warmed.append(
+                    {
+                        "symbol": spec.symbol,
+                        "timeframe": timeframe,
+                        "error": "no history source is configured for this symbol",
+                    }
+                )
+                continue
+            before = await self.state.count_candles(spec.symbol, timeframe)
+            try:
+                await backfiller.backfill_series(spec, timeframe, force=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as failure:
+                log.warning(
+                    "Requested warm-up of %s %s failed: %s", spec.symbol, timeframe, failure
+                )
+                warmed.append(
+                    {"symbol": spec.symbol, "timeframe": timeframe, "error": str(failure)}
+                )
+                continue
+            after = await self.state.count_candles(spec.symbol, timeframe)
+            self._history_owed.pop((spec.symbol, timeframe), None)
+            warmed.append(
+                {
+                    "symbol": spec.symbol,
+                    "timeframe": timeframe,
+                    "bars_before": before,
+                    "bars": after,
+                }
+            )
+        return {"warmed": warmed, "unknown": unknown}
+
+    async def _flush_on_request(self, symbols) -> dict:
+        """Drop these windows from Redis, and forget what was built on them.
+
+        Three things go together or none of them does: the stored bars, the
+        staging watermark that `discard_candle_state` clears with them, and the
+        resampler's in-flight bucket. A window flushed while its resampler
+        still holds a half-built bar would publish that bar next, as a close
+        with no history behind it; re-marking the join point drops it instead.
+        """
+        resolved, unknown = self._requested_series(symbols)
+        flushed: list[dict] = []
+        joined_at = datetime.now(UTC)
+        for spec, timeframe in resolved:
+            held = await self.state.count_candles(spec.symbol, timeframe)
+            await self.state.discard_candle_state(spec.symbol, timeframe)
+            self._history_owed[(spec.symbol, timeframe)] = spec
+            self._gap_asked_at.pop((spec.symbol, timeframe), None)
+            flushed.append({"symbol": spec.symbol, "timeframe": timeframe, "dropped": held})
+        for spec, _ in resolved:
+            resampler = self._resamplers.get(spec.symbol)
+            if resampler is not None:
+                resampler.mark_joined(joined_at)
+        if flushed:
+            log.warning(
+                "Flushed %d window(s) on request: %s",
+                len(flushed),
+                ", ".join(f"{row['symbol']} {row['timeframe']}" for row in flushed),
+            )
+        return {"flushed": flushed, "unknown": unknown}
+
     def request_stop(self) -> None:
         """Ask :meth:`run_forever` to unwind. Safe to call from a signal handler."""
         self._stopping.set()
@@ -405,7 +590,16 @@ class IngestionService:
         if record_event:
             with contextlib.suppress(Exception):
                 await self.events.record_event(service=SERVICE_NAME, event="stopped")
-        for close in (self.state.close, self.bus.close):
+        # Announced on every shutdown, including one that began with a failed
+        # start, and awaited rather than queued — see the runner for why.
+        with contextlib.suppress(Exception):
+            await self.status.announce_stopped()
+        for close in (
+            self.telegram_errors.stop,
+            self.status.aclose,
+            self.state.close,
+            self.bus.close,
+        ):
             try:
                 await close()
             except Exception:

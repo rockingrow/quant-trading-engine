@@ -261,6 +261,29 @@ services:
     # next container is refused until an operator clears it.
     stop_grace_period: 60s
 
+  # The operator's Telegram bot (src/qte_bot).
+  #
+  # Opt in with QTE_BOT__ENABLED=true in .env, which is what puts the `bot`
+  # profile on every compose call the Makefile builds. Off by default because
+  # it needs a BotFather token of its own: a bot container with no token exits
+  # rather than polling, and restart: unless-stopped would turn that into a
+  # crash loop in a stack nobody asked to have a bot in.
+  #
+  # It opens no vendor socket and loads no strategy. What it needs is the
+  # control plane (NATS), the candle windows (Redis) and the book (Postgres) —
+  # which is also why it can answer /positions and /closed while the runner is
+  # down.
+  telegram-bot:
+    <<: *app
+    profiles: ["bot"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # aiogram for the Bot API, and the httpx that comes with it. No vendor
+      # socket, no pyarrow, no pandas needed to answer a command.
+      args: {QTE_EXTRAS: "bot"}
+    command: ["qte-bot"]
+
   # The dev-only market data simulator.
   #
   # Opt in with the dev profile (`make dev`). The in-process environment

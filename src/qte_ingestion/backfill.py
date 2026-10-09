@@ -237,7 +237,12 @@ class HistoryBackfiller:
         return unwarmed
 
     async def backfill_series(
-        self, spec: SymbolSpec, timeframe: str, *, before: datetime | None = None
+        self,
+        spec: SymbolSpec,
+        timeframe: str,
+        *,
+        before: datetime | None = None,
+        force: bool = False,
     ) -> None:
         """Warm one series now. Raises what the fetch raises.
 
@@ -246,6 +251,12 @@ class HistoryBackfiller:
         that included the bar itself would raise the staging watermark to it,
         and the close would then be dropped as a duplicate of its own history
         without ever being published.
+
+        *force* asks for the whole window even when Redis already holds a full
+        and current one. The automatic paths never want that -- a request that
+        can only return bars already held is a request worth skipping -- but an
+        operator asking for a refresh by hand is asking for exactly it, usually
+        because they suspect what is held is wrong.
         """
         source = self._history_source()
         if source is None:
@@ -253,7 +264,7 @@ class HistoryBackfiller:
         cache = None
         if source.cacheable:
             cache = self.cache or HistoryCache(self.provider_name)
-        await self._backfill_one(source, cache, spec, timeframe, before=before)
+        await self._backfill_one(source, cache, spec, timeframe, before=before, force=force)
 
     def _target_for(self, source: HistorySource) -> int:
         """Bars a window is full at: the configured history, or what one fetch returns."""
@@ -270,6 +281,7 @@ class HistoryBackfiller:
         timeframe: str,
         *,
         before: datetime | None = None,
+        force: bool = False,
     ) -> None:
         moment = self.utc_clock()
         provider_name = self.provider_name
@@ -279,7 +291,10 @@ class HistoryBackfiller:
         last_completed = floor_to_bucket(moment, timeframe) - timedelta(
             seconds=timeframe_seconds(timeframe)
         )
-        topping_up = held_count >= target and newest is not None
+        # A forced refresh asks for the full window rather than the tail, so
+        # what comes back can correct bars already held and not merely extend
+        # them. That is the point of asking again by hand.
+        topping_up = held_count >= target and newest is not None and not force
 
         if topping_up and newest.open_time >= last_completed:
             log.info(
