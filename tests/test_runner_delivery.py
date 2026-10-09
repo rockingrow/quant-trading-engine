@@ -108,6 +108,15 @@ class RecordingSignals:
     async def get_delivery(self, delivery_id):
         return next((record for record in self.pending if str(record.id) == delivery_id), None)
 
+    async def cycle_timeframes(self, cycle_ids):
+        """The timeframe each staged signal was published on, by cycle id."""
+        wanted = set(cycle_ids)
+        return {
+            signal.signal_uxid: signal.timeframe
+            for signal, _ in self.rows
+            if signal.signal_uxid in wanted and signal.timeframe
+        }
+
 
 class RecordingBus:
     def __init__(self):

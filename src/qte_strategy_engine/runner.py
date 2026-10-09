@@ -72,6 +72,7 @@ from qte_shared.models import (
     Candle,
     CandleClosedEvent,
     OpenPosition,
+    PositionBlock,
     SignalAction,
     TickEvent,
 )
@@ -1410,6 +1411,13 @@ class StrategyRunner:
         reported per pair rather than failing the whole request -- an operator
         asking for everything wants whatever can be closed to be closed, and to
         be told plainly about the rest.
+
+        The book this walks is the whole stored book, not only the pairs this
+        runner drives. A row whose strategy was unmapped or removed while it
+        still held a position has no slot, and skipping it silently is what made
+        ``/flat`` report "nothing was open" while ``/positions`` kept listing it
+        and the broker never heard anything. Those rows are closed by
+        :meth:`_flatten_orphan_cycle` instead.
         """
         everything = bool(scope.get("everything"))
         symbol = (scope.get("symbol") or "").upper() or None
@@ -1450,7 +1458,130 @@ class StrategyRunner:
                         refused.append({**record, "reason": "the close was not delivered"})
                     else:
                         closed.append(record)
+
+        for position in await self._orphan_positions(everything, symbol, strategy):
+            record = {
+                "strategy": position.strategy,
+                "symbol": position.symbol,
+                "signal_uxid": position.signal_uxid,
+            }
+            refusal = await self._flatten_orphan_cycle(position, moment)
+            if refusal is None:
+                closed.append(record)
+            else:
+                refused.append({**record, "reason": refusal})
         return {"closed": closed, "refused": refused}
+
+    async def _orphan_positions(
+        self, everything: bool, symbol: str | None, strategy: str | None
+    ) -> list[OpenPosition]:
+        """Stored cycles inside the scope that no running slot can close.
+
+        Read from Postgres rather than from the factories because that is the
+        whole point: these are exactly the rows no factory knows about. The
+        pairs this runner does drive are left to the loop above, which goes
+        through the strategy's own factory and keeps the backtest and the live
+        loop deciding alike.
+        """
+        driven = {slot.key for slot in self.slots}
+        orphans: list[OpenPosition] = []
+        for position in await self.positions.list_open():
+            if (position.strategy, position.symbol.upper()) in driven:
+                continue
+            if (
+                not everything
+                and position.symbol.upper() != symbol
+                and position.strategy != strategy
+            ):
+                continue
+            orphans.append(position)
+        return orphans
+
+    async def _flatten_orphan_cycle(self, position: OpenPosition, moment: datetime) -> str | None:
+        """Send the ``FLAT`` that ends a cycle this runner drives no strategy for.
+
+        Built here rather than by a :class:`SignalFactory` because there is no
+        factory for an unmapped strategy, and minting one would need the
+        mapping entry that is precisely what is gone. Everything else is the
+        ordinary path: staged in the durable outbox, sent through the one sink,
+        marked in the outbox, and only then reconciled locally.
+
+        ``timeframe`` comes from the signals that opened the cycle — the broker
+        payload requires one and :class:`OpenPosition` carries none. Without it
+        no truthful payload exists, so the row is refused with that said rather
+        than closed with a guess.
+
+        Local state is dropped only on a confirmed ``sent``. A failed or
+        ambiguous delivery leaves the row in place: the broker may still be
+        carrying the trade, and a book that forgot it is worse than one that
+        still shows it.
+
+        Returns the refusal reason, or ``None`` when the cycle is closed.
+        """
+        if position.state_namespace not in (None, self._scope.namespace):
+            return "the stored position belongs to another state namespace"
+        if not self._scope.is_paper and self.sink.shadow_mode:
+            return "live delivery is paused (shadow mode)"
+        timeframes = await self.signals.cycle_timeframes([position.signal_uxid])
+        timeframe = timeframes.get(position.signal_uxid)
+        if not timeframe:
+            return "no signal records the timeframe this cycle trades, so no payload can be built"
+
+        signal = BrokerSignal(
+            strategy=position.strategy,
+            symbol=position.symbol,
+            timeframe=timeframe,
+            timestamp=moment,
+            signal_uxid=position.signal_uxid,
+            position=PositionBlock(
+                action=SignalAction.FLAT,
+                price=position.price,
+                quantity=position.remaining or None,
+            ),
+        )
+        signal.validate_shape()
+        log.warning(
+            "Operator FLAT on an unmapped strategy: closing %s on %s uxid=%s",
+            position.strategy,
+            position.symbol,
+            position.signal_uxid,
+        )
+        delivery_id = await self.signals.stage_signal(
+            signal, transport=self.sink.transport, shadow=self._scope.is_paper
+        )
+        if delivery_id is None:
+            return "the close could not be staged in the outbox, so it was not sent"
+        outcome = await self._send_staged_signal(signal, delivery_id, shadow=self._scope.is_paper)
+        if outcome is None:
+            return "the close was not delivered"
+        self.telegram.note_signal(
+            signal,
+            delivery_id=delivery_id,
+            delivery_status=outcome.status,
+            transport=outcome.transport,
+            detail=outcome.detail or None,
+        )
+        if outcome.status in {"sent", "shadow"}:
+            await self.signals.mark_delivery(delivery_id, status=f"{outcome.status}_pending")
+        await self.signals.mark_delivery(
+            delivery_id, status=outcome.status, error=outcome.detail or None
+        )
+        if outcome.status not in {"sent", "shadow"}:
+            log.error(
+                "FLAT for unmapped %s %s uxid=%s came back %s — the stored position is kept "
+                "until the broker confirms",
+                position.strategy,
+                position.symbol,
+                position.signal_uxid,
+                outcome.status,
+            )
+            return f"the broker did not confirm the close ({outcome.status})"
+        await self.state.clear_open_position(
+            position.strategy, position.symbol, position.signal_uxid
+        )
+        if not await self.positions.clear(position.strategy, position.symbol, position.signal_uxid):
+            return "the broker took the close but the stored position could not be cleared"
+        return None
 
     # ── Emission ──────────────────────────────────────────────────────
 

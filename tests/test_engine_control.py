@@ -15,7 +15,14 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime, timedelta
 
-from test_runner_delivery import AcceptingSink, FakeState, RecordingSignals, _runner, _slot
+from test_runner_delivery import (
+    AcceptingSink,
+    FailedSink,
+    FakeState,
+    RecordingSignals,
+    _runner,
+    _slot,
+)
 
 from qte_shared.bar_gate import BAR_GATE_FLAG, BarGate
 from qte_shared.config import settings
@@ -246,6 +253,60 @@ async def test_flat_goes_out_as_an_ordinary_flat_signal():
     # from a strategy's exit and from the weekend flat.
     reasons = [payload.get("reason") for _, payload in runner.bus.published]
     assert reasons[-1] == "MANUAL_FLAT"
+
+
+async def test_flat_closes_a_cycle_whose_strategy_is_no_longer_mapped():
+    """The book is the authority, not the slots this runner happens to hold.
+
+    A strategy unmapped while it still held a position leaves a row no factory
+    knows about. Skipping it is what let ``/flat`` answer "nothing was open"
+    while ``/positions`` kept listing the trade and the broker heard nothing.
+    """
+    runner, slot = _ready_runner()
+    uxid = await _open_a_cycle(runner, slot)
+    runner.slots.clear()
+
+    answer = await _ask(runner, {"action": "flat", "scope": {"everything": True}})
+
+    assert [row["signal_uxid"] for row in answer["closed"]] == [uxid]
+    assert answer["refused"] == []
+    flat_signal = runner.signals.rows[-1][0]
+    assert flat_signal.position.action is SignalAction.FLAT
+    assert flat_signal.signal_uxid == uxid
+    assert flat_signal.timeframe == "15"
+    assert await runner.positions.list_open() == []
+
+
+async def test_flat_on_an_unmapped_strategy_keeps_the_row_when_the_broker_refuses(monkeypatch):
+    """A book that forgot a position the broker may still carry is worse."""
+    # A live book: a paper one never reaches the sink, so a refusal needs one.
+    monkeypatch.setattr(settings, "env", "prod")
+    monkeypatch.setattr(settings.state_config, "execution_mode", "live")
+    runner, slot = _ready_runner()
+    uxid = await _open_a_cycle(runner, slot)
+    runner.slots.clear()
+    runner.sink = FailedSink()
+
+    answer = await _ask(runner, {"action": "flat", "scope": {"everything": True}})
+
+    assert answer["closed"] == []
+    assert [row["signal_uxid"] for row in answer["refused"]] == [uxid]
+    assert "failed" in answer["refused"][0]["reason"]
+    assert [position.signal_uxid for position in await runner.positions.list_open()] == [uxid]
+
+
+async def test_flat_on_an_unmapped_strategy_needs_the_timeframe_of_its_cycle():
+    """No timeframe, no truthful payload — said plainly instead of guessed."""
+    runner, slot = _ready_runner()
+    uxid = await _open_a_cycle(runner, slot)
+    runner.slots.clear()
+    runner.signals.rows.clear()
+
+    answer = await _ask(runner, {"action": "flat", "scope": {"everything": True}})
+
+    assert answer["closed"] == []
+    assert "timeframe" in answer["refused"][0]["reason"]
+    assert [position.signal_uxid for position in await runner.positions.list_open()] == [uxid]
 
 
 async def test_flat_leaves_a_pair_that_is_not_in_scope_alone():

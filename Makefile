@@ -291,13 +291,18 @@ market-plan: ## Fail unless every configured provider has its plan file
 ##@ Stack
 
 # `up`, `start`, `restart` and `dev` build before they boot; these two only
-# build. `build-prod` names its services because compose has no "all but one"
-# flag — the list is every buildable service except the dev-only simulator.
-build: strategy-requirements ## Rebuild every service image
-	docker compose build
+# build. `--profile "*"` is what makes `build` mean every image: a bare
+# `docker compose build` enables no profile, so it silently skipped the
+# telegram bot, the dev simulator and the audit tool — a changed bot would
+# then still run from a stale image. `build-prod` names its services because
+# compose has no "all but one" flag — the list is every buildable service a
+# production stack runs, which is everything except the dev-only simulator and
+# the one-shot audit tool.
+build: strategy-requirements ## Rebuild every service image, in every profile
+	docker compose --profile "*" build
 
-build-prod: strategy-requirements ## Rebuild every service image except the dev simulator
-	docker compose build db-migrate data-ingestion strategy-runner
+build-prod: strategy-requirements ## Rebuild every production service image (no dev simulator)
+	docker compose build db-migrate data-ingestion strategy-runner telegram-bot
 
 up: market-plan strategy-requirements ## Start the application stack without the dev simulator
 	docker compose $(COMPOSE_PROFILE) up -d --build
