@@ -295,6 +295,62 @@ async def test_flat_on_an_unmapped_strategy_keeps_the_row_when_the_broker_refuse
     assert [position.signal_uxid for position in await runner.positions.list_open()] == [uxid]
 
 
+async def test_flat_on_an_unmapped_strategy_keeps_the_row_when_the_outbox_cannot_mark_it():
+    """A cleared book against an unmarked outbox row is unrecoverable.
+
+    No slot drives the pair, so the retry loop can never reconcile the row it
+    would be left with -- the position has to stay until something can.
+    """
+    runner, slot = _ready_runner()
+    uxid = await _open_a_cycle(runner, slot)
+    runner.slots.clear()
+
+    async def failing_mark(delivery_id, *, status, error=None):
+        return False
+
+    runner.signals.mark_delivery = failing_mark
+
+    answer = await _ask(runner, {"action": "flat", "scope": {"everything": True}})
+
+    assert answer["closed"] == []
+    assert "outbox" in answer["refused"][0]["reason"]
+    assert [position.signal_uxid for position in await runner.positions.list_open()] == [uxid]
+
+
+async def test_flat_reports_a_malformed_row_instead_of_losing_the_whole_reply():
+    """One row the broker's schema cannot express must not abort the request.
+
+    The operator would lose the report of every cycle already closed and could
+    not tell which half of the ``/flat`` took effect.
+    """
+    runner, slot = _ready_runner()
+    uxid = await _open_a_cycle(runner, slot)
+    runner.slots.clear()
+    stored = (await runner.positions.list_open())[0]
+    # A price no broker payload accepts: `PositionBlock` forbids non-finite
+    # numbers, and the model validates on construction.
+    object.__setattr__(stored, "price", float("inf"))
+
+    answer = await _ask(runner, {"action": "flat", "scope": {"everything": True}})
+
+    assert answer["closed"] == []
+    assert [row["signal_uxid"] for row in answer["refused"]] == [uxid]
+    assert "broker payload" in answer["refused"][0]["reason"]
+
+
+async def test_flat_on_an_unmapped_strategy_reports_a_remaining_size_of_zero_as_zero():
+    """``or None`` would say "size unknown" where the book says "none left"."""
+    runner, slot = _ready_runner()
+    await _open_a_cycle(runner, slot)
+    runner.slots.clear()
+    stored = (await runner.positions.list_open())[0]
+    object.__setattr__(stored, "remaining", 0.0)
+
+    await _ask(runner, {"action": "flat", "scope": {"everything": True}})
+
+    assert runner.signals.rows[-1][0].position.quantity == 0.0
+
+
 async def test_flat_on_an_unmapped_strategy_needs_the_timeframe_of_its_cycle():
     """No timeframe, no truthful payload — said plainly instead of guessed."""
     runner, slot = _ready_runner()

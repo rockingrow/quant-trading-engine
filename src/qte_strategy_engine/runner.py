@@ -1511,10 +1511,16 @@ class StrategyRunner:
         no truthful payload exists, so the row is refused with that said rather
         than closed with a guess.
 
-        Local state is dropped only on a confirmed ``sent``. A failed or
-        ambiguous delivery leaves the row in place: the broker may still be
-        carrying the trade, and a book that forgot it is worse than one that
-        still shows it.
+        Local state is dropped only on a confirmed ``sent`` whose outbox
+        checkpoint also landed. A failed or ambiguous delivery, or a checkpoint
+        that could not be written, leaves the row in place: the broker may
+        still be carrying the trade, and a book that forgot it is worse than
+        one that still shows it.
+
+        Every failure is returned as a refusal reason rather than raised. One
+        malformed row must not abort the reply: the operator would lose the
+        report of every cycle the slots already closed, and could not tell
+        which half of a ``/flat`` took effect.
 
         Returns the refusal reason, or ``None`` when the cycle is closed.
         """
@@ -1527,19 +1533,35 @@ class StrategyRunner:
         if not timeframe:
             return "no signal records the timeframe this cycle trades, so no payload can be built"
 
-        signal = BrokerSignal(
-            strategy=position.strategy,
-            symbol=position.symbol,
-            timeframe=timeframe,
-            timestamp=moment,
-            signal_uxid=position.signal_uxid,
-            position=PositionBlock(
-                action=SignalAction.FLAT,
-                price=position.price,
-                quantity=position.remaining or None,
-            ),
-        )
-        signal.validate_shape()
+        try:
+            signal = BrokerSignal(
+                strategy=position.strategy,
+                symbol=position.symbol,
+                timeframe=timeframe,
+                timestamp=moment,
+                signal_uxid=position.signal_uxid,
+                position=PositionBlock(
+                    action=SignalAction.FLAT,
+                    price=position.price,
+                    # Passed through as stored. ``or None`` here would read a
+                    # remaining size of zero as "size unknown", which is a
+                    # different thing to tell the broker and the audit trail.
+                    quantity=position.remaining,
+                ),
+            )
+            signal.validate_shape()
+        except ValueError as invalid:
+            # Both models validate on construction and pydantic's
+            # ``ValidationError`` is a ``ValueError``, so a malformed uxid or a
+            # non-finite price arrives here. Refused, never raised: see above.
+            log.error(
+                "Cannot build the FLAT for %s %s uxid=%s: %s",
+                position.strategy,
+                position.symbol,
+                position.signal_uxid,
+                invalid,
+            )
+            return "the stored position cannot be expressed as a broker payload"
         log.warning(
             "Operator FLAT on an unmapped strategy: closing %s on %s uxid=%s",
             position.strategy,
@@ -1561,9 +1583,18 @@ class StrategyRunner:
             transport=outcome.transport,
             detail=outcome.detail or None,
         )
+        # Checkpointed before the local writes and only then finalised, the
+        # same order `_finish_delivery` keeps. A checkpoint that cannot be
+        # written is a refusal: clearing the book against an outbox row still
+        # reading `prepared` would leave the position forgotten here and the
+        # row unresolvable, since no slot drives the pair the retry loop would
+        # need to reconcile it.
+        checkpointed = True
         if outcome.status in {"sent", "shadow"}:
-            await self.signals.mark_delivery(delivery_id, status=f"{outcome.status}_pending")
-        await self.signals.mark_delivery(
+            checkpointed = await self.signals.mark_delivery(
+                delivery_id, status=f"{outcome.status}_pending"
+            )
+        finalized = await self.signals.mark_delivery(
             delivery_id, status=outcome.status, error=outcome.detail or None
         )
         if outcome.status not in {"sent", "shadow"}:
@@ -1576,6 +1607,16 @@ class StrategyRunner:
                 outcome.status,
             )
             return f"the broker did not confirm the close ({outcome.status})"
+        if not (checkpointed and finalized):
+            log.error(
+                "FLAT for unmapped %s %s uxid=%s was %s but its outbox row could not be "
+                "marked — the stored position is kept for reconciliation",
+                position.strategy,
+                position.symbol,
+                position.signal_uxid,
+                outcome.status,
+            )
+            return "the broker took the close but the outbox could not record it"
         await self.state.clear_open_position(
             position.strategy, position.symbol, position.signal_uxid
         )
