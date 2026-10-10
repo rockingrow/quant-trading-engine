@@ -44,19 +44,14 @@ from qte_backtest.diagnostics import CRITICAL, INFO, WARNING, DiagnosticContext,
 from qte_backtest.execution import SimulatedPosition
 from qte_backtest.replay import BacktestResult
 from qte_backtest.visualize import render_html
+from qte_shared.config import REPORT_SCHEMA_VERSION
 from qte_shared.logging_setup import get_logger
 from qte_shared.strategies.signal_serialization import signal_record
 
 log = get_logger(__name__)
 
-#: Bump the major part when a consumer that understood the old shape would
-#: misread the new one.
-#:
-#: 2.0 — ``market.rows`` carries epoch-second integers in ``t`` where 1.x
-#: carried ISO strings, and the rows are now the run's own bars rather than a
-#: fixed-count downsampling of them. A reader that fed ``t`` to a date parser
-#: would get a number it cannot parse, which is what a major bump is for.
-SCHEMA_VERSION = "2.0"
+#: Defined once in :mod:`qte_shared.config`; kept under this name for readers.
+SCHEMA_VERSION = REPORT_SCHEMA_VERSION
 
 #: Stands in for ``market.rows`` while the document is indented, so the rows
 #: can be written back one per line. Chosen to be something no value in the
