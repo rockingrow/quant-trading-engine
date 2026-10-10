@@ -33,10 +33,13 @@ table and the check commands; read it before you commit or open a PR.
    `master`. Opening the PR is the user's call.
 5. **Artefacts**: backtest output to `data/reports/`, audits to `data/audits/`
    (`YYYY-MM-DD-<topic>.md`) — both git-ignored and local-only, never pushed to
-   GitHub. Never into `docs/` or the repository root.
+   GitHub. Never into `docs/` or the repository root. **One session, one
+   subfolder**: every file a session writes under `data/reports/` — JSON,
+   Markdown, HTML dashboard, chart assets — goes into a single
+   `data/reports/YYYY-MM-DD-<topic>/`, never loose at the top of the folder.
 6. **Every backtest writes its HTML dashboard** beside its JSON — the default
    of `--report` and `make backtest`; never narrow `--report-format` to drop
-   `html`. Research scripts pass `formats=("json", "md", "html")`, and a JSON
+   `html`, and write it into the session subfolder of rule 5. Research scripts pass `formats=("json", "md", "html")`, and a JSON
    without its page gets one from `make chart REPORT=<file>.json`.
 
 ## Working approach
