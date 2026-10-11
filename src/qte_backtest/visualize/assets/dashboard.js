@@ -133,6 +133,30 @@ function niceTicks(min, max, count = 5) {
   return out.length ? out : [min, max];
 }
 
+/**
+ * The extent of a series, by iteration rather than by spread.
+ *
+ * `Math.min(...values)` passes every element as an argument, and a report
+ * carrying five years of M15 bars hands the price chart 160 000 of them at full
+ * zoom. V8 overflows the call stack somewhere above 65 000 arguments where
+ * SpiderMonkey does not, so the same file drew in Firefox and went blank in
+ * Chrome. A loop has no such ceiling.
+ *
+ * Non-finite entries are skipped; an empty or all-null series yields
+ * `[Infinity, -Infinity]`, which `padDomain` already reads as "no domain".
+ */
+function extentOf(values, readValue = (value) => value) {
+  let lowest = Infinity;
+  let highest = -Infinity;
+  for (const entry of values) {
+    const value = readValue(entry);
+    if (!Number.isFinite(value)) continue;
+    if (value < lowest) lowest = value;
+    if (value > highest) highest = value;
+  }
+  return [lowest, highest];
+}
+
 /** Pad a numeric domain so the extremes are not drawn on the frame itself. */
 function padDomain(min, max, slack = 0.08) {
   if (!Number.isFinite(min) || !Number.isFinite(max)) return [0, 1];
@@ -371,7 +395,7 @@ function performanceChart(container, view, enabled) {
   if (enabled.hold) for (const row of holdSeries) values.push(row.pnl);
   if (enabled.excursion)
     for (const row of series) values.push(row.base + row.point.runup, row.base + row.point.adverse);
-  const [lo, hi] = padDomain(Math.min(...values), Math.max(...values));
+  const [lo, hi] = padDomain(...extentOf(values));
 
   mount(container, 300, (svg, width, height) => {
     const { plot, y } = frame(svg, width, height, { domain: [lo, hi], yTicks: 5, format: compact });
@@ -767,9 +791,12 @@ function priceChart(container, view) {
           .flatMap((trade) => [trade.tp1, trade.tp2, trade.sl])
           .filter((level) => level !== null && level !== undefined && Number.isFinite(level))
       : [];
+    const [lowestLow] = extentOf(rows, (row) => row[3]);
+    const [, highestHigh] = extentOf(rows, (row) => row[2]);
+    const [lowestLevel, highestLevel] = extentOf(levels);
     const [fitLo, fitHi] = padDomain(
-      Math.min(...rows.map((row) => row[3]), ...levels),
-      Math.max(...rows.map((row) => row[2]), ...levels),
+      Math.min(lowestLow, lowestLevel),
+      Math.max(highestHigh, highestLevel),
       0.05
     );
     const halfRange = ((fitHi - fitLo) / 2) * state.priceScale;
@@ -1302,8 +1329,9 @@ function scatterChart(container, points, opts) {
   if (!points.length) return container.appendChild(h("p", { class: "empty", text: "No trade carries an R-multiple." }));
   const xs = points.map(opts.x).filter(Number.isFinite);
   const ys = points.map(opts.y).filter(Number.isFinite);
-  const [xLo, xHi] = padDomain(Math.min(0, ...xs), Math.max(...xs));
-  const [yLo, yHi] = padDomain(Math.min(...ys), Math.max(...ys));
+  const [lowestX, highestX] = extentOf(xs);
+  const [xLo, xHi] = padDomain(Math.min(0, lowestX), highestX);
+  const [yLo, yHi] = padDomain(...extentOf(ys));
 
   mount(container, 280, (svg, width, height) => {
     const { plot, y } = frame(svg, width, height, {
