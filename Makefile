@@ -486,6 +486,30 @@ sim-watch: ## Tail closed candles and emitted signals on NATS
 
 ##@ Live control
 
+# Probed from inside a running service container, not from the host. The
+# container carries the stack's real namespace (in production QTE_ENV comes
+# from the compose overlay, not from .env), and with Tailscale on the broker's
+# NATS is reachable only through broker-nats-relay on the compose network.
+# Either app container will do: both get the same environment, and the probe
+# opens its own connections. `--profile "*"` so the table lists the tailnet
+# and bot containers whatever the switches say today.
+status: ## Containers, then every link: Redis, Postgres, NATS, runner, ingestion, MT5 ingester, broker
+	@docker compose --profile "*" ps --all
+ifeq ($(TAILSCALE_ACTIVE),1)
+	@echo
+	@$(TS_CLI) status || echo "The tailscale container did not answer - see make tailscale-status."
+endif
+	@echo
+	@for service in strategy-runner data-ingestion; do \
+		if [ -n "$$(docker compose ps --quiet --status running $$service 2>/dev/null)" ]; then \
+			docker compose exec -T $$service qte-control status; \
+			exit $$?; \
+		fi; \
+	done; \
+	echo "Neither strategy-runner nor data-ingestion is running, so nothing can be probed" >&2; \
+	echo "from inside the stack. Start it with make start, then run make status again." >&2; \
+	exit 1
+
 shadow-status: ## Show whether signals are reaching the broker
 	uv run qte-control shadow status
 
@@ -510,4 +534,4 @@ owner-clear: ## Remove a stale runner claim after an unclean exit (refuses while
 	db-upgrade db-downgrade db-revision db-current db-history db-check \
 	download backtest chart reports csv-import \
 	sim sim-status sim-replay warmup warmup-cache sim-bar bar signal sim-walk sim-stop sim-reset sim-watch \
-	shadow-status shadow-on shadow-off ping owner-status owner-clear
+	status shadow-status shadow-on shadow-off ping owner-status owner-clear

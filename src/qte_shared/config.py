@@ -58,6 +58,18 @@ REPO_ROOT = _find_repo_root()
 # ``QTE_POSTGRES__DSN=… make db-upgrade`` still overrides the file.
 load_dotenv(REPO_ROOT / ".env", override=False)
 
+#: The version stamped into every backtest report's ``schema_version``. A
+#: constant rather than a ``Settings`` field on purpose: it describes the shape
+#: this code writes, so an environment variable must not be able to change it.
+#: Bump the major part when a consumer that understood the old shape would
+#: misread the new one.
+#:
+#: 1.0 — ``market.rows`` carries epoch-second integers in ``t`` where 1.x
+#: carried ISO strings, and the rows are now the run's own bars rather than a
+#: fixed-count downsampling of them. A reader that fed ``t`` to a date parser
+#: would get a number it cannot parse, which is what a major bump is for.
+REPORT_SCHEMA_VERSION = "1.0"
+
 
 class NatsSettings(BaseSettings):
     """QTE's own internal event bus (candles, ticks, engine control).

@@ -125,7 +125,7 @@ line to be understood costs a reader (and an agent) a file jump every time.
 
 | Artefact | Directory | Tracked in git |
 | --- | --- | --- |
-| Backtest reports — JSON, Markdown, HTML dashboards | `data/reports/` | No, git-ignored: regenerated per run and timestamped |
+| Backtest reports — JSON, Markdown, HTML dashboards | `data/reports/<YYYY-MM-DD-topic>/` | No, git-ignored: regenerated per run and timestamped |
 | Audits, reviews, quality write-ups | `data/audits/` | No, git-ignored: a dated local snapshot, never pushed to GitHub |
 
 - Generated artefacts live only on the machine that produced them. `data/reports/`
@@ -133,6 +133,17 @@ line to be understood costs a reader (and an agent) a file jump every time.
   ignored. Do not commit an audit, and do not force-add one past the ignore rule.
 - Backtests are written there by the tooling already (`make backtest`,
   `make chart`); do not redirect them elsewhere and do not hand-edit them.
+- **One session, one subfolder.** Every file a session generates under
+  `data/reports/` — each JSON, its Markdown, its HTML dashboard and any chart
+  asset — goes into a single subfolder named for that session,
+  `data/reports/YYYY-MM-DD-<topic>/`, for example
+  `data/reports/2026-10-09-gold-oil-entry-exit-study/`. Never leave generated
+  files loose at the top of `data/reports/`, and never split one session's
+  output across several subfolders: a study is reviewed as a set, and a loose
+  HTML page nobody can tie back to its JSON is noise. Pass the subfolder as the
+  output directory (`--report data/reports/<YYYY-MM-DD-topic>`, or the
+  `directory` argument of `BacktestReport.write`) so the tooling writes there from the start instead of
+  moving files afterwards.
 - Audits are named `YYYY-MM-DD-<topic>.md` — for example
   `data/audits/2026-08-26-repository-audit.md`. One file per audit run; update
   the existing file when re-verifying the same scope rather than opening a
@@ -161,6 +172,8 @@ only as JSON is one nobody reviews.
   gets one without re-running anything:
   `make chart REPORT=data/reports/<file>.json` (or
   `uv run qte-backtest chart <file>.json`), which writes `<file>.html` beside it.
+- The dashboard lands in the session's subfolder with the JSON it belongs to
+  (rule 5), never loose in `data/reports/`.
 - An audit that cites a backtest links the dashboard as well as the JSON.
 
 ---
@@ -170,7 +183,8 @@ only as JSON is one nobody reviews.
 - [ ] `make check` passes (Ruff + pytest)
 - [ ] Comments, docstrings and Markdown are English (rule 2)
 - [ ] New names are explicit and ≥ 6 characters (rule 3)
-- [ ] Reports in `data/reports/`, audits in `data/audits/`, both git-ignored (rule 5)
+- [ ] Reports in one `data/reports/YYYY-MM-DD-<topic>/` subfolder per session,
+      audits in `data/audits/`, both git-ignored (rule 5)
 - [ ] Every backtest has its HTML dashboard beside its JSON (rule 6)
 - [ ] Commit message is English with no generated-by footer (rule 1)
 - [ ] PR base branch is `dev` (rule 4)
