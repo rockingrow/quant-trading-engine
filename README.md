@@ -1019,6 +1019,16 @@ runner's `ALGO_BROKER__NATS_URL` at `nats://broker-nats-relay:4222`; the token,
 the NATS protocol and the runner's reconnect behaviour pass through unchanged.
 Host-side `ALGO_BROKER__NATS_URL` in `.env` is not routed over the tailnet.
 
+The same policy file also carries a `nodeAttrs` block granting `tag:broker`
+the Funnel attribute. That is for the broker, not the engine: TradingView posts
+its webhooks from the public internet, and a grant only ever matches a tagged
+tailnet node, so Funnel is what publishes one port of the broker on a public
+`https://<name>.<tailnet>.ts.net` address and forwards it to the broker's
+webhook port. Funnel bypasses every grant above it, so the webhook handler's
+shared secret is the only thing standing between the internet and an order.
+Keep the block in the copy you paste into the admin console — a tailnet has one
+policy.
+
 If the tailnet connection drops, NATS becomes unreachable the same way it
 would from any other network fault; `uv run qte-control ping` says so
 explicitly instead of reporting success — see
@@ -1044,6 +1054,30 @@ uv run qte-control ping            # which runners are up, and in what mode
 The flag is written to Redis first and broadcast second, so a runner that starts
 *after* the broadcast still comes up in the mode you last chose. If NATS is
 unreachable the command says so explicitly rather than reporting success.
+
+**Is everything connected?** `make status` prints the stack's containers (and
+the tailnet peers, with Tailscale on), then asks every link the engine depends
+on and exits non-zero if one is down:
+
+```text
+State namespace: prod:live:mt5
+  [ OK ] Redis            redis-cache:6379, runner claim held by 7c1e…
+  [ OK ] Postgres         postgres-audit:5432/qte_audit
+  [ OK ] NATS (QTE)       nats:4222
+  [ OK ] strategy-runner  4 slot(s), delivering LIVE, namespace prod:live:mt5
+  [ OK ] data-ingestion   providers mt5, 6 series, newest bar 2026-10-12T10:00:00+00:00
+  [FAIL] Ingester (mt5)   no NATS client is subscribed under INGESTER_RPC.history.mt5 — …
+  [ OK ] Broker           broker-nats-relay:4222: SIGNALS stream holds 0 undelivered signal(s); broker_signal_handler is pulling
+```
+
+The runner and ingestion answer a `ping` on their control subjects. The MT5
+ingester and the broker are other machines with no ping in their contracts, so
+neither is sent anything: the ingester is read off the NATS server's client
+list (`/connz` — is anyone subscribed to the history request subject), and the
+broker off its `SIGNALS` stream — a stream nothing is pulling from is a broker
+that is down. Every probe is read-only. It runs inside a service container
+(`qte-control status`), because that is where the stack's real namespace and,
+with Tailscale on, the relay to the broker both live.
 
 **Coming back from an outage.** One strategy-symbol pair holds one trade cycle
 at a time, so a position that outlived a long downtime locks that pair: every

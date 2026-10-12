@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`make status` — every link the engine depends on, on one screen.** Prints
+  the stack's containers (and the tailnet peers when `TAILSCALE_ENABLED` is
+  on), then runs the new `qte-control status` inside a service container:
+  Redis, Postgres, QTE's NATS, the runner and ingestion (a `ping` on each
+  control subject, telling "not running" from "running and silent"), the MT5
+  ingester and the broker. The last two are other machines with no ping in
+  their contracts, so nothing is sent to them: the ingester is read off the
+  NATS server's client list (`/connz` — is anyone subscribed under
+  `<rpc_prefix>.history.<gateway>`), and the broker off its `SIGNALS` stream,
+  where a consumer with no pull request waiting is a broker that is down. On
+  the HTTP transport the broker's `/v1/health` is asked instead. Read-only
+  throughout, endpoints are printed as `host:port` with no credentials, and
+  the exit code is non-zero when any link is down. New:
+  `qte_strategy_engine.connectivity`.
+
 - **The indicator window is requested from the MT5 ingester, not replayed by
   it** — that vendor serves no history endpoint, so a stack on a cold or
   part-filled Redis used to climb one bar per close: a day and a half for 150
@@ -184,6 +199,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The shared tailnet policy grants `tag:broker` the Funnel attribute.**
+  TradingView fires its webhooks from the public internet, and a grant only
+  ever matches a tagged tailnet node, so no grant can let it in. The
+  `nodeAttrs` block in `config/tailscale/policy.hujson` lets the broker publish
+  one port on its public `ts.net` address instead, and the broker's own
+  `serve.json` maps that down to its webhook port. Funnel bypasses the grants,
+  so the webhook handler's shared secret is the only thing authenticating the
+  caller. `algo-trading-broker` keeps the same file: paste the updated policy
+  into the admin console so the two copies stay identical.
 - **Market-data plans moved to `config/data_providers/`.** The templates
   (`<provider>.example.toml`) and the git-ignored plans `make tiingo` / `mt5` /
   `binance` / `simulator` write from them now live there, and the engine reads

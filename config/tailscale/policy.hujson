@@ -28,7 +28,10 @@
 //                                                   broker through it
 //   Broker server       tag:broker                  algo-trading-broker; its
 //                                                   `tailscale` container
-//                                                   forwards 4222/8222/5432
+//                                                   forwards 4222/8222/5432,
+//                                                   and Funnels 443 to the
+//                                                   webhook port for
+//                                                   TradingView
 //
 // Every flow is a NATS client opening a TCP connection to a NATS server, so a
 // grant only ever needs the server's port: replies and subscriptions ride the
@@ -47,6 +50,21 @@
     "tag:worker":   ["autogroup:admin"],
   },
 
+  // TradingView fires its webhooks from the public internet, so no grant can
+  // let it in: grants only ever match tagged tailnet nodes. Tailscale Funnel
+  // does, by publishing one port of tag:broker on a public
+  // https://<name>.<tailnet>.ts.net address and forwarding it to the broker's
+  // WEBHOOK_PORT. Funnel accepts 443, 8443 or 10000 only — never 80 — so the
+  // webhook URL configured in TradingView is https on 443, and the broker's
+  // config/tailscale/serve.json is what maps it down to the service's port 80.
+  //
+  // Funnel bypasses the grants above: anything on the internet can POST to
+  // that path. The broker's webhook handler is the only thing authenticating
+  // it, so its shared secret is what keeps a stranger from sending orders.
+  "nodeAttrs": [
+    {"target": ["tag:broker"], "attr": ["funnel"]},
+  ],
+
   "grants": [
     // Ingester → engine NATS: closed bars on INGEST.bar.closed.>
     {"src": ["tag:ingester"], "dst": ["tag:engine"], "ip": ["tcp:4222"]},
@@ -58,8 +76,8 @@
     {"src": ["tag:engine", "tag:worker"], "dst": ["tag:broker"], "ip": ["tcp:4222"]},
 
     // Worker → broker HTTP API (WEBHOOK_PORT, 80 by default; the `tailscale`
-    // container forwards it to the broker service). Only the worker gets it:
-    // the engine talks to the broker over NATS, not HTTP.
+    // container forwards it to the broker service). The worker reaches it over
+    // the tailnet; TradingView cannot — see nodeAttrs above.
     {"src": ["tag:worker"], "dst": ["tag:broker"], "ip": ["tcp:80"]},
 
     // Operators' own devices: everything, including the NATS monitoring ports

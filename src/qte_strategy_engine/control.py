@@ -8,6 +8,9 @@ listing strategies, reading the audit trail, running a backtest — is either a
 CLI command already or a SQL query, and neither of those needs a web service
 kept alive to answer it.
 
+``status`` changes nothing: it asks every link the engine depends on and
+prints one line each — see :mod:`qte_strategy_engine.connectivity`.
+
 The execution namespace selects paper or live at startup. Shadow mode pauses
 live delivery without converting broker positions into simulated ones. Its
 control message travels on the namespace-qualified NATS control subject.
@@ -32,6 +35,7 @@ from qte_shared.cache import RedisState
 from qte_shared.config import settings
 from qte_shared.db import EventRepository
 from qte_shared.logging_setup import configure_logging, get_logger
+from qte_strategy_engine import connectivity
 
 log = get_logger(__name__)
 
@@ -55,6 +59,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     subparsers.add_parser("ping", help="Ask the running runners to identify themselves")
+    subparsers.add_parser(
+        "status",
+        help="Check every link the engine depends on: Redis, Postgres, NATS, the runner, "
+        "ingestion, the MT5 ingester and the broker",
+    )
 
     owner = subparsers.add_parser(
         "owner", help="Inspect or clear the runner ownership claim left by an unclean exit"
@@ -279,6 +288,14 @@ async def _clear_runner_owner(*, assume_yes: bool) -> None:
     print("Cleared. The next runner to start will claim the namespace.")
 
 
+async def _show_status() -> int:
+    """Print one line per link; the return value is the process exit code."""
+    reports = await connectivity.collect_reports()
+    print(f"State namespace: {settings.state_scope.namespace}")
+    print(connectivity.render_reports(reports))
+    return connectivity.exit_code(reports)
+
+
 def _die(message: str, exc: Exception) -> None:
     """Fail the way a CLI should: one line of what went wrong, no traceback.
 
@@ -296,6 +313,9 @@ def main() -> None:
     if args.command == "ping":
         asyncio.run(_ping())
         return
+
+    if args.command == "status":
+        raise SystemExit(asyncio.run(_show_status()))
 
     if args.command == "owner":
         if args.operation == "status":
