@@ -1,0 +1,41 @@
+[project]
+name = "qte-signal-simulator"
+version = "0.1.0"
+description = "Strategies with no edge that drive full trade cycles through QTE, to test algo-trading-broker."
+readme = "README.md"
+# The engine imports plugins into its own process and pins 3.13; so does this.
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "numpy>=2.2",
+    "pandas>=2.3",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/qss"]
+
+# Installed next to the other mounted repos in the engine's venv, so it keeps
+# the same NumPy ceiling pandas-ta forces on quant-trading-strategies.
+[tool.uv]
+constraint-dependencies = ["numpy<2.3"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["B027", "UP042"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]

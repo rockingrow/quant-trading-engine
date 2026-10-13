@@ -231,6 +231,7 @@ __marimo__/
 # fresh checkout still shows the shape of this directory. It publishes an inert
 # strategy — see __strategies__/_boilerplate/README.md — and is safe to delete.
 !/__strategies__/_boilerplate/
+!/__strategies__/qte-signal-simulator/
 
 # Frozen out of the strategy repo's lockfile by `make strategy-requirements` so
 # the image build can install what the plugins need. Regenerated per deploy and
