@@ -92,6 +92,11 @@ class NatsSettings(BaseSettings):
     connect_timeout: float = 5.0
     max_reconnect_attempts: int = -1
     reconnect_time_wait: float = 2.0
+    #: How long ``NatsBus.close`` lets nats-py drain subscriptions before it
+    #: gives up and closes the socket. nats-py defaults to 30s, which turns a
+    #: subscription that will not drain — a pull consumer with a fetch in
+    #: flight — into half a minute of hang on every reconnect.
+    drain_timeout: float = 5.0
 
 
 class BrokerSettings(BaseSettings):

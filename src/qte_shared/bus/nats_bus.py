@@ -20,6 +20,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 import nats
+from nats import errors as nats_errors
 from nats.aio.client import Client as NATSClient
 from nats.aio.msg import Msg
 from nats.js import JetStreamContext
@@ -91,6 +92,7 @@ class NatsBus:
             "connect_timeout": settings.nats.connect_timeout,
             "max_reconnect_attempts": settings.nats.max_reconnect_attempts,
             "reconnect_time_wait": settings.nats.reconnect_time_wait,
+            "drain_timeout": settings.nats.drain_timeout,
             "disconnected_cb": self._on_disconnected,
             "reconnected_cb": self._on_reconnected,
             "error_cb": self._on_error,
@@ -156,6 +158,18 @@ class NatsBus:
                 log.exception("A reconnect hook failed name=%s", self._name)
 
     async def _on_error(self, exc: Exception) -> None:
+        # nats-py reports a drain that ran out of time through the error
+        # callback and then closes the connection anyway, so during our own
+        # shutdown it describes a slow close, not an outage. Logging it at
+        # ERROR paged the operator every time a subscription was slow to
+        # drain; the close itself is still logged right after.
+        if self._closing and isinstance(exc, nats_errors.DrainTimeoutError):
+            log.warning(
+                "NATS drain timed out after %.1fs name=%s — closing anyway",
+                settings.nats.drain_timeout,
+                self._name,
+            )
+            return
         log.error("NATS error name=%s: %s", self._name, exc)
 
     # ── Publish ───────────────────────────────────────────────────────

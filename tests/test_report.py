@@ -295,7 +295,7 @@ def test_the_json_keeps_one_candle_per_line(report):
     text = report.to_json()
 
     assert '"rows": [\n      [' in text, "rows start on their own lines"
-    assert '"schema_version": "2.0"' in text
+    assert f'"schema_version": "{SCHEMA_VERSION}"' in text
     assert "@@qte.market.rows@@" not in text, "the placeholder must not survive"
     rows = json.loads(text)["market"]["rows"]
     assert rows == report.to_dict()["market"]["rows"]
