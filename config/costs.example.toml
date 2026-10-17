@@ -1,0 +1,111 @@
+# What a backtest charges a fill, per symbol and per account type.
+#
+#   cp config/costs.example.toml config/costs.toml
+#
+# This template is tracked; `config/costs.toml` is git-ignored, like every
+# other operator-owned config in this repo. Keep the two in step: a key added
+# here is a key the operator can use, and a key only in the real file is one
+# nobody can review.
+#
+# Read by the backtest alone. Live fills come from the broker, so nothing here
+# reaches the runner — see src/qte_backtest/costs.py for the whole story.
+#
+# Resolution for each of the three costs, highest first:
+#
+#   1. --spread / --slippage / --commission on the command line
+#   2. [profiles.<profile>.symbols.<SYMBOL>]
+#   3. [profiles.<profile>.defaults]
+#   4. QTE_ACCOUNT__SPREAD / __SLIPPAGE / __COMMISSION_PER_UNIT
+#
+# Every key resolves on its own, so a symbol that restates only the spread
+# keeps its profile's slippage. The report records which layer won for each
+# number, under `costs.sources`.
+#
+# All three are in **price units**, never pips or points: 0.25 on XAUUSD is 25
+# cents per ounce, which is what the fill simulator subtracts. Negative values
+# and unknown keys are refused — a cost is paid, never earned, and a
+# misspelled key that was quietly ignored is the silent mispricing this file
+# exists to prevent.
+
+
+# Which profile a run that passes no --cost-profile is priced at. Required
+# once the file holds more than one profile; QTE_ACCOUNT__COST_PROFILE
+# overrides it, and --cost-profile overrides both.
+default_profile = "exness_standard"
+
+
+# ── Standard account: the fee lives in the spread ───────────────────────
+# No commission, a wider floating spread. The numbers below are measured
+# medians from an Exness XAUUSDm export, not the broker's marketing figure:
+# 0.20 (2023-24), 0.16 (2025), 0.26 (2026) — see
+# data/audits/2026-09-26-mt5-gold-stoch-rsi-m15-xauusd.md. 0.25 is therefore
+# the conservative choice, and the one every gold audit in data/audits/ uses.
+#
+# The "from 0.2 pips" an account page advertises is an FX-majors figure and a
+# floor, not an average, and not a metals number at all.
+
+[profiles.exness_standard.defaults]
+# What a symbol with no table of its own is priced at. Deliberately the oil
+# spread the engine shipped with, so an unlisted symbol is priced like
+# something rather than like nothing — the run log warns when this applies.
+spread = 0.04
+slippage = 0.0
+commission_per_unit = 0.0
+
+[profiles.exness_standard.symbols.XAUUSD]
+spread = 0.25
+slippage = 0.0
+commission_per_unit = 0.0
+
+[profiles.exness_standard.symbols.USOIL]
+# data/audits/2026-09-17-mt5-oil-m15-v1-usoil.md prices every run at 0.04.
+spread = 0.04
+slippage = 0.0
+commission_per_unit = 0.0
+
+[profiles.exness_standard.symbols.BTCUSDT]
+spread = 20.0
+slippage = 0.0
+commission_per_unit = 0.0
+
+
+# ── Zero / Raw Spread account: a tight spread, billed commission ────────
+# The same strategy priced the other way round. Whether an edge survives both
+# is the question two profiles exist to answer:
+#
+#   qte-backtest run ... --cost-profile exness_zero
+#
+# Fill in the commission your own account actually charges — per unit, each
+# side, so a round turn on one unit pays twice what is written here. The
+# figures below are placeholders, not quotes.
+
+[profiles.exness_zero.defaults]
+spread = 0.0
+slippage = 0.0
+commission_per_unit = 0.0
+
+[profiles.exness_zero.symbols.XAUUSD]
+spread = 0.05
+slippage = 0.0
+commission_per_unit = 0.035
+
+[profiles.exness_zero.symbols.USOIL]
+spread = 0.01
+slippage = 0.0
+commission_per_unit = 0.01
+
+
+# ── A pessimistic profile, for stress-testing an edge ───────────────────
+# Same book, every cost widened: what the equity curve looks like on a bad
+# fill day. A strategy whose edge only exists at the median spread is worth
+# knowing about before it trades, not after.
+#
+# [profiles.pessimistic.defaults]
+# spread = 0.10
+# slippage = 0.02
+# commission_per_unit = 0.0
+#
+# [profiles.pessimistic.symbols.XAUUSD]
+# spread = 0.50
+# slippage = 0.05
+# commission_per_unit = 0.0

@@ -270,17 +270,18 @@ def _entries_rejected(context: DiagnosticContext) -> Finding | None:
     return Finding(
         code="ENTRIES_REJECTED",
         severity=WARNING,
-        title=f"{rejected} entry signals were dropped because a position was already open",
+        title=f"{rejected} entry signals were dropped because the factory refused them",
         detail=(
-            f"{100.0 * rejected / attempted:.0f}% of the strategy's entry signals could not "
-            "be taken. The live worker behaves the same way — it answers REJECTED rather "
-            "than stacking — so these signals are noise on the wire, not missed trades."
+            f"{100.0 * rejected / attempted:.0f}% of the strategy's entry signals never "
+            "reached a broker payload. The live runner builds through the same factory, so "
+            "these are entries the runner would drop too — a malformed bracket, no size to "
+            "trade, or an entry reusing the id of a cycle already open. None of them was "
+            "refused for being a second position: nothing caps the cycles a pair stacks."
         ),
         suggestion=(
-            "Gate the entry on `context.open_uxid is None` so the strategy stops signalling "
-            "while it is in a trade. If the intent was to add to the position, that needs "
-            "an explicit scale-in (`is_scale_position`), which this engine does not "
-            "simulate."
+            "Read the `Dropped intent` warnings in the run's log for the reason. An entry "
+            "needs a stop on the far side of its price, and an entry that mints its own "
+            "`signal_uxid` must not reuse one still open."
         ),
         evidence={"rejected": rejected, "taken": context.metrics.trades},
     )

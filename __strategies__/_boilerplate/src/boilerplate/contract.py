@@ -74,11 +74,10 @@ class SignalIntent:
     ``signal_uxid`` ties a close back to the entry that opened it, under the same
     name the Pine strategies and the broker payload use. On a pair that holds one
     cycle, leave it ``None`` on an entry — the runner mints the id — and set it
-    to ``context.open_uxid`` on a follow-up that manages an exit. On a pair
-    allowed several cycles (``context.max_open_cycles > 1``), mint it yourself
-    on the entry with :func:`new_uxid`, remember it with the trade, and set it on
-    every close: with more than one cycle open, a close that names none is
-    refused.
+    to ``context.open_uxid`` on a follow-up that manages an exit. In a strategy
+    that stacks cycles, mint it yourself on the entry with :func:`new_uxid`,
+    remember it with the trade, and set it on every close: with more than one
+    cycle open, a close that names none is refused.
 
     ``quantity`` is a proposal, not the size that trades. The runner risk-sizes
     every entry against the account it was configured with and rescales your
@@ -129,21 +128,13 @@ class StrategyContext:
     #: most recent one when several are open. ``None`` means flat, and that is
     #: what selects entries over exits below.
     open_uxid: str | None = None
-    #: Every cycle open on this pair, oldest first. Empty when flat.
+    #: Every cycle open on this pair, oldest first. Empty when flat. Nothing
+    #: caps its length: a strategy may stack as many cycles as it fires.
     open_uxids: tuple[str, ...] = ()
-    #: How many cycles the pair may hold at once: 1, unless the mapping table
-    #: sets ``allow_multiple_cycles`` and ``max_open_cycles`` for it.
-    max_open_cycles: int = 1
 
     @property
     def is_live(self) -> bool:
         return self.mode == "live"
-
-    @property
-    def can_open(self) -> bool:
-        """Whether a new entry would be accepted — fewer cycles open than allowed."""
-        held = len(self.open_uxids) or (1 if self.open_uxid is not None else 0)
-        return held < self.max_open_cycles
 
 
 def new_uxid() -> str:
@@ -332,15 +323,13 @@ class SignalStrategy(StrategyBase):
     def on_candle_closed(self, df: pd.DataFrame, context: StrategyContext) -> IntentResult:
         """Ask the signal methods in order. "Holding" is ``context.open_uxid``,
         which both drivers maintain, so live and backtest sequence identically.
-        A pair allowed several cycles is asked for its exits and then, while
-        ``context.can_open``, for one more entry.
+        Holding is not a block on entering again: the pair is asked for its
+        exits and then for one more entry, however many cycles are open.
         """
         if context.open_uxid is not None:
             collected: list[SignalIntent] = []
             for name in EXIT_SIGNAL_ORDER:
                 collected.extend(self._ask(name, df, context))
-            if not context.can_open:
-                return collected
             for name in ENTRY_SIGNAL_ORDER:
                 produced = self._ask(name, df, context)
                 if produced:

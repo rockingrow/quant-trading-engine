@@ -21,11 +21,11 @@ in exactly this position in the bar, which is what keeps a replay a prediction
 of what the runner does over a Friday evening rather than a strictly
 more-traded version of it.
 
-A pair mapped with ``allow_multiple_cycles`` holds up to ``max_open_cycles``
-positions at once. Each is its own cycle — its own ``signal_uxid``, bracket and
-fill record — step 1 walks every one of them, and each close is routed to the
-cycle its ``signal_uxid`` names. The limit comes from the same factory the
-runner builds, so the replay holds exactly as many positions as live would.
+A pair holds as many positions at once as its strategy opens — nothing caps
+the count. Each is its own cycle — its own ``signal_uxid``, bracket and fill
+record — step 1 walks every one of them, and each close is routed to the cycle
+its ``signal_uxid`` names. The runner stacks them the same way, so the replay
+holds exactly as many positions as live would.
 """
 
 from __future__ import annotations
@@ -121,7 +121,17 @@ class BacktestResult:
     metrics: BacktestMetrics
     positions: list[SimulatedPosition] = field(default_factory=list)
     signals: list[BrokerSignal] = field(default_factory=list)
+    #: **Entry** intents the factory refused to build a payload from — a
+    #: malformed bracket, no size, an entry reusing the id of an open cycle.
+    #: Nothing is refused for being a second position: a pair stacks as many
+    #: cycles as its strategy fires. Counts entries only, because the
+    #: diagnostics read it against the entries that did fill.
     rejected: int = 0
+    #: **Closes** the factory refused, which is a different failure: a close
+    #: naming no cycle while several are open, or naming one already gone.
+    #: Kept apart from :attr:`rejected` because there is no count of closes
+    #: that should have happened to read it against.
+    rejected_closes: int = 0
     params: dict[str, Any] = field(default_factory=dict)
 
     # Context the report and the diagnostics need. Captured here because the
@@ -150,7 +160,9 @@ class BacktestResult:
         header = f"{self.strategy} — {self.symbol} {self.timeframe}"
         body = format_report(self.metrics, header)
         if self.rejected:
-            body += f"\nRejected entries  {self.rejected} (position already open)"
+            body += f"\nRejected entries  {self.rejected} (the factory refused the payload)"
+        if self.rejected_closes:
+            body += f"\nRejected closes   {self.rejected_closes} (no open cycle to close)"
         return body
 
     def trades_as_rows(self) -> list[dict[str, Any]]:
@@ -223,6 +235,9 @@ class BacktestEngine:
         #: signal_uxid → open position, oldest first.
         self._open: dict[str, SimulatedPosition] = {}
         self._rejected = 0
+        #: Closes the factory refused. Kept apart from ``_rejected``, which the
+        #: diagnostics read as a share of the entries that did fill.
+        self._rejected_closes = 0
         #: Entries the weekend window refused. Counted separately from
         #: ``_rejected`` because these are not malformed — the calendar said no.
         self._blocked = 0
@@ -260,7 +275,6 @@ class BacktestEngine:
             now=_as_datetime(frame.index[warmup - 1]),
             mode="backtest",
             params=self.strategy.params,
-            max_open_cycles=self.factory.max_open_cycles,
         )
         self.strategy.on_start(context)
 
@@ -325,6 +339,7 @@ class BacktestEngine:
             positions=self.positions,
             signals=self.signals,
             rejected=self._rejected,
+            rejected_closes=self._rejected_closes,
             params=dict(self.strategy.params),
             costs=self.simulator.costs,
             warmup=warmup,
@@ -367,17 +382,13 @@ class BacktestEngine:
         if intent.price is None:
             intent.price = close
 
-        if intent.action.is_entry and len(self._open) >= self.factory.max_open_cycles:
-            # The pair holds as many cycles as its mapping allows (one unless
-            # `allow_multiple_cycles`), and the runner would refuse this entry
-            # too — a backtest that stacked it would score a trade live never takes.
-            self._rejected += 1
-            log.debug("Rejected %s at %s — cycle limit reached", intent.action.value, bar_time)
-            return
-
         try:
             signal = self.factory.build(intent, symbol=self.symbol, moment=bar_time)
         except ValueError as exc:
+            if intent.action.is_entry:
+                self._rejected += 1
+            else:
+                self._rejected_closes += 1
             log.warning("Dropped intent at %s: %s", bar_time, exc)
             return
         self.signals.append(signal)

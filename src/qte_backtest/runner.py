@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from qte_backtest.costs import CostProfiles, resolve_costs
 from qte_backtest.data_store import load_history
 from qte_backtest.db import BacktestRepository
 from qte_backtest.execution import CostModel
@@ -34,12 +35,20 @@ class BacktestRequest:
     start: datetime | None = None
     end: datetime | None = None
     params: dict[str, Any] = field(default_factory=dict)
-    #: Defaulted from ``QTE_ACCOUNT__*`` so a run with no flags is priced and
-    #: capitalised the way the live account is. Pass a value to override one
-    #: without disturbing the rest.
-    spread: float = field(default_factory=lambda: settings.account.spread)
-    slippage: float = field(default_factory=lambda: settings.account.slippage)
-    commission_per_unit: float = field(default_factory=lambda: settings.account.commission_per_unit)
+    #: Fill costs, ``None`` for "not stated" — which is what lets the cost
+    #: profile for this symbol win over the account-wide fallback. A number
+    #: here is the operator overriding both, for this run only. See
+    #: :mod:`qte_backtest.costs` for the whole order of precedence.
+    spread: float | None = None
+    slippage: float | None = None
+    commission_per_unit: float | None = None
+    #: Which account type to price this run at — a profile in
+    #: :attr:`~qte_shared.config.AccountSettings.costs_file`. ``None`` takes
+    #: the file's ``default_profile``, then ``QTE_ACCOUNT__COST_PROFILE``.
+    cost_profile: str | None = None
+    #: The profile file itself, when a caller wants one other than the
+    #: configured ``QTE_ACCOUNT__COSTS_FILE``.
+    costs_file: Path | None = None
     contract_size: float = field(default_factory=lambda: settings.account.contract_size)
     #: Fallback size for an entry the risk sizer could not size (no stop).
     quantity: float = 1.0
@@ -101,14 +110,28 @@ async def run_backtest(
         request.history_file,
     )
 
+    # What this symbol costs to trade, from the operator's cost profile rather
+    # than from one account-wide number — the flags still win, for a run that
+    # deliberately prices something else. See :mod:`qte_backtest.costs`.
+    costs = resolve_costs(
+        request.symbol,
+        profiles=CostProfiles.load(request.costs_file or settings.account.costs_file),
+        profile=request.cost_profile or settings.account.cost_profile,
+        flags={
+            "spread": request.spread,
+            "slippage": request.slippage,
+            "commission_per_unit": request.commission_per_unit,
+        },
+    )
+
     engine = BacktestEngine(
         strategy,
         symbol=request.symbol,
         timeframe=request.timeframe,
         costs=CostModel(
-            spread=request.spread,
-            slippage=request.slippage,
-            commission_per_unit=request.commission_per_unit,
+            spread=costs.spread,
+            slippage=costs.slippage,
+            commission_per_unit=costs.commission_per_unit,
             contract_size=request.contract_size,
         ),
         starting_equity=request.starting_equity,
@@ -120,7 +143,7 @@ async def run_backtest(
         weekend_flat=weekend_flat,
     )
     result = engine.run(frame)
-    report = build_report(result)
+    report = build_report(result, cost_origin=costs.origin)
 
     critical = report.severity_counts()["critical"]
     if critical:

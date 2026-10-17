@@ -45,10 +45,9 @@ class SignalIntent:
     same name the Pine strategies and the broker payload use. Leave it ``None``
     on an entry — the runner mints the cycle id and remembers it — and set it
     on a follow-up when the strategy is managing an exit it opened itself. A
-    pair allowed several cycles (``context.max_open_cycles > 1``) needs it on
-    both: mint it on the entry with :func:`new_uxid`, keep it with the trade,
-    and set it on every close, since an unnamed close is refused while more
-    than one cycle is open.
+    strategy that stacks cycles needs it on both: mint it on the entry with
+    :func:`new_uxid`, keep it with the trade, and set it on every close, since
+    an unnamed close is refused while more than one cycle is open.
     """
 
     action: SignalAction
@@ -95,21 +94,13 @@ class StrategyContext:
     #: tracked by whoever is driving it. ``None`` means flat. With several
     #: cycles open it is the most recent; :attr:`open_uxids` lists them all.
     open_uxid: str | None = None
-    #: Every cycle open on this pair, oldest first. Empty when flat.
+    #: Every cycle open on this pair, oldest first. Empty when flat. Nothing
+    #: caps its length: a strategy may stack as many cycles as it fires.
     open_uxids: tuple[str, ...] = ()
-    #: How many cycles the pair may hold at once — 1 unless the engine's mapping
-    #: table sets ``allow_multiple_cycles`` and ``max_open_cycles`` for it.
-    max_open_cycles: int = 1
 
     @property
     def is_live(self) -> bool:
         return self.mode == "live"
-
-    @property
-    def can_open(self) -> bool:
-        """Whether a new entry would be accepted — fewer cycles open than allowed."""
-        held = len(self.open_uxids) or (1 if self.open_uxid is not None else 0)
-        return held < self.max_open_cycles
 
 
 def new_uxid() -> str:
@@ -124,11 +115,6 @@ def open_cycles(context: Any) -> tuple[str, ...]:
         return reported
     single = getattr(context, "open_uxid", None)
     return (single,) if single is not None else ()
-
-
-def cycle_limit(context: Any) -> int:
-    """How many cycles *context* allows, 1 for a driver that predates the setting."""
-    return max(1, int(getattr(context, "max_open_cycles", 1) or 1))
 
 
 IntentResult = SignalIntent | Sequence[SignalIntent] | None
@@ -361,11 +347,10 @@ class SignalStrategy(StrategyBase):
             collected: list[SignalIntent] = []
             for method_name in EXIT_SIGNAL_ORDER:
                 collected.extend(self._ask(method_name, df, context))
-            if len(open_cycles(context)) < cycle_limit(context):
-                for method_name in ENTRY_SIGNAL_ORDER:
-                    produced = self._ask(method_name, df, context)
-                    if produced:
-                        return collected + produced
+            for method_name in ENTRY_SIGNAL_ORDER:
+                produced = self._ask(method_name, df, context)
+                if produced:
+                    return collected + produced
             return collected or None
 
         for method_name in ENTRY_SIGNAL_ORDER:

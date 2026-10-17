@@ -21,11 +21,12 @@ The factory owns four things a strategy is deliberately not allowed to:
   every close it emits is scaled by that ratio.
 * **Timeframe spelling.** QTE says ``M15``; the broker's contract says ``"15"``.
 
-**One cycle per (strategy, symbol) at a time — unless the pair allows more.**
-By default the factory refuses a second entry while one is open. A pair mapped
-with ``allow_multiple_cycles = true`` may hold up to ``max_open_cycles``, each
-under its own ``signal_uxid``; every close must then name the cycle it closes
-(an unnamed close is only unambiguous while one cycle is open). The factory is
+**As many cycles per (strategy, symbol) as the strategy fires.** The factory
+caps nothing: every entry opens its own cycle under its own ``signal_uxid``,
+beside whatever is already open. The only entry it still refuses is one that
+reuses the id of a cycle already open, which would merge two trades into one
+record. Every close must name the cycle it closes (an unnamed close is only
+unambiguous while a single cycle is open). The factory is
 also what decides when a cycle is over:
 ``TP2``/``SL``/``R_SL``/``FLAT`` end it outright, and so does a ``TP1`` that
 takes the entry's whole quantity. That state is an
@@ -50,11 +51,7 @@ from qte_shared.models import (
 )
 from qte_shared.strategies.sizing import PositionSizer, resolve_use_equity_sizing
 from qte_shared.strategies.strategy_base import SignalIntent
-from qte_shared.strategies.strategy_settings import (
-    PORT_ONLY_PARAMS,
-    CyclePolicy,
-    resolve_cycle_policy,
-)
+from qte_shared.strategies.strategy_settings import PORT_ONLY_PARAMS
 from qte_shared.timeframes import to_broker_timeframe
 
 log = get_logger(__name__)
@@ -130,7 +127,6 @@ class SignalFactory:
         inputs: dict[str, Any] | None = None,
         sizer: PositionSizer | None = None,
         default_quantity: float | None = None,
-        cycle_policy: CyclePolicy | None = None,
     ) -> None:
         self.strategy_name = strategy_name
         self.timeframe = timeframe
@@ -157,20 +153,12 @@ class SignalFactory:
         #: What the pair's configuration says about equity sizing, mirrored
         #: onto every payload. It never changes the number above.
         self.use_equity_sizing = resolve_use_equity_sizing(self.inputs)
-        #: How many cycles one symbol may hold. Read from the pair's params — the
-        #: mapping table's ``allow_multiple_cycles`` / ``max_open_cycles`` — when
-        #: the caller does not pass one, so both drivers agree without wiring.
-        self.cycle_policy = cycle_policy or resolve_cycle_policy(self.inputs)
         #: symbol → {signal_uxid → cycle}, oldest first.
         self._book: dict[str, dict[str, OpenPosition]] = {}
         #: symbol → sizing scale of an entry built but not yet committed.
         self._pending_scale: dict[str, float] = {}
 
     # ── Cycle bookkeeping ─────────────────────────────────────────────
-
-    @property
-    def max_open_cycles(self) -> int:
-        return self.cycle_policy.limit
 
     def open_cycle(self, symbol: str) -> str | None:
         """Cycle id of the most recent position on *symbol*, or ``None`` when flat."""
@@ -359,17 +347,6 @@ class SignalFactory:
 
     def _prepare_entry(self, intent: SignalIntent, symbol: str) -> str:
         cycles = self._book.get(symbol, {})
-        if len(cycles) >= self.max_open_cycles:
-            if self.max_open_cycles == 1:
-                existing = next(iter(cycles))
-                raise ValueError(
-                    f"{intent.action.value} for {symbol} would replace open cycle "
-                    f"{existing} — close the current position before opening another"
-                )
-            raise ValueError(
-                f"{intent.action.value} for {symbol} would open cycle {len(cycles) + 1} "
-                f"of at most {self.max_open_cycles} — open: {', '.join(cycles)}"
-            )
         if intent.signal_uxid is not None and intent.signal_uxid in cycles:
             raise ValueError(
                 f"{intent.action.value} for {symbol} reuses open cycle id {intent.signal_uxid}"
