@@ -194,7 +194,7 @@ def test_a_tp2_that_is_never_reached_is_flagged():
     assert "TP2_NEVER_REACHED" in _codes(positions)
 
 
-def test_heavy_rejection_points_at_the_missing_open_position_guard():
+def test_heavy_rejection_points_at_the_payloads_the_factory_refused():
     codes = _codes(_healthy_positions(), rejected=200)
     assert "ENTRIES_REJECTED" in codes
 

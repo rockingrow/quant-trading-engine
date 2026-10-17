@@ -37,9 +37,8 @@ bars therefore give the same cycles in a backtest, in the runner, and in the
 runner again after a restart replays a bar. ``seed`` changes the sequence,
 ``outcome`` forces one path, ``weights`` skews the draw.
 
-**One cycle per pair** (the engine's default) means a new entry on the bar after
-the previous cycle ended. Map the pair with ``allow_multiple_cycles = true`` and
-``max_open_cycles >= 3`` to open one on every single bar.
+**Nothing caps the open cycles**, so it enters on every bar it is asked on and
+stacks cycles while earlier ones are still being walked.
 
 ``tp1_qty_pc`` must stay below 100: a ``TP1`` that closes everything ends the
 cycle, and the ``TP2``/``R_SL`` after it would name one that no longer exists.

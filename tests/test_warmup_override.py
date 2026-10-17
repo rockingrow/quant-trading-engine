@@ -29,6 +29,7 @@ from qte_shared.strategies.sizing import PositionSizer
 from qte_shared.strategies.strategy_base import SignalIntent, candles_to_frame
 from qte_shared.strategies.strategy_settings import (
     PORT_ONLY_PARAMS,
+    RETIRED_CYCLE_PARAMS,
     WARMUP_PARAM,
     describe_warmup,
     resolve_warmup,
@@ -298,4 +299,4 @@ def test_the_payload_carries_the_pairs_params_but_not_the_warmup():
     assert WARMUP_PARAM not in factory.inputs
     assert WARMUP_PARAM not in signal.inputs
     assert signal.inputs["risk_percent"] == 1.0
-    assert PORT_ONLY_PARAMS == {WARMUP_PARAM}
+    assert PORT_ONLY_PARAMS == {WARMUP_PARAM} | RETIRED_CYCLE_PARAMS

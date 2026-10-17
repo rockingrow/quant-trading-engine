@@ -398,13 +398,26 @@ csv-import: ## Convert an MT5 CSV export to parquet: make csv-import CSV=data/cs
 download: ## Fetch provider history for the market-data plan [ARGS="--symbol X --timeframe M15 --market fx"]
 	uv run qte-backtest download $(ARGS)
 
+# Leave all four empty for the normal case: the symbol's own costs then come
+# from config/costs.toml, which is the point of that file. SPREAD and friends
+# are for a run that deliberately prices something else.
 SPREAD ?=
 SLIPPAGE ?=
 COMMISSION ?=
+PROFILE ?=
 
-backtest: ## Replay one strategy: make backtest STRATEGY=... SYMBOL=XAUUSD TF=M15 FILE=... [SPREAD=] [SLIPPAGE=] [COMMISSION=]
+costs: ## Copy the backtest cost profiles into place (never overwrites)
+	@if [ -f config/costs.toml ]; then \
+		echo "config/costs.toml exists - leaving it alone"; \
+	else \
+		sed -e '/^[ \t]*#/d' config/costs.example.toml | cat -s | sed -e '/./,$$!d' > config/costs.toml; \
+		echo "Wrote config/costs.toml (git-ignored, comments stripped) - set the spread, slippage and commission each symbol is charged"; \
+	fi
+
+backtest: ## Replay one strategy: make backtest STRATEGY=... SYMBOL=XAUUSD TF=M15 FILE=... [PROFILE=] [SPREAD=] [SLIPPAGE=] [COMMISSION=]
 	uv run qte-backtest run --strategy $(STRATEGY) --symbol $(SYMBOL) \
 		--timeframe $(TF) --file $(FILE) --report \
+		$(if $(PROFILE),--cost-profile $(PROFILE)) \
 		$(if $(SPREAD),--spread $(SPREAD)) \
 		$(if $(SLIPPAGE),--slippage $(SLIPPAGE)) \
 		$(if $(COMMISSION),--commission $(COMMISSION))
@@ -532,6 +545,6 @@ owner-clear: ## Remove a stale runner claim after an unclean exit (refuses while
 	build build-prod up start stop down restart dev dev-restart logs logging logging-broker nuke tailscale-status \
 	strategy-mount strategy-audit strategy-requirements strategy-test strategies audit audit-strict strategy-mapping \
 	db-upgrade db-downgrade db-revision db-current db-history db-check \
-	download backtest chart reports csv-import \
+	download backtest chart reports csv-import costs \
 	sim sim-status sim-replay warmup warmup-cache sim-bar bar signal sim-walk sim-stop sim-reset sim-watch \
 	status shadow-status shadow-on shadow-off ping owner-status owner-clear

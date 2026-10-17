@@ -115,20 +115,19 @@ QTE normalises rather than rejecting, so either spelling round-trips.)
 
 ## The trade cycle
 
-**One cycle per (strategy, symbol) at a time, unless the pair allows more.** By
-default a second entry while one is open is refused before it reaches the wire,
-so a backtest never scores a trade live trading would not take.
+**As many cycles per (strategy, symbol) as the strategy opens.** Nothing caps
+the count: an entry that fires while positions are already open stacks another
+one beside them, both live and in the backtest, so a replay still predicts what
+live trading does.
 
-A pair mapped with `allow_multiple_cycles = true` (in
-`config/strategies_mapping.toml`) may hold up to `max_open_cycles` positions at
-once. Each is its own cycle: its own `signal_uxid`, minted on its entry, and its
-own bracket. Every `TP1`/`TP2`/`SL`/`R_SL`/`FLAT` then carries the `signal_uxid`
-of the one cycle it closes — QTE refuses an unnamed close while more than one is
-open, and the weekend flat and the stale-position flush send one close per
-cycle. The worker must keep the positions apart by that id, on a hedging
-account: a netting account would merge them into one position and lose every
-bracket but the last. The backtest enforces the same limit, from the same
-setting.
+Each is its own cycle: its own `signal_uxid`, minted on its entry, and its own
+bracket. Every `TP1`/`TP2`/`SL`/`R_SL`/`FLAT` carries the `signal_uxid` of the
+one cycle it closes — QTE refuses an unnamed close while more than one is open,
+and the weekend flat and the stale-position flush send one close per cycle. The
+worker must keep the positions apart by that id, on a hedging account: a netting
+account would merge them into one position and lose every bracket but the last.
+The only entry QTE still refuses is one reusing the id of a cycle already
+open.
 
 A cycle ends on `TP2`, `SL`, `R_SL` or `FLAT` — and also on a `TP1` that happens
 to close the entry's whole quantity. A strategy taking "50%" of a position that

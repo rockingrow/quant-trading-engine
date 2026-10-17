@@ -76,23 +76,37 @@ def build_parser() -> argparse.ArgumentParser:
         default=1.0,
         help="Fallback size for an entry the risk sizer cannot size (no stop)",
     )
+    # These three default to None, not to QTE_ACCOUNT__*: a flag that carried
+    # the account's number could not be told from one the operator typed, and
+    # would outrank this symbol's cost profile without anyone asking it to.
     run.add_argument(
         "--spread",
         type=float,
-        default=settings.account.spread,
-        help="Full bid/ask distance in price units (default: QTE_ACCOUNT__SPREAD)",
+        default=None,
+        help="Full bid/ask distance in price units. Overrides the cost profile "
+        "for this run (default: this symbol's profile, then QTE_ACCOUNT__SPREAD)",
     )
     run.add_argument(
         "--slippage",
         type=float,
-        default=settings.account.slippage,
-        help="Added on top of half the spread, each side (default: QTE_ACCOUNT__SLIPPAGE)",
+        default=None,
+        help="Added on top of half the spread, each side (default: this symbol's "
+        "profile, then QTE_ACCOUNT__SLIPPAGE)",
     )
     run.add_argument(
         "--commission",
         type=float,
-        default=settings.account.commission_per_unit,
-        help="Per unit, charged each side (default: QTE_ACCOUNT__COMMISSION_PER_UNIT)",
+        default=None,
+        help="Per unit, charged each side (default: this symbol's profile, then "
+        "QTE_ACCOUNT__COMMISSION_PER_UNIT)",
+    )
+    run.add_argument(
+        "--cost-profile",
+        default=None,
+        metavar="NAME",
+        help="Which account type to price the fills at — a profile in "
+        "config/costs.toml, e.g. exness_standard or exness_zero "
+        "(default: that file's default_profile, then QTE_ACCOUNT__COST_PROFILE)",
     )
     run.add_argument("--contract-size", type=float, default=settings.account.contract_size)
     run.add_argument(
@@ -255,6 +269,7 @@ async def _run(args: argparse.Namespace) -> None:
             spread=args.spread,
             slippage=args.slippage,
             commission_per_unit=args.commission,
+            cost_profile=args.cost_profile,
             contract_size=args.contract_size,
             quantity=args.quantity,
             starting_equity=args.equity,

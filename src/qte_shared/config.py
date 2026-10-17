@@ -68,7 +68,12 @@ load_dotenv(REPO_ROOT / ".env", override=False)
 #: carried ISO strings, and the rows are now the run's own bars rather than a
 #: fixed-count downsampling of them. A reader that fed ``t`` to a date parser
 #: would get a number it cannot parse, which is what a major bump is for.
-REPORT_SCHEMA_VERSION = "1.0"
+#:
+#: 1.1 — the ``costs`` block also states ``profile``, ``profile_file`` and
+#: ``sources``: which cost profile priced the fills, and which layer supplied
+#: each number (:mod:`qte_backtest.costs`). Purely additive — every 1.0 key is
+#: still there, with the same meaning — so a minor bump.
+REPORT_SCHEMA_VERSION = "1.1"
 
 
 class NatsSettings(BaseSettings):
@@ -145,8 +150,9 @@ class AccountSettings(BaseSettings):
     live, the broker charges and fills its own — but they belong to the
     account rather than to a run, which is why they sit here and only default
     the CLI flags. ``spread``/``slippage`` are per-symbol in reality (0.30 on
-    gold, ~2.0 on BTCUSDT); this default only covers a run that names none,
-    it is not a substitute for setting the right value per pair.
+    gold, ~2.0 on BTCUSDT), so the three of them are the *last* layer: state
+    them per symbol in :attr:`costs_file` instead, where a profile also says
+    which account type they describe.
     """
 
     model_config = SettingsConfigDict(env_prefix="QTE_ACCOUNT__", extra="ignore")
@@ -163,6 +169,14 @@ class AccountSettings(BaseSettings):
     spread: float = 0.0
     #: Added on top of half the spread, on both entry and exit fills.
     slippage: float = 0.0
+    #: Per-symbol cost profiles the backtest prices fills at — see
+    #: :mod:`qte_backtest.costs`. Git-ignored, with a tracked template beside
+    #: it. No file means the three numbers above price every symbol, which is
+    #: only ever right for a one-symbol engine.
+    costs_file: Path = REPO_ROOT / "config" / "costs.toml"
+    #: The profile a run that passes no ``--cost-profile`` is priced at. Empty
+    #: takes ``default_profile`` from the file itself.
+    cost_profile: str = ""
     #: Units per contract/lot. Scales both P&L and commission.
     contract_size: float = 1.0
     #: Hard ceiling on a sized entry. ``0`` means uncapped.

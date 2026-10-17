@@ -95,7 +95,6 @@ from qte_shared.strategies.strategy_settings import (
     NO_WEEKEND_FLAT,
     WeekendFlatPolicy,
     describe_warmup,
-    resolve_cycle_policy,
     resolve_warmup,
     resolve_weekend_flat,
 )
@@ -440,7 +439,6 @@ class StrategyRunner:
                 # A value that cannot be honoured stops the start, never reads as off.
                 try:
                     weekend_flat = resolve_weekend_flat(entry.settings.weekend_flat, params)
-                    cycle_policy = resolve_cycle_policy(params)
                 except ValueError as error:
                     raise ValueError(f"{entry.name} on {symbol}: {error}") from None
                 strategy = entry.instantiate(params)
@@ -467,7 +465,6 @@ class StrategyRunner:
                     inputs=strategy.params,
                     sizer=sizer,
                     default_quantity=runner_settings.default_quantity,
-                    cycle_policy=cycle_policy,
                 )
                 slot = StrategySlot(
                     strategy, symbol, factory, weekend_flat=weekend_flat, warmup=warmup
@@ -477,7 +474,7 @@ class StrategyRunner:
                 self._by_subject[(symbol, slot.timeframe)].append(slot)
                 log.info(
                     "Slot ready strategy=%s symbol=%s tf=%s warmup=%s risk=%.3f%% of %.2f "
-                    "weekend_flat=%s (%s) cycles=%s",
+                    "weekend_flat=%s (%s)",
                     strategy.name,
                     symbol,
                     slot.timeframe,
@@ -486,7 +483,6 @@ class StrategyRunner:
                     sizer.capital,
                     slot.weekend_flat.describe(),
                     self._market_zone.key,
-                    cycle_policy.describe(),
                 )
 
     @staticmethod
@@ -777,30 +773,17 @@ class StrategyRunner:
                 position.quantity,
                 position.remaining,
             )
-        if len(positions) > slot.factory.max_open_cycles:
-            # Restored rather than refused: these are real positions at the
-            # broker. New entries stay blocked until closes bring the pair
-            # back under its limit.
-            log.warning(
-                "%s %s holds %d open cycles, over its limit of %d — no entry until it is back "
-                "under the limit",
-                strategy,
-                symbol,
-                len(positions),
-                slot.factory.max_open_cycles,
-            )
 
     # ── Stale positions ───────────────────────────────────────────────
 
     async def _flush_stale_positions(self) -> None:
-        """Close what an outage left open, so the pair is not locked on it.
+        """Close what an outage left open, so nothing is left unmanaged.
 
-        The lock is the point. One ``(strategy, symbol)`` pair holds one cycle
-        at a time, or ``max_open_cycles`` with ``allow_multiple_cycles`` —
-        :meth:`SignalFactory._prepare_entry` refuses an entry over that limit —
-        so rows that survived a long downtime mean every entry the strategy
-        proposes from here on is refused, against positions whose brackets the
-        market left behind hours ago. Each stale cycle is closed on its own.
+        A pair stacks as many cycles as its strategy opens, so rows that
+        survived a long downtime are not a lock on new entries any more. They
+        are still positions whose brackets the market left behind hours ago,
+        with nothing deciding on them and their size counted against the
+        account on every later sizing. Each stale cycle is closed on its own.
 
         Age is what separates that from an ordinary restart. A deploy comes back
         inside ``QTE_RUNNER__STALE_POSITION_MAX_AGE`` and keeps its positions,
@@ -1160,7 +1143,6 @@ class StrategyRunner:
             params=slot.strategy.params,
             open_uxid=open_uxids[-1] if open_uxids else None,
             open_uxids=open_uxids,
-            max_open_cycles=slot.factory.max_open_cycles,
         )
 
     async def _flatten_for_the_weekend(

@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+from qte_backtest.costs import CostOrigin
 from qte_backtest.execution import CostModel
 from qte_backtest.replay import BacktestEngine
 from qte_backtest.report import SCHEMA_VERSION, build_report
@@ -136,6 +137,30 @@ def test_costs_are_recorded_so_a_result_can_be_re_priced(report):
     costs = report.to_dict()["costs"]
     assert costs["spread"] == 0.2
     assert costs["round_trip_cost"] == 0.2
+    # Hand-built engine, so no cost profile priced it — the keys are still
+    # there, saying exactly that rather than naming an account type.
+    assert costs["profile"] is None
+    assert costs["sources"] == {}
+
+
+def test_the_cost_profile_that_priced_the_run_is_named(trending_frame):
+    """Two runs differing only in account type must not look identical on disk."""
+    result = BacktestEngine(
+        TwoTradeStrategy(),
+        symbol="XAUUSD",
+        costs=CostModel(spread=0.25),
+        starting_equity=10_000,
+    ).run(trending_frame)
+    origin = CostOrigin(
+        profile="exness_standard",
+        profile_file="config/costs.toml",
+        sources={"spread": "profile.symbols"},
+    )
+
+    report = build_report(result, cost_origin=origin)
+
+    assert report.to_dict()["costs"]["profile"] == "exness_standard"
+    assert "profile exness_standard" in report.to_markdown()
 
 
 def test_every_trade_carries_what_the_aggregates_were_derived_from(report):

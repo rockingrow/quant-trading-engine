@@ -25,7 +25,6 @@ from qss.core.strategy import (
     StrategyBase,
     StrategyContext,
     as_intents,
-    cycle_limit,
     new_uxid,
     open_cycles,
 )
@@ -57,7 +56,6 @@ __all__ = [
     "StrategyContext",
     "as_intents",
     "as_utc",
-    "cycle_limit",
     "new_uxid",
     "open_cycles",
     "floor_to_bucket",

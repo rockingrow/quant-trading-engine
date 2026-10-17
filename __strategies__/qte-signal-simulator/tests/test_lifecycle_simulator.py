@@ -30,7 +30,7 @@ def make_candles(bar_count: int, frequency: str = "15min") -> pd.DataFrame:
     )
 
 
-def drive(strategy: LifecycleSimulator, bar_count: int = 120, *, max_open_cycles: int = 1):
+def drive(strategy: LifecycleSimulator, bar_count: int = 120):
     """Feed bars one at a time; return every intent tagged with its bar number."""
     candles = make_candles(bar_count)
     open_uxids: list[str] = []
@@ -43,7 +43,6 @@ def drive(strategy: LifecycleSimulator, bar_count: int = 120, *, max_open_cycles
             now=frame.index[-1].to_pydatetime(),
             open_uxid=open_uxids[-1] if open_uxids else None,
             open_uxids=tuple(open_uxids),
-            max_open_cycles=max_open_cycles,
         )
         for intent in as_intents(strategy.on_candle_closed(frame, context)):
             emitted.append((position, intent))
@@ -87,9 +86,8 @@ def test_it_still_instantiates_without_params_for_the_audit():
 # ── The cycles ────────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("max_open_cycles", [1, 3])
-def test_every_cycle_walks_one_scripted_path_one_bar_per_step(max_open_cycles):
-    emitted = drive(LifecycleSimulator(), max_open_cycles=max_open_cycles)
+def test_every_cycle_walks_one_scripted_path_one_bar_per_step():
+    emitted = drive(LifecycleSimulator())
     finished = 0
     for uxid, steps in cycles(emitted).items():
         assert len(uxid) == 16 and uxid == uxid.upper()
@@ -103,22 +101,14 @@ def test_every_cycle_walks_one_scripted_path_one_bar_per_step(max_open_cycles):
     assert finished > 10
 
 
-def test_a_single_cycle_pair_reopens_on_the_bar_after_the_exit():
-    emitted = drive(LifecycleSimulator(), max_open_cycles=1)
-    for (exit_bar, previous), (next_bar, current) in zip(emitted, emitted[1:], strict=False):
-        if previous.action in TERMINAL:
-            assert current.action in ENTRIES
-            assert next_bar == exit_bar + 1
-
-
-def test_several_cycles_open_one_entry_on_every_bar():
-    emitted = drive(LifecycleSimulator(), max_open_cycles=3)
+def test_an_entry_opens_on_every_bar_because_nothing_caps_the_book():
+    emitted = drive(LifecycleSimulator())
     entry_bars = [position for position, intent in emitted if intent.action in ENTRIES]
     assert entry_bars == list(range(entry_bars[0], entry_bars[0] + len(entry_bars)))
 
 
 def test_all_three_outcomes_and_both_directions_occur():
-    emitted = drive(LifecycleSimulator(), bar_count=300, max_open_cycles=3)
+    emitted = drive(LifecycleSimulator(), bar_count=300)
     entries = [intent for _, intent in emitted if intent.action in ENTRIES]
     assert set(Counter(intent.inputs["outcome"] for intent in entries)) == set(OUTCOMES)
     assert {intent.action for intent in entries} == ENTRIES
@@ -164,10 +154,14 @@ def test_a_cycle_it_never_opened_is_closed_once_with_flat():
     )
     first = as_intents(strategy.on_candle_closed(make_candles(40), context))
     again = as_intents(strategy.on_candle_closed(make_candles(41), context))
-    assert [(intent.action, intent.signal_uxid) for intent in first] == [
-        (SignalAction.FLAT, "ABCDEF0123456789")
-    ]
-    assert again == []
+
+    def closes(intents):
+        return [
+            (intent.action, intent.signal_uxid) for intent in intents if intent.action in TERMINAL
+        ]
+
+    assert closes(first) == [(SignalAction.FLAT, "ABCDEF0123456789")]
+    assert closes(again) == [], "the orphan is closed once, not on every bar"
 
 
 def test_a_tp1_that_would_close_everything_is_refused():

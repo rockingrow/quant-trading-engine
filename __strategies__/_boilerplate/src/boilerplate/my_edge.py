@@ -84,8 +84,8 @@ class MyEdge(SignalStrategy):
     # -- Entries -------------------------------------------------------
     #
     # Asked while flat, in the order long -> short, and the first that answers
-    # wins: a bar cannot be both. A pair mapped with `allow_multiple_cycles` is
-    # also asked while holding, as long as `context.can_open`.
+    # wins: a bar cannot be both. A holding pair is asked too, so an entry here
+    # stacks another cycle beside what is already open.
 
     def long(self, df: pd.DataFrame, context: StrategyContext) -> IntentResult:
         return self._entry(df, context, direction=1)
