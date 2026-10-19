@@ -28,6 +28,8 @@ sizing when the broker is the one holding the equity.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from decimal import ROUND_DOWN, Decimal
+from math import isfinite
 from typing import Any
 
 from qte_shared.config import settings
@@ -35,8 +37,9 @@ from qte_shared.logging_setup import get_logger
 
 log = get_logger(__name__)
 
-#: Key the mapping table and ``QTE_RUNNER__STRATEGY_PARAMS`` use to state a
-#: pair's risk. Read off a strategy's params, which is where both land.
+#: Key the mapping table uses to state a pair's risk — in a
+#: ``[strategies.<name>]`` default or a ``[symbols.<symbol>.params.<name>]``
+#: override. Read off a strategy's params, which is where both land.
 RISK_PERCENT_KEY = "risk_percent"
 
 #: Params key mirrored onto the payload's ``position.use_equity_sizing``.
@@ -58,6 +61,22 @@ class PositionSizer:
     max_quantity: float | None = None
     precision: int = 4
 
+    def __post_init__(self) -> None:
+        for setting_name in ("capital", "risk_percent", "contract_size"):
+            setting_value = getattr(self, setting_name)
+            if not isfinite(setting_value) or setting_value < 0:
+                raise ValueError(f"{setting_name} must be finite and nonnegative")
+        if self.contract_size == 0:
+            raise ValueError("contract_size must be positive")
+        if self.max_quantity is not None and (
+            not isfinite(self.max_quantity) or self.max_quantity < 0
+        ):
+            raise ValueError("max_quantity must be finite and nonnegative")
+        if isinstance(self.precision, bool) or not isinstance(self.precision, int):
+            raise ValueError("quantity precision must be an integer")
+        if not 0 <= self.precision <= 12:
+            raise ValueError("quantity precision must be between 0 and 12")
+
     @classmethod
     def from_settings(
         cls,
@@ -68,7 +87,8 @@ class PositionSizer:
         """Build one from ``QTE_ACCOUNT__*`` and a pair's strategy params.
 
         *params* is what ``config/strategies_mapping.toml`` mapped to this pair
-        (merged over ``QTE_RUNNER__STRATEGY_PARAMS``), so a ``risk_percent``
+        (its ``[strategies.<name>]`` defaults merged under the pair's
+        ``[symbols.<symbol>.params.<name>]`` overrides), so a ``risk_percent``
         stated there wins over the account default. An explicit *risk_percent*
         argument wins over both — that is the caller saying it already resolved
         the question.
@@ -97,31 +117,34 @@ class PositionSizer:
     def size(self, price: float | None, sl: float | None) -> float | None:
         """Quantity for an entry at *price* stopping at *sl*.
 
-        ``None`` when the trade cannot be sized — no stop, a stop sitting on
-        the entry, or a budget that does not buy one tick of the instrument.
-        Every one of those is a caller's decision to make, and the honest
-        answer here is "I cannot", not a zero the broker would reject.
+        Only missing inputs return ``None``. An invalid stop, zero budget or
+        quantity smaller than one supported step raises ``ValueError``: those
+        are rejected trades and must never select a fallback quantity.
         """
+        if not isfinite(self.risk_budget) or self.risk_budget <= 0:
+            raise ValueError("Risk budget must be finite and positive for an entry")
         if price is None or sl is None:
             return None
-        stop_distance = abs(price - sl)
-        if stop_distance <= 0 or self.contract_size <= 0 or self.risk_budget <= 0:
-            return None
+        if not isfinite(price) or not isfinite(sl):
+            raise ValueError("Entry price and stop must be finite")
+        stop_distance = abs(Decimal(str(price)) - Decimal(str(sl)))
+        if stop_distance == 0:
+            raise ValueError("Entry stop distance must be positive")
+        risk_budget = Decimal(str(self.capital)) * Decimal(str(self.risk_percent)) / 100
+        quantity = risk_budget / (stop_distance * Decimal(str(self.contract_size)))
+        return self.limit_quantity(quantity)
 
-        quantity = self.risk_budget / (stop_distance * self.contract_size)
+    def limit_quantity(self, quantity: float | Decimal) -> float:
+        """Enforce the account ceiling and round down, including fallback sizes."""
+        if not isfinite(quantity) or quantity <= 0:
+            raise ValueError("Entry quantity must be finite and positive")
+        bounded = Decimal(str(quantity))
         if self.max_quantity:
-            quantity = min(quantity, self.max_quantity)
-        quantity = round(quantity, self.precision)
-        if quantity <= 0:
-            log.warning(
-                "Risk budget %.4f over a stop %.5f away rounds to zero at %d dp — "
-                "raise QTE_ACCOUNT__CAPITAL or the pair's risk_percent",
-                self.risk_budget,
-                stop_distance,
-                self.precision,
-            )
-            return None
-        return quantity
+            bounded = min(bounded, Decimal(str(self.max_quantity)))
+        rounded = bounded.quantize(Decimal(1).scaleb(-self.precision), rounding=ROUND_DOWN)
+        if rounded <= 0:
+            raise ValueError("Entry quantity is below the supported quantity step")
+        return float(rounded)
 
     def replace(self, **changes: Any) -> PositionSizer:
         """A copy with some fields overridden.

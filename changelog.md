@@ -5,9 +5,143 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.1] - 2026-10-19
 
 ### Added
+
+- **`make status` — every link the engine depends on, on one screen.** Prints
+  the stack's containers (and the tailnet peers when `TAILSCALE_ENABLED` is
+  on), then runs the new `qte-control status` inside a service container:
+  Redis, Postgres, QTE's NATS, the runner and ingestion (a `ping` on each
+  control subject, telling "not running" from "running and silent"), the MT5
+  ingester and the broker. The last two are other machines with no ping in
+  their contracts, so nothing is sent to them: the ingester is read off the
+  NATS server's client list (`/connz` — is anyone subscribed under
+  `<rpc_prefix>.history.<gateway>`), and the broker off its `SIGNALS` stream,
+  where a consumer with no pull request waiting is a broker that is down. On
+  the HTTP transport the broker's `/v1/health` is asked instead. Read-only
+  throughout, endpoints are printed as `host:port` with no credentials, and
+  the exit code is non-zero when any link is down. New:
+  `qte_strategy_engine.connectivity`.
+
+- **The indicator window is requested from the MT5 ingester, not replayed by
+  it** — that vendor serves no history endpoint, so a stack on a cold or
+  part-filled Redis used to climb one bar per close: a day and a half for 150
+  bars of M15. Ingestion now sends one core-NATS request per planned series on
+  `<rpc_prefix>.history.<gateway>.<SYMBOL>.<TF>` and gets every bar back in a
+  single reply, merged into the stored window in one compare-and-swap against
+  the per-series staging watermark — raised to the newest bar merged, never
+  lowered, so a bar the stream replays afterwards is still read as the duplicate
+  it is. Merged by open time with the held bar winning a tie, so a reply that
+  ends behind the live stream cannot cost a newer close, and nothing it returns
+  is staged, published or decided on. QTE decides which series and how many
+  bars (`history_bars`, default 500); the ingester holds no warm-up setting.
+  New: `qte_shared.providers.mt5.history.IngesterHistorySource`, reached through
+  `Capability.RECENT_BARS` — deliberately *not* `HISTORY`, because "the newest n
+  closed bars" is a window and not an archive: a backtest download still
+  refuses the provider and nothing it returns reaches the parquet history cache.
+  A reply for another series, or on a `schema_version` nobody listed, is refused
+  rather than merged. See `examples/nats/history.{request,reply}*.json` and
+  "Why the indicator window is asked for, not pushed" in `docs/architecture.md`.
+
+- **Ingestion starts without the ingester and never polls for it** — a boot that
+  finds nobody to ask logs it once and carries on with what Redis holds, rather
+  than failing or retrying on a timer. The ingester announces itself on
+  `<rpc_prefix>.online.<gateway>` when it is connected and answering, and again
+  after every reconnect; only then does ingestion compare each planned window
+  against Redis and request the ones that are short or stale, so a full, current
+  window costs one Redis read and no request. The one announcement that can go
+  unheard is one made while QTE's own NATS connection was down, and that is
+  covered by re-checking when the connection returns — which is why
+  `QTE_INGESTION__HISTORY_OFFLINE_PROBE_INTERVAL` defaults to `0`, no probe at
+  all. A vendor that answers "not ready" (an MT5 terminal still logging in) is a
+  different case and *is* retried, after
+  `QTE_INGESTION__HISTORY_RETRY_INTERVAL`, doubling to `..._MAX_INTERVAL`. A
+  symbol the vendor does not carry is refused once (`HistoryNotServed`) and not
+  asked for again.
+
+- **A gap in front of a live bar is filled before that bar is staged** — the
+  ingester publishes nothing it found already closed when it started, so after
+  it has been down the next close arrives with the bars in between missing and
+  nothing else would ever fetch them. Ingestion now requests them first, so the
+  runner never decides on a window with a hole in it. Only bars older than the
+  live one are merged: including it would raise the watermark to it and the
+  close would then be dropped as a duplicate of its own history. A market's own
+  session break looks identical and costs one request per
+  `QTE_INGESTION__HISTORY_GAP_COOLDOWN`.
+
+- **Each long-running service writes its own daily log file** —
+  `<QTE_LOG_DIR>/<YYYYMMDD>-data-ingestion.log` and `-strategy-runner.log`, at
+  `QTE_LOG_LEVEL`, mounted from `./logs` by Compose and rolling at midnight
+  without a restart. `docker compose logs` keeps only what the *current*
+  container wrote, so recreating a service used to take the history of every
+  decision with it. One file per service rather than a shared one, because both
+  containers append to the same mounted directory and a shared file would tear
+  their lines. Only an entry point names a service, so importing anything from
+  the package — a test, a backtest, `qte-control` — still writes no file and
+  creates no directory, and an unwritable directory is reported once on the
+  console and otherwise ignored rather than stopping a service that is ready to
+  trade. Nothing is pruned; an empty `QTE_LOG_DIR` turns the files off.
+
+- **The `warmup_bar` reader is kept for an older ingester** — a numbered,
+  replayed batch is still buffered and merged
+  (`IngestionService._handle_warmup_bar`), so a gateway from before the change
+  above is understood. Nothing in the current pair of services emits one.
+
+- **`warmup` is now a mapping-table setting** — how many closed candles a pair
+  collects before it may decide is no longer only a class attribute inside a
+  private strategy repository. State `warmup` under
+  `[strategies.<NAME>]` to move it everywhere that strategy runs, or under
+  `[symbols.<SYMBOL>.params.<NAME>]` for one pair; omit it and the count the
+  strategy declares stands, exactly as before. The runner and the replay
+  resolve it from the same pair params (`resolve_warmup`), and `--param
+  warmup=` works on a backtest, so a replay still starts deciding on the same
+  bar the runner would — the report's `warmup_bars` records the number actually
+  used. A count below the declaration is the operator's call and logs a warning
+  naming both numbers, because what a strategy really needs is a property of
+  its slowest indicator and the engine cannot measure it; a count that is not a
+  positive whole number, or one above the strategy's `max_history`, stops the
+  start instead, the latter because the runner's buffer could never reach it.
+  The key configures the port rather than the edge, so it is kept out of a
+  payload's `inputs` block and the broker contract is unchanged.
+
+- **Recovery from a stale runner ownership claim** — the non-expiring
+  `runner:owner` claim still refuses a second runner and still never fails
+  over, but an unclean exit no longer has to end in a crash loop and a manual
+  `redis-cli DEL`. `strategy-runner` gets `stop_grace_period: 60s`, so a deploy
+  or `docker compose stop` is no longer killed ten seconds into the shutdown
+  that releases the claim. A restart of the **same container** takes back the
+  claim its crashed predecessor left (`QTE_RUNNER__RECLAIM_OWN_CLAIM`, default
+  `true`): only the container's PID 1 qualifies, because that process knows
+  every earlier one in its PID namespace is gone; a recreated container, another
+  host and a host process are refused as before. New `qte-control owner
+  status|clear` (`make owner-status`, `make owner-clear`) removes a stale claim
+  only when no runner answers a ping, after the namespace is typed back, and
+  only if the holder is still the one it showed. A refused start now names the
+  namespace and the holder and records an `ownership_refused` audit event;
+  `ownership_reclaimed` and `runner_owner_cleared` are recorded too, and the
+  runner's ping reply carries its `owner_id`.
+
+- **Optional Tailscale node, as a container** — the same design as
+  `algo-trading-broker`, behind the same `.env` switch, `TAILSCALE_ENABLED`
+  (default **`false`**). Turned on, `make start`/`up`/`dev`/`start-prod` also
+  start a `tailscale` container (`tailscale/tailscale`, userspace networking,
+  profile `tailscale`) that joins the tailnet as `TAILSCALE_HOSTNAME`, tagged
+  `tag:engine`, and through Tailscale Serve (`config/tailscale/serve.json`)
+  forwards its tailnet ports 4222 (NATS), 8222 (NATS monitoring) and 5432
+  (Postgres); the Redis, Postgres and NATS host ports are then published on
+  `127.0.0.1` only, so the MT5 ingester has to join the tailnet and connect to
+  `nats://<TAILSCALE_HOSTNAME>:4222`. Signals go the other way through a new
+  `broker-nats-relay` container (socat over the node's SOCKS5 proxy) to
+  `nats://<TAILSCALE_BROKER_HOSTNAME>:4222`, and the Makefile points the
+  runner's `ALGO_BROKER__NATS_URL` at it. New `TAILSCALE_AUTHKEY` (first login
+  only — the identity is kept in a per-stack `*-tailscale` volume),
+  `TAILSCALE_HOSTNAME`, `TAILSCALE_BROKER_HOSTNAME`, and `make
+  tailscale-status`. New `config/tailscale/policy.hujson`, the tailnet policy
+  shared with `algo-trading-broker` (keep both copies identical), with tests
+  pinning it to the engine's tag, Serve forwards and relay port; `make stop`/`down`/`nuke` now include the `tailscale`
+  profile. Turned off, neither container is pulled and every port binds
+  `0.0.0.0` as before.
 
 - **Backtest dashboard** (`qte-backtest chart`) — A report rendered as one
   self-contained HTML page, laid out like a strategy tester: cumulative P&L
@@ -65,6 +199,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The shared tailnet policy grants `tag:broker` the Funnel attribute.**
+  TradingView fires its webhooks from the public internet, and a grant only
+  ever matches a tagged tailnet node, so no grant can let it in. The
+  `nodeAttrs` block in `config/tailscale/policy.hujson` lets the broker publish
+  one port on its public `ts.net` address instead, and the broker's own
+  `serve.json` maps that down to its webhook port. Funnel bypasses the grants,
+  so the webhook handler's shared secret is the only thing authenticating the
+  caller. `algo-trading-broker` keeps the same file: paste the updated policy
+  into the admin console so the two copies stay identical.
+- **Market-data plans moved to `config/data_providers/`.** The templates
+  (`<provider>.example.toml`) and the git-ignored plans `make tiingo` / `mt5` /
+  `binance` / `simulator` write from them now live there, and the engine reads
+  `config/data_providers/<provider>.toml` by default. Move an existing
+  `config/<provider>.toml` into the new folder; `QTE_MARKET_DATA__CONFIG_FILE`
+  still overrides the path.
+- **Host ports take a bare number; the bind address follows
+  `TAILSCALE_ENABLED`.** Redis, Postgres and NATS publish on
+  `${PRIVATE_BIND_ADDRESS}` — `0.0.0.0` with Tailscale off, `127.0.0.1` with it
+  on. A `.env` that prefixed an address (`QTE_REDIS_PORT=localhost:2690`) no
+  longer renders: drop the prefix.
+- **The runner's container dials the broker at
+  `nats://host.docker.internal:4222` by default** (was `:2701`, one
+  deployment's port). Set `ALGO_CONTAINER_BROKER_NATS_URL` when the broker
+  publishes another port; with `TAILSCALE_ENABLED=true` the tailnet relay is
+  used instead.
+- **`QTE_NATS__URL` defaults to `nats://localhost:4222`**, the host-side
+  published port, instead of one machine's tailnet name — nothing is installed
+  on the host any more, so that name no longer resolves there.
+- **The price chart carries the run's own bars, however long the history.**
+  `market.rows` no longer climbs to a coarser timeframe above 20,000 rows, so a
+  five-year M15 run is drawn at M15 — ~120k rows, a report and dashboard of
+  about 6 MB each, and a slower page, accepted so every trade can be inspected.
+  `sample_market(max_rows=…)` still rolls up for a caller that asks for it.
+
+- **A backtest report is written in all three formats by default.**
+  `--report` now writes `json,md,html`; `--report-format` narrows it
+  (`--report-format json`), and `--chart` still adds `html` back to an explicit
+  list that left it out. `BacktestRequest.report_formats` and
+  `BacktestReport.write` share the same default, so `make backtest` writes the
+  dashboard too.
+
+- **A symbol's market is stated, never guessed.** `qte_shared.symbols` had two
+  hardcoded lists — crypto base assets and stablecoin quotes — that
+  `infer_market()` matched a symbol name against to pick `fx` or `crypto`. A
+  coin outside the list resolved to `fx` silently, which is the wrong socket
+  and no error. `market` is now required: beside each symbol in
+  `config/<provider>.toml`, in `QTE_INGESTION__MARKET_OVERRIDES` for every
+  symbol on the no-plan fallback path, on `DownloadRequest`, and as
+  `qte-backtest download --market` for a target that is not in the plan. A plan
+  entry with no `market` is refused rather than half-read.
+
+- **The dev simulator asks for a starting price instead of inventing one.**
+  `qte_simulator.bars` carried a `REFERENCE_PRICES` table (XAUUSD 2400, BTCUSDT
+  60000, …) that seeded a synthetic walk when nothing else set the level. It
+  only ever applied to the first `replay --generate` or `walk` of a symbol on a
+  cold simulator; after the first bar the series continues itself. That first
+  call now needs `--start-price` / `price` (or a prior `tick`/`bar`/`replay` to
+  set the level) — `make warmup START=<price>`, `make sim-walk PRICE=<price>`.
+
+- **Per-strategy parameters move from `QTE_RUNNER__STRATEGY_PARAMS` into the
+  mapping table.** `config/strategies_mapping.toml` gains a `[strategies.<name>]`
+  table — one sub-table of default parameters per strategy, applied wherever
+  that strategy is mapped, with the per-pair `[symbols.<symbol>.params.<name>]`
+  overrides merged on top. The environment variable is gone: a strategy × pair
+  × parameter matrix belongs in the reviewable file next to the routing it
+  tunes, not flattened into JSON in `.env`. The backtest reads the same two
+  layers now, so a run measures the book the runner would trade.
+  `make strategy-mapping` now strips the template's comments as it copies, the
+  way `make tiingo` and `make simulator` already do.
+
 - **A `TP1` that closes the entry's whole quantity ends the trade cycle.**
   Previously only `TP2`/`SL`/`R_SL`/`FLAT` did, so a strategy taking "50%" of a
   position sized at one unit left the runner holding a cycle the broker had
@@ -94,6 +298,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   report still comes from the full series. `run.default_quantity` is recorded
   alongside it so the benchmark is sized the way the strategy was. Additive:
   a consumer of 1.0 reads a 1.1 report unchanged.
+
+### Fixed
+
+- **Backfill no longer stores the bucket still forming as a closed bar.**
+  Tiingo's intraday history for today includes the bar being built, and it was
+  written to Redis as closed: the runner then rejected the real close of that
+  bucket as a duplicate and kept the snapshot in its window. History sources
+  drop unfinished buckets (`drop_unfinished_bars`), and a fresh fetch replaces a
+  held vendor bar instead of deferring to it.
+
+- **A bar built from part of its bucket is completed before it is published.**
+  The first bucket after ingestion starts, and a bar restored from Redis after a
+  restart, used to go out as though whole. Each is now merged with the vendor's
+  bar for the same bucket — its open, the extremes of both, and the engine's own
+  close while the engine was still listening when the bucket ended — or
+  published as built with a log line when that bar is unavailable or takes
+  longer than five seconds. A restored bar whose bucket ended during the
+  downtime takes the vendor's close too, and is closed before backfill runs so
+  the top-up does not duplicate it.
+
+- **Backfill notices a stale cache, not only a short one.** A full Redis list
+  whose newest bar predates the last completed bucket is topped up from that
+  bar, so an outage no longer leaves a hole the bar count cannot see.
+
+- **The runner decides on closes it missed while starting.** It records the
+  newest bar each pair was fed (`qte:decided:*`) and, once subscribed, feeds
+  every newer bar Redis holds: it decides on those that closed within
+  `QTE_RUNNER__CATCH_UP_MAX_AGE` (120 s) and keeps older ones as history only.
+  Restored history is de-duplicated by open time.
+
+- **Ingestion discards candle state another provider wrote.** The writing
+  provider is recorded (`qte:history:provider`). A switch, state with no
+  recorded writer — everything written before this release, discarded once on
+  the first start after upgrading — or bars dated after now from a provider that
+  is not synthetic discards the candle lists, open bars and candle outbox before
+  anything reads them, so simulator bars left in Redis no longer make a Tiingo
+  feed drop every tick. Open positions are not touched.
 
 ## [0.1.0] - 2026-08-24
 
@@ -337,5 +578,5 @@ interfaces may still move.
   token is only enforced on the HTTP path, which is the one to use across any
   boundary you do not control.
 
-[Unreleased]: https://github.com/rockingrow/quant-trading-engine/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/rockingrow/quant-trading-engine/releases/tag/v0.1.0
+[0.1.1]: https://github.com/rockingrow/quant-trading-engine/releases/tag/v0.1.1
+[0.0.1]: https://github.com/rockingrow/quant-trading-engine/releases/tag/v0.0.1

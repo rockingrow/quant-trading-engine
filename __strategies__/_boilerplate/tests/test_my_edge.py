@@ -112,19 +112,50 @@ def test_the_bracket_is_derived_from_atr(
     assert strategy.short(candles, context) is None
 
 
-def test_the_dispatcher_asks_exits_while_holding(
+def test_the_dispatcher_asks_the_exits_and_then_an_entry_while_holding(
     candles: pd.DataFrame, context: StrategyContext, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A held position routes to the exits, and never to an entry.
+    """A held position routes to the exits, and then to an entry as well.
 
-    The rule below would open in both directions; ``open_uxid`` being set is
-    what keeps ``long``/``short`` from ever being asked.
+    Nothing caps how many cycles a pair stacks, so a held bar is asked for one
+    more entry after its exits. This edge declares no exits, so the entry is
+    all that comes back.
     """
     monkeypatch.setattr(MyEdge, "_rule", lambda self, df, *, direction: True)
     strategy = MyEdge({})
     context.open_uxid = "cycle-1"
 
-    assert strategy.on_candle_closed(candles, context) == []
+    produced = strategy.on_candle_closed(candles, context)
+    assert [intent.action for intent in produced] == [SignalAction.LONG]
+
+
+def test_a_holding_pair_keeps_being_asked_for_another_entry(
+    candles: pd.DataFrame, context: StrategyContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """However many cycles are open, the next entry is still asked for."""
+    monkeypatch.setattr(MyEdge, "_rule", lambda self, df, *, direction: direction > 0)
+    strategy = MyEdge({})
+    context.open_uxid = "A000000000000001"
+    context.open_uxids = ("A000000000000001",)
+
+    produced = strategy.on_candle_closed(candles, context)
+    assert [intent.action for intent in produced] == [SignalAction.LONG]
+    assert produced[0].signal_uxid not in context.open_uxids
+
+    context.open_uxids = tuple(f"{letter}000000000000001" for letter in "ABCDEF")
+    context.open_uxid = context.open_uxids[-1]
+    produced = strategy.on_candle_closed(candles, context)
+    assert [intent.action for intent in produced] == [SignalAction.LONG], "no limit stops it"
+
+
+def test_every_entry_carries_its_own_cycle_id(
+    candles: pd.DataFrame, context: StrategyContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(MyEdge, "_rule", lambda self, df, *, direction: direction > 0)
+    strategy = MyEdge({})
+    first, second = strategy.long(candles, context), strategy.long(candles, context)
+    assert first.signal_uxid != second.signal_uxid
+    assert len(first.signal_uxid) == 16 and first.signal_uxid.isupper()
 
 
 def test_the_repo_imports_nothing_from_the_engine() -> None:

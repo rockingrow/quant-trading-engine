@@ -31,6 +31,10 @@ Use plan mode, and confirm the approach, before editing:
 - `src/qte_shared/models.py` and
   `src/qte_shared/strategies/strategy_base.py` — a contract change
   for every private strategy repo, which this repository cannot see.
+- `src/qte_shared/providers/mt5/{protocol,history}.py` — the wire contract with
+  `algo-trading-ingester`: the subjects, the request/reply shape and the
+  accepted `schema_version`. Both sides have to change together, and this
+  repository cannot see the other one either.
 
 ## Session hygiene
 

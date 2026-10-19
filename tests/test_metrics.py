@@ -1,3 +1,5 @@
+"""Realised return and risk metrics, including independent drawdown maxima."""
+
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -97,6 +99,29 @@ def test_drawdown_is_a_percentage_of_the_peak_balance_not_of_the_profit():
     metrics = compute_metrics([_position(100, 1), _position(-50, 2)], starting_equity=1000)
     assert metrics.max_drawdown == pytest.approx(50.0)
     assert metrics.max_drawdown_pct == pytest.approx(4.5455, abs=1e-3)
+
+
+@pytest.mark.parametrize(
+    "starting_equity,profits,cash_drawdown,percent_drawdown",
+    [
+        (100, [-50, 950, -100], 100, 50),
+        (100, [900, -100, -850], 950, 95),
+        (100, [10, 20], 0, 0),
+        (0, [-10, -20], 30, None),
+        (0, [100, -50], 50, 50),
+        (100, [-150], 150, 150),
+    ],
+)
+def test_cash_and_percentage_drawdown_have_independent_maxima(
+    starting_equity, profits, cash_drawdown, percent_drawdown
+):
+    positions = [_position(profit, offset) for offset, profit in enumerate(profits)]
+    metrics = compute_metrics(positions, starting_equity=starting_equity)
+    assert metrics.max_drawdown == pytest.approx(cash_drawdown)
+    if percent_drawdown is None:
+        assert metrics.max_drawdown_pct is None
+    else:
+        assert metrics.max_drawdown_pct == pytest.approx(percent_drawdown)
 
 
 def test_the_same_trades_on_a_bigger_account_are_a_smaller_return():

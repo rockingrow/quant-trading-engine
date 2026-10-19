@@ -1,9 +1,9 @@
 """Turning a strategy's :class:`SignalIntent` into a broker-shaped payload.
 
 Both drivers use this — the backtest replay and the live runner — so a signal
-recorded in a backtest report is byte-identical to the one a worker would have
-executed. That is the whole point: reconciliation compares two rows, not two
-implementations.
+recorded in a backtest report has the same trading fields as a live command.
+Authentication is injected by the delivery sink and omitted from secondary
+records. Reconciliation compares trading data, not credentials.
 
 The factory owns four things a strategy is deliberately not allowed to:
 
@@ -21,8 +21,13 @@ The factory owns four things a strategy is deliberately not allowed to:
   every close it emits is scaled by that ratio.
 * **Timeframe spelling.** QTE says ``M15``; the broker's contract says ``"15"``.
 
-**One cycle per (strategy, symbol) at a time.** The factory refuses a second
-entry while one is open, and it is what decides when a cycle is over:
+**As many cycles per (strategy, symbol) as the strategy fires.** The factory
+caps nothing: every entry opens its own cycle under its own ``signal_uxid``,
+beside whatever is already open. The only entry it still refuses is one that
+reuses the id of a cycle already open, which would merge two trades into one
+record. Every close must name the cycle it closes (an unnamed close is only
+unambiguous while a single cycle is open). The factory is
+also what decides when a cycle is over:
 ``TP2``/``SL``/``R_SL``/``FLAT`` end it outright, and so does a ``TP1`` that
 takes the entry's whole quantity. That state is an
 :class:`~qte_shared.models.OpenPosition`, which the live runner persists to
@@ -35,7 +40,6 @@ from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
 
-from qte_shared.config import settings
 from qte_shared.logging_setup import get_logger
 from qte_shared.models import (
     QUANTITY_EPSILON,
@@ -47,6 +51,7 @@ from qte_shared.models import (
 )
 from qte_shared.strategies.sizing import PositionSizer, resolve_use_equity_sizing
 from qte_shared.strategies.strategy_base import SignalIntent
+from qte_shared.strategies.strategy_settings import PORT_ONLY_PARAMS
 from qte_shared.timeframes import to_broker_timeframe
 
 log = get_logger(__name__)
@@ -94,7 +99,9 @@ class BracketPolicy:
             )
 
         risk = abs(intent.price - intent.sl)
-        if intent.tp1 is None and risk > 0:
+        # A supplied TP2 with no TP1 is an intentional single-target bracket.
+        # Synthesizing a nearer TP1 would close it before the strategy's target.
+        if intent.tp1 is None and intent.tp2 is None and risk > 0:
             intent.tp1 = intent.price + direction * risk * self.tp1_r
         if intent.tp2 is None and risk > 0:
             intent.tp2 = intent.price + direction * risk * self.tp2_r
@@ -123,39 +130,61 @@ class SignalFactory:
     ) -> None:
         self.strategy_name = strategy_name
         self.timeframe = timeframe
-        self.token = token if token is not None else settings.broker.token
+        # Explicit tokens remain supported for broker contract fixtures. Live
+        # credentials belong to the sink and never enter backtest factories.
+        self.token = token or ""
         self.bracket = bracket or BracketPolicy()
-        self.inputs = dict(inputs or {})
+        # Minus the keys that configure the port rather than the edge. A caller
+        # hands over the pair's whole params dict, and `warmup` in there gates
+        # when this engine starts deciding — it says nothing about the trade, so
+        # publishing it would widen the broker contract for no reader.
+        self.inputs = {
+            key: value for key, value in (inputs or {}).items() if key not in PORT_ONLY_PARAMS
+        }
         #: Risk sizing for this pair. Built from ``QTE_ACCOUNT__*`` and the
         #: pair's own params, so the mapping table's ``risk_percent`` is
         #: honoured without every caller having to dig it out.
         self.sizer = sizer or PositionSizer.from_settings(
             self.inputs, risk_percent=self.bracket.risk_percent
         )
-        #: Size for an entry the sizer could not size — no stop, or a stop
-        #: sitting on the entry. ``None`` keeps whatever the strategy proposed.
+        #: Size when sizing inputs are missing. Rejected sizes never fall back.
+        #: ``None`` keeps the strategy proposal, subject to the account ceiling.
         self.default_quantity = default_quantity
         #: What the pair's configuration says about equity sizing, mirrored
         #: onto every payload. It never changes the number above.
         self.use_equity_sizing = resolve_use_equity_sizing(self.inputs)
-        #: symbol → the one cycle we believe is open on it.
-        self._book: dict[str, OpenPosition] = {}
+        #: symbol → {signal_uxid → cycle}, oldest first.
+        self._book: dict[str, dict[str, OpenPosition]] = {}
         #: symbol → sizing scale of an entry built but not yet committed.
         self._pending_scale: dict[str, float] = {}
 
     # ── Cycle bookkeeping ─────────────────────────────────────────────
 
     def open_cycle(self, symbol: str) -> str | None:
-        """Cycle id of the position held on *symbol*, or ``None`` when flat."""
-        position = self._book.get(symbol.upper())
-        return position.signal_uxid if position else None
+        """Cycle id of the most recent position on *symbol*, or ``None`` when flat."""
+        cycles = self.open_cycles(symbol)
+        return cycles[-1] if cycles else None
 
-    def open_position(self, symbol: str) -> OpenPosition | None:
-        """The whole cycle record — what the runner persists and reloads."""
-        return self._book.get(symbol.upper())
+    def open_cycles(self, symbol: str) -> tuple[str, ...]:
+        """Every cycle id open on *symbol*, oldest first."""
+        return tuple(self._book.get(symbol.upper(), {}))
+
+    def open_position(self, symbol: str, signal_uxid: str | None = None) -> OpenPosition | None:
+        """One cycle record — the named one, or the most recent when unnamed."""
+        cycles = self._book.get(symbol.upper(), {})
+        if signal_uxid is not None:
+            return cycles.get(signal_uxid)
+        return next(reversed(cycles.values()), None)
+
+    def positions_for(self, symbol: str) -> list[OpenPosition]:
+        """Every cycle open on *symbol*, oldest first — what the runner persists."""
+        return list(self._book.get(symbol.upper(), {}).values())
 
     def open_positions(self) -> dict[str, OpenPosition]:
-        return dict(self._book)
+        """Every open cycle across every symbol, keyed by ``signal_uxid``."""
+        return {
+            uxid: position for cycles in self._book.values() for uxid, position in cycles.items()
+        }
 
     def restore_cycles(self, cycles: Mapping[str, str]) -> None:
         """Reload bare cycle ids after a restart.
@@ -175,13 +204,23 @@ class SignalFactory:
 
     def restore_position(self, position: OpenPosition, symbol: str | None = None) -> None:
         key = (symbol or position.symbol).upper()
-        self._book[key] = position.model_copy(
+        self._book.setdefault(key, {})[position.signal_uxid] = position.model_copy(
             update={"symbol": key, "strategy": position.strategy or self.strategy_name}
         )
 
-    def forget_cycle(self, symbol: str) -> None:
-        self._book.pop(symbol.upper(), None)
-        self._pending_scale.pop(symbol.upper(), None)
+    def forget_cycle(self, symbol: str, signal_uxid: str | None = None) -> None:
+        """Drop one cycle, or every cycle on *symbol* when none is named."""
+        key = symbol.upper()
+        if signal_uxid is None:
+            self._book.pop(key, None)
+            self._pending_scale.pop(key, None)
+            return
+        cycles = self._book.get(key)
+        if cycles is None:
+            return
+        cycles.pop(signal_uxid, None)
+        if not cycles:
+            self._book.pop(key, None)
 
     def commit(self, signal: BrokerSignal, *, delivery_id: str | None = None) -> None:
         """Apply the cycle transition represented by a delivered signal.
@@ -199,13 +238,13 @@ class SignalFactory:
         action = block.action
 
         if action.is_entry:
-            existing = self._book.get(symbol)
-            if existing is not None and existing.signal_uxid == signal.signal_uxid:
+            cycles = self._book.setdefault(symbol, {})
+            if signal.signal_uxid in cycles:
                 # Recovery may replay an outbox entry after its position state
                 # was already committed but before the audit row was marked.
                 # Never reset that cycle's remaining size back to the entry.
                 return
-            self._book[symbol] = OpenPosition(
+            cycles[signal.signal_uxid] = OpenPosition(
                 signal_uxid=signal.signal_uxid,
                 strategy=signal.strategy,
                 symbol=symbol,
@@ -230,17 +269,15 @@ class SignalFactory:
             )
             return
 
-        position = self._book.get(symbol)
+        # Looked up by id, so a delayed close for an older cycle can never
+        # touch a newer position on the same strategy and symbol.
+        position = self._book.get(symbol, {}).get(signal.signal_uxid)
         if position is None:
-            return
-        # Do not let a delayed close for an older cycle erase a newer position
-        # that happens to use the same strategy and symbol.
-        if position.signal_uxid != signal.signal_uxid:
             return
         if delivery_id and delivery_id in position.applied_delivery_ids:
             return
         if position.apply_close(action, block.quantity):
-            self._book.pop(symbol, None)
+            self.forget_cycle(symbol, signal.signal_uxid)
         elif delivery_id:
             position.applied_delivery_ids.append(delivery_id)
 
@@ -277,7 +314,11 @@ class SignalFactory:
         cannot act on — an entry with no size, a close with no cycle to close.
         Failing here keeps a malformed signal off the wire entirely.
         """
-        target_symbol = (intent.symbol or symbol).upper()
+        target_symbol = symbol.upper()
+        if intent.symbol is not None and intent.symbol.upper() != target_symbol:
+            raise ValueError(
+                f"Intent symbol {intent.symbol!r} differs from slot symbol {target_symbol!r}"
+            )
         if intent.action.is_entry:
             uxid = self._prepare_entry(intent, target_symbol)
         else:
@@ -305,11 +346,10 @@ class SignalFactory:
     # ── Entries ───────────────────────────────────────────────────────
 
     def _prepare_entry(self, intent: SignalIntent, symbol: str) -> str:
-        existing = self._book.get(symbol)
-        if existing is not None:
+        cycles = self._book.get(symbol, {})
+        if intent.signal_uxid is not None and intent.signal_uxid in cycles:
             raise ValueError(
-                f"{intent.action.value} for {symbol} would replace open cycle "
-                f"{existing.signal_uxid} — close the current position before opening another"
+                f"{intent.action.value} for {symbol} reuses open cycle id {intent.signal_uxid}"
             )
         self.bracket.apply(intent)
         if intent.risk_percent is None:
@@ -336,6 +376,9 @@ class SignalFactory:
         if sized is None:
             if proposed is None and self.default_quantity is not None:
                 intent.quantity = self.default_quantity
+            if intent.quantity is not None:
+                intent.quantity = self.sizer.limit_quantity(intent.quantity)
+                self._pending_scale[symbol] = intent.quantity / proposed if proposed else 1.0
             log.debug(
                 "Entry for %s could not be risk-sized (price=%s sl=%s); keeping quantity=%s",
                 symbol,
@@ -351,7 +394,16 @@ class SignalFactory:
     # ── Closes ────────────────────────────────────────────────────────
 
     def _prepare_close(self, intent: SignalIntent, symbol: str) -> str:
-        position = self._book.get(symbol)
+        cycles = self._book.get(symbol, {})
+        if intent.signal_uxid is not None:
+            position = cycles.get(intent.signal_uxid)
+        elif len(cycles) > 1:
+            raise ValueError(
+                f"{intent.action.value} for {symbol} names no cycle while {len(cycles)} are "
+                f"open ({', '.join(cycles)}) — set signal_uxid on the close"
+            )
+        else:
+            position = next(iter(cycles.values()), None)
         uxid = intent.signal_uxid or (position.signal_uxid if position else None)
         if uxid is None:
             raise ValueError(

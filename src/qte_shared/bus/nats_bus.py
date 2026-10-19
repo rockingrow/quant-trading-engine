@@ -5,6 +5,11 @@ replaced by a fresher one a moment later, so paying JetStream's persistence
 cost for it would buy nothing. Signals are the opposite — losing one loses a
 trade — and those go out over JetStream, which is why :meth:`publish_jetstream`
 exists alongside :meth:`publish`.
+
+Every connection is authenticated: NATS is reached from other machines —
+over the tailnet or a published port — rather than only over a compose-private
+network, so :meth:`connect` refuses an empty token instead of falling back to
+anonymous access.
 """
 
 from __future__ import annotations
@@ -15,6 +20,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 import nats
+from nats import errors as nats_errors
 from nats.aio.client import Client as NATSClient
 from nats.aio.msg import Msg
 from nats.js import JetStreamContext
@@ -43,6 +49,11 @@ class NatsBus:
         self._nc: NATSClient | None = None
         self._js: JetStreamContext | None = None
         self._subscriptions: list[Any] = []
+        # Set while closing on purpose, so the drain's own disconnect callback
+        # is not logged as an outage.
+        self._closing = False
+        #: Called after every re-established connection, in registration order.
+        self._reconnect_hooks: list[Callable[[], Awaitable[None]]] = []
 
     # ── Lifecycle ─────────────────────────────────────────────────────
 
@@ -66,18 +77,27 @@ class NatsBus:
     async def connect(self) -> None:
         if self.is_connected:
             return
+        # Token authentication is mandatory. The bus is reached from other
+        # machines, over the tailnet or a published port, so an anonymous
+        # connection is not a local-development convenience any more. Refuse
+        # before dialling rather than trust a server that allows it.
+        if not self._token:
+            raise RuntimeError(
+                f"NATS at {self._url} requires a token — set QTE_NATS__TOKEN "
+                "(or ALGO_BROKER__NATS_TOKEN for the broker's own cluster)"
+            )
         options: dict[str, Any] = {
             "servers": [self._url],
             "name": self._name,
             "connect_timeout": settings.nats.connect_timeout,
             "max_reconnect_attempts": settings.nats.max_reconnect_attempts,
             "reconnect_time_wait": settings.nats.reconnect_time_wait,
+            "drain_timeout": settings.nats.drain_timeout,
             "disconnected_cb": self._on_disconnected,
             "reconnected_cb": self._on_reconnected,
             "error_cb": self._on_error,
         }
-        if self._token:
-            options["token"] = self._token
+        options["token"] = self._token
 
         # nats-py applies ``max_reconnect_attempts`` to the *initial* connect as
         # well, so -1 (retry forever once we are up, which is what we want for a
@@ -99,6 +119,7 @@ class NatsBus:
     async def close(self) -> None:
         if self._nc is None:
             return
+        self._closing = True
         try:
             # Drain rather than close: in-flight publishes and queued messages
             # for our subscriptions get flushed instead of dropped on shutdown.
@@ -110,15 +131,45 @@ class NatsBus:
             self._nc = None
             self._js = None
             self._subscriptions.clear()
+            self._closing = False
             log.info("NATS closed name=%s", self._name)
 
     async def _on_disconnected(self) -> None:
+        if self._closing:
+            return
         log.warning("NATS disconnected name=%s", self._name)
+
+    def on_reconnect(self, hook: Callable[[], Awaitable[None]]) -> None:
+        """Run *hook* each time the connection comes back after a drop.
+
+        Core NATS delivers nothing published while a subscriber was away, so
+        whoever depends on hearing something says here what to do about the
+        part it may have missed.
+        """
+        self._reconnect_hooks.append(hook)
 
     async def _on_reconnected(self) -> None:
         log.info("NATS reconnected name=%s url=%s", self._name, self._url)
+        for hook in self._reconnect_hooks:
+            try:
+                await hook()
+            except Exception:
+                # One hook failing must not cost the others, nor nats-py its callback.
+                log.exception("A reconnect hook failed name=%s", self._name)
 
     async def _on_error(self, exc: Exception) -> None:
+        # nats-py reports a drain that ran out of time through the error
+        # callback and then closes the connection anyway, so during our own
+        # shutdown it describes a slow close, not an outage. Logging it at
+        # ERROR paged the operator every time a subscription was slow to
+        # drain; the close itself is still logged right after.
+        if self._closing and isinstance(exc, nats_errors.DrainTimeoutError):
+            log.warning(
+                "NATS drain timed out after %.1fs name=%s — closing anyway",
+                settings.nats.drain_timeout,
+                self._name,
+            )
+            return
         log.error("NATS error name=%s: %s", self._name, exc)
 
     # ── Publish ───────────────────────────────────────────────────────

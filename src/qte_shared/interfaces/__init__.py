@@ -13,6 +13,8 @@ from __future__ import annotations
 from qte_shared.interfaces.market_data import (
     OHLCV_COLUMNS,
     Capability,
+    HistoryNotServed,
+    HistoryOffline,
     HistoryRequest,
     HistorySource,
     LiveFeed,
@@ -23,6 +25,7 @@ from qte_shared.interfaces.market_data import (
     TickHandler,
     UnknownProvider,
     UnsupportedCapability,
+    drop_unfinished_bars,
     empty_ohlcv_frame,
     normalize_ohlcv,
 )
@@ -30,6 +33,8 @@ from qte_shared.interfaces.market_data import (
 __all__ = [
     "OHLCV_COLUMNS",
     "Capability",
+    "HistoryNotServed",
+    "HistoryOffline",
     "HistoryRequest",
     "HistorySource",
     "LiveFeed",
@@ -40,6 +45,7 @@ __all__ = [
     "TickHandler",
     "UnknownProvider",
     "UnsupportedCapability",
+    "drop_unfinished_bars",
     "empty_ohlcv_frame",
     "normalize_ohlcv",
 ]

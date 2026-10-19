@@ -154,3 +154,52 @@ def test_restore_still_resumes_a_bar_that_was_genuinely_open():
     fresh.restore(in_progress)
     resumed = fresh.open_candle("M1")
     assert resumed is not None and resumed.open_time == START
+
+
+# ── Partial bars ──────────────────────────────────────────────────────────
+#
+# A bar is partial when this process was not listening for the whole of its
+# bucket. It still closes on the clock; the flag is what lets ingestion complete
+# it from vendor history before a strategy decides on it.
+
+
+def test_the_bucket_joined_late_closes_partial_and_says_so_once():
+    resampler = Resampler("XAUUSD", ["M1"])
+    resampler.mark_joined(START + timedelta(seconds=25))
+    resampler.add_tick(_tick(30, 2000.0))
+
+    closed = resampler.flush(START + timedelta(minutes=1))
+
+    assert resampler.take_partial(closed[0]) is True
+    assert resampler.take_partial(closed[0]) is False, "the flag is collected once"
+
+
+def test_a_bucket_that_opened_after_joining_is_whole():
+    resampler = Resampler("XAUUSD", ["M1"])
+    resampler.mark_joined(START + timedelta(seconds=25))
+    resampler.add_tick(_tick(30, 2000.0))
+    first_close = resampler.add_tick(_tick(61, 2001.0))
+    second_close = resampler.flush(START + timedelta(minutes=2))
+
+    assert resampler.take_partial(first_close[0]) is True
+    assert resampler.take_partial(second_close[0]) is False
+
+
+def test_a_restored_bar_is_partial_whatever_the_join_time():
+    before_restart = Resampler("XAUUSD", ["M1"])
+    before_restart.add_tick(_tick(5, 2000.0))
+    in_progress = before_restart.open_candle("M1")
+    assert in_progress is not None
+
+    revived = Resampler("XAUUSD", ["M1"])
+    revived.restore(in_progress)
+    closed = revived.flush(START + timedelta(minutes=1))
+
+    assert revived.take_partial(closed[0]) is True
+
+
+def test_without_a_join_time_nothing_is_ever_partial():
+    resampler = Resampler("XAUUSD", ["M1"])
+    resampler.add_tick(_tick(30, 2000.0))
+    closed = resampler.flush(START + timedelta(minutes=1))
+    assert resampler.take_partial(closed[0]) is False

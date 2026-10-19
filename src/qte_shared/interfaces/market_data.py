@@ -5,7 +5,10 @@ QTE asks a vendor for exactly two things:
 * **history** -- completed OHLCV bars for a symbol/timeframe/date range, used
   by the backtest engine (:class:`HistorySource`);
 * **live** -- a stream of :class:`~qte_shared.models.Tick` objects, used by
-  ingestion (:class:`LiveFeed`).
+  ingestion (:class:`LiveFeed`). A vendor that already resamples -- the MT5
+  ingester publishes closed bars, not ticks -- streams
+  :class:`~qte_shared.models.Candle` objects instead
+  (:attr:`Capability.LIVE_BARS`), and ingestion skips its own resampler.
 
 A vendor is represented by one :class:`MarketDataProvider` -- a *factory* that
 knows its own credentials, endpoints and ticker spelling, and hands back those
@@ -23,7 +26,7 @@ import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 from enum import Enum
 from typing import Any, ClassVar
 
@@ -33,12 +36,51 @@ from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, Settings
 
 from qte_shared.config import REPO_ROOT
 from qte_shared.indicators import OHLCV_COLUMNS
-from qte_shared.models import Tick
+from qte_shared.market_data_plan import SymbolFeed
+from qte_shared.models import Candle, Tick
 from qte_shared.symbols import Market, SymbolSpec
 from qte_shared.timeframes import normalize_timeframe, timeframe_seconds
 
 #: Called once per parsed tick. Async because every sink downstream is.
 TickHandler = Callable[[Tick], Awaitable[None]]
+
+#: Called once per bar a vendor has already closed. Async for the same reason.
+CandleHandler = Callable[[Candle], Awaitable[None]]
+
+
+@dataclass(frozen=True, slots=True)
+class WarmupBatch:
+    """Where one replayed bar sits in the batch it belongs to.
+
+    A vendor that can replay its own history into QTE's indicator window sends
+    that window as a batch of bars rather than as one request, so the receiver
+    has to know when the batch is whole: it buffers the bars and writes them in
+    one transaction, because merging each one separately rewrites the whole
+    stored window once per bar.
+
+    *index* is 1-based, which is the ingester's convention on the wire and keeps
+    "bar 7 of 150" readable in a log line.
+    """
+
+    index: int
+    total: int
+
+    @property
+    def is_last(self) -> bool:
+        """Whether this bar completes the batch.
+
+        ``>=`` rather than ``==``: a batch whose counters disagree must still be
+        written, because the alternative is a window that waits in memory for a
+        bar that never comes.
+        """
+        return self.index >= self.total
+
+
+#: Called once per bar a vendor is replaying as warm-up history rather than
+#: publishing as a close. Separate from :data:`CandleHandler` because the two
+#: are not the same event: a warm-up bar carries no decision and must not be
+#: staged or published, only merged into the stored window.
+WarmupBarHandler = Callable[[Candle, WarmupBatch], Awaitable[None]]
 
 
 class Capability(str, Enum):
@@ -49,7 +91,17 @@ class Capability(str, Enum):
     """
 
     HISTORY = "history"
+    #: The newest bars of a series, on request: enough to fill an indicator
+    #: window at boot, and not an archive. Kept apart from :attr:`HISTORY` so a
+    #: backtest download still refuses a vendor that can only say what happened
+    #: lately — a date range it answers with whatever recent bars it has would
+    #: be a silently short file.
+    RECENT_BARS = "recent_bars"
+    #: A live stream of ticks, resampled into bars by ingestion.
     LIVE = "live"
+    #: A live stream of bars the vendor already closed. Nothing is resampled:
+    #: each bar goes to Redis and the candle subject as it arrives.
+    LIVE_BARS = "live_bars"
 
 
 # -- Errors ----------------------------------------------------------------
@@ -71,6 +123,24 @@ class UnsupportedCapability(ProviderError):
     """Raised when a provider is asked for something it does not serve."""
 
 
+class HistoryOffline(ProviderError):
+    """Nobody is there to answer a history request.
+
+    Not an error to retry on a timer: the vendor is another process and it is
+    not connected. A caller waits for it to announce itself
+    (:meth:`HistorySource.watch_online`) and asks then.
+    """
+
+
+class HistoryNotServed(ProviderError):
+    """The vendor answered a history request, and the answer is a final no.
+
+    A symbol it does not carry, a request it cannot read. Distinct from every
+    other :class:`ProviderError` on a fetch, which may be an outage: this one
+    is not worth asking again, so a caller that retries stops here.
+    """
+
+
 # -- Configuration ---------------------------------------------------------
 
 
@@ -86,7 +156,7 @@ class ProviderSettings(BaseSettings):
     * the **key** in ``.env`` as ``QTE_DATA_PROVIDER_API_KEY`` -- one name for
       whichever vendor is switched on, because a secret is the one thing that
       must not move file when the vendor changes;
-    * the **knobs** in ``[provider]`` of ``config/<provider>.toml``, beside the
+    * the **knobs** in ``[provider]`` of ``config/data_providers/<provider>.toml``, beside the
       symbols they are fetched for (:mod:`qte_shared.market_data_plan`).
 
     Environment still wins over the file, so ``QTE_TIINGO__MAX_ROWS_PER_REQUEST``
@@ -108,6 +178,10 @@ class ProviderSettings(BaseSettings):
     #: in, and a rename of the vendor should not invalidate a deployed secret.
     api_key: str = Field(default="", validation_alias="QTE_DATA_PROVIDER_API_KEY")
 
+    #: The registry name whose plan (``config/<provider_name>.toml``) supplies
+    #: ``[provider]``. With several providers configured, each reads its own.
+    provider_name: ClassVar[str] = ""
+
     @classmethod
     def settings_customise_sources(
         cls,
@@ -128,7 +202,7 @@ class ProviderSettings(BaseSettings):
 
 
 class _MarketDataPlanOptions(PydanticBaseSettingsSource):
-    """``[provider]`` from ``config/<provider>.toml``, as a settings source.
+    """``[provider]`` from the owning provider's plan, as a settings source.
 
     Generic on purpose: whatever a vendor's settings class declares can be
     written in that table, so a second vendor needs no wiring of its own here.
@@ -140,9 +214,12 @@ class _MarketDataPlanOptions(PydanticBaseSettingsSource):
         return None, field_name, False  # pragma: no cover
 
     def __call__(self) -> dict[str, Any]:
-        from qte_shared.config import market_data_plan
+        from qte_shared.config import market_data_plan, provider_market_data_plan
 
-        return dict(market_data_plan().options)
+        provider_name = getattr(self.settings_cls, "provider_name", "")
+        if not provider_name:
+            return dict(market_data_plan().options)
+        return dict(provider_market_data_plan(provider_name).options)
 
 
 # -- Values on the wire ----------------------------------------------------
@@ -180,6 +257,34 @@ class HistoryRequest:
 class HistorySource(ABC):
     """Completed bars, already shaped the way the rest of QTE reads them."""
 
+    #: Whether a fetch may be answered from, and written to, the parquet history
+    #: cache. False for a source that only ever serves "the newest bars": what
+    #: it returns for a date range changes by the minute, and a file of it
+    #: would shadow the archive a backtest reads from the same path.
+    cacheable: ClassVar[bool] = True
+
+    @property
+    def max_bars(self) -> int | None:
+        """The most bars one fetch returns, or ``None`` when a range decides.
+
+        A caller sizing a window reads this as the ceiling: asking a source
+        that serves 500 bars to fill 6000 would leave it "short" forever.
+        """
+        return None
+
+    async def watch_online(self, on_online: Callable[[], Awaitable[None]]) -> bool:
+        """Call *on_online* whenever the vendor says it has (re)connected.
+
+        Only a source whose vendor is another process has anything to watch;
+        the default says so by returning False. True means the watch is in
+        place and :meth:`close` ends it.
+        """
+        return False
+
+    async def close(self) -> None:
+        """Release whatever :meth:`watch_online` opened. Idempotent."""
+        return None
+
     @abstractmethod
     async def fetch(self, request: HistoryRequest) -> pd.DataFrame:
         """Return the canonical OHLCV frame for *request*.
@@ -188,6 +293,10 @@ class HistorySource(ABC):
         :data:`~qte_shared.indicators.OHLCV_COLUMNS`. Build it with
         :func:`normalize_ohlcv` rather than by hand, and return an empty frame
         -- not ``None`` -- when the vendor has nothing for that range.
+
+        Only bars whose bucket has ended belong in it. A vendor that also
+        answers with the bucket still forming must pass the frame through
+        :func:`drop_unfinished_bars` first.
         """
 
     def supports_timeframe(self, timeframe: str) -> bool:
@@ -245,6 +354,10 @@ class MarketDataProvider(ABC):  # noqa: B024
     capabilities: ClassVar[frozenset[Capability]] = frozenset()
     #: Markets the vendor quotes; symbols on any other market are dropped.
     markets: ClassVar[tuple[Market, ...]] = ("fx", "crypto")
+    #: Whether the prices are invented rather than quoted. A synthetic feed may
+    #: stamp bars ahead of the wall clock on purpose, so the checks that treat a
+    #: future-dated bar as corrupt state do not apply to it.
+    synthetic: ClassVar[bool] = False
 
     def supports(self, capability: Capability) -> bool:
         return capability in self.capabilities
@@ -264,6 +377,25 @@ class MarketDataProvider(ABC):  # noqa: B024
     def live_feeds(self, specs: list[SymbolSpec], on_tick: TickHandler) -> list[LiveFeed]:
         """One or more feeds covering *specs*; empty when none of them apply."""
         raise UnsupportedCapability(f"{self.name!r} does not serve a live feed")
+
+    def bar_feeds(
+        self,
+        subscriptions: list[SymbolFeed],
+        on_bar: CandleHandler,
+        on_warmup: WarmupBarHandler | None = None,
+    ) -> list[LiveFeed]:
+        """Feeds of closed bars covering *subscriptions*; empty when none apply.
+
+        Takes whole subscriptions rather than specs because a bar feed has to
+        know the timeframes as well: the vendor decides which bars close, and
+        the feed drops the series nobody planned.
+
+        *on_warmup* receives the bars a vendor replays to fill the indicator
+        window, which are history rather than closes. It is optional so that a
+        provider which never replays, and a caller that does not want the
+        window warmed, both stay unchanged: left out, such bars are dropped.
+        """
+        raise UnsupportedCapability(f"{self.name!r} does not serve a live bar feed")
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         served = ",".join(sorted(capability.value for capability in self.capabilities))
@@ -309,3 +441,25 @@ def normalize_ohlcv(rows: list[dict[str, Any]], timeframe: str) -> pd.DataFrame:
     frame.attrs["timeframe"] = normalize_timeframe(timeframe)
     frame.attrs["timeframe_seconds"] = timeframe_seconds(timeframe)
     return frame
+
+
+def drop_unfinished_bars(
+    history: pd.DataFrame, timeframe: str, moment: datetime | None = None
+) -> pd.DataFrame:
+    """Only the bars whose bucket had ended by *moment* (default: now).
+
+    An intraday endpoint asked for "up to today" answers with the bucket that is
+    still forming, and nothing in the row says so. Stored as closed, that
+    snapshot becomes the newest bar a strategy decides on, and the live close
+    for the same bucket is then rejected as a duplicate of it. Bars are keyed by
+    open time, so one is finished once its open time plus a timeframe has passed.
+    """
+    if history.empty:
+        return history
+    cutoff = pd.Timestamp(moment or datetime.now(UTC))
+    if cutoff.tzinfo is None:
+        cutoff = cutoff.tz_localize("UTC")
+    duration = pd.Timedelta(seconds=timeframe_seconds(timeframe))
+    finished = history[history.index + duration <= cutoff]
+    finished.attrs.update(history.attrs)
+    return finished

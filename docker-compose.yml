@@ -1,33 +1,69 @@
 # QTE local/VPS stack.
 #
-# The schema is NOT created by this file. Run `make db-upgrade` after the first
-# `up` — Alembic owns the schema, and an init-hook script would only ever run on
-# an empty volume, which is precisely the case a migration tool exists to
-# outgrow.
+# The db-migrate one-shot applies the Alembic chain before the app services
+# start. No separate schema command or database init-hook is needed.
 #
-# `nats` here is for standalone development. In production you normally point
-# QTE_BROKER__NATS_URL at the *broker's* NATS, because that is where the
-# JetStream `SIGNALS` stream its workers consume actually lives — publishing to
-# a second cluster would mean nobody ever receives the signals. Run this one
-# either way for QTE's own candle traffic, or set QTE_NATS__URL to the broker's
-# cluster and drop this service.
+# `nats` here serves QTE's own candle traffic. The containers dial it by its
+# compose service name; host processes use the published port (QTE_NATS_PORT),
+# which is what QTE_NATS__URL in .env points at. The MT5 ingester on another
+# machine reaches it one of two ways, chosen by TAILSCALE_ENABLED in .env:
+#   false → this host's address and QTE_NATS_PORT, with QTE_NATS__TOKEN;
+#   true  → nats://<TAILSCALE_HOSTNAME>:4222 over the tailnet, through the
+#           `tailscale` service below — the published port is then bound to
+#           127.0.0.1 and the tailnet is the only way in from another machine.
+#
+# In production you normally point ALGO_BROKER__NATS_URL at the *broker's* NATS,
+# because that is where the JetStream `SIGNALS` stream its workers consume
+# actually lives — publishing to a second cluster would mean nobody ever
+# receives the signals. Run this one either way, or set QTE_NATS__URL to the
+# broker's cluster and drop this service.
 
-name: qte
+name: qte-${QTE_ENV:-dev}-${QTE_STATE__MODE:-shadow}-${QTE_STATE__PROVIDER_KEY:-${QTE_MARKET_DATA__PROVIDER:-mt5}}
 
 # Container-side network URLs. .env carries the host-side ones (127.0.0.1) so
-# `make ingestion` / alembic / qte-simulator on the host work out of the box;
+# alembic / qte-simulator / qte-backtest on the host work out of the box;
 # these overrides swap them for the compose service names once the process is
 # inside the network. `environment:` wins over `env_file:` in compose, so the
-# same .env drives both worlds.
+# same .env drives both worlds, NATS included: .env carries the host-side
+# address, the containers use the `nats` service. Same server, same token.
 x-container-envs: &container-envs
+  QTE_ENV: ${QTE_ENV:-dev}
+  QTE_STATE__MODE: ${QTE_STATE__MODE:-shadow}
+  QTE_MARKET_DATA__PROVIDER: ${QTE_MARKET_DATA__PROVIDER:-mt5}
+  # Checked against the provider list at start-up: the volumes this stack
+  # mounts are named with it, so a stale key would mount another set's state.
+  QTE_STATE__PROVIDER_KEY: ${QTE_STATE__PROVIDER_KEY:-}
   QTE_NATS__URL: nats://nats:4222
   QTE_REDIS__URL: redis://redis-cache:6379/0
-  QTE_POSTGRES__DSN: postgresql+asyncpg://qte:qte@postgres-audit:5432/qte_audit
+  # Empty DSN selects URL-encoded components shared with postgres-audit.
+  # A separate explicit DSN permits an external/container database without
+  # accidentally reusing the host-side localhost URL from .env.
+  QTE_POSTGRES__DSN: ${QTE_CONTAINER_POSTGRES_DSN:-}
+  QTE_POSTGRES__HOSTNAME: postgres-audit
+  QTE_POSTGRES__PORT_NUMBER: "5432"
+  QTE_POSTGRES__USERNAME: ${POSTGRES_USER:-qte}
+  QTE_POSTGRES__PASSWORD: ${POSTGRES_PASSWORD:-qte}
+  QTE_POSTGRES__DATABASE: ${POSTGRES_DB:-qte_audit}
   QTE_SIMULATOR__URL: ws://market-simulator:8901/stream
+  # The broker's NATS is a separate stack, and .env carries the host-side
+  # address, which inside a container is the container itself. Two routes:
+  #   - TAILSCALE_ENABLED=true: the Makefile sets TAILNET_BROKER_NATS_URL to
+  #     the `broker-nats-relay` service below, which carries the connection
+  #     across the tailnet to nats://<TAILSCALE_BROKER_HOSTNAME>:4222. It wins
+  #     over everything else: a broker that is on the tailnet publishes its
+  #     NATS on its own 127.0.0.1 only.
+  #   - otherwise the broker's published port on the Docker host, through
+  #     host.docker.internal; set ALGO_CONTAINER_BROKER_NATS_URL to override
+  #     (another host, a non-default port, or nats://nats:4222 when the broker
+  #     is this stack's own NATS).
+  ALGO_BROKER__NATS_URL: ${TAILNET_BROKER_NATS_URL:-${ALGO_CONTAINER_BROKER_NATS_URL:-nats://host.docker.internal:4222}}
 
 x-app: &app
   env_file: [.env]
   environment: *container-envs
+  # host-gateway makes host.docker.internal resolve on Linux VPS hosts too;
+  # Docker Desktop already provides it.
+  extra_hosts: ["host.docker.internal:host-gateway"]
   restart: unless-stopped
   volumes:
     # The private strategy repo, mounted read-only: the engine loads it and
@@ -39,6 +75,11 @@ x-app: &app
     - ./config:/app/config:ro
     - ./data/parquet:/app/data/parquet
     - ./data/reports:/app/data/reports
+    # Each service's daily log file, on the host: `docker logs` keeps only what
+    # the current container wrote, so a recreate would otherwise take the
+    # history of every decision with it. One file per service per day
+    # (QTE_LOG_DIR), writable because both services append to their own.
+    - ./logs:/app/logs
   depends_on:
     redis-cache: {condition: service_healthy}
     postgres-audit: {condition: service_healthy}
@@ -50,13 +91,16 @@ x-app: &app
 services:
   redis-cache:
     image: redis:7-alpine
+    restart: unless-stopped
     # AOF on: hot state (open cycles, the warm-up window) has to survive a
     # restart, and losing the cycle id of an open position means the engine
     # forgets which trade it is in.
     command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
     volumes:
       - redis-data:/data
-    ports: ["${QTE_REDIS_PORT:-6379}:6379"]
+    # PRIVATE_BIND_ADDRESS is set by the Makefile from TAILSCALE_ENABLED — see
+    # the `nats` ports below. Redis is never forwarded onto the tailnet.
+    ports: ["${PRIVATE_BIND_ADDRESS:-0.0.0.0}:${QTE_REDIS_PORT:-6379}:6379"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -65,28 +109,104 @@ services:
 
   postgres-audit:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-qte}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-qte}
       POSTGRES_DB: ${POSTGRES_DB:-qte_audit}
     volumes:
       - postgres-data:/var/lib/postgresql/data
-    ports: ["${QTE_POSTGRES_PORT:-5432}:5432"]
+    ports: ["${PRIVATE_BIND_ADDRESS:-0.0.0.0}:${QTE_POSTGRES_PORT:-5432}:5432"]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-qte} -d ${POSTGRES_DB:-qte_audit}"]
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
       interval: 5s
       timeout: 3s
       retries: 10
 
   nats:
     image: nats:2-alpine
+    restart: unless-stopped
     command: ["-c", "/etc/nats/nats.conf"]
+    # nats.conf reads the token from the environment, so the server and every
+    # client authenticate with the same .env value. `:?` fails the whole stack
+    # here rather than starting a bus nothing is allowed to publish to.
+    environment:
+      QTE_NATS__TOKEN: ${QTE_NATS__TOKEN:?QTE_NATS__TOKEN is required — NATS refuses anonymous access}
     volumes:
       - ./config/nats.conf:/etc/nats/nats.conf:ro
       - nats-data:/data
     ports:
-      - "${QTE_NATS_PORT:-4222}:4222"
-      - "${QTE_NATS_MONITOR_PORT:-8222}:8222"
+      # Inside the stack NATS always listens on 4222/8222; QTE_NATS_PORT and
+      # QTE_NATS_MONITOR_PORT only move the host side. PRIVATE_BIND_ADDRESS
+      # comes from the Makefile: 0.0.0.0 with Tailscale off (the ingester
+      # dials this host's address), 127.0.0.1 with it on (remote clients come
+      # in through the `tailscale` service instead). A bare `docker compose
+      # up` falls back to 0.0.0.0.
+      - "${PRIVATE_BIND_ADDRESS:-0.0.0.0}:${QTE_NATS_PORT:-4222}:4222"
+      - "${PRIVATE_BIND_ADDRESS:-0.0.0.0}:${QTE_NATS_MONITOR_PORT:-8222}:8222"
+
+  # ─────────────────────────────────────────────────────────────────
+  # TAILSCALE — this stack's own node on the tailnet (profile `tailscale`,
+  # enabled by the Makefile only when .env sets TAILSCALE_ENABLED=true).
+  # Nothing is installed on the host. Same container, same userspace mode as
+  # algo-trading-broker's, which owns the tailnet policy for the whole
+  # deployment (its config/tailscale/policy.hujson).
+  #
+  # Inbound: the node joins the tailnet as TAILSCALE_HOSTNAME and, through
+  # Tailscale Serve (config/tailscale/serve.json), forwards its tailnet ports
+  # 4222/8222/5432 to nats and postgres-audit. The MT5 ingester therefore
+  # reaches this engine at nats://<TAILSCALE_HOSTNAME>:4222; the policy lets
+  # tag:ingester reach port 4222 and nothing else.
+  #
+  # Outbound: userspace networking routes nothing for the other containers,
+  # so the node also runs Tailscale's SOCKS5 proxy (on the compose network
+  # only, never published) and `broker-nats-relay` turns it into a plain TCP
+  # port the runner's NATS client can dial.
+  #
+  # Userspace networking: no /dev/net/tun and no NET_ADMIN, and every other
+  # service keeps its own network namespace, so restarting this container
+  # only drops tailnet connections until they reconnect.
+  # ─────────────────────────────────────────────────────────────────
+  tailscale:
+    image: tailscale/tailscale:stable
+    profiles: ["tailscale"]
+    restart: unless-stopped
+    environment:
+      # Needed only for the first login: the node's identity is kept in the
+      # tailscale-data volume, and TS_AUTH_ONCE stops a restart from logging
+      # in again with a single-use key that has already been spent.
+      TS_AUTHKEY: ${TAILSCALE_AUTHKEY:-}
+      TS_AUTH_ONCE: "true"
+      TS_HOSTNAME: ${TAILSCALE_HOSTNAME:-qte-engine}
+      # Must be a tag the auth key may apply (the broker's policy.hujson →
+      # tagOwners); tag:engine is what the policy grants the broker's 4222.
+      TS_EXTRA_ARGS: --advertise-tags=tag:engine
+      TS_STATE_DIR: /var/lib/tailscale
+      # The directory is watched, not just the file: editing serve.json is
+      # applied live, without restarting the container.
+      TS_SERVE_CONFIG: /config/serve.json
+      # For broker-nats-relay. tailscaled resolves tailnet names itself, which
+      # a container's own DNS cannot.
+      TS_SOCKS5_SERVER: ":1055"
+    volumes:
+      - tailscale-data:/var/lib/tailscale
+      - ./config/tailscale:/config:ro
+
+  # Signals to the broker's NATS over the tailnet (profile `tailscale`). A
+  # plain TCP port on the compose network, relayed through the `tailscale`
+  # node's SOCKS5 proxy to nats://<TAILSCALE_BROKER_HOSTNAME>:4222 — the port
+  # the broker's own Serve config forwards. NATS clients cannot speak SOCKS,
+  # hence this hop. One connection in, one out: the NATS protocol, the token
+  # and the runner's reconnect behaviour pass through untouched.
+  broker-nats-relay:
+    image: alpine/socat:1.8.1.3
+    profiles: ["tailscale"]
+    restart: unless-stopped
+    depends_on:
+      tailscale: {condition: service_started}
+    command:
+      - TCP-LISTEN:4222,fork,reuseaddr
+      - SOCKS5-CONNECT:tailscale:1055:${TAILSCALE_BROKER_HOSTNAME:-algo-trading-broker}:4222
 
   # One-shot: `alembic upgrade head` against postgres-audit, then exit 0.
   # App services `depends_on` this with condition: service_completed_successfully,
@@ -97,6 +217,11 @@ services:
   db-migrate:
     env_file: [.env]
     environment: *container-envs
+    # env.py imports qte_shared.config, which validates QTE_ENGINE__* against
+    # the market-data plan. Without the plan the defaults are M15 only, and
+    # QTE_ENGINE__SIGNAL_TIMEFRAME=M1 is rejected before Alembic runs.
+    volumes:
+      - ./config:/app/config:ro
     build:
       context: .
       dockerfile: Dockerfile
@@ -114,7 +239,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      # The vendor client and the dev simulator's socket, nothing else. No
+      # The Tiingo client and the dev simulator's socket, nothing else. The MT5
+      # and Binance providers need no extra (nats-py is a core dependency). No
       # pyarrow: the boot-time warm-up cache degrades to "no cache" without it.
       args: {QTE_EXTRAS: "tiingo simulator"}
     command: ["qte-ingestion"]
@@ -129,20 +255,45 @@ services:
       # host job via `make backtest`, not something the live container can do.
       args: {QTE_EXTRAS: "broker"}
     command: ["qte-strategy-runner"]
+    # Docker's default is SIGKILL ten seconds after SIGTERM. The runner has to
+    # cancel its tasks, drain NATS and stop the sink before it releases its
+    # Redis ownership claim; killed first, it leaves the claim behind and the
+    # next container is refused until an operator clears it.
+    stop_grace_period: 60s
+
+  # The operator's Telegram bot (src/qte_bot).
+  #
+  # Opt in with QTE_BOT__ENABLED=true in .env, which is what puts the `bot`
+  # profile on every compose call the Makefile builds. Off by default because
+  # it needs a BotFather token of its own: a bot container with no token exits
+  # rather than polling, and restart: unless-stopped would turn that into a
+  # crash loop in a stack nobody asked to have a bot in.
+  #
+  # It opens no vendor socket and loads no strategy. What it needs is the
+  # control plane (NATS), the candle windows (Redis) and the book (Postgres) —
+  # which is also why it can answer /positions and /closed while the runner is
+  # down.
+  telegram-bot:
+    <<: *app
+    profiles: ["bot"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # aiogram for the Bot API, and the httpx that comes with it. No vendor
+      # socket, no pyarrow, no pandas needed to answer a command.
+      args: {QTE_EXTRAS: "bot"}
+    command: ["qte-bot"]
 
   # The dev-only market data simulator.
   #
-  # Started by every `docker compose up` — the in-process guard
-  # (`qte_shared.dev_only`) refuses to run outside dev, so leaving it out of
-  # a profile is safe. Two feeds on one symbol still race the resampler; when
-  # you want a real vendor instead, set QTE_MARKET_DATA__PROVIDER=tiingo (or
-  # equivalent), write its plan (`make tiingo`) and stop this service
-  # explicitly.
+  # Opt in with the dev profile (`make dev`). The in-process environment
+  # guard still refuses to fabricate prices outside QTE_ENV=dev.
   #
   # It depends on nothing: no Redis, no Postgres, no NATS. It owns a socket and
   # the ticks it is told to send, and everything downstream of that is the real
   # pipeline — which is what makes the rehearsal worth running.
   market-simulator:
+    profiles: ["dev"]
     env_file: [.env]
     environment: *container-envs
     restart: unless-stopped
@@ -192,5 +343,12 @@ services:
 
 volumes:
   redis-data:
+    name: qte-${QTE_ENV:-dev}-${QTE_STATE__MODE:-shadow}-${QTE_STATE__PROVIDER_KEY:-${QTE_MARKET_DATA__PROVIDER:-mt5}}-redis
   postgres-data:
+    name: qte-${QTE_ENV:-dev}-${QTE_STATE__MODE:-shadow}-${QTE_STATE__PROVIDER_KEY:-${QTE_MARKET_DATA__PROVIDER:-mt5}}-postgres
   nats-data:
+    name: qte-${QTE_ENV:-dev}-${QTE_STATE__MODE:-shadow}-${QTE_STATE__PROVIDER_KEY:-${QTE_MARKET_DATA__PROVIDER:-mt5}}-nats
+  # The tailnet node's identity, one per stack like the rest of its state: a
+  # new book is a new node, which logs in once with TAILSCALE_AUTHKEY.
+  tailscale-data:
+    name: qte-${QTE_ENV:-dev}-${QTE_STATE__MODE:-shadow}-${QTE_STATE__PROVIDER_KEY:-${QTE_MARKET_DATA__PROVIDER:-mt5}}-tailscale

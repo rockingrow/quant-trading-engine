@@ -205,6 +205,17 @@ async def test_partial_runner_startup_unwinds_resources_in_reverse_order(monkeyp
         async def stop(self):
             events.append(f"stop:{self.name}")
 
+        async def get_flag(self, flag_name, default=None):
+            return default
+
+        async def claim_runner(self, owner_id):
+            return True
+
+        async def release_runner(self, owner_id):
+            return True
+
+        shadow_mode = True
+
     monkeypatch.setattr("qte_strategy_engine.runner.run_preflight_audit", lambda: None)
     runner = StrategyRunner()
     runner.bus = Resource("bus")
@@ -219,7 +230,7 @@ async def test_partial_runner_startup_unwinds_resources_in_reverse_order(monkeyp
         "start:bus",
         "start:state",
         "start:sink",
+        "stop:bus",
         "stop:sink",
         "stop:state",
-        "stop:bus",
     ]

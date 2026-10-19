@@ -63,7 +63,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 # __strategies__/ is never baked in. It is a mounted volume, so the private
 # repo can be updated (or pulled) without rebuilding the public engine.
-RUN mkdir -p /app/__strategies__ /app/config /app/data/parquet /app/data/reports \
+RUN mkdir -p /app/__strategies__ /app/config /app/data/parquet /app/data/reports /app/logs \
     && useradd --create-home --uid 10001 qte \
     && chown -R qte:qte /app
 USER qte

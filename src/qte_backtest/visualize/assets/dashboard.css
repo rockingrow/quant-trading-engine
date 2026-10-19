@@ -209,7 +209,12 @@ body {
 
 /* ── Charts ─────────────────────────────────────────────────────────── */
 
-.chart { position: relative; width: 100%; }
+.chart { position: relative; width: 100%; cursor: grab; touch-action: none; user-select: none; }
+.chart.grabbing { cursor: grabbing; }
+.chart.on-axis, .chart.scaling { cursor: ns-resize; }
+.chart-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 0 0 8px; }
+.chart-tools .tab { padding: 3px 9px; font-size: 11.5px; }
+.chart-tools .hint { margin: 0 2px; }
 .chart svg { display: block; width: 100%; overflow: visible; }
 .chart-title {
   font-size: 12.5px;
@@ -236,6 +241,23 @@ body {
 .fill-blue-soft { fill: var(--blue-soft); }
 .crosshair { stroke: var(--axis); stroke-width: 1; stroke-dasharray: 3 3; pointer-events: none; }
 .marker { stroke: var(--panel); stroke-width: 1; }
+.trade-mark { pointer-events: none; }
+.trade-label {
+  font-size: 10px;
+  font-weight: 600;
+  font-family: var(--sans);
+  text-anchor: middle;
+  fill: var(--text);
+  stroke: var(--panel);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+  paint-order: stroke;
+  pointer-events: none;
+}
+.trade-label.up { fill: var(--up); }
+.trade-label.down { fill: var(--down); }
+.trade-label.note { font-weight: 400; fill: var(--muted); }
+.trade-label.level { text-anchor: end; font-size: 9.5px; }
 .candle-up { stroke: var(--up); fill: var(--up); }
 .candle-down { stroke: var(--down); fill: var(--down); }
 .hit { fill: transparent; }
@@ -294,6 +316,7 @@ body {
 .tooltip dl { display: grid; grid-template-columns: auto auto; gap: 2px 14px; margin: 0; }
 .tooltip dt { color: var(--muted); }
 .tooltip dd { margin: 0; text-align: right; font-family: var(--mono); font-size: 11.5px; }
+.tooltip dd.note { font-family: var(--sans); font-size: 11.5px; color: var(--text); overflow-wrap: anywhere; }
 
 /* ── Split layouts ──────────────────────────────────────────────────── */
 

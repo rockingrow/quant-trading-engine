@@ -6,6 +6,11 @@ is an error), imports it *by file path* and calls :func:`load_all`. What comes
 back is the complete list of strategies this repository publishes, keyed by the
 name the broker's workers subscribe to.
 
+It then calls :func:`load_settings`, which is optional and says what the engine
+should do *around* those strategies — going flat before their market shuts. Both
+names are re-exported here so the engine reads one module; the settings table
+itself lives in :mod:`boilerplate.settings`, beside the code it describes.
+
 That is the whole integration. The engine learns no package name, no module
 path and no directory layout, so this repo can reorganise itself freely — and
 publishing is opt-in: a half-finished experiment sitting in ``src/`` cannot
@@ -34,6 +39,7 @@ if str(_SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(_SOURCE_ROOT))
 
 from boilerplate.my_edge import MyEdge  # noqa: E402
+from boilerplate.settings import SETTINGS, load_settings  # noqa: E402
 
 #: alias → class. The alias **is** the NATS subject the broker's workers
 #: subscribe to (``SIGNALS.<alias>``), so it has to match what they are
@@ -66,4 +72,4 @@ def load(alias: str) -> type:
         raise LookupError(f"{alias!r} is not published here (published: {known})") from None
 
 
-__all__ = ["ALIASES", "REPO_ROOT", "aliases", "load", "load_all"]
+__all__ = ["ALIASES", "REPO_ROOT", "SETTINGS", "aliases", "load", "load_all", "load_settings"]

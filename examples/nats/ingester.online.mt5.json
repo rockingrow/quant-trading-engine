@@ -1,0 +1,19 @@
+{
+  "schema_version": "1.0.0",
+  "event_type": "ingester.online",
+  "source": {
+    "gateway": "mt5",
+    "market": "forex",
+    "ingester_id": "vps-mt5-01",
+    "venue": "Broker-Server-Demo"
+  },
+  "announced_at": "2026-09-28T10:15:03.120000Z",
+  "symbols": [
+    "XAUUSD",
+    "USOIL"
+  ],
+  "timeframes": [
+    "M15"
+  ],
+  "reason": "started"
+}

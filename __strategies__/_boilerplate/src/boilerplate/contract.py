@@ -24,6 +24,7 @@ your own extra fields is free — the engine ignores what it does not know.
 
 from __future__ import annotations
 
+import secrets
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -71,9 +72,12 @@ class SignalIntent:
     whole of it. A strategy may carry fewer than these; it must not rename one.
 
     ``signal_uxid`` ties a close back to the entry that opened it, under the same
-    name the Pine strategies and the broker payload use. Leave it ``None`` on
-    an entry — the runner mints the trade-cycle id and remembers it — and set it
-    to ``context.open_uxid`` on a follow-up that manages an exit.
+    name the Pine strategies and the broker payload use. On a pair that holds one
+    cycle, leave it ``None`` on an entry — the runner mints the id — and set it
+    to ``context.open_uxid`` on a follow-up that manages an exit. In a strategy
+    that stacks cycles, mint it yourself on the entry with :func:`new_uxid`,
+    remember it with the trade, and set it on every close: with more than one
+    cycle open, a close that names none is refused.
 
     ``quantity`` is a proposal, not the size that trades. The runner risk-sizes
     every entry against the account it was configured with and rescales your
@@ -120,13 +124,22 @@ class StrategyContext:
     now: datetime
     mode: str = "backtest"
     params: dict[str, Any] = field(default_factory=dict)
-    #: Cycle id of the position the driver believes this strategy holds.
-    #: ``None`` means flat, and that is what selects entries over exits below.
+    #: Cycle id of the position the driver believes this strategy holds — the
+    #: most recent one when several are open. ``None`` means flat, and that is
+    #: what selects entries over exits below.
     open_uxid: str | None = None
+    #: Every cycle open on this pair, oldest first. Empty when flat. Nothing
+    #: caps its length: a strategy may stack as many cycles as it fires.
+    open_uxids: tuple[str, ...] = ()
 
     @property
     def is_live(self) -> bool:
         return self.mode == "live"
+
+
+def new_uxid() -> str:
+    """A fresh trade-cycle id in the broker's shape: 16 uppercase hex characters."""
+    return secrets.token_hex(8).upper()
 
 
 #: Return type of every signal method: nothing, one intent, or several.
@@ -310,11 +323,17 @@ class SignalStrategy(StrategyBase):
     def on_candle_closed(self, df: pd.DataFrame, context: StrategyContext) -> IntentResult:
         """Ask the signal methods in order. "Holding" is ``context.open_uxid``,
         which both drivers maintain, so live and backtest sequence identically.
+        Holding is not a block on entering again: the pair is asked for its
+        exits and then for one more entry, however many cycles are open.
         """
         if context.open_uxid is not None:
             collected: list[SignalIntent] = []
             for name in EXIT_SIGNAL_ORDER:
                 collected.extend(self._ask(name, df, context))
+            for name in ENTRY_SIGNAL_ORDER:
+                produced = self._ask(name, df, context)
+                if produced:
+                    return collected + produced
             return collected
 
         for name in ENTRY_SIGNAL_ORDER:

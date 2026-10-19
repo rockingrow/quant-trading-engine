@@ -191,6 +191,11 @@ def _check_signatures(name: str, candidate: Any, source: Path) -> list[Finding]:
             continue
         method = getattr(candidate, method_name, None)
         try:
+            # The dispatcher supplies a receiver for ordinary instance methods.
+            # Inspect the raw callable so an invalid zero-argument method is an
+            # arity error, not an uninspectable bound-method warning.
+            descriptor = inspect.getattr_static(candidate, method_name)
+            bind_instance = inspect.isclass(candidate) and inspect.isfunction(descriptor)
             signature = inspect.signature(method)
         except (TypeError, ValueError):
             # A C-implemented or otherwise uninspectable callable. Rare enough
@@ -207,7 +212,7 @@ def _check_signatures(name: str, candidate: Any, source: Path) -> list[Finding]:
             )
             continue
 
-        if not _accepts_two_positionals(signature):
+        if not _accepts_two_positionals(signature, bind_instance=bind_instance):
             findings.append(
                 Finding(
                     code="signal-method-arity",
@@ -223,25 +228,14 @@ def _check_signatures(name: str, candidate: Any, source: Path) -> list[Finding]:
     return findings
 
 
-def _accepts_two_positionals(signature: inspect.Signature) -> bool:
-    """Whether ``(df, context)`` can be passed positionally, ``*args`` included."""
-    positional = 0
-    for parameter in signature.parameters.values():
-        if parameter.name == "self":
-            continue
-        if parameter.kind is inspect.Parameter.VAR_POSITIONAL:
-            return True
-        if parameter.kind in (
-            inspect.Parameter.POSITIONAL_ONLY,
-            inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        ):
-            positional += 1
-        elif parameter.default is inspect.Parameter.empty and parameter.kind in (
-            inspect.Parameter.KEYWORD_ONLY,
-        ):
-            # A required keyword-only argument the dispatcher never passes.
-            return False
-    return positional >= SIGNAL_METHOD_ARITY
+def _accepts_two_positionals(signature: inspect.Signature, *, bind_instance: bool = False) -> bool:
+    """Bind exactly the arguments the dispatcher supplies to the bound hook."""
+    try:
+        argument_count = SIGNAL_METHOD_ARITY + int(bind_instance)
+        signature.bind(*(object() for _ in range(argument_count)))
+    except TypeError:
+        return False
+    return True
 
 
 # ── Metadata the runner reads before the first bar ───────────────────────

@@ -1,17 +1,19 @@
 # The backtest report
 
 `qte_backtest.report` writes a JSON artefact meant for an AI agent or a script,
-a Markdown companion rendering the same object for a human, and — on request —
-an HTML dashboard rendering it again as charts. They are not a summary and a
-detail view of different numbers: the Markdown is the JSON laid out for reading,
-and the HTML is the JSON drawn.
+a Markdown companion rendering the same object for a human, and an HTML
+dashboard rendering it again as charts — all three by default. They are not a
+summary and a detail view of different numbers: the Markdown is the JSON laid
+out for reading, and the HTML is the JSON drawn.
 
 ```bash
-uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --report
-# → data/reports/MY_EDGE_XAUUSD_M15_20260823T150404Z.{json,md}
+uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --timeframe M15 \
+    --file data/parquet/tiingo/XAUUSD_M15.parquet --report
+# → data/reports/MY_EDGE_XAUUSD_M15_20260823T150404Z.{json,md,html}
 
-uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --report --chart
-# → …{json,md,html}
+uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --timeframe M15 \
+    --file data/parquet/tiingo/XAUUSD_M15.parquet --report --report-format json
+# → …json only
 ```
 
 ## What the JSON contains
@@ -20,14 +22,14 @@ uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --report --chart
 | --- | --- |
 | `reading_guide` | The conventions an agent would otherwise have to guess — what R means, what the fill model assumes, why there is only ever one position. |
 | `run` | Strategy, class, module, params, warm-up, starting equity and the `risk_percent` every quantity was sized at. |
-| `data` | Bar count, first and last bar, bars left after warm-up, gap count. |
-| `market` | A downsampled OHLC window of the replayed history, plus the buy-and-hold basis — the one thing the trades cannot re-derive. |
-| `costs` | Spread, slippage, commission, contract size, derived round-trip cost. |
+| `data` | Bar count, first and last bar, decision-eligible bars including the warm-up boundary, gap count. |
+| `market` | The OHLC window of the replayed history for drawing — normally the run's own bars — plus the buy-and-hold basis, the one thing the trades cannot re-derive. |
+| `costs` | Spread, slippage, commission, contract size, derived round-trip cost — and where each came from: `profile` names the account type in `config/costs.toml` that priced the run, `profile_file` the file it was read from, and `sources` says per key whether it came from a `flag`, `profile.symbols`, `profile.defaults` or the `account` fallback. All three are null/empty for a run priced entirely from `QTE_ACCOUNT__*`. |
 | `metrics` | Currency **and** R-multiple statistics, excursion averages, exit-reason counts, direction split, exposure, streaks, equity curve. |
 | `diagnostics` | Findings, most severe first, each with its threshold, its evidence and one concrete change. |
-| `activity` | Trades taken, entries rejected, signals emitted. |
-| `trades` | Every trade — entry, exit, bars held, initial risk, R-multiple, MAE/MFE, and each partial leg. |
-| `signals` | The exact broker payloads the run would have published. |
+| `activity` | Trades taken, entries rejected, closes rejected, signals emitted. `rejected_entries` and `rejected_closes` are the intents the signal factory refused to build a payload from, counted apart because only the first has the entries that did fill to be read against. Neither counts anything refused for being a second position: nothing caps the cycles a pair stacks. |
+| `trades` | Every trade — entry, exit, bars held, initial risk, R-multiple, MAE/MFE, and each partial leg. `exit_note` (also on each leg) is the strategy's own explanation for that close, taken verbatim from `SignalIntent.reason`; null on a bracket fill, since the strategy is never consulted when a TP/SL level is simply touched. |
+| `signals` | Broker trading fields the run would have published; authentication token omitted. |
 
 Two design choices to know about:
 
@@ -36,13 +38,34 @@ Two design choices to know about:
   Pass `--no-report-signals` if the emitted payloads are not wanted.
 - **`schema_version` is the first key.** A consumer that learned this shape can
   detect that it changed.
-- **`market` is for drawing, never for computing.** Each row aggregates
-  `bucket_bars` consecutive bars — first open, highest high, lowest low, last
-  close — so a chart of a multi-year run stays a few hundred rows. Every metric
-  in the report comes from the full series; anything computed off these rows
-  would be a coarser answer wearing the same name.
+- **`market` is for drawing, never for computing.** Rows are
+  `[t, o, h, l, c]` with `t` in **epoch seconds, UTC**, and they are the bars of
+  the run's own timeframe: `base_timeframe` names it and `bucket_bars` is 1. A
+  dashboard can roll those up to H1 or D1 itself, which it cannot do from bars
+  that arrived pre-aggregated. There is no row ceiling: five years of M15 ships
+  ~120k rows, a report and dashboard of about 6 MB each, and a slower page — the
+  cost of a chart on which every trade can still be inspected. Only a caller
+  that passes `sample_market` a `max_rows` gets the timeframe ladder —
+  `base_timeframe` then names the coarser timeframe and `bucket_bars` says how
+  many of the run's bars a row nominally covers, first open, highest high,
+  lowest low, last close, bucketed on the calendar. Every
+  metric in the report comes from the full series regardless; anything computed
+  off these rows would be a coarser answer wearing the same name.
+- **The rows are written one per line.** The rest of the document is indented;
+  `market.rows` is not, because indenting fifteen thousand candles five values
+  deep more than doubles the file and nobody reads a candle down a column.
 
 ## Reading it
+
+Live and replay may first decide on the closed bar that completes `warmup`
+bars of history (zero-based index `warmup - 1`). Exactly `warmup` input bars
+therefore allow one decision. The benchmark starts on that same bar, and
+`data.bars_after_warmup` includes it. Older reports used the following bar.
+`run.warmup_bars` is the count the run actually used, which is the strategy's
+own `warmup` unless the mapping table or `--param warmup=` set another — read
+it rather than the strategy source when reproducing a result.
+Cash and percentage maximum drawdown are tracked independently over realised
+equity; their worst points need not be the same trade.
 
 Everything risk-normalised is in **R** — profit divided by the risk taken at
 entry (`|entry - initial_sl| × quantity × contract_size`). Read expectancy and

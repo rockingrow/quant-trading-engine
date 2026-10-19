@@ -5,8 +5,10 @@ trading strategies. The engine is public; **your alpha is not** — strategies
 live in `__strategies__/`, which is git-ignored here and cloned from your own
 private repository at deploy time.
 
-QTE ingests market data from a pluggable provider (Tiingo ships with it, plus a
-dev-only simulator you drive by hand), keeps hot state in Redis, audits every
+QTE ingests market data from a pluggable provider (Tiingo ships with it, so
+does MT5 through
+[`algo-trading-ingester`](https://github.com/rockingrow/algo-trading-ingester),
+plus a dev-only simulator you drive by hand), keeps hot state in Redis, audits every
 signal into PostgreSQL, and publishes trade signals over NATS to
 [`algo-trading-broker`](https://github.com/rockingrow/algo-trading-broker),
 which fans them out to MT5 / Binance workers.
@@ -25,6 +27,9 @@ which fans them out to MT5 / Binance workers.
   into its own process. See `pyproject.toml`.
 - [uv](https://docs.astral.sh/uv/)
 - Docker & Docker Compose
+- Optional: a Tailscale auth key, when `algo-trading-broker` runs with
+  `TAILSCALE_ENABLED=true` — Tailscale itself runs as a container; see
+  [Connecting to algo-trading-broker over Tailscale](#connecting-to-algo-trading-broker-over-tailscale).
 
 ### 2. Installation
 
@@ -33,7 +38,7 @@ git clone https://github.com/rockingrow/quant-trading-engine
 cd quant-trading-engine
 
 cp .env.example .env          # fill in QTE_DATA_PROVIDER_API_KEY at minimum
-make tiingo                   # config/tiingo.toml: which symbols to feed
+make tiingo                   # config/data_providers/tiingo.toml: which symbols to feed
 make install-dev              # uv sync
 ```
 
@@ -62,12 +67,12 @@ without the file it writes.
 **Production — the whole stack in Docker.**
 
 ```bash
-make up        # build and start; a one-shot db-migrate container creates the schema first
+make start-prod  # production images and QTE_ENV=prod; migrate before apps start
 make logs
 ```
 
 Signals are built, audited and logged but reach no broker until you point
-`QTE_BROKER__*` at
+`ALGO_BROKER__*` at
 [`algo-trading-broker`](https://github.com/rockingrow/algo-trading-broker) and
 turn shadow mode off — see
 [Sending signals to the broker](#sending-signals-to-the-broker) and
@@ -75,8 +80,9 @@ turn shadow mode off — see
 
 **Development — no vendor key, no market open.**
 
-`make dev` is the same stack with `src/` bind-mounted for live editing, and
-`QTE_MARKET_DATA__PROVIDER=simulator` swaps the vendor for a WebSocket feed you
+`make dev` enables the simulator profile, sets `QTE_ENV=dev` and bind-mounts
+`src/` for live editing. Plain `make up` / `make start` exclude the simulator.
+Set `QTE_MARKET_DATA__PROVIDER=simulator` to swap the vendor for a WebSocket feed you
 drive by hand, so the real pipeline runs on invented prices.
 
 👉 [`docs/simulator.md`](docs/simulator.md) is the step-by-step walkthrough.
@@ -92,6 +98,7 @@ To measure a strategy rather than run one, go straight to
 flowchart TD
     subgraph providers["📈 Market data"]
         TIINGO["Tiingo<br/>live + history"]
+        INGESTER["algo-trading-ingester<br/>closed MT5 bars"]
         SIM["qte-simulator<br/>dev only, QTE_ENV=dev"]
     end
 
@@ -109,7 +116,7 @@ flowchart TD
         REDIS[("Redis<br/>hot state, signal_uxid, shadow flag")]
         NATS{{"NATS / JetStream"}}
         PG[("PostgreSQL<br/>signal audit, JSONB")]
-        PARQUET[("data/parquet<br/>history")]
+        PARQUET[("data/parquet/&lt;source&gt;<br/>history")]
     end
 
     subgraph broker["🤝 algo-trading-broker (separate repo)"]
@@ -120,6 +127,7 @@ flowchart TD
     end
 
     TIINGO -->|websocket| ING
+    INGESTER -->|"JetStream INGESTER.bar.closed.mt5.&lt;symbol&gt;.&lt;tf&gt;"| ING
     SIM -.->|websocket, dev| ING
     TIINGO -->|"qte-backtest download"| PARQUET
 
@@ -138,8 +146,8 @@ flowchart TD
     CTL -->|"shadow flag"| REDIS
     CTL -->|"broadcast"| NATS
 
-    RUN ==>|"QTE_BROKER__TRANSPORT=nats (default)<br/>JetStream SIGNALS.&lt;strategy&gt;, Nats-Msg-Id dedupe"| SW
-    RUN -.->|"QTE_BROKER__TRANSPORT=http<br/>token-checked"| WH
+    RUN ==>|"ALGO_BROKER__TRANSPORT=nats (default)<br/>JetStream SIGNALS.&lt;strategy&gt;, Nats-Msg-Id dedupe"| SW
+    RUN -.->|"ALGO_BROKER__TRANSPORT=http<br/>token-checked"| WH
     WH -->|"same stream"| SW
     SW --> MT5
     SW --> BIN
@@ -297,6 +305,48 @@ engine recognises a strategy structurally — a concrete `on_candle_closed`, a
 models. That is what lets a plugin repo run its own lint, test and release cycle
 with this one nowhere in sight.
 
+A manifest may expose a second hook, `load_settings()`, returning
+`{alias: settings}` — what the engine should enforce *around* each strategy
+rather than ask it about. Optional, and today it carries one setting, the
+weekend flat:
+
+```python
+# __strategies__/my-strategies/src/mine/settings.py
+SETTINGS = {
+    "MT5_GOLD_M5_SCALP": {
+        "weekend_flat": {
+            "enabled": True,
+            "flat_from": "FRI 17:00",  # when the instrument shuts
+            "flat_until": "SUN 22:00",  # when it reopens
+        },
+    },
+}
+
+
+def load_settings():
+    return SETTINGS
+```
+
+Inside that window the engine refuses new entries and closes any open position
+with a `FLAT` — in the backtest and in the live runner alike. Exits are never
+blocked. The strategy declares the calendar and does not implement it, because a
+cut-off written inside one strategy is one the next strategy can forget to copy.
+`QTE_ENGINE__WEEKEND_FLAT_TIMEZONE` (default `UTC`) decides whose clock those
+times are read on, and `QTE_RUNNER__WEEKEND_FLAT_SWEEP_INTERVAL` how often the
+runner also checks between bars — a stalled feed otherwise leaves no close to
+act on. A repo with no settings hook, and a strategy missing from the table,
+get no weekend flat; a setting that will not parse stops that strategy loading
+rather than quietly reverting to "off".
+
+`enabled` is the strategy's *default*; the pair decides. Set `use_weekend_flat`
+in `config/strategies_mapping.toml` — under `[strategies.<name>]` for every pair,
+or `[symbols.<symbol>.params.<name>]` for one — or pass `--param
+use_weekend_flat=true` to a backtest, and it overrides the declared `enabled`
+for that pair in both drivers. A window declared with `enabled = false` is still
+parsed and validated, so switching it on is a mapping edit. Switching on a
+window the repo never declared, or giving the key anything but `true`/`false`,
+stops the runner (and the backtest) from starting that pair.
+
 **A directory scan — for a single file.** Failing a manifest, every `.py` under
 the directory is imported and anything that looks like a strategy is collected.
 Drop a single `.py` file in and it runs, no ceremony.
@@ -315,13 +365,27 @@ make strategies                              # list what the engine can see
 make audit                                   # check that what it sees is fit to trade
 ```
 
-`strategy-mount` records each repo's audit result in
-`__strategies__/strategies.toml` — auto-generated, never hand-edited. `make up`
-and `make dev` read it to freeze only the audit-passing repos into the image,
-and refuse to start without it.
+`strategy-mount` records the audit result of every strategy each repo publishes
+in `__strategies__/strategies.toml` — auto-generated, never hand-edited, one
+table per repo and one line per strategy:
 
-> Why a manifest, why the contract is structural rather than nominal, and why
-> the interface is seven methods rather than one:
+```toml
+[strategies.my-strategies]
+MT5_GOLD_M15_V1 = true
+MT5_GOLD_M5_V1 = false
+```
+
+`make up` and `make dev` read it to freeze only the repos that still have a
+passing strategy into the image, and refuse to start without it. So does the
+runner: a strategy marked `false` is not loaded, because its dependencies were
+never frozen into the image it would have to run in, and a repo with nothing
+passing is not even imported. Fix what the audit found and mount it again.
+`make strategies` lists what the engine can see; `uv run qte-strategy-mount
+--show` lists what the mount recorded.
+
+> Why a manifest, why the contract is structural rather than nominal, why the
+> weekend flat is the engine's job rather than a strategy's, and why the
+> interface is seven methods rather than one:
 > [`docs/architecture.md`](docs/architecture.md).
 
 ---
@@ -335,10 +399,18 @@ Which strategies trade which symbols lives in
 [symbols.XAUUSD]
 strategies = ["MT5_GOLD_M5_SCALP"]
 
-# Per-pair overrides. They beat QTE_RUNNER__STRATEGY_PARAMS, so one strategy
+# Per-strategy defaults, applied wherever this strategy runs.
+[strategies.MT5_GOLD_M5_SCALP]
+risk_percent = 1.0
+
+# Read by the engine, not the strategy: the candles this pair collects before
+# it may decide. Omit it to keep the count the strategy declares.
+warmup = 150
+
+# Per-pair overrides beat the [strategies.*] defaults above, so one strategy
 # can run tighter on gold than it does on everything else.
 [symbols.XAUUSD.params.MT5_GOLD_M5_SCALP]
-risk_percent = 1.0
+risk_percent = 0.5
 
 # Parks a symbol without deleting its configuration.
 [symbols.EURUSD]
@@ -360,6 +432,15 @@ With no file at all nothing breaks: each strategy falls back to its own
 `symbols` attribute, or to `QTE_ENGINE__SYMBOLS` when it declares none. A file
 that exists but maps nothing means *trade nothing*, which is a different thing
 and is treated as one.
+
+`warmup` is the one setting there that decides *when* a pair starts trading
+rather than how. A strategy declares the candles its slowest indicator needs;
+the mapping may ask for another number, and both the runner and the backtest
+honour it, so a replay still starts deciding on the same bar. Asking for fewer
+than the strategy declares is allowed and logged — what it really needs is a
+property of its indicators, which the engine cannot check — while asking for
+more than its `max_history` is refused, because the runner's buffer could never
+reach that count.
 
 The runner builds one instance per `(symbol, strategy)` pair, so a strategy
 carrying state between bars never has gold's last bar deciding what happens on
@@ -388,8 +469,15 @@ the pair's own value in `config/strategies_mapping.toml`, falling back to
 QTE_ACCOUNT__CAPITAL=1000.0          # the account, and what a % of risk is a % of
 QTE_ACCOUNT__RISK_PERCENT=1.0        # fallback when a pair states none
 QTE_ACCOUNT__COMMISSION_PER_UNIT=0.0 # backtest cost, charged each side
+QTE_ACCOUNT__SPREAD=0.0              # full bid/ask distance, each side pays half
+QTE_ACCOUNT__SLIPPAGE=0.0            # on top of half the spread, each side
 QTE_ACCOUNT__CONTRACT_SIZE=1.0
+QTE_ACCOUNT__COST_PROFILE=           # which profile in config/costs.toml prices a fill
 ```
+
+Those three costs are the *last* layer: one spread for the whole engine is
+wrong as soon as a second symbol is replayed, so state them per symbol in
+`config/costs.toml` instead — see [the cost profiles](#cost-profiles) below.
 
 The capital is **fixed for a run**; it does not compound. Sizing off running
 equity would make later trades depend on earlier P&L, so two backtests differing
@@ -467,20 +555,27 @@ worse than none, the wrong one when four strategies trading beats zero.
 ## Backtesting
 
 ```bash
-make download                                        # provider history → data/parquet/
-make backtest STRATEGY=MY_EDGE SYMBOL=XAUUSD TF=M15
+make download                                        # → data/parquet/<provider>/
+make backtest STRATEGY=MY_EDGE SYMBOL=XAUUSD TF=M15 \
+    FILE=data/parquet/tiingo/XAUUSD_M15.parquet
 ```
 
 or the CLI directly, for the full set of knobs:
 
 ```bash
-uv run qte-backtest download --symbol XAUUSD --timeframe M15 --start 2023-01-01
-uv run qte-backtest list
-uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --spread 0.30 --persist
+uv run qte-backtest download --symbol XAUUSD --timeframe M15 --market fx --start 2023-01-01
+uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --timeframe M15 \
+    --file data/parquet/tiingo/XAUUSD_M15.parquet --spread 0.30 --persist
 ```
 
+Every history file lives under the source that produced it —
+`data/parquet/tiingo/`, `data/parquet/mt5/` for a broker CSV import — and a
+replay names the file it reads. The same pair from two sources disagrees about
+session times, weekend gaps and volume, and choosing between them by convention
+is how a run measures a book nobody meant to test.
+
 A run starts from `QTE_ACCOUNT__CAPITAL` (default **$1,000**) and prices its
-fills with `QTE_ACCOUNT__COMMISSION_PER_UNIT`, so P&L, max drawdown and profit
+fills from the cost profile below, so P&L, max drawdown and profit
 factor are figures about a real balance rather than about one arbitrary unit.
 Entries are risk-sized against that capital exactly as the live runner sizes
 them, and the pair's overrides in `config/strategies_mapping.toml` apply here
@@ -493,6 +588,41 @@ Net PnL           378.79   (fees 0.00)
 Profit factor     1.294
 Max drawdown      243.31  (18.50%)
 ```
+
+#### Cost profiles
+
+What a fill costs is a property of the symbol and the account type, not of a
+run — gold's measured spread is **0.25**, oil's is **0.04**, BTCUSDT's is around
+**20** — so the three numbers live in `config/costs.toml`, one table per symbol
+inside one profile per account type:
+
+```bash
+make costs    # copy config/costs.example.toml into place; git-ignored
+```
+
+```toml
+default_profile = "exness_standard"
+
+[profiles.exness_standard.symbols.XAUUSD]
+spread = 0.25                 # measured median: 0.20 (2023-24), 0.16 (2025), 0.26 (2026)
+slippage = 0.0
+commission_per_unit = 0.0
+
+[profiles.exness_zero.symbols.XAUUSD]
+spread = 0.05                 # tighter spread, commission billed separately
+slippage = 0.0
+commission_per_unit = 0.035
+```
+
+A Standard account hides its fee inside the spread; a Zero/Raw account quotes a
+tighter spread and bills commission. Whether an edge survives both is a real
+question, and `--cost-profile exness_zero` answers it without editing anything.
+Each cost resolves on its own, highest precedence first: `--spread` /
+`--slippage` / `--commission` on the command line, then
+`[profiles.<name>.symbols.<SYMBOL>]`, then that profile's `defaults`, then
+`QTE_ACCOUNT__*`. Every report records which layer won for each number, under
+`costs.profile` and `costs.sources`, so a run's prices can be traced rather
+than guessed at.
 
 The fill simulator is deliberately pessimistic — it is meant to disprove a
 strategy, not flatter one:
@@ -508,12 +638,14 @@ strategy, not flatter one:
 
 ### The report
 
-`--report` writes a JSON artefact for an agent to analyse plus a Markdown
-companion for a human — same object, two renderings:
+`--report` writes a JSON artefact for an agent to analyse, a Markdown companion
+for a human and an HTML dashboard — same object, three renderings.
+`--report-format json` (or any comma-separated subset) writes fewer:
 
 ```bash
-uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --report
-# → data/reports/MY_EDGE_XAUUSD_M15_20260823T150404Z.{json,md}
+uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --timeframe M15 \
+    --file data/parquet/tiingo/XAUUSD_M15.parquet --report
+# → data/reports/MY_EDGE_XAUUSD_M15_20260823T150404Z.{json,md,html}
 ```
 
 Beyond the headline metrics it carries what makes a result diagnosable: every
@@ -545,7 +677,8 @@ reads:
 
 ```bash
 make chart REPORT=data/reports/MY_EDGE_XAUUSD_M15_20260823T150404Z.json
-uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --report --chart
+uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --timeframe M15 \
+    --file data/parquet/tiingo/XAUUSD_M15.parquet --report --chart
 ```
 
 The equity curve against buy-and-hold, the price window with every trade marked
@@ -605,18 +738,96 @@ would have two sources.
 
 ---
 
+## Taking MT5 bars from algo-trading-ingester
+
+[`algo-trading-ingester`](https://github.com/rockingrow/algo-trading-ingester)
+runs beside the MT5 terminal on Windows, detects every closed bar and publishes
+it to NATS on `INGESTER.bar.closed.mt5.<SYMBOL>.<TF>`. The `mt5` provider is
+QTE's side of that hand-off:
+
+```bash
+make mt5                              # config/data_providers/mt5.toml — symbols, timeframes, stream
+QTE_MARKET_DATA__PROVIDER=mt5         # in .env
+```
+
+- **Bars, not ticks.** The ingester already closed them, so ingestion skips its
+  resampler: each bar goes through the same Redis outbox and
+  `QTE.candle.closed.<symbol>.<tf>` subject as a resampled one.
+- **The ingester is never kept waiting.** Every message is acknowledged the
+  moment it is held — a JetStream ack, or `{"code": 200}` to a core-NATS
+  request — and decoded and staged afterwards by a separate worker. When its
+  queue is full QTE stops pulling rather than refusing what it already took.
+- **QTE asks for its indicator window; the ingester never pushes one.** At
+  start-up ingestion sends one request per planned series on
+  `INGESTER_RPC.history.mt5.<SYMBOL>.<TF>` and gets the newest `history_bars`
+  closed bars back in a single reply, merged into Redis behind the staging
+  watermark. QTE decides which series and how many bars — the ingester holds no
+  warm-up setting. A symbol the ingester is not configured for is refused once
+  and not asked for again.
+- **QTE starts without the ingester and does not poll for it.** A boot that
+  finds nobody to ask carries on with what Redis holds. The ingester announces
+  itself on `INGESTER_RPC.online.mt5` once it is connected and answering — and
+  again after every reconnect — and only then does ingestion check each planned
+  window against Redis and request the ones that are short or stale; a full,
+  current window costs one Redis read and no request. Nothing is asked on a
+  timer in between (the one announcement that could go unheard, made while
+  QTE's own NATS connection was down, is covered by checking once when that
+  connection returns). An ingester that is connected but not ready — its
+  terminal still logging in — is asked again after
+  `QTE_INGESTION__HISTORY_RETRY_INTERVAL`, doubling to `..._MAX_INTERVAL`.
+- **The request never touches the stream.** It is core NATS request/reply on a
+  prefix of its own (`rpc_prefix`, default `<subject_prefix>_RPC`). Under
+  `subject_prefix` it would be stored as market data and answered by the
+  stream's own acknowledgement, so both sides refuse that configuration.
+- **A hole is filled before the bar after it is staged.** The ingester
+  publishes nothing it found already closed when it started, so a live bar
+  that does not follow the newest stored one has the bars in between fetched
+  first; the runner never decides on a window with a gap in it.
+- **The stream is the fallback, not the history.** A new durable consumer still
+  replays what `INGESTER` holds (`deliver_policy`), but inside a filled window
+  those bars are duplicates and are dropped; bars older than
+  `QTE_RUNNER__CATCH_UP_MAX_AGE` are kept as history, never decided on. A
+  restart resumes from the last bar QTE acknowledged. "The newest bars" is not
+  an archive: for a backtest, export from MT5 and `make csv-import`.
+- **Keep the two `.env` files in step.** `subject_prefix`, `jetstream` and
+  `rpc_prefix` in `config/data_providers/mt5.toml` mirror the ingester's
+  `NATS_SUBJECT_PREFIX`, `NATS_JETSTREAM_ENABLED` and
+  `NATS_RPC_SUBJECT_PREFIX`; `stream` mirrors nothing it can set, because the
+  ingester names the stream after that prefix's first token. Its
+  `NATS_HOST`/`NATS_PORT` normally name QTE's own NATS, so
+  `QTE_MT5__NATS_URL`/`QTE_MT5__NATS_TOKEN` stay blank and fall back to
+  `QTE_NATS__*`. Symbols are the bare names in its `MT5_SYMBOLS`, timeframes a
+  subset of its `MT5_TIMEFRAMES`.
+- **The wire contract is a list, not a constant.** `schema_versions` in
+  `config/data_providers/mt5.toml` is which of the ingester's `schema_version`
+  values QTE decodes. Each is a full `major.minor.patch` and matches that
+  version alone, so every version to accept is named: the default `["1.0.0"]`
+  is the ingester's own `SCHEMA_VERSION` default (a shortened version on the
+  wire reads as semver, so `1.0` is `1.0.0`), and `["1.0.0", "2.0.0"]` keeps
+  bars flowing while a fleet of ingesters is upgraded host by host. A bar on any
+  other version is logged with its version and dropped, never decoded on a
+  guess — so **any** ingester bump, a patch one included, needs this list edited
+  with it, and until it is the feed goes quiet with that warning in the log.
+- **Beside another vendor.** `QTE_MARKET_DATA__PROVIDER=mt5,binance` runs both,
+  each feeding the symbols of its own `config/data_providers/<provider>.toml`; a symbol may be
+  planned by only one. The list is part of the state identity — see
+  [docs/state-isolation.md](docs/state-isolation.md). `binance` is a placeholder
+  today: listed, it stops ingestion at start-up as not implemented.
+
+---
+
 ## Sending signals to the broker
 
 QTE emits exactly the payload `algo-trading-broker` validates — its
 `WebhookPayload`: `strategy`, `symbol`, `timeframe`, `timestamp`,
 `signal_uxid`, a `position` block, `indicators`, `inputs`, `token`. Two
-transports carry it, selected with `QTE_BROKER__TRANSPORT`:
+transports carry it, selected with `ALGO_BROKER__TRANSPORT`:
 
 | | `nats` (default) | `http` |
 | --- | --- | --- |
 | Destination | JetStream `SIGNALS.<strategy>` | `POST /secret/webhook` |
 | Why | The broker's own webhook endpoint writes to that same stream, so we inherit its persistence, retry and de-duplication with no HTTP hop in the trade path. | Slower, but it is the path that verifies the `token` field. |
-| Auth | Access to the NATS cluster **is** the authentication. | `QTE_BROKER__TOKEN`, matched against the broker's. |
+| Auth | Access to the NATS cluster **is** the authentication. | `ALGO_BROKER__TOKEN`, matched against the broker's. |
 | Use when | QTE and the broker share a trusted/private NATS cluster. | Anything crosses a boundary you do not control. |
 
 Each publish carries a fresh `Nats-Msg-Id`, so a retried publish inside the
@@ -627,17 +838,256 @@ stream's duplicate window is stored once and a worker opens one position.
 
 ---
 
+## Telegram notifications for a position's lifecycle
+
+One Telegram message per trade cycle, **edited in place** as the position
+progresses: the entry posts it, and every `TP1`/`TP2`/`R_SL`/`SL`/`FLAT` that
+follows appends to its Actions block until the header flips to `CLOSED`. It is
+the same message shape `algo-trading-broker` broadcasts, so a trade reads the
+same way whichever service posted it, and it is keyed by the same triple —
+`strategy` + `symbol` + `signal_uxid`.
+
+```
+[⏳RUNNING]
+📈 LONG XAUUSD (M15)
+-----------
+Price: 2340
+Quantity: 0.05 | Risk: 1%
+SL: 2330 | TP1: 2350 | TP2: 2360
+2026-10-08 12:00:00 UTC
+-----------
+Actions:
+-----------
+🎯 TP1
+Price: 2350 | Quantity: 0.025
+2026-10-08 12:30:00 UTC
+-----------
+```
+
+Create a send-only bot with @BotFather (the broker's own bot works too), add it
+to the chats, and fill in `.env`:
+
+| Variable | What it does |
+| --- | --- |
+| `QTE_TELEGRAM__BOT_TOKEN` | The bot. Empty switches the whole feature off. |
+| `QTE_TELEGRAM__BROADCAST_CHAT_IDS` | The position: side, symbol, price, levels, action timeline. |
+| `QTE_TELEGRAM__PRIVATE_CHAT_IDS` | The above plus the strategy name, the cycle id and how delivery went. |
+| `QTE_TELEGRAM__TIMEZONE` | Display zone for the timestamps. Moves nothing about trading. |
+
+**An empty chat list sends nothing to that audience** — which is how you run
+broadcast-only, private-only or neither. Each is a comma-separated list, so one
+audience can fan out to several chats, and a `<chat id>_<topic id>` entry
+addresses a single topic inside a supergroup that has Topics enabled:
+
+```ini
+QTE_TELEGRAM__PRIVATE_CHAT_IDS="-1002173777783_924584,-1001111111111"
+```
+
+A shadow-mode signal is notified too, labelled `[🧪SHADOW]`, and an action the
+broker never took is marked `⚠️ NOT DELIVERED` rather than quietly omitted.
+Nothing here is on the trade path: the runner only queues the update, a
+background worker does the sending, and a Telegram outage costs the chat its
+update, never a signal. See
+[docs/architecture.md](docs/architecture.md) — *Why one Telegram message per
+position, edited in place*.
+
+### Errors in the same chat
+
+`QTE_TELEGRAM__LOG_ERRORS_ENABLED=true` forwards every `ERROR` log line the
+runner writes to Telegram — the same switch `algo-trading-broker` spells
+`TELEGRAM_LOG_ERRORS_ENABLED`, and off by default.
+
+| Variable | What it does |
+| --- | --- |
+| `QTE_TELEGRAM__LOG_ERRORS_ENABLED` | Forward `ERROR` and `CRITICAL` records. |
+| `QTE_TELEGRAM__LOG_DEDUP_WINDOW` | Seconds an identical error is suppressed for. Default `60`; `0` forwards the whole storm. |
+| `QTE_TELEGRAM__LOG_CHAT_IDS` | Where errors go. Empty falls back to the **private** chats, never the broadcast ones. |
+| `QTE_TELEGRAM__LOG_BOT_TOKEN` | A second bot for errors, so a ban on one channel does not take the other with it. Empty falls back to the main token. |
+
+Dedup is keyed on the logger, the level and the message, so a reconnect loop
+logging the same line every second is one message a minute, while a different
+error on the same logger still gets through immediately. The Telegram modules
+and the HTTP client underneath them are filtered out of forwarding, so a failing
+send cannot log an error that triggers another send.
+
+### Start and stop in the same chat
+
+Every `make start` and `make stop` announces itself, on by default once a token
+and a chat are set (`QTE_TELEGRAM__SERVICE_STATUS_ENABLED`):
+
+```
+🟢 strategy-runner UP
+-----------
+Book: dev.shadow.mt5
+Strategies: XAUUSD M15 QTE_EXAMPLE_EMA_ATR
+Transport: nats
+Shadow mode: ON
+-----------
+2026-10-09 07:12:33 UTC
+```
+
+```
+🛑 data-ingestion DOWN
+-----------
+Uptime: 4h 12m
+-----------
+2026-10-09 11:24:05 UTC
+```
+
+Two services speak: `data-ingestion` and `strategy-runner`. Redis, Postgres,
+NATS and the Tailscale node are images this repository does not control, and
+they do not need to announce themselves — neither service finishes starting
+without them, so an UP message is itself proof that its dependencies answered.
+A service that dies on the way up still sends a DOWN message, marked `did not
+finish starting`, which is the case nobody is watching a terminal for.
+
+Both announcements are awaited rather than queued: there are two per process
+lifetime, and the DOWN one has to leave before the event loop does. Like
+everything else here they go to `QTE_TELEGRAM__LOG_CHAT_IDS` (falling back to
+the private chats), never to the broadcast audience, and a Telegram outage
+never stops a service from stopping.
+
+---
+
+## Steering the engine from Telegram
+
+The notifications above are one-way. The bot is the other half: nine commands
+for looking at a running engine and steering it, shaped after
+`algo-trading-broker`'s own bot so the two read alike — the same monospace
+tables, the same Prev/Next paging, the same confirmation in front of anything
+that closes a position.
+
+It is its own service (`src/qte_bot`, `qte-bot`), off by default:
+
+```ini
+QTE_BOT__ENABLED=true
+QTE_BOT__TELEGRAM_TOKEN=   # its own BotFather bot, not the notification one
+QTE_BOT__ADMIN_IDS=        # your Telegram user id; an empty list answers nobody
+```
+
+`make start` then brings it up with everything else. It needs its own token
+because only one process may poll `getUpdates` for a token at a time.
+
+| Command | What it answers |
+| --- | --- |
+| `/redis` | Bars held per symbol and timeframe, and the newest one |
+| `/runner` | Every strategy, its window, and whether it can decide on the next bar |
+| `/positions` | What is open: symbol, timeframe, strategy, `signal_uxid`, opened |
+| `/closed` | Positions that are over, newest first, paged |
+| `/flat all \| SYMBOL \| STRATEGY` | Closes positions, after a confirmation |
+| `/prevent all \| SYMBOL \| STRATEGY` | Stops deciding on closed bars |
+| `/allow all \| SYMBOL \| STRATEGY` | Resumes deciding |
+| `/warmup all \| SYMBOL` | Asks the vendor for the warm-up window again |
+| `/flush all \| SYMBOL` | Drops the warm-up bars Redis holds |
+
+Three things are worth knowing before you use the last five:
+
+* **`/prevent` does not drop bars.** They keep arriving and keep filling the
+  window; only the decision is skipped, so `/allow` resumes on the next bar
+  with no hole behind it. It is stored in Redis, so it survives a runner
+  restart, and it does not touch a position that is already open — that is what
+  `/flat` is for.
+* **`/flat` is an ordinary exit.** It goes out as a `FLAT` through the outbox,
+  sized and audited like a strategy's own close, labelled `MANUAL_FLAT`. The
+  reply says what it closed and what it refused, per cycle.
+* **`/warmup` and `/flush` are served by ingestion**, not by the bot reaching
+  into Redis. The stored bars, the staging watermark and the resampler's
+  in-flight bucket are one piece of state; dropping the bars from outside would
+  leave the other two pointing at bars that no longer exist. Their symbol list
+  comes from the data-provider file, so it is the list you edited.
+
+There is no HTTP control plane and this adds none: the bot asks the running
+services over NATS request/reply — the same actions `qte-control` uses — and
+reads Redis and Postgres directly for `/redis`, `/positions` and `/closed`, so
+those three still answer when the runner is down.
+
+---
+
+## Connecting to algo-trading-broker over Tailscale
+
+Tailscale is optional and off by default, and it runs as a container — nothing
+is installed on the host. One `.env` switch, `TAILSCALE_ENABLED`, the same one
+`algo-trading-broker` reads, decides how the engine is reached and how it
+reaches the broker. The Makefile reads it (`make start`, `up`, `dev`,
+`start-prod`); a bare `docker compose up` ignores it.
+
+| | `TAILSCALE_ENABLED=false` | `TAILSCALE_ENABLED=true` |
+| --- | --- | --- |
+| Redis / Postgres / NATS host ports | every interface (`0.0.0.0`) | `127.0.0.1` only |
+| MT5 ingester → engine NATS | `nats://<this host>:<QTE_NATS_PORT>` + `QTE_NATS__TOKEN` | `nats://<TAILSCALE_HOSTNAME>:4222` + `QTE_NATS__TOKEN`, from inside the tailnet |
+| Runner → broker NATS | `ALGO_CONTAINER_BROKER_NATS_URL` (default `nats://host.docker.internal:4222`) | `nats://<TAILSCALE_BROKER_HOSTNAME>:4222` over the tailnet |
+
+**Turn it on whenever the broker has it on** — its NATS is then reachable over
+the tailnet only.
+
+1. **Mint an auth key** in the Tailscale admin console (Settings → Keys),
+   tagged `tag:engine`. The tailnet policy that grants `tag:engine` the
+   broker's port 4222, and `tag:ingester` this engine's, is
+   `config/tailscale/policy.hujson` — paste it into the admin console's
+   Access controls. `algo-trading-broker` keeps the same file and a tailnet
+   has one policy, so keep the two copies identical. The key is used
+   for the first login only; the node identity is then kept in the stack's
+   `*-tailscale` volume. Each book (`QTE_ENV` / `QTE_STATE__MODE` / provider)
+   is its own stack and its own node, so a reusable key saves minting one per
+   book.
+2. **Fill in `.env`:**
+
+   ```bash
+   TAILSCALE_ENABLED=true
+   TAILSCALE_AUTHKEY=tskey-auth-...
+   TAILSCALE_HOSTNAME=qte-engine                 # this engine's tailnet name
+   TAILSCALE_BROKER_HOSTNAME=algo-trading-broker # the broker's TAILSCALE_HOSTNAME
+   ALGO_BROKER__NATS_TOKEN=...                   # the broker's NATS_TOKEN
+   ```
+
+   The `QTE_*_PORT` variables stay bare port numbers — the bind address comes
+   from the switch.
+3. **Start the stack** (`make start` / `make start-prod`) and check the node:
+
+   ```bash
+   make tailscale-status   # tailnet peers (the broker should be listed), Serve forwards,
+                           # or the login URL if the node has not logged in
+   ```
+
+How it works: the `tailscale` service (userspace networking, profile
+`tailscale`) forwards its tailnet ports 4222/8222/5432 to `nats` and
+`postgres-audit` through Tailscale Serve (`config/tailscale/serve.json`). For
+the outbound direction it also runs Tailscale's SOCKS5 proxy on the compose
+network, and `broker-nats-relay` — a socat container — turns that into a plain
+TCP port, because a NATS client cannot speak SOCKS. The Makefile points the
+runner's `ALGO_BROKER__NATS_URL` at `nats://broker-nats-relay:4222`; the token,
+the NATS protocol and the runner's reconnect behaviour pass through unchanged.
+Host-side `ALGO_BROKER__NATS_URL` in `.env` is not routed over the tailnet.
+
+The same policy file also carries a `nodeAttrs` block granting `tag:broker`
+the Funnel attribute. That is for the broker, not the engine: TradingView posts
+its webhooks from the public internet, and a grant only ever matches a tagged
+tailnet node, so Funnel is what publishes one port of the broker on a public
+`https://<name>.<tailnet>.ts.net` address and forwards it to the broker's
+webhook port. Funnel bypasses every grant above it, so the webhook handler's
+shared secret is the only thing standing between the internet and an order.
+Keep the block in the copy you paste into the admin console — a tailnet has one
+policy.
+
+If the tailnet connection drops, NATS becomes unreachable the same way it
+would from any other network fault; `uv run qte-control ping` says so
+explicitly instead of reporting success — see
+[Operating a running engine](#operating-a-running-engine).
+
+---
+
 ## Operating a running engine
 
 There is no web service. The one control that genuinely has to reach a *running*
-process is shadow mode — the live/paper switch, which must not require
-restarting a runner mid-position — and it travels on NATS like every other
-engine event:
+process is the delivery pause. Paper and live use separate state selected by
+`QTE_STATE__MODE` at startup. The pause travels on scoped NATS subjects. See
+[state isolation and deployment transitions](docs/state-isolation.md) before
+changing an existing deployment:
 
 ```bash
 uv run qte-control shadow status   # is it paper or live right now?
 uv run qte-control shadow on       # pause delivery to the broker
-uv run qte-control shadow off      # GO LIVE — prompts unless you pass --yes
+uv run qte-control shadow off      # resume a live namespace; prompts for confirmation
 uv run qte-control ping            # which runners are up, and in what mode
 ```
 
@@ -645,12 +1095,50 @@ The flag is written to Redis first and broadcast second, so a runner that starts
 *after* the broadcast still comes up in the mode you last chose. If NATS is
 unreachable the command says so explicitly rather than reporting success.
 
+**Is everything connected?** `make status` prints the stack's containers (and
+the tailnet peers, with Tailscale on), then asks every link the engine depends
+on and exits non-zero if one is down:
+
+```text
+State namespace: prod:live:mt5
+  [ OK ] Redis            redis-cache:6379, runner claim held by 7c1e…
+  [ OK ] Postgres         postgres-audit:5432/qte_audit
+  [ OK ] NATS (QTE)       nats:4222
+  [ OK ] strategy-runner  4 slot(s), delivering LIVE, namespace prod:live:mt5
+  [ OK ] data-ingestion   providers mt5, 6 series, newest bar 2026-10-12T10:00:00+00:00
+  [FAIL] Ingester (mt5)   no NATS client is subscribed under INGESTER_RPC.history.mt5 — …
+  [ OK ] Broker           broker-nats-relay:4222: SIGNALS stream holds 0 undelivered signal(s); broker_signal_handler is pulling
+```
+
+The runner and ingestion answer a `ping` on their control subjects. The MT5
+ingester and the broker are other machines with no ping in their contracts, so
+neither is sent anything: the ingester is read off the NATS server's client
+list (`/connz` — is anyone subscribed to the history request subject), and the
+broker off its `SIGNALS` stream — a stream nothing is pulling from is a broker
+that is down. Every probe is read-only. It runs inside a service container
+(`qte-control status`), because that is where the stack's real namespace and,
+with Tailscale on, the relay to the broker both live.
+
+**Coming back from an outage.** One strategy-symbol pair holds one trade cycle
+at a time, so a position that outlived a long downtime locks that pair: every
+entry the strategy proposes afterwards is refused, against a position whose
+bracket the market left behind hours ago. On start the runner closes anything
+older than `QTE_RUNNER__STALE_POSITION_MAX_AGE` (default one hour) with an
+`R_SL`, which ends the cycle and frees the pair. A deploy or a config change
+comes back well inside that window and keeps its positions, which is what the
+Redis and Postgres recovery path is for. Set
+`QTE_RUNNER__FLUSH_STALE_POSITIONS=warn` to see what a first run would close
+before letting it close anything, `off` to disable it, or the age to `0` to
+close the book on every start. Why it is age-gated rather than unconditional:
+[`docs/architecture.md`](docs/architecture.md).
+
 Everything else the engine knows is a CLI command or a SQL query:
 
 | Want | Do |
 | --- | --- |
 | Signal audit trail | `SELECT * FROM signals ORDER BY created_at DESC LIMIT 20` |
 | One trade cycle end to end | `SELECT * FROM signals WHERE signal_uxid = '…' ORDER BY created_at` |
+| What is open right now | `SELECT strategy, symbol, signal_uxid, remaining, updated_at FROM open_positions` |
 | What strategies are loaded | `make strategies` |
 | Look at a report | `make chart REPORT=data/reports/….json`, then open the HTML |
 | Rehearse the live path | `make sim`, then `qte-simulator replay …` (dev only) |
@@ -702,16 +1190,27 @@ make strategy-mount STRATEGY=my-strategies
 make strategies                      # confirm the engine can see them
 
 # 4. Say what to feed and what trades it, then check the whole thing
-make tiingo                          # config/tiingo.toml — symbols, timeframes, vendor knobs
+make tiingo                          # config/data_providers/tiingo.toml — symbols, timeframes, vendor knobs
 make strategy-mapping                # config/strategies_mapping.toml, git-ignored — edit it
 make audit-strict                    # fails on anything the runner would skip
 
-# 5. Up. `make up` freezes the plugin repos' requirements into deploy/ first,
+# 5. `make start-prod` freezes plugin requirements into deploy/ first,
 #    and a one-shot db-migrate container creates the schema before the services
 #    start.
-make up
+make start-prod
 make logs
 ```
+
+`make logs` streams what the *current* containers have written, so a recreate
+takes that history with it. Each long-running service therefore also writes its
+own daily file on the host: `logs/<YYYYMMDD>-data-ingestion.log` and
+`logs/<YYYYMMDD>-strategy-runner.log`, at `QTE_LOG_LEVEL`, mounted from
+`./logs` and rolling at midnight without a restart. One file per service, never
+a shared one — both containers append to the same mounted directory, and a
+shared file would tear their lines. Nothing is pruned; `QTE_LOG_DIR` moves them
+and an empty value turns them off. Only these services write files: a CLI
+(`qte-control`, `qte-backtest`, the audit) prints to the console and leaves no
+dated file behind.
 
 Each service builds its **own image**: `QTE_EXTRAS` selects which
 `[project.optional-dependencies]` get installed, so the ingestion container
@@ -723,23 +1222,27 @@ deliberately in no container — replaying history is done on the host, not
 inside the live trading process.
 
 `docker-compose.yml` ships a `nats` service for standalone development. In
-production you normally point `QTE_BROKER__NATS_URL` at the **broker's** NATS,
+production you normally point `ALGO_BROKER__NATS_URL` at the **broker's** NATS,
 because that is where the `SIGNALS` stream its workers consume actually lives —
 publishing to a second cluster means nobody ever receives the signals.
 
 ### Going live
 
 1. **Backtest** until the numbers hold up.
-2. **Shadow mode** — `QTE_BROKER__SHADOW_MODE=true` (the default). Ingestion and
+2. **Shadow mode** — select `QTE_STATE__MODE=shadow` (the default). Ingestion and
    strategies run, signals are built, logged and audited, and nothing reaches
    the broker.
 3. **Reconcile** — read the `signals` table and check the entries and exits
    against the chart. Filtering by `signal_uxid` gives you one trade end to end.
-4. **Go live** — `make shadow-off`. It takes effect on every running runner
-   immediately, and the flag is stored in Redis so a restart comes up in the
-   mode you last chose.
+4. **Select live state** — stop paper, select `QTE_ENV=prod` and
+   `QTE_STATE__MODE=live`, and restart into the separate live volumes. Keep
+   delivery paused while reconciling the actual broker account. Paper positions
+   are never carried into the live book.
+5. **Enable delivery** — run `make shadow-off` with the matching live identity
+   and confirm the target. The pause flag persists within that namespace.
 
-`make shadow-on` puts it back. That is the kill switch; keep it to hand.
+`make shadow-on` pauses live decisions and delivery while preserving broker
+positions. It does not create simulated trades in the live book.
 
 ---
 

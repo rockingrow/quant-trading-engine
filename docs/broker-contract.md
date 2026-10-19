@@ -38,6 +38,10 @@ QTE emits the broker's `WebhookPayload` (`broker/schemas/webhook_schema.py`):
 
 Field-level notes:
 
+- **A supplied `tp2` with `tp1 = null` is a single full-position target.**
+  The shared factory preserves that null instead of inventing an earlier TP1.
+  Replay closes the remaining position at TP2; the chart omits a null TP1.
+  Entries without either target still receive the default bracket.
 - **`timeframe` is TradingView's spelling** — the bare minute count (`"15"`,
   `"60"`), not QTE's `M15`. `qte_shared.timeframes.to_broker_timeframe` converts.
 - **`price`/`quantity` are optional in the schema** because a `FLAT` carries
@@ -111,10 +115,19 @@ QTE normalises rather than rejecting, so either spelling round-trips.)
 
 ## The trade cycle
 
-**One cycle per (strategy, symbol) at a time.** A second entry while one is open
-is refused before it reaches the wire — the broker's workers answer `REJECTED`
-rather than stacking, so a backtest that allowed it would be scoring trades live
-trading will never take.
+**As many cycles per (strategy, symbol) as the strategy opens.** Nothing caps
+the count: an entry that fires while positions are already open stacks another
+one beside them, both live and in the backtest, so a replay still predicts what
+live trading does.
+
+Each is its own cycle: its own `signal_uxid`, minted on its entry, and its own
+bracket. Every `TP1`/`TP2`/`SL`/`R_SL`/`FLAT` carries the `signal_uxid` of the
+one cycle it closes — QTE refuses an unnamed close while more than one is open,
+and the weekend flat and the stale-position flush send one close per cycle. The
+worker must keep the positions apart by that id, on a hedging account: a netting
+account would merge them into one position and lose every bracket but the last.
+The only entry QTE still refuses is one reusing the id of a cycle already
+open.
 
 A cycle ends on `TP2`, `SL`, `R_SL` or `FLAT` — and also on a `TP1` that happens
 to close the entry's whole quantity. A strategy taking "50%" of a position that
@@ -128,7 +141,7 @@ writes it **twice**:
 
 | | Redis | Postgres |
 | --- | --- | --- |
-| Key | hash `qte:cycle:<strategy>`, field `<symbol>` | `open_positions`, unique on (strategy, symbol) |
+| Key | hash `qte:cycle:<strategy>`, field `<symbol>\|<signal_uxid>` | `open_positions`, one row per cycle, unique on `signal_uxid` |
 | Role | hot copy, read on every bar | durable copy |
 | Read on boot | first | when the cache has nothing |
 
@@ -158,14 +171,22 @@ Two consequences worth stating plainly:
 - **QTE never creates or reconfigures the `SIGNALS` stream.** The broker owns
   it; editing another service's durability guarantees from here would be a bug.
 
-Each publish carries a fresh `Nats-Msg-Id` so a retry inside the stream's
-duplicate window is stored once.
+Each outbox row carries a stable `Nats-Msg-Id` across its retries. A confirmed
+send only retries local persistence. Ambiguous live sends require reconciliation
+unless `QTE_RUNNER__DELIVERY_RETRY_MAX_AGE` explicitly enables a bounded retry
+inside a verified broker duplicate window, including time for publication.
 
 ### `http`
 
-`POST {QTE_BROKER__HTTP_URL}/secret/webhook` with the payload as the JSON body.
-This path *does* verify `token` (`QTE_BROKER__TOKEN`, matched against the
+`POST {ALGO_BROKER__HTTP_URL}/secret/webhook` with the payload as the JSON body.
+This path *does* verify `token` (`ALGO_BROKER__TOKEN`, matched against the
 broker's). Use it across any boundary you do not control.
+
+The sink injects the current `ALGO_BROKER__TOKEN` for both transports at send
+time. Reports, persisted audit/outbox payloads and internal signal mirrors omit
+the token, including when serializing a legacy signal that still contains one.
+Trading fields remain unchanged. Existing historical files and database rows
+are not automatically rewritten by this change.
 
 ## What QTE does not do
 

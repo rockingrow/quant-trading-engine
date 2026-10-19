@@ -33,7 +33,14 @@ table and the check commands; read it before you commit or open a PR.
    `master`. Opening the PR is the user's call.
 5. **Artefacts**: backtest output to `data/reports/`, audits to `data/audits/`
    (`YYYY-MM-DD-<topic>.md`) — both git-ignored and local-only, never pushed to
-   GitHub. Never into `docs/` or the repository root.
+   GitHub. Never into `docs/` or the repository root. **One session, one
+   subfolder**: every file a session writes under `data/reports/` — JSON,
+   Markdown, HTML dashboard, chart assets — goes into a single
+   `data/reports/YYYY-MM-DD-<topic>/`, never loose at the top of the folder.
+6. **Every backtest writes its HTML dashboard** beside its JSON — the default
+   of `--report` and `make backtest`; never narrow `--report-format` to drop
+   `html`, and write it into the session subfolder of rule 5. Research scripts pass `formats=("json", "md", "html")`, and a JSON
+   without its page gets one from `make chart REPORT=<file>.json`.
 
 ## Working approach
 
@@ -55,10 +62,13 @@ make check          # Ruff + pytest — what CI runs; the gate before any commit
 make test           # uv run pytest -q   (one file: uv run pytest tests/test_replay.py -q)
 make lint / format  # ruff check / ruff format + --fix
 make audit          # validate __strategies__/ against the signal contract
-make tiingo         # write config/tiingo.toml — what the vendor is asked to feed
+make tiingo         # write config/data_providers/tiingo.toml — what the vendor is asked to feed
+make mt5            # write config/data_providers/mt5.toml — what the MT5 ingester's bars feed
 make db-check       # fail if the models drifted from the migrations
+make status         # containers, then every link the running stack depends on (read-only)
 make db-upgrade     # Alembic; there is no init script
-make backtest STRATEGY=QTE_EXAMPLE_EMA_ATR SYMBOL=XAUUSD [TF=M15]
+make costs          # write config/costs.toml — what a replay charges a fill, per symbol
+make backtest STRATEGY=QTE_EXAMPLE_EMA_ATR SYMBOL=XAUUSD TF=M15 FILE=data/parquet/tiingo/XAUUSD_M15.parquet
 make chart REPORT=data/reports/<file>.json
 make help           # every target, one line each
 ```
@@ -80,23 +90,36 @@ package; never scan from the repository root.
 | Wire models, enums, candles, ticks, `SignalIntent` | `src/qte_shared/models.py` |
 | Strategy contract and its seven methods | `src/qte_shared/strategies/strategy_base.py` |
 | Strategy discovery and manifests | `src/qte_shared/strategies/plugin_loader.py` |
+| What `make strategy-mount` recorded, per strategy | `src/qte_shared/strategies/mount_manifest.py`, `__strategies__/strategies.toml` |
+| Per-strategy settings a repo declares; the weekend flat; the mapping's `warmup` override | `src/qte_shared/strategies/strategy_settings.py`, each repo's `settings.py` |
 | Intent to broker payload | `src/qte_shared/strategies/signal_factory.py` |
 | Position sizing and account risk | `src/qte_shared/strategies/sizing.py` |
 | Indicators (pure, arrays in and out) | `src/qte_shared/indicators.py` |
 | Timeframes, candle buckets, symbol markets | `src/qte_shared/{timeframes,symbols}.py` |
 | Symbol to strategy mapping | `src/qte_shared/strategies/mapping.py`, `config/strategies_mapping.example.toml` |
-| What the vendor feeds: symbols, markets, timeframes, vendor knobs | `src/qte_shared/market_data_plan.py`, `config/tiingo.example.toml` |
+| What the vendor feeds: symbols, markets, timeframes, vendor knobs | `src/qte_shared/market_data_plan.py`, `config/data_providers/{tiingo,mt5}.example.toml` |
 | Settings and `QTE_*` environment variables | `src/qte_shared/config.py`, each service's `settings.py`, `.env.example` |
+| Console logging, and each service's daily log file (`QTE_LOG_DIR`, `logs/<date>-<service>.log`) | `src/qte_shared/logging_setup.py`, `configure_logging(service=…)` in each service's `main.py` |
 | NATS subjects and publishing | `src/qte_shared/bus/{subjects,nats_bus}.py` |
 | Redis state and the candle outbox | `src/qte_shared/cache/redis_state.py` |
 | Postgres models and repositories | `src/qte_shared/db/`, each engine's `db/`, `migrations/versions/` |
-| Market data interface and vendors | `src/qte_shared/interfaces/market_data.py`, `providers/` (`registry.py`, `tiingo/`, `simulator/`) |
+| Market data interface and vendors | `src/qte_shared/interfaces/market_data.py`, `providers/` (`registry.py`, `tiingo/`, `mt5/`, `simulator/`) |
+| Closed MT5 bars from `algo-trading-ingester` over NATS | `src/qte_shared/providers/mt5/` (`feed.py`, `protocol.py`), `config/data_providers/mt5.example.toml` |
+| The indicator window asked of the ingester (request/reply): on its `online` announcement, retry, gap top-up | `src/qte_shared/providers/mt5/history.py`, `src/qte_ingestion/{backfill,service}.py`, `tests/test_mt5_history.py` |
+| Optional Tailscale node: tailnet forwards, signals to the broker over the tailnet | `docker-compose.yml` (`tailscale`, `broker-nats-relay`), `config/tailscale/{serve.json,policy.hujson}`, `TAILSCALE_ENABLED` in the `Makefile` |
 | Live feed, resampling, Redis and NATS | `src/qte_ingestion/{service,resampler}.py` |
 | Live loop, broker delivery, control CLI | `src/qte_strategy_engine/{runner,broker_sink,preflight,control}.py` |
+| `make status` / `qte-control status`: read-only probes of Redis, Postgres, NATS, runner, ingestion, MT5 ingester, broker | `src/qte_strategy_engine/connectivity.py`, `tests/test_connectivity.py` |
+| Operator's Telegram bot: the nine commands, tables, paging | `src/qte_bot/`, `QTE_BOT__*` |
+| Control plane the bot and `qte-control` both call (NATS request/reply) | `_on_control_message` in `src/qte_strategy_engine/runner.py` and `src/qte_ingestion/service.py`, `Subjects.{engine,ingestion}_control` |
+| Pausing decisions per symbol/strategy (`/prevent`, `/allow`) | `src/qte_shared/bar_gate.py` |
+| Telegram position-lifecycle message: one per cycle, edited in place | `src/qte_strategy_engine/telegram_notify.py` |
+| Telegram Bot API calls, chat/topic ids, ERROR forwarding, service UP/DOWN | `src/qte_shared/notifications/`, `TelegramSettings` in `src/qte_shared/config.py`, `QTE_TELEGRAM__*` in `.env.example` |
 | Backtest replay, fills, metrics, reports | `src/qte_backtest/{replay,execution,metrics,report,diagnostics}.py` |
-| Parquet history: download, read, list | `src/qte_backtest/{downloader,data_store}.py` |
+| What a replay charges a fill, per symbol and per account type (`--cost-profile`) | `src/qte_backtest/costs.py`, `config/costs.example.toml` |
+| Parquet history: download to `data/parquet/<source>/`, read one file | `src/qte_backtest/{downloader,data_store}.py` |
 | Backtest HTML dashboard | `src/qte_backtest/visualize/` |
-| Strategy deploy audit | `src/qte_strategy_audit/{auditor,contract}.py` |
+| Strategy deploy audit | `src/qte_strategy_audit/{auditor,contract,mount}.py` |
 | Dev-only WebSocket simulator | `src/qte_simulator/` (refuses to run unless `QTE_ENV=dev`) |
 | **Why** something is built this way | `docs/architecture.md` — 20 "Why X" sections; run `rg -n '^## ' docs/architecture.md`, then read only the one you need |
 | Broker payload contract | `docs/broker-contract.md` |
@@ -104,7 +127,8 @@ package; never scan from the repository root.
 | Simulator walkthrough, and running the whole stack locally with no vendor | `docs/simulator.md` |
 
 CLI entry points: `qte-backtest`, `qte-ingestion`, `qte-strategy-runner`,
-`qte-control`, `qte-strategy-audit`, `qte-simulator`.
+`qte-control`, `qte-strategy-audit`, `qte-strategy-mount`, `qte-simulator`,
+`qte-bot`.
 
 `README.md` is ~46KB — never read it whole. Run `rg -n '^#{1,3} ' README.md` for
 the section index, then read only that range.

@@ -241,6 +241,37 @@ def test_var_positional_counts_as_accepting_both(repo):
     assert audit_of(repo).ok
 
 
+@pytest.mark.parametrize(
+    "declaration,accepted",
+    [
+        ("def long()", False),
+        ("def long(self)", False),
+        ("def long(self, candles_frame)", False),
+        ("def long(self, *arguments)", True),
+        ("def long(*arguments)", True),
+        ("def long(self, candles_frame, context, required_extra)", False),
+        ("def long(self, candles_frame, context, optional_extra=None)", True),
+        ("def long(self, *arguments, required_extra)", False),
+        ("def long(self, *arguments, optional_extra=None)", True),
+        ("def long(self, candles_frame, /, context)", True),
+        ("def long(self, candles_frame, *, context)", False),
+        ("def long(self, candles_frame, context, *, required_extra)", False),
+        ("def long(self, candles_frame, context, *, optional_extra=None)", True),
+        ("def long(receiver, candles_frame, context)", True),
+        ("@staticmethod\n        def long(candles_frame, context)", True),
+        ("@staticmethod\n        def long(self, candles_frame, context)", False),
+    ],
+)
+def test_signal_hook_accepts_exactly_the_dispatchers_call(repo, declaration, accepted):
+    write(
+        repo / "my-strategies",
+        {"src/gold.py": GOOD.replace("def long(self, df, context)", declaration)},
+    )
+    report = audit_of(repo)
+    assert ("signal-method-arity" not in codes(report)) is accepted
+    assert report.ok is accepted
+
+
 def test_a_class_the_engine_cannot_drive_at_all_is_reported_as_such(repo):
     """Published by the manifest, so it was certainly *meant* as a strategy."""
     write(repo / "my-strategies", {"src/gold.py": "class GoldEdge:\n    pass\n"})

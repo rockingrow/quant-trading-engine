@@ -114,7 +114,9 @@ def test_it_serves_live_and_deliberately_not_history():
 
 def test_one_socket_carries_every_symbol():
     provider = create_provider("simulator")
-    feeds = provider.live_feeds(build_specs(["XAUUSD", "BTCUSDT"]), _noop)
+    feeds = provider.live_feeds(
+        build_specs(["XAUUSD", "BTCUSDT"], {"XAUUSD": "fx", "BTCUSDT": "crypto"}), _noop
+    )
     assert len(feeds) == 1
     assert feeds[0].symbols == ("BTCUSDT", "XAUUSD")
 
@@ -316,6 +318,13 @@ async def test_a_walk_is_refused_rather_than_run_at_a_nonsense_rate():
             await dispatch(SimulatorHub(), {"op": "walk", "symbol": "XAUUSD", **bad})
 
 
+async def test_a_first_walk_without_a_price_is_refused():
+    """A walk continues a series; the first one for a symbol has none to continue,
+    and the level is never guessed from the symbol name."""
+    with pytest.raises(CommandError, match="no last price"):
+        await dispatch(SimulatorHub(), {"op": "walk", "symbol": "XAUUSD", "rate": 5})
+
+
 async def _drained(hub: SimulatorHub) -> None:
     while hub.generators:
         await asyncio.sleep(0.01)
@@ -443,15 +452,64 @@ def test_replay_without_bars_or_a_cached_file_says_so(monkeypatch, capsys):
     assert "QTE_SIMULATOR_PARQUET_FILE" in capsys.readouterr().err
 
 
-def test_real_history_is_anchored_in_the_past_and_synthetic_bars_ahead():
-    """Prices that printed carry timestamps that already happened; a random walk
-    does not, and forward anchoring is what keeps the flush timer off it."""
-    arguments = cli.build_parser().parse_args(["replay"])
-    assert cli._resolve_anchor(arguments, from_file=True) == "past"
-    assert cli._resolve_anchor(arguments, from_file=False) == "next"
+def test_a_first_generate_without_a_start_price_says_so(monkeypatch, capsys):
+    """The synthetic feed is a random walk; a cold simulator has no level to start it,
+    and it is never guessed from the symbol name."""
+    monkeypatch.setattr(cli, "ControlClient", lambda url=None: _loopback(SimulatorHub()))
+    arguments = cli.build_parser().parse_args(["replay", "--symbol", "XAUUSD", "--generate", "5"])
+    assert asyncio.run(cli._replay(arguments)) == 2
+    assert "--start-price" in capsys.readouterr().err
 
-    explicit = cli.build_parser().parse_args(["replay", "--anchor", "next"])
-    assert cli._resolve_anchor(explicit, from_file=True) == "next"
+
+@pytest.mark.parametrize("source", [[], ["--file", "history.parquet"], ["--generate"]])
+def test_every_replay_source_continues_the_forward_series(source):
+    arguments = cli.build_parser().parse_args(["replay", *source])
+    assert cli._resolve_anchor(arguments) == "next"
+
+    explicit = cli.build_parser().parse_args(["replay", *source, "--anchor", "past"])
+    assert cli._resolve_anchor(explicit) == "past"
+
+
+def test_next_anchoring_after_idle_does_not_replay_elapsed_buckets():
+    cursor = NOW - timedelta(days=1)
+    open_times = anchor_open_times(2, "M15", mode="next", now=NOW, cursor=cursor)
+    assert open_times[0] == floor_to_bucket(NOW, "M15")
+
+
+async def test_file_replay_after_generated_warmup_survives_flush_and_batching(
+    monkeypatch, tmp_path
+):
+    simulator = SimulatorHub()
+    resampler = Resampler("XAUUSD", ["M15"])
+    received = {}
+
+    async def receive(frame_text):
+        market_tick = decode_tick(loads(frame_text))
+        for candle in resampler.add_tick(market_tick) + resampler.flush(datetime.now(UTC)):
+            received[candle.open_time] = candle
+
+    simulator.attach("ingestion", receive)
+    monkeypatch.setattr(cli, "ControlClient", lambda url=None: _loopback(simulator))
+    monkeypatch.setattr(cli, "MAX_BARS", 2)
+    warmup_result = await dispatch(
+        simulator,
+        {"op": "bars", "symbol": "XAUUSD", "anchor": "next", "bars": [a_bar().to_dict()]},
+    )
+    source_file = tmp_path / "scenario.jsonl"
+    source_file.write_text((dumps(a_bar().to_dict()) + "\n") * 5, encoding="utf-8")
+    arguments = cli.build_parser().parse_args(
+        ["replay", "--symbol", "XAUUSD", "--file", str(source_file)]
+    )
+    arguments.anchor = cli._resolve_anchor(arguments)
+    replay_result = await cli._send_bars(arguments, "M15", load_bars(source_file))
+    expected = [Candle.model_validate(candle) for candle in replay_result["expected"]]
+    assert expected[0].open_time > Candle.model_validate(warmup_result["expected"][-1]).open_time
+    assert replay_result["ticks"] == 5 * TICKS_PER_BAR + 1
+    assert all(compare(candle, received.get(candle.open_time)).ok for candle in expected)
+    assert {
+        later.open_time - earlier.open_time
+        for earlier, later in zip(expected, expected[1:], strict=False)
+    } == {timedelta(minutes=15)}
 
 
 def test_a_missing_symbol_falls_back_to_the_one_the_engine_watches(monkeypatch):
@@ -560,7 +618,7 @@ async def test_the_provider_feed_reconnects_and_delivers_into_the_tick_handler()
     async with _running_server() as server:
         config = SimulatorSettings(url=f"ws://127.0.0.1:{server.bound_port}/stream")
         feed = create_provider("simulator", config=config).live_feeds(
-            build_specs(["XAUUSD"]), on_tick
+            build_specs(["XAUUSD"], {"XAUUSD": "fx"}), on_tick
         )[0]
         feed.start()
         await _until(lambda: bool(server.hub.subscribers))

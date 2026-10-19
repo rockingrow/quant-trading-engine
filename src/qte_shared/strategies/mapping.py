@@ -13,8 +13,13 @@ So the pairing moves out of the code and into a file the operator owns:
     [symbols.XAUUSD]
     strategies = ["MT5_GOLD_M5_SCALP"]
 
-    [symbols.XAUUSD.params.MT5_GOLD_M5_SCALP]
+    # Per-strategy defaults, applied wherever this strategy runs.
+    [strategies.MT5_GOLD_M5_SCALP]
     risk_percent = 1.0
+
+    # Per-pair overrides win over the per-strategy defaults above.
+    [symbols.XAUUSD.params.MT5_GOLD_M5_SCALP]
+    risk_percent = 0.5
 
 **The real file is git-ignored; the template beside it is not.** What pairs
 with what — and at what risk — is position information, and this repo is
@@ -47,6 +52,9 @@ SYMBOLS_TABLE = "symbols"
 #: Table applied to a symbol that has no entry of its own.
 DEFAULTS_TABLE = "defaults"
 
+#: Top-level table holding one sub-table of default parameters per strategy.
+STRATEGIES_TABLE = "strategies"
+
 
 @dataclass(frozen=True, slots=True)
 class Pairing:
@@ -66,6 +74,10 @@ class SymbolMapping:
     """The parsed mapping table. Falsy means "no file — use the fallback"."""
 
     pairings: tuple[Pairing, ...] = ()
+    #: Default parameters per strategy, from the ``[strategies.<name>]`` tables.
+    #: Applied to every pair running that strategy; a pair's own
+    #: ``[symbols.<symbol>.params.<name>]`` overrides win over these.
+    strategy_defaults: dict[str, dict[str, Any]] = field(default_factory=dict)
     source: Path | None = None
 
     def __bool__(self) -> bool:
@@ -97,6 +109,17 @@ class SymbolMapping:
                 return dict(pairing.params)
         return {}
 
+    def defaults_for(self, strategy: str) -> dict[str, Any]:
+        """Per-strategy default parameters, applied to every pair it runs on.
+
+        These sit under :meth:`params_for`: a value stated in
+        ``[strategies.<strategy>]`` applies everywhere the strategy runs, and a
+        pair that needs a different number restates just that key. Empty when
+        the table has no entry for *strategy*, and empty on a mapping that was
+        never read.
+        """
+        return dict(self.strategy_defaults.get(strategy, {}))
+
     @property
     def symbols(self) -> list[str]:
         """Every symbol mentioned, deduplicated, in file order."""
@@ -127,7 +150,11 @@ class SymbolMapping:
 
         with path.open("rb") as handle:
             document = tomllib.load(handle)
-        return cls(pairings=tuple(_parse(document, path)), source=path)
+        return cls(
+            pairings=tuple(_parse(document, path)),
+            strategy_defaults=_parse_strategy_defaults(document, path),
+            source=path,
+        )
 
 
 def _parse(document: dict[str, Any], path: Path) -> list[Pairing]:
@@ -168,6 +195,28 @@ def _parse(document: dict[str, Any], path: Path) -> list[Pairing]:
                 raise ValueError(f"{path}: [{where}.params.{name}] must be a table")
             pairings.append(Pairing(symbol=symbol, strategy=name, params=dict(params)))
     return pairings
+
+
+def _parse_strategy_defaults(document: dict[str, Any], path: Path) -> dict[str, dict[str, Any]]:
+    """Read ``[strategies.<name>]`` — one table of default parameters per strategy.
+
+    These are the values a strategy runs at wherever it is mapped; the per-pair
+    ``[symbols.<symbol>.params.<name>]`` overrides are merged on top. An absent
+    table means no defaults, which is not an error — a strategy keeps whatever
+    its own code sets.
+    """
+    table = document.get(STRATEGIES_TABLE, {})
+    if not isinstance(table, dict):
+        raise ValueError(f"{path}: [{STRATEGIES_TABLE}] must be a table keyed by strategy name")
+
+    defaults: dict[str, dict[str, Any]] = {}
+    for raw_name, params in table.items():
+        if not isinstance(params, dict):
+            raise ValueError(
+                f"{path}: [{STRATEGIES_TABLE}.{raw_name}] must be a table of parameters"
+            )
+        defaults[str(raw_name)] = dict(params)
+    return defaults
 
 
 def _strategy_names(entry: dict[str, Any], path: Path, where: str) -> list[str]:

@@ -107,6 +107,20 @@ def test_the_strategys_own_levels_are_never_overwritten():
     )
 
 
+@pytest.mark.parametrize(
+    "action,stop_price,target_price",
+    [(SignalAction.LONG, 1990.0, 2050.0), (SignalAction.SHORT, 2010.0, 1950.0)],
+)
+def test_a_tp2_only_entry_does_not_acquire_an_earlier_target(action, stop_price, target_price):
+    signal = _factory().build(
+        SignalIntent(action=action, price=2000.0, sl=stop_price, tp2=target_price),
+        symbol="XAUUSD",
+        moment=NOW,
+    )
+    assert signal.position.tp1 is None
+    assert signal.position.tp2 == target_price
+
+
 def test_timeframe_is_rendered_the_way_the_broker_stores_it():
     signal = _factory().build(
         SignalIntent(action=SignalAction.LONG, price=2000.0, quantity=1.0, sl=1990.0),
@@ -161,22 +175,23 @@ def test_invalid_entry_does_not_leave_a_ghost_open_cycle():
     assert factory.open_cycle("XAUUSD") is None
 
 
-def test_a_second_entry_cannot_orphan_the_open_cycle():
+def test_a_second_entry_opens_its_own_cycle_beside_the_first():
+    """Nothing caps the book, so the second entry stacks rather than being refused."""
     factory = _factory()
     first = factory.build(
         SignalIntent(action=SignalAction.LONG, price=2000.0, quantity=1.0, sl=1990.0),
         symbol="XAUUSD",
         moment=NOW,
     )
+    second = factory.build(
+        SignalIntent(action=SignalAction.LONG, price=2001.0, quantity=1.0, sl=1991.0),
+        symbol="XAUUSD",
+        moment=NOW,
+    )
 
-    with pytest.raises(ValueError, match="close the current position"):
-        factory.build(
-            SignalIntent(action=SignalAction.LONG, price=2001.0, quantity=1.0, sl=1991.0),
-            symbol="XAUUSD",
-            moment=NOW,
-        )
-
-    assert factory.open_cycle("xauusd") == first.signal_uxid
+    assert second.signal_uxid != first.signal_uxid
+    assert factory.open_cycles("xauusd") == (first.signal_uxid, second.signal_uxid)
+    assert factory.open_cycle("xauusd") == second.signal_uxid, "the most recent"
 
 
 # ── Sizing ───────────────────────────────────────────────────────────────
@@ -218,9 +233,7 @@ def test_the_strategys_own_size_is_replaced_not_honoured():
     assert signal.position.quantity == pytest.approx(6.0)
 
 
-def test_an_entry_that_cannot_be_sized_falls_back_to_the_configured_default():
-    # No stop reaches the sizer only when the bracket cannot supply one either,
-    # which is why the fallback exists at all.
+def test_a_zero_stop_distance_cannot_select_the_configured_fallback():
     factory = SignalFactory(
         "S",
         timeframe="M5",
@@ -229,8 +242,9 @@ def test_an_entry_that_cannot_be_sized_falls_back_to_the_configured_default():
         default_quantity=0.01,
     )
     intent = SignalIntent(action=SignalAction.LONG, price=2334.50, sl=2334.50)
-    signal = factory.build(intent, symbol="XAUUSD", moment=NOW)
-    assert signal.position.quantity == pytest.approx(0.01)
+    with pytest.raises(ValueError, match="stop distance"):
+        factory.build(intent, symbol="XAUUSD", moment=NOW)
+    assert factory.open_position("XAUUSD") is None
 
 
 def test_a_strategy_declining_the_trade_with_a_zero_size_is_not_sized_into_one():

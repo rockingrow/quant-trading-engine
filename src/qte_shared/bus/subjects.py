@@ -19,7 +19,8 @@ class Subjects:
     """Subject builders. Instantiate with a prefix or use the module default."""
 
     def __init__(self, prefix: str | None = None) -> None:
-        self.prefix = prefix or settings.nats.subject_prefix
+        namespace = settings.state_scope.namespace.replace(":", ".")
+        self.prefix = f"{prefix or settings.nats.subject_prefix}.{namespace}"
 
     # ── QTE internal ────────────────────────────────────────────────
 
@@ -41,8 +42,19 @@ class Subjects:
         return f"{self.prefix}.candle.closed.{symbol}.{timeframe}"
 
     def engine_control(self) -> str:
-        """Control-plane fan-out: shadow-mode toggles, reload requests."""
+        """The runner's control plane: shadow mode, the bar gate, status, FLAT."""
         return f"{self.prefix}.control"
+
+    def ingestion_control(self) -> str:
+        """Ingestion's own control plane: status, warm-up requests, flush.
+
+        Separate from :meth:`engine_control` rather than shared with a
+        discriminator in the payload, because these are request/reply actions
+        and both services subscribe without a queue group: on one subject a
+        request would be answered twice and the caller would read whichever
+        reply arrived first.
+        """
+        return f"{self.prefix}.ingestion.control"
 
     def signal_emitted(self) -> str:
         """Mirror of every signal the runner produced, for observers/UI."""

@@ -5,8 +5,8 @@ are.
 
 ## Why two NATS namespaces
 
-`QTE.*` is ours — ticks and candle closes, on **core** NATS. At twenty ticks a
-second a dropped tick is replaced by a fresher one immediately, so paying
+`QTE.<env>.<mode>.<provider>.*` is ours — ticks and candle closes, on **core**
+NATS. At twenty ticks a second a dropped tick is replaced by a fresher one immediately, so paying
 JetStream's persistence cost for raw market data buys nothing. Candle closes
 are different: ingestion stages them in a Redis outbox before publishing and
 only removes them after Core NATS accepts the publish. A crash can replay a
@@ -36,6 +36,14 @@ it on the quarter hour. `Resampler.flush(now)` runs on a timer and closes any
 bucket the clock has passed, regardless of feed activity. A bucket with no ticks
 produces no candle: forward-filling a flat synthetic bar would feed strategies a
 body that never traded, which corrupts any indicator with a range in it.
+
+The clock also decides whether a bar is *whole*. A process that starts, or
+restarts, after a bucket opened builds that bar from the ticks it received and
+misses the open and whatever printed before. The resampler marks such a bar
+partial, and ingestion completes it from the vendor's bar for the same bucket
+before staging it (`qte_ingestion.repair`). History fetched for "today" is the
+mirror image: the vendor includes the bucket still forming, so every bar whose
+bucket has not ended is dropped rather than stored as closed.
 
 ## Why each engine owns its own tables
 
@@ -81,9 +89,98 @@ the last write. The runner rebuilds its indicator window from Redis on boot
 instead of waiting hours for live candles, which is what makes a restart resume
 trading on the next close.
 
-Postgres is the audit trail — written *after* the signal has gone out, and its
-failures are logged rather than raised. A logging outage must not become a
-runner that stops trading.
+Two keys make that rebuild trustworthy. `qte:<namespace>:decided:<strategy>:<symbol>:<tf>`
+holds the newest bar each pair was fed. Closes published while the runner was
+down or still starting are the bars newer than it, and the runner replays them
+once subscribed — deciding only on those that closed within
+`QTE_RUNNER__CATCH_UP_MAX_AGE`, because a late entry trades a price the backtest
+never saw. `qte:<namespace>:history:provider` names the feed that wrote the candle state:
+before anything reads it back, ingestion discards candle lists, open bars and
+staged closes that another provider wrote, that no provider was recorded for,
+or that are dated after now. Positions are never part of that discard.
+
+Postgres stages each signal as `prepared` before it can go out. The runner
+records `unknown` before calling the broker, then `sent_pending` or
+`shadow_pending` before persisting the resulting position to both stores.
+Only after those writes succeed does the row become `sent` or `shadow`.
+Every unfinished phase is revisited with keyset pagination, and its pair
+cannot decide again until all older rows are reconciled. Accepted rows only
+retry local persistence; they never resend to the broker.
+
+An ambiguous live result, including legacy `pending` rows, requires operator
+reconciliation by default. `QTE_RUNNER__DELIVERY_RETRY_MAX_AGE` can opt into
+retries only inside a verified broker deduplication horizon. It must leave room
+for the publish timeout and network latency; the engine does not infer a
+guarantee from an HTTP header or assume NATS retains message ids forever.
+
+The runner also reconciles Redis before processing a new live close and every
+`QTE_RUNNER__HISTORY_SYNC_INTERVAL` seconds. Missing cached bars are replayed in
+order with the same decision-age limit. Cold windows incorporate backfill that
+finishes after startup; initial history warms without inventing past decisions.
+Only actual cached bars fill gaps, so closed market sessions create no fake bars.
+
+**One active runner per Redis namespace.** A non-expiring `runner:owner` claim
+is acquired before restoration or subscriptions and checked before decisions
+and delivery. Graceful shutdown drains callbacks before releasing it. A second
+process refuses to start; queue groups do not provide shared strategy state.
+There is deliberately no lease timeout or automatic takeover without broker
+fencing. After a crash, stop and verify the previous runner is gone, reconcile
+outstanding broker outcomes, then explicitly remove only that namespace's stale
+ownership key before restarting. Never clear it while an owner may still run.
+Redis persistence and retention of this key are required; do not flush or evict
+the trading namespace while runners are active.
+
+Three things keep that rule from turning every unclean exit into an outage:
+
+- **A shutdown that is allowed to finish.** `strategy-runner` sets
+  `stop_grace_period: 60s`. Docker's default kills ten seconds after SIGTERM,
+  before the runner has drained NATS and released the claim.
+- **The same container takes its own claim back.** A container's PID namespace
+  dies with its PID 1, so a runner that *is* PID 1 knows every earlier process
+  of that container is gone. Its owner id carries a random token kept on the
+  container's writable layer (`QTE_RUNNER__INSTANCE_FILE`), and a held claim
+  with that token is replaced atomically instead of refused. This is not a
+  lease and not failover: a recreated container has a new token, another host
+  has another token, and a host process or `docker exec` has none, so all of
+  them are refused as before. Recovery then runs as on any start — an ambiguous
+  delivery still blocks its pair. Running the runner under an init wrapper
+  (`init: true`) makes Python something other than PID 1 and so turns this off;
+  `QTE_RUNNER__RECLAIM_OWN_CLAIM=false` does the same deliberately.
+- **A checked way to clear it.** `qte-control owner status` shows the key and
+  its holder. `qte-control owner clear` refuses while any runner answers a ping
+  or while NATS cannot be reached, asks for the namespace to be typed back, and
+  deletes only the holder it displayed. A paused or hung runner does not answer
+  a ping, so the operator still has to know that none is left. Run it where the
+  namespace is the running stack's — in production `QTE_ENV=prod` comes from the
+  compose overlay, not from `.env`:
+
+  ```bash
+  docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+    run --rm --no-deps strategy-runner qte-control owner clear
+  ```
+
+A refused start logs `Runner ownership is already held` with the namespace and
+the holder, and records an `ownership_refused` event at `ERROR`; the container
+then restarts into the same refusal about once a minute. Alert on either — the
+log line, or `SELECT ... WHERE event = 'ownership_refused'` on the audit event
+table. `ownership_reclaimed` and `runner_owner_cleared` are recorded at
+`WARNING`.
+
+Ingestion keeps each retired candle, including its partial-bar repair state,
+until Redis acknowledges staging. It retries that batch before retiring more
+bars, bounding the backlog by configured series. Redis stages history and the
+candle outbox with an atomic per-series watermark, so a lost response can be
+retried without duplicate history/events or deletion of a newer open candle.
+
+That watermark reads any bar at or below it as a duplicate, which is correct for
+a forward-only feed and wrong for a vendor replaying the history a part-filled
+window is missing — those bars are precisely the old ones. So a replayed
+warm-up batch takes the one write that is allowed behind the watermark:
+`merge_history_candles` buffers the batch, merges it into the stored window by
+open time in a single compare-and-swap against that same watermark, and raises
+the watermark without ever lowering it. Such bars are history and not events —
+never staged, published or decided on — and the runner picks the merged window
+up when it re-reads Redis on the next live close.
 
 **The open position is the exception, and is written to both.** It is the one
 piece of hot state whose loss is not merely slow to recover from: a runner that
@@ -93,6 +190,64 @@ cannot distinguish "flat" from "the cache was re-provisioned", so `open_position
 in Postgres answers that question and the runner re-seeds Redis from it. That
 table is the only mutable row QTE keeps — everything else there is append-only —
 which is exactly why it is a table of its own rather than a column on `signals`.
+
+## Why a stale position is flushed on start
+
+Remembering a cycle across a restart is the right answer, and it has a failure
+mode of its own. Nothing caps how many cycles a `(strategy, symbol)` pair
+holds, so a long outage does not lock the pair out of trading — it leaves it
+carrying positions nobody is deciding on. The rows survive, the pair comes back
+still believing it holds them, and each was sized against a bracket the market
+left behind hours ago. Every later entry is then sized against an account those
+ghosts are still charged to, and each one's bracket sits at the broker waiting
+on a level that stopped meaning anything.
+
+So the runner closes what has gone stale, on start, with `R_SL` — a terminal
+action, so the cycle ends and the book is back to what is really being
+managed. `R_SL` rather than `FLAT`
+because `FLAT` means "close everything on this strategy" and this closes exactly
+one cycle, named by its `signal_uxid`. It goes out through the ordinary `_emit`
+path, so it is staged in the durable outbox, delivered and audited like any
+strategy exit and inherits every guard there.
+
+**Age is the whole design.** An unconditional flush would close the book on
+every deploy, and would make most of the recovery machinery above pointless —
+the runner would be carefully restoring a cycle it is about to close. So
+`QTE_RUNNER__STALE_POSITION_MAX_AGE` draws the line: inside it, nothing changes
+and the position is restored exactly as before; outside it, the position is
+treated as what it is, a leftover. `0` restores the unconditional behaviour for
+an operator who wants it, and `QTE_RUNNER__FLUSH_STALE_POSITIONS=warn` lists
+what a first `close` run would do without doing it.
+
+**It decides from the slots, not from the table.** What a pair believes it
+holds is the cycle `_restore_position` put on its slot, and that came from Redis in
+preference to Postgres. The two can disagree: `_persist_position` writes Redis
+first, and `OpenPositionRepository.upsert` swallows its own failure by design,
+so a cycle can live in the cache and not in the table. A flush driven by the
+table would skip exactly that pair and leave it locked — the failure it was
+added to prevent. The table is still read, for the two things the slots cannot
+show: rows belonging to no running strategy, and duplicate ids across the whole
+namespace.
+
+Two things it deliberately does not do. It skips a pair whose delivery the
+outbox has not reconciled, because flushing over an ambiguous send would
+manufacture a second command against the same cycle. And it does not close a
+position belonging to a strategy this runner is not driving — `OpenPosition`
+records no timeframe and the broker payload needs one, so the engine cannot
+speak for a strategy it is not running. That case is logged as an error rather
+than swallowed, because nobody else will ever close it either.
+
+The same section of the boot sequence enforces the other direction of the pair
+rule: two pairs must never hold one `signal_uxid`. The broker groups a whole
+trade by that id, so a close on either pair would close the other's position and
+nothing in the audit trail would explain the loss.
+`uq_open_positions_uxid` makes it impossible to write; the startup check catches
+rows that predate the constraint or were inserted by hand, and it refuses to
+start rather than warning, because every entry and exit on either pair is unsafe
+until an operator says which one is real. It reads the restored slots as well as
+the table, because `list_open` answers with an empty list when it could not read
+at all — a check resting on the table alone would pass on no data the first time
+Postgres was slow to accept connections.
 
 ## Why the strategy returns intents instead of publishing
 
@@ -108,9 +263,14 @@ Four things a strategy is not allowed to own, all in `SignalFactory`:
    that sized itself would be sizing against a number it invented.
 4. **Timeframe spelling** — QTE says `M15`, the broker's contract says `"15"`.
 
-Because both drivers go through the factory, a signal in a backtest report is
-byte-identical to the one a worker would have executed. Reconciliation compares
-two rows, not two implementations.
+Both drivers reject an intent naming a symbol other than its slot before
+building or committing it. Risk sizing rounds down; an invalid budget or a
+quantity below the supported step rejects the trade rather than choosing a
+fallback. The ceiling also applies to fallback quantities.
+
+Because both drivers go through the factory, the trading fields in a backtest
+report match those sent live. The sink injects the current broker credential
+only at delivery; reports, audit payloads and internal mirrors omit it.
 
 ## Why the plugin loader imports by path
 
@@ -192,6 +352,77 @@ The scan is still there for the one-file case, and the two mix: a loose
 manifest. What a manifest claims, the scan leaves alone — importing those
 modules a second time would register every class twice.
 
+## Why the weekend flat is the engine's job, not the strategy's
+
+A CFD book closes on Friday evening and reopens on Sunday. A position left open
+across that gap cannot be stopped out, and Monday's first print reprices it
+against two days of news. Something has to be flat before the close.
+
+For a while that something was the strategy. `MT5_GOLD_M5_V2` carried a
+`use_weekend_flat` param, a `weekend_flat_time`, a cut-off parser, a term in its
+entry gate and a `FLAT` branch in its trade mirror — five places, all correct,
+all invisible from outside the file. The trouble is what that implies for the
+second strategy on the same instrument: it either copies the five, or it does
+not have them. A protection you can forget by omission is not a protection, and
+"did anyone remember the Friday cut-off in this one?" is not a question a code
+review reliably catches.
+
+So the decision moved, and the declaration stayed. A strategy repository
+declares its market's window as data — `flat_from`, `flat_until`, a weekday and
+a wall time — in a settings file beside its alias table, published through a
+second manifest hook (`load_settings`, alongside `load_all`). The engine parses
+it at the plugin boundary and enforces it: inside the window entry intents are
+dropped and any open cycle is closed with a `FLAT`. The strategy stops owning
+the clock and keeps owning the only part that was ever its business, which is
+knowing when its instrument trades.
+
+Three details are load-bearing.
+
+**It is a window, not a cut-off.** A cut-off says when to close and not when the
+block ends, so the engine would flatten at 17:00 and the strategy — no longer
+holding a gate of its own — would re-enter on the next bar and be flattened
+again, taking turns until the market shut. `flat_until` is what makes the block
+terminate, and stating the reopen is also the honest way to describe a weekend.
+
+Shortened holiday sessions can start the block earlier through `extra_windows`,
+a list of `{flat_from: "YYYY-MM-DD HH:MM", flat_until: "YYYY-MM-DD HH:MM"}`
+declarations in that same market zone. These half-open dated windows extend
+the weekly block; they cannot reopen a market inside it. Both drivers and the
+runner's between-bar sweep use the same predicate. Dates must be maintained
+against the broker calendar: neither driver guesses a holiday from a future
+bar or invents a fill after the market has already closed.
+
+**The zone is the operator's, not the strategy's.**
+`QTE_ENGINE__WEEKEND_FLAT_TIMEZONE` decides whose clock those wall times are
+read on, default `UTC`. It sits in the engine block rather than the runner's
+because the backtest reads it too: a replay evaluating a different window from
+the runner would stop predicting the one thing this feature changes.
+
+**The repository declares the window; the pair switches it.** Whether a market
+shuts is the instrument's business, but whether *this* book wants to hold
+through it is a risk decision, and those live in the mapping table beside
+`risk_percent`. So `enabled` in the declaration is a default, and a pair's
+`use_weekend_flat` — `[strategies.<name>]`, `[symbols.<symbol>.params.<name>]`,
+or `--param` on a backtest — overrides it. Both drivers resolve it with the same
+function from the same params, so the replay keeps predicting the runner. A
+window declared `enabled = false` is still parsed, so turning it on cannot
+surface a typo on the day it matters; asking for a window nobody declared, or
+writing anything but a boolean, stops that pair from starting.
+
+**A setting that will not parse stops the strategy loading.** The alternative is
+falling back to "off", which turns a misspelled `flat_form` into a position held
+through a shut market — the exact failure the setting exists to prevent. The
+loader records it as a load failure, so `make audit` reports it and
+`QTE_RUNNER__AUDIT_ON_START=error` refuses to start on it.
+
+The runner has one thing the replay does not: a periodic sweep that also
+flattens between bars. Bar-driven evaluation is what keeps the two drivers
+deciding alike, and it is not enough on its own — a feed that stalls at 16:50 on
+a Friday delivers no further close, and the position rides through the weekend.
+The sweep only ever fires at moments that have no bar, which is precisely the
+set a backtest cannot represent, so it costs no parity.
+`QTE_RUNNER__WEEKEND_FLAT_SWEEP_INTERVAL=0` turns it off.
+
 ## Why the strategy interface is seven methods, not one
 
 A strategy could say everything it has to say through `on_candle_closed`, and
@@ -253,6 +484,155 @@ model in the code path that is supposed to be reacting to a candle close. The
 runner does reach for it once, at start-up, and that is the single exception
 `tests/test_packaging.py` records by name.
 
+## Why one Telegram message per position, edited in place
+
+A trade is not one signal. The runner emits an entry, then its TP1, maybe a
+TP2, a stop or a weekend `FLAT` — posted one notification each, a chat shows
+four unrelated messages and whoever reads them has to stitch the position back
+together by eye, usually on a phone. So a cycle owns **one** message per chat:
+the entry sends it, every later action edits it and appends to its Actions
+block, and the header flips from `RUNNING` to `CLOSED` when a terminal action
+arrives. `algo-trading-broker` already does this for its own broadcast, and the
+body here is deliberately shaped like
+`broker/helpers/message_formatter.py` so the same trade reads the same way
+whichever service posted it.
+
+The body is re-rendered from the cycle's stored events every time rather than
+appended to a string. The header has to change with the cycle, and the message
+is the only copy a chat holds: one Telegram rejected has to come back
+*complete* on the next action, not missing the action in between.
+
+What identifies a cycle is `strategy` + `symbol` + `signal_uxid`, the triple
+the broker groups a broadcast by, plus the state namespace so a paper book and
+a live one never edit each other's messages. It is kept in Postgres
+(`telegram_cycle_messages`) and not in Redis, for the reason
+[Why Redis holds state that Postgres does not](#why-redis-holds-state-that-postgres-does-not)
+gives from the other side: a flushed cache would lose both the message id and
+the events, and the next action would post a second message for a position
+already on screen.
+
+No reply is posted under the message. Telegram notifies nobody about an edit,
+which is why the broker also sends a two-line reply under each update — that is
+a channel with an audience. Here the chat is the operator's own, the broker's
+reply already covers the audience case, and a notification per action would
+undo the thing this design is for.
+
+Nothing about it is on the trade path. `note_signal` is synchronous and only
+queues; one background worker drains the queue, which also keeps a cycle's
+edits in the order its actions happened. `api.telegram.org` is throttled or
+silently dropped on plenty of networks, and a send that sits there for the full
+HTTP timeout must not stand in front of the next bar. A full queue drops the
+newest update with a warning: the signal outbox, not a chat, is the record of
+what was sent.
+
+## Why forwarded errors are de-duplicated and filtered
+
+Forwarding `ERROR` logs to a chat is one switch
+(`QTE_TELEGRAM__LOG_ERRORS_ENABLED`) and two failure modes, both of which turn
+the feature against the incident it exists to report.
+
+The first is recursion. The send path logs its own failures — that is what
+makes a misconfigured bot visible at all — so a handler that forwards every
+error would answer a dead Bot API by sending another message through it, and
+answer that failure the same way. Records from the Telegram modules, and from
+the HTTP client underneath them, are filtered out of forwarding for that
+reason. The second is the storm: a reconnect loop writes the same line every
+second, and a chat that shows it sixty times a minute is a chat nobody reads by
+the time the next, different error arrives. Identical errors are suppressed for
+a window (60 seconds by default), keyed on the logger, the level and the
+interpolated message rather than on the whole formatted text, so two
+occurrences of one error collapse even when their tracebacks differ.
+
+The bridge between `logging` and the Bot API is the same one the broker uses: a
+`logging.Handler` cannot await anything and may be called from any thread,
+while the send must be awaited, so `emit` only formats, de-duplicates and hands
+the text to the loop with `call_soon_threadsafe`, and one worker task does the
+sending. The handler is attached to the *root* logger, which is where this
+repository's console and daily-file handlers already live — one attachment then
+covers every module, including whatever a mounted strategy repo logs under its
+own name.
+
+Errors default to the **private** chat list and never fall back to the
+broadcast one. A stack trace carries file paths, symbols and internal state;
+publishing that to a signal channel because an operator filled in only one of
+the two lists would be a configuration mistake the code should not make
+possible.
+
+## Why only two services announce themselves
+
+`make start` brings up Redis, Postgres, NATS, ingestion, the runner and
+sometimes a Tailscale node, and the chat hears from exactly two of them. The
+other four are images this repository does not control: adding a sidecar whose
+only job is to watch containers and post about them would be a second health
+system to maintain, running beside the one Docker already has.
+
+It is also unnecessary, because of the order things start in. Neither service
+finishes starting until the infrastructure it depends on has answered — the
+runner's announcement comes after Redis gave up the ownership claim, after
+Postgres reconciled the outbox, after NATS accepted the subscriptions and after
+the strategies loaded. "🟢 strategy-runner UP" is therefore not a claim about
+the runner alone; it is the only line in the chat that is evidence about the
+whole stack. Its absence says the same thing in reverse, which is why a service
+that dies on the way up still sends a DOWN message rather than going quiet.
+
+These two sends are the only ones on the Telegram path that are **awaited**
+rather than queued. Everything else here is deliberately fire-and-forget, so
+that a throttled `api.telegram.org` can never stand in front of a bar or an
+order. The stop message is the one case where that reasoning inverts: a queued
+message would sit in a worker that is about to be cancelled, and the event loop
+it needs is seconds from ending. So it is sent in line, bounded by the HTTP
+timeout and wrapped so a dead Bot API cannot stop a service from stopping —
+which the container's 60-second stop grace period leaves ample room for.
+
+## Why the bot talks over NATS and not to an HTTP API
+
+The broker's bot calls the broker's HTTP API, and copying that here would mean
+bringing back the control-plane service this repository deliberately removed
+(see `qte_strategy_engine.control`). The actions an operator needs already
+exist as NATS request/reply on the two services' control subjects, because that
+is how `qte-control` has always reached a running runner: a subject, an
+`action`, and a reply. The bot is one more client of exactly those.
+
+What that buys is that a command cannot do more than the CLI can. There is no
+second code path into the runner to keep correct, no endpoint to authenticate
+separately, and nothing listening on a port that was not already there. The
+bot's own authorisation is the operator id list, checked before a handler runs.
+
+Three commands deliberately do *not* go through NATS. `/redis`, `/positions`
+and `/closed` read Redis and Postgres directly, because the moment an operator
+most wants to know what the book holds is the moment the runner is not
+answering. The ones that must reach a live process — `/runner`, which reports
+in-memory window state, and everything that changes something — have nowhere
+else to go, and say so plainly when nobody answers.
+
+`/warmup` and `/flush` reach *ingestion* rather than the runner, and are served
+there rather than by the bot writing Redis itself. A warm-up window is three
+pieces of state that have to move together: the stored bars, the staging
+watermark that decides whether a replayed bar is a duplicate, and the
+resampler's half-built bucket. Only ingestion holds all three, so only
+ingestion can drop them consistently — a flush from outside would leave a
+watermark pointing at bars that no longer exist, and the next close would be
+read as a duplicate of its own history.
+
+## Why a paused pair still fills its window
+
+`/prevent` could have dropped the bar. It does not, and the reason is what
+happens on `/allow`: a window with a hole in it exactly as wide as the pause
+produces indicators that silently disagree with the market, so the first
+decision after resuming would be computed on data the market never traded. The
+close is therefore fed into the window and recorded as seen, and only the call
+into the strategy is skipped.
+
+The gate lives in Redis rather than in the runner's memory for the same reason
+shadow mode does: a runner that restarts during a pause must come back paused.
+The NATS broadcast that follows a change only decides whether it takes effect
+now or on the next bar, which is why the bot reports "stored, but no runner
+answered" rather than claiming either.
+
+It is also why `/prevent` is not a substitute for `/flat`. It stops new
+decisions; it does nothing to a position that is already open, and a position
+nobody is deciding on is a position nobody is managing either.
+
 ## Why symbol → strategy pairing lives in a file
 
 A strategy declaring `symbols = ("XAUUSD",)` is fine for one strategy and wrong
@@ -274,10 +654,13 @@ which is the same split `__strategies__/` makes for the code.
 
 Three details earn their complexity:
 
-- **Per-pair parameters, not per-strategy.** One strategy running tighter on
-  gold than on bitcoin is the ordinary case, and the runner builds one instance
-  per pair so a strategy carrying state between bars never has gold's last bar
-  deciding bitcoin's next one.
+- **Parameters layer: per-strategy default, per-pair override.** A
+  `[strategies.<name>]` table sets what a strategy runs at everywhere it is
+  mapped; a `[symbols.<symbol>.params.<name>]` table restates only the keys
+  that differ for one pair. One strategy running tighter on gold than on
+  bitcoin is the ordinary case, and the runner builds one instance per pair so
+  a strategy carrying state between bars never has gold's last bar deciding
+  bitcoin's next one.
 - **An absent file is not an empty one.** No file means fall back to what each
   strategy declares — the behaviour from before the table existed. A file that
   maps nothing means trade nothing. Those differ by a deploy, so the table's
@@ -310,9 +693,16 @@ process to keep alive, secure and monitor in exchange for a second way to reach
 the same data.
 
 The exception is shadow mode, which genuinely has to reach a *process that is
-already running* — flipping live/paper must not require a restart mid-position.
-That is one message on `QTE.control`, so `qte-control` publishes it straight to
+already running*. It pauses a live book without simulating position changes.
+Paper/live identity is selected at startup; see [state isolation](state-isolation.md).
+The pause is one message on `QTE.<env>.<mode>.<provider>.control`, sent straight to
 NATS and no service is needed to carry it.
+
+The runner reads the durable Redis flag before recovery and again before each
+delivery, including when a broadcast was lost. A delayed message cannot
+overwrite a newer flag. Missing state uses `ALGO_BROKER__SHADOW_MODE`; malformed
+or unreadable state fails closed. `ALGO_BROKER__FORCE_SHADOW_MODE=true` overrides
+both the persisted flag and runtime controls and never permits live delivery.
 
 Relatedly, `NatsBus.connect` bounds the *initial* connect even though reconnects
 are unlimited: nats-py applies `max_reconnect_attempts` to both, so `-1` (what a
@@ -324,6 +714,38 @@ Listed in the README. The one worth repeating: when a bar's range covers both
 the stop and the target, the simulator takes the **stop**. Without tick data
 there is no ordering, and assuming the favourable one is precisely how a losing
 strategy backtests profitably.
+
+## Why fill costs live in a profile file, not in the environment
+
+`QTE_ACCOUNT__SPREAD` is one number for the whole engine, and a cost is not a
+property of an engine: gold's measured median spread is 0.25, oil's is 0.04,
+BTCUSDT's is around 20. Whichever number that variable holds is therefore wrong
+for every symbol but one — and the engine's shipped default, 0.04, is oil's.
+
+Passing `--spread` per run moves the problem rather than solving it. The flag
+has to be remembered on every invocation, by every script and every agent, and
+forgetting it does not fail: it prices gold six times too cheaply and reports
+"0.04" with the same confidence it would report a number somebody chose.
+
+So the three costs move into `config/costs.toml`, keyed by symbol and grouped
+into profiles — one profile per account type, because an account type is a whole
+cost model and not a spread. A Standard account hides its fee inside the spread
+and charges no commission; a Zero/Raw account quotes a tighter spread and bills
+the commission separately. Both are plausible deployments of the same strategy,
+and `--cost-profile` is how one run answers for both.
+
+Three consequences worth stating:
+
+- **Each cost resolves on its own** — flag, then the symbol's table, then the
+  profile's `defaults`, then `QTE_ACCOUNT__*`. A profile stating only a spread
+  keeps the account's slippage rather than silently zeroing it.
+- **The report records which layer won**, per cost, in `costs.sources`, beside
+  the profile's name. A price nobody can trace is a result nobody can reproduce,
+  and two runs that differ only in account type are otherwise indistinguishable
+  on disk.
+- **Nothing here reaches the live path.** The runner's fills come from the
+  broker, so the module sits in `qte_backtest` — by the rule that what only one
+  service uses does not belong in `qte_shared`.
 
 ## Why the repo root is searched for, not counted
 
@@ -347,6 +769,21 @@ a plugin would win.
 
 ## Why the strategy sees a bounded window
 
+Both drivers first decide when the closed history contains `warmup` bars,
+including the bar just closed. Replay starts at index `warmup - 1`, and its
+buy-and-hold benchmark starts at that same close. Exactly `warmup` input bars
+are enough for one decision; a shorter history is rejected.
+
+`warmup` is the strategy's declaration and the deployment's decision. A pair
+may restate it in the mapping table — `warmup` under `[strategies.<name>]` or
+`[symbols.<symbol>.params.<name>]` — and `resolve_warmup` applies it in both
+drivers from the same pair params, so a replay still starts on the bar the
+runner will. The engine does not police whether the number is big enough,
+because that is a property of the strategy's slowest indicator and only the
+strategy's author knows it: a count below the declaration logs a warning and
+runs. What it does refuse is a count above `history_window()`, since the
+runner's deque is capped there and the pair could never finish warming up.
+
 `StrategyBase.history_window()` is read by *both* drivers, and that is the whole
 point of it existing. Before it did, the live runner kept a deque of
 `max(warmup * 2, 400)` candles while the backtest passed `frame.iloc[:i+1]` —
@@ -365,6 +802,22 @@ runner will. Making it faster means incremental indicators that carry state
 between bars, which is a real design change rather than a tuning exercise.
 
 ## Why each service builds its own image
+
+Default Compose startup includes the vendor applications and infrastructure.
+The simulator is behind the `dev` profile; `make dev` opts in and explicitly
+sets development mode. `make start-prod` uses the production overlay and an
+explicit application service list with `QTE_ENV=prod`. Redis, Postgres and
+NATS use `restart: unless-stopped`, matching the applications; the migration
+job remains one-shot. A stale runner ownership claim still needs the manual
+reconciliation described above after an unclean runner exit.
+
+Container Postgres URLs are built from the same `POSTGRES_USER`,
+`POSTGRES_PASSWORD` and `POSTGRES_DB` that initialize Postgres, using
+SQLAlchemy's URL builder to encode credentials. `QTE_POSTGRES__DSN` remains
+the host-tool URL; `QTE_CONTAINER_POSTGRES_DSN` explicitly overrides the URL
+inside containers. All applications and the migrator share that resolution.
+Changing initialization variables does not rename users or databases in an
+existing Postgres volume.
 
 This used to be a uv workspace of six distributions, and `uv sync --package`
 cut the images along that seam. It no longer is, because the seam was in the
@@ -391,6 +844,22 @@ has to keep running, where the resolver enforced it for free.
 
 ## Why the market data vendor sits behind an interface
 
+Explicit `QTE_ENGINE__SYMBOLS` and `QTE_ENGINE__TIMEFRAMES` override the plan.
+A symbol override selects the exact symbol list; without a timeframe override,
+existing symbols keep their individual planned timeframes and new symbols use
+the engine's timeframe list. A timeframe override applies to every selected
+symbol. Planned markets stay authoritative; a new symbol requires a market in
+`QTE_INGESTION__MARKET_OVERRIDES`. Ingestion and unqualified history downloads
+use the same resolver. A present plan with no enabled symbols stays empty;
+only a missing plan uses default symbols and timeframes.
+
+`QTE_INGESTION__PUBLISH_TICKS` is shared deployment configuration, read by both
+ingestion and runner. When a strategy overrides `on_tick`, or the runner's
+explicit tick subscription is enabled, startup refuses a false publication
+setting before restoring positions or recovering deliveries. Set the variable
+consistently in both processes; Compose uses the shared `.env` for this. This
+checks configuration compatibility, not whether the upstream feed is healthy.
+
 Tiingo used to be spelled out in three places: a WebSocket client inside
 `data_ingestion`, a REST downloader inside `backtest_engine`, a `tiingo_ticker`
 property on `SymbolSpec` in shared, and a settings block on root `Settings`.
@@ -409,12 +878,14 @@ Three consequences are worth naming:
 * **The engines never import a vendor.** They call `create_provider()`, which
   resolves `QTE_MARKET_DATA__PROVIDER` through a registry. Adding a vendor is a
   file under `qte_shared/providers/` and a `register_provider` call; swapping one
-  is an environment variable.
+  is an environment variable. That variable is a comma-separated list, so
+  ingestion can run several vendors at once (`mt5,binance`): each feeds the
+  symbols of its own plan and stamps them with its own `origin.provider`.
 * **The vendor's configuration lives with the vendor.** Root `Settings` carries
   the *choice* (`market_data.provider`) and no vendor block, so a second vendor
   never edits the core config. `QTE_TIINGO__*` is read by
   `qte_shared.providers.tiingo`, its standing values come from the `[provider]`
-  table of `config/<provider>.toml` (`qte_shared.market_data_plan`), and its key comes
+  table of `config/data_providers/<provider>.toml` (`qte_shared.market_data_plan`), and its key comes
   from one generic `QTE_DATA_PROVIDER_API_KEY` — a credential is the one
   setting that must not be invalidated by changing vendor.
 * **Images stay split.** Built-ins are registered as import-path strings and
@@ -426,6 +897,71 @@ Three consequences are worth naming:
 `SymbolSpec` kept the part that is genuinely vendor-independent — which market a
 symbol trades on, since that decides which endpoint a provider reaches for — and
 lost `tiingo_ticker`, which is now `MarketDataProvider.ticker_for()`.
+
+## Why the indicator window is asked for, not pushed
+
+A vendor that closes its own bars (`Capability.LIVE_BARS`) has no history
+endpoint to backfill from, so a QTE starting on a cold Redis used to have no
+indicator window at all: the runner climbed one bar per close, which on M15 is
+a day and a half for 150 bars. The MT5 ingester runs beside the terminal and
+could read those bars in a millisecond. The question was only how to get them
+across.
+
+The first answer was to push them. The ingester replayed its start-up window
+onto the same subject it publishes closes on, flagged `warmup_bar` and numbered
+`warmup_index` of `warmup_total` so the subscriber knew when the batch was
+whole. It does not work, for two reasons that are worth keeping written down:
+
+* **The transport de-duplicates the payload.** Bars ride JetStream with
+  `Nats-Msg-Id` set to the bar's own `event_id`, which is what makes a
+  redelivery harmless. A replayed window is the *same bars again*, so inside
+  the stream's duplicate window the stream drops them — silently, with an ack
+  that reads like a success. A restart minutes after the last one delivered
+  nothing; a restart hours after it delivered the old bars but dropped the
+  newest, including the one carrying `warmup_index == warmup_total`, which left
+  the subscriber buffering a batch that could never complete. Both failures
+  were observed on a running pair of services, not reasoned about: a restart ten
+  minutes after the previous one had all 300 of its replayed bars dropped as
+  duplicates while the stream reported every publish as stored.
+* **The trigger sat on the wrong side.** The ingester knows when *it* restarted.
+  It does not know when QTE's window is short — which is the condition that
+  actually matters, and which also arises from a flushed Redis, a new symbol in
+  the plan, or a state namespace that has never been warmed.
+
+So the direction is inverted. QTE asks: one core-NATS request per planned
+series on `<rpc_prefix>.history.<gateway>.<SYMBOL>.<TF>`, answered with every
+bar in a single reply. The consequences are the reason it is better rather than
+merely different:
+
+* **A window arrives whole or not at all.** There is no series to reassemble and
+  no message of it that can be lost on its own, so there is no half-filled
+  state to represent. A reply that does not come is a timeout, and a timeout is
+  retried.
+* **Requests stay out of the stream.** The request prefix may not sit under the
+  publish prefix — both sides refuse that configuration — because the stream
+  captures its whole subject tree and would store a request as market data and
+  answer it with its own acknowledgement before the ingester could.
+* **The vendor holds no policy.** Which series are warmed and how deep is
+  `history_bars` and the `[symbols.*]` tables on QTE's side. The ingester has no
+  warm-up setting left to disagree with them.
+* **It is a window, not an archive.** The reply is "the newest *n* closed bars",
+  which is why this is `Capability.RECENT_BARS` and not `HISTORY`: a backtest
+  download still refuses the provider, and nothing it returns is written to the
+  parquet history cache, where it would shadow a real archive at the same path.
+
+QTE does not wait for the vendor and does not poll for it. It starts on
+whatever Redis holds; the ingester publishes an announcement once it is
+answering requests, and again after every reconnect, and only then does
+ingestion compare each planned window against Redis and request the short ones.
+A full, current window costs one Redis read. The single announcement that could
+go unheard is one made while QTE's own NATS connection was down, and that is
+covered by checking once when the connection returns — which is why there is no
+timer anywhere in this path.
+
+The replayed-batch reader is still in `qte_ingestion.service`, so an older
+ingester that pushes a numbered window is understood and merged. It is kept for
+compatibility, not as a second mechanism: nothing in the current pair of
+services emits one.
 
 ## Why the simulator is a provider and not a test mode
 

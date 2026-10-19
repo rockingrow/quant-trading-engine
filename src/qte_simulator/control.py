@@ -39,7 +39,6 @@ from qte_simulator.bars import (
     anchor_open_times,
     bar_ticks,
     expected_candle,
-    reference_price,
     seal_tick,
 )
 from qte_simulator.hub import SimulatorHub
@@ -280,8 +279,12 @@ async def _walk(hub: SimulatorHub, command: Mapping[str, Any]) -> dict[str, Any]
     rate = _defaulted(command, "rate", 1.0, positive=True)
     speed = _defaulted(command, "speed", 1.0, positive=True)
     # Continue from wherever the series is, exactly as a replay does — a walk
-    # that restarted at a reference price would put a step in the bar it joins.
-    resume = hub.last_prices.get(symbol) or reference_price(symbol)
+    # that restarted at some chosen level would put a step in the bar it joins.
+    # The first walk of a symbol the simulator has not seen has nothing to
+    # continue, so `price` is required rather than picked.
+    resume = hub.last_prices.get(symbol)
+    if resume is None and _optional_float(command, "price") is None:
+        raise CommandError(f"no last price for {symbol} yet — pass `price` for its first walk")
     price = _defaulted(command, "price", resume, positive=True)
     volatility = _defaulted(command, "volatility", 0.0005)
     spread = _defaulted(command, "spread", 0.0)

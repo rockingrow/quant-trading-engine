@@ -231,6 +231,7 @@ __marimo__/
 # fresh checkout still shows the shape of this directory. It publishes an inert
 # strategy — see __strategies__/_boilerplate/README.md — and is safe to delete.
 !/__strategies__/_boilerplate/
+!/__strategies__/qte-signal-simulator/
 
 # Frozen out of the strategy repo's lockfile by `make strategy-requirements` so
 # the image build can install what the plugins need. Regenerated per deploy and
@@ -246,9 +247,22 @@ __marimo__/
 
 # The market-data plan: which symbols are actually subscribed, at what size of
 # window. Same rule as the routing table — the template is tracked, the real
-# file is not. `make tiingo` writes it.
-/config/tiingo.toml
-!/config/tiingo.example.toml
+# file is not. `make tiingo`, `make mt5` and `make simulator` write them.
+# What a backtest charges a fill, per symbol and per account type. The broker
+# and account type an operator trades is theirs; the template beside it carries
+# the schema and the measured numbers the audits use.
+/config/costs.toml
+/config/costs.*.toml
+!/config/costs.example.toml
+
+/config/data_providers/tiingo.toml
+/config/data_providers/mt5.toml
+/config/data_providers/binance.toml
+/config/data_providers/simulator.toml
+!/config/data_providers/tiingo.example.toml
+!/config/data_providers/mt5.example.toml
+!/config/data_providers/binance.example.toml
+!/config/data_providers/simulator.example.toml
 
 # Downloaded market history — regenerate with `make download`, never commit.
 /data/parquet/*

@@ -9,23 +9,30 @@ two columns::
 
 The rest of QTE only knows one shape — a UTC ``open_time`` index over
 ``open/high/low/close/volume`` — so this converts into exactly what
-:class:`~qte_backtest.downloader.HistoryDownloader` writes, and drops the file
-where :class:`~qte_backtest.data_store.ParquetStore` looks for it. A file
-converted here and one downloaded through a market data provider are interchangeable to a replay.
+:class:`~qte_backtest.downloader.HistoryDownloader` writes. It lands in
+``data/parquet/mt5/`` because a downloader writes ``data/parquet/<provider>/``:
+every history file names the source it came from, and a replay says which one
+it reads rather than picking by convention.
 
 Two things the CSV does not carry and the caller must get right:
 
-* **The clock.** MT5 timestamps are *broker server time*, not UTC. Most MT5
-  brokers run EET (UTC+2/+3 with DST); pass ``--tz`` with the server's zone so
-  the bars land on the same UTC instants as downloaded history. The default is
-  UTC — correct only if the terminal itself is UTC.
+* **The clock.** MT5 timestamps are *broker server time*, not UTC. Many MT5
+  brokers run EET (UTC+2/+3 with DST), but not all of them: Exness (the
+  ``XAUUSDm`` suffix) runs its servers on UTC+0, and converting its export as
+  EET lands every bar two hours early in winter and three in summer, which
+  silently moves every session window a strategy gates on. Pass ``--tz`` with
+  the server's zone so the bars land on the same UTC instants as downloaded
+  history. The default is UTC. Check the result rather than the broker's
+  marketing: gold's daily break is 17:00-18:00 New York, so XAUUSD bars resume
+  at 23:00 UTC in winter and 22:00 UTC in summer.
 * **The symbol.** Brokers suffix their tickers (``XAUUSDm``, ``XAUUSD.pro``).
   The suffix is stripped by default so the parquet matches the symbol the
   engine trades; ``--symbol`` overrides the guess outright.
 
 Usage::
 
-    uv run python scripts/mt5_csv_to_parquet.py data/csv/XAUUSDm_M5_*.csv --tz EET
+    uv run python scripts/mt5_csv_to_parquet.py data/csv/XAUUSDm_M5_*.csv --tz UTC
+    uv run python scripts/mt5_csv_to_parquet.py data/csv/XAUUSD_M5_*.csv --tz EET
 """
 
 from __future__ import annotations
@@ -42,6 +49,10 @@ from qte_shared.config import settings
 from qte_shared.timeframes import normalize_timeframe
 
 OHLCV = ["open", "high", "low", "close", "volume"]
+
+#: Broker imports get their own directory beside each provider's, so a file's
+#: path always says where its bars came from.
+MT5_PARQUET_DIR = settings.engine.parquet_dir / "mt5"
 
 #: ``<SYMBOL>_<TF>_<from>_<to>.csv`` — how MT5 names its exports.
 _EXPORT_NAME = re.compile(r"^(?P<symbol>[A-Za-z0-9.#_-]+?)_(?P<timeframe>[A-Za-z]\d+)_\d+_\d+$")
@@ -98,9 +109,10 @@ def read_mt5_csv(path: Path, tz: str) -> pd.DataFrame:
     # <VOL> is real volume and is 0 for most FX/CFD feeds; <TICKVOL> counts
     # ticks and is the only volume MT5 actually has there. Prefer the real one
     # when the broker reports it, so a volume-aware strategy is not fed ticks.
-    real = pd.to_numeric(frame.get("vol", 0), errors="coerce").fillna(0.0)
-    ticks = pd.to_numeric(frame.get("tickvol", 0), errors="coerce").fillna(0.0)
-    frame["volume"] = real if float(real.sum()) > 0 else ticks
+    empty_volume = pd.Series(0.0, index=frame.index)
+    real_volume = pd.to_numeric(frame.get("vol", empty_volume), errors="coerce").fillna(0.0)
+    tick_volume = pd.to_numeric(frame.get("tickvol", empty_volume), errors="coerce").fillna(0.0)
+    frame["volume"] = real_volume if float(real_volume.sum()) > 0 else tick_volume
 
     frame = frame.set_index("open_time")[OHLCV].astype(float).sort_index()
     return frame[~frame.index.duplicated(keep="last")]
@@ -168,8 +180,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--out-dir",
         type=Path,
-        default=settings.engine.parquet_dir,
-        help=f"Where to write. Default: {settings.engine.parquet_dir}",
+        default=MT5_PARQUET_DIR,
+        help=f"Where to write. Default: {MT5_PARQUET_DIR}",
     )
     parser.add_argument("--overwrite", action="store_true", help="Replace an existing parquet")
     args = parser.parse_args(argv)

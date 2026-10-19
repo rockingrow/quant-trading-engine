@@ -35,6 +35,12 @@ from typing import Any
 #: that a 40-trade run does not turn into a picket fence of single counts.
 HISTOGRAM_BINS = 17
 
+#: Points the buy-and-hold line is thinned to. It is one line on one chart, and
+#: the price rows behind it are now the run's own bars — tens of thousands of
+#: them on a long M15 file, every one of which would otherwise be copied into
+#: this block as a four-key object.
+BENCHMARK_POINTS = 600
+
 #: Trades this many inter-quartile ranges beyond the quartiles are outliers —
 #: Tukey's fence, the same rule TradingView's "Outliers" row uses.
 OUTLIER_FENCE = 1.5
@@ -281,11 +287,18 @@ def _curve(trades: Sequence[Trade], equity: float) -> dict[str, Any]:
 
 
 def _benchmark(market: dict[str, Any] | None, equity: float) -> dict[str, Any]:
-    """Buy and hold, sampled at the market rows the report carries.
+    """Buy and hold, sampled from the market rows the report carries.
 
     The comparison a strategy has to win is not zero, it is the instrument. This
     line pays no spread and no commission, which makes it a floor rather than a
     fair fight — and that is the point of a floor.
+
+    Thinned to :data:`BENCHMARK_POINTS` on the way out. The price rows are the
+    run's own bars now and there can be tens of thousands of them; this is one
+    line on one chart, and a point every few pixels is as much as it can show.
+    Thinning by stride is safe here where it would not be for the candles: a
+    line is read for its level, and the last row is always kept so the end of
+    the line is the real ending equity rather than wherever the stride landed.
     """
     if not market or not market.get("rows"):
         return {"available": False, "points": []}
@@ -297,15 +310,18 @@ def _benchmark(market: dict[str, Any] | None, equity: float) -> dict[str, Any]:
     if anchor is None or not size:
         return {"available": False, "points": []}
 
+    rows = [row for row in market["rows"] if not _before(row[0], start)]
+    stride = max(1, -(-len(rows) // BENCHMARK_POINTS))
+    kept = rows[::stride]
+    if rows and kept[-1] is not rows[-1]:
+        kept.append(rows[-1])
+
     points = []
-    for row in market["rows"]:
-        moment = _parse(row[0])
-        if start is not None and moment is not None and moment < start:
-            continue
+    for row in kept:
         close = float(row[4])
         points.append(
             {
-                "t": row[0],
+                "t": _moment_iso(row[0]),
                 "close": close,
                 "equity": round(equity + (close - anchor) * size, 6),
                 "pnl": round((close - anchor) * size, 6),
@@ -327,6 +343,7 @@ def _market(market: dict[str, Any] | None, trades: Sequence[Trade]) -> dict[str,
     return {
         "available": True,
         "bucket_bars": market.get("bucket_bars"),
+        "base_timeframe": market.get("base_timeframe"),
         "columns": market.get("columns"),
         "rows": market["rows"],
         "trades": [
@@ -340,13 +357,49 @@ def _market(market: dict[str, Any] | None, trades: Sequence[Trade]) -> dict[str,
                 "sl": _maybe_float(trade.row.get("initial_sl")),
                 "tp1": _maybe_float(trade.row.get("tp1")),
                 "tp2": _maybe_float(trade.row.get("tp2")),
+                "quantity": _maybe_float(trade.row.get("quantity")),
                 "pnl": round(trade.net, 6),
                 "r": trade.r,
                 "reason": trade.row.get("exit_reason"),
+                "note": trade.row.get("exit_note"),
+                "legs": _exit_legs(trade),
             }
             for index, trade in enumerate(trades, start=1)
         ],
     }
+
+
+def _exit_legs(trade: Trade) -> list[dict[str, Any]]:
+    """Every close a trade went through, so a TP1 partial is drawn where it filled.
+
+    A report written before legs were recorded still has one exit — the trade's
+    own — and gets it as a single leg rather than no exit marker at all.
+    """
+    legs = trade.row.get("legs") or []
+    if not legs:
+        # ``trade.closed`` falls back to the entry; an exit marker must not.
+        closed = _parse(trade.row.get("closed_at"))
+        if closed is None or trade.row.get("exit_price") is None:
+            return []
+        return [
+            {
+                "t": _iso(closed),
+                "price": _maybe_float(trade.row.get("exit_price")),
+                "quantity": _maybe_float(trade.row.get("quantity")),
+                "reason": trade.row.get("exit_reason"),
+                "note": trade.row.get("exit_note"),
+            }
+        ]
+    return [
+        {
+            "t": leg.get("closed_at"),
+            "price": _maybe_float(leg.get("price")),
+            "quantity": _maybe_float(leg.get("quantity")),
+            "reason": leg.get("reason"),
+            "note": leg.get("note"),
+        }
+        for leg in legs
+    ]
 
 
 # ── Performance analysis ──────────────────────────────────────────────
@@ -920,6 +973,31 @@ def _parse(raw: Any) -> datetime | None:
 
 def _iso(moment: datetime | None) -> str | None:
     return moment.isoformat() if moment else None
+
+
+def _moment(raw: Any) -> datetime | None:
+    """A market row's ``t``, as a datetime.
+
+    Epoch seconds since report schema 2.0, an ISO string before it. Both are
+    read here rather than at each call site because ``qte-backtest chart`` is
+    documented to re-render a JSON written by an older engine, and a dashboard
+    that refused those would make every archived report unopenable.
+    """
+    if isinstance(raw, int | float) and not isinstance(raw, bool):
+        return datetime.fromtimestamp(float(raw), tz=UTC)
+    return _parse(raw)
+
+
+def _moment_iso(raw: Any) -> str | None:
+    return _iso(_moment(raw))
+
+
+def _before(raw: Any, start: datetime | None) -> bool:
+    """Whether a row's ``t`` falls before *start*. Unknown times are kept."""
+    if start is None:
+        return False
+    moment = _moment(raw)
+    return moment is not None and moment < start
 
 
 def _key(moment: datetime | None, period: str) -> str:

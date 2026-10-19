@@ -1,7 +1,7 @@
 [project]
 name = "quant-trading-engine"
-version = "0.1.0"
-description = "Event-driven quant trading engine: ingestion, backtest, live strategy runner, signal broker bridge."
+version = "0.1.1"
+description = "Data-driven quant trading engine for backtesting and executing proprietary strategies via integrated data providers (Tiingo first), featuring full trade lifecycle management and external signal routing."
 readme = "README.md"
 # Pinned to 3.13, and the reason is not this repo's own dependencies — they are
 # happy on anything from 3.11 up. The strategy runner imports the plugins in
@@ -14,7 +14,7 @@ requires-python = ">=3.13,<3.14"
 # so an image installs the sockets and file formats it actually uses.
 dependencies = [
     "pydantic>=2.7",
-    "pydantic-settings>=2.3",
+    "pydantic-settings>=2.7",  # NoDecode, for the schema_versions env form
     "pandas>=2.2",
     "numpy>=1.26",
     "nats-py>=2.7",
@@ -41,8 +41,20 @@ tiingo = [
 simulator = [
     "websockets>=12.0",
 ]
-# The runner's HTTP client for algo-trading-broker. See qte_strategy_engine.broker_sink.
+# The services' HTTP client: algo-trading-broker on the http transport, and the
+# Telegram Bot API. See qte_strategy_engine.broker_sink and
+# qte_shared.notifications.telegram_sink, which degrades to sending nothing when
+# httpx is absent rather than refusing to import.
 broker = [
+    "httpx>=0.27",
+]
+# The operator's Telegram bot (./src/qte_bot). aiogram is a production
+# dependency and a new one: the bot is a long-poll client of the Bot API, which
+# is exactly what this library is for, and writing that loop by hand would be
+# more code with worse retry behaviour. httpx comes with it for the sink the
+# bot shares with the notifications.
+bot = [
+    "aiogram>=3.13",
     "httpx>=0.27",
 ]
 # 84 MB, and only two callers touch parquet: the backtest history store, which
@@ -59,7 +71,9 @@ qte-ingestion = "qte_ingestion.main:run"
 qte-strategy-runner = "qte_strategy_engine.main:run"
 qte-control = "qte_strategy_engine.control:main"
 qte-strategy-audit = "qte_strategy_audit.main:run"
+qte-strategy-mount = "qte_strategy_audit.mount:run"
 qte-simulator = "qte_simulator.cli:main"
+qte-bot = "qte_bot.main:run"
 
 [dependency-groups]
 dev = [
@@ -67,6 +81,7 @@ dev = [
     "pytest-asyncio>=0.24",
     "ruff>=0.6",
     "httpx>=0.27",
+    "fakeredis[lua]>=2.38",
 ]
 
 [build-system]
@@ -84,6 +99,7 @@ packages = [
     "src/qte_strategy_engine",
     "src/qte_strategy_audit",
     "src/qte_simulator",
+    "src/qte_bot",
 ]
 
 # Marks this file as the repository root for `qte_shared.config._find_repo_root()`,

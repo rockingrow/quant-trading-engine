@@ -1,14 +1,13 @@
 """What the engine trades and how the vendor is asked for it, read from TOML.
 
-One provider, one file: ``config/<provider>.toml``, named after
-``QTE_MARKET_DATA__PROVIDER``. It answers three questions that used to be four
-environment variables and a JSON blob:
+One provider, one file: ``config/data_providers/<provider>.toml``, named after each entry of
+``QTE_MARKET_DATA__PROVIDER`` (a comma-separated list, ``mt5,binance``). With
+several providers their plans are merged by :meth:`MarketDataPlan.merge`: each
+symbol belongs to exactly one of them, and each provider keeps its own
+``[provider]`` table. A plan answers what used to be two environment variables
+and a JSON blob:
 
 .. code-block:: toml
-
-    [feed]
-    timeframes = ["M15"]
-    signal_timeframe = "M15"
 
     [provider]
     backfill_history = true
@@ -25,10 +24,15 @@ and ``QTE_INGESTION__MARKET_OVERRIDES={"BTCUSD":"fx"}`` bolted the third column
 back on as JSON inside a shell variable. Written as tables, the symbol and its
 settings sit together and a reviewer can see what will actually be subscribed.
 
+The bar a strategy *decides* on is not here: it is one value for the whole
+engine, not a per-symbol one, so it stays in the environment as
+``QTE_ENGINE__SIGNAL_TIMEFRAME`` (default ``M15``). ``EngineSettings`` refuses
+to start when it names a bar no symbol is resampled to.
+
 **The real file is git-ignored; the template beside it is not**, for the same
 reason as :mod:`qte_shared.strategies.mapping`: what a desk trades is position
 information and this repository is public. ``make tiingo`` writes
-``config/tiingo.toml`` from ``config/tiingo.example.toml``.
+``config/data_providers/tiingo.toml`` from ``config/data_providers/tiingo.example.toml``.
 
 **Credentials never appear here.** The vendor key is a secret and stays in
 ``.env`` as ``QTE_DATA_PROVIDER_API_KEY`` — one name whatever the vendor, which
@@ -44,12 +48,12 @@ to what it used to be" look identical in a log until the P&L arrives.
 from __future__ import annotations
 
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 from qte_shared.logging_setup import get_logger
-from qte_shared.symbols import Market, SymbolSpec, infer_market
+from qte_shared.symbols import Market, SymbolSpec
 from qte_shared.timeframes import normalize_timeframe
 
 log = get_logger(__name__)
@@ -57,15 +61,29 @@ log = get_logger(__name__)
 #: Table holding the per-symbol entries.
 SYMBOLS_TABLE = "symbols"
 
-#: Table of settings shared by every symbol that names none of its own.
-FEED_TABLE = "feed"
-
 #: Table of the vendor's own knobs, read by that provider's settings block.
 PROVIDER_TABLE = "provider"
 
+#: What a symbol is resampled to when it names no ``timeframes`` of its own.
+DEFAULT_TIMEFRAMES = ("M15",)
+
 #: Never taken from the file, however it got written there — a key in a config
-#: file is a key in a diff. It is read from ``QTE_DATA_PROVIDER_API_KEY``.
+#: file is a key in a diff. The vendor key is read from
+#: ``QTE_DATA_PROVIDER_API_KEY``; any other credential from its provider's own
+#: environment variable. A prefixed spelling (``nats_token``) counts too.
 _SECRET_OPTIONS = ("api_key", "token", "password", "secret")
+
+
+def _is_secret_option(name: str) -> bool:
+    """Whether *name* is credential-shaped: a secret word, alone or as a suffix."""
+    return any(name == secret or name.endswith(f"_{secret}") for secret in _SECRET_OPTIONS)
+
+
+#: Keys an earlier layout put at the top of the plan. ``[feed]`` carried a
+#: default timeframe list and ``signal_timeframe``; both moved — timeframes to
+#: each ``[symbols.*]``, the signal bar to ``QTE_ENGINE__SIGNAL_TIMEFRAME``.
+#: Kept here only so a stale plan is warned about rather than silently obeyed.
+_RETIRED_KEYS = ("feed", "signal_timeframe")
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +93,9 @@ class SymbolFeed:
     symbol: str
     market: Market
     timeframes: tuple[str, ...]
+    #: The provider whose plan lists the symbol, and so the one that feeds it.
+    #: Empty only for a plan read on its own, before :meth:`MarketDataPlan.merge`.
+    provider: str = ""
 
     @property
     def spec(self) -> SymbolSpec:
@@ -87,9 +108,10 @@ class MarketDataPlan:
     """The parsed plan. Falsy means "no file — use the environment defaults"."""
 
     feeds: tuple[SymbolFeed, ...] = ()
-    signal_timeframe: str = ""
     options: dict[str, Any] = field(default_factory=dict)
     source: Path | None = None
+    #: Every file a merged plan was read from; ``(source,)`` for a single plan.
+    sources: tuple[Path, ...] = ()
 
     def __bool__(self) -> bool:
         """Whether a file was *read*, not whether it planned anything.
@@ -98,7 +120,7 @@ class MarketDataPlan:
         deliberate state; no file at all means "nobody has written a plan yet".
         The two differ by a deploy, so they must not collapse into one answer.
         """
-        return self.source is not None
+        return self.source is not None or bool(self.sources)
 
     # ── Queries ───────────────────────────────────────────────────────
 
@@ -138,6 +160,36 @@ class MarketDataPlan:
     # ── Loading ───────────────────────────────────────────────────────
 
     @classmethod
+    def merge(cls, plans_by_provider: dict[str, MarketDataPlan]) -> MarketDataPlan:
+        """One plan over several providers, each feed tagged with its provider.
+
+        A symbol listed by two providers is refused: ingestion would publish two
+        bar series under one candle subject, and the runner cannot tell which one
+        it traded on. ``[provider]`` survives only when there is a single plan —
+        with several, each vendor reads its own table from its own plan.
+        """
+        feeds: list[SymbolFeed] = []
+        owners: dict[str, str] = {}
+        for provider_name, plan in plans_by_provider.items():
+            for feed in plan.feeds:
+                if feed.symbol in owners:
+                    raise ValueError(
+                        f"{feed.symbol} is planned by both {owners[feed.symbol]!r} and "
+                        f"{provider_name!r}; one symbol must have one provider"
+                    )
+                owners[feed.symbol] = provider_name
+                feeds.append(replace(feed, provider=provider_name))
+        read_plans = [plan for plan in plans_by_provider.values() if plan]
+        sources = tuple(path for plan in read_plans for path in plan.sources or (plan.source,))
+        single_plan = len(plans_by_provider) == 1
+        return cls(
+            feeds=tuple(feeds),
+            options=dict(read_plans[0].options) if single_plan and read_plans else {},
+            source=sources[0] if sources else None,
+            sources=sources,
+        )
+
+    @classmethod
     def load(cls, path: Path | str) -> MarketDataPlan:
         """Parse *path*, or return an empty plan when it does not exist."""
         path = Path(path)
@@ -152,24 +204,20 @@ class MarketDataPlan:
 
 def _parse(document: dict[str, Any], path: Path) -> MarketDataPlan:
     """Turn the parsed TOML into a plan, validating as it goes."""
-    feed_table = _table(document, FEED_TABLE, path)
-    default_timeframes = _timeframes(feed_table, path, FEED_TABLE) or ["M15"]
-    signal_timeframe = feed_table.get("signal_timeframe", default_timeframes[0])
-    if not isinstance(signal_timeframe, str):
-        raise ValueError(f"{path}: [{FEED_TABLE}].signal_timeframe must be a timeframe label")
-    signal_timeframe = normalize_timeframe(signal_timeframe)
+    _warn_on_retired_keys(document, path)
 
     options = _table(document, PROVIDER_TABLE, path)
-    for name in _SECRET_OPTIONS:
-        if name in options:
+    for name in options:
+        if _is_secret_option(name):
             log.warning(
                 "Ignoring [%s].%s in %s — credentials belong in .env "
-                "(QTE_DATA_PROVIDER_API_KEY), not in a file that gets committed",
+                "(QTE_DATA_PROVIDER_API_KEY, or the provider's own variable), "
+                "not in a file that gets committed",
                 PROVIDER_TABLE,
                 name,
                 path,
             )
-    options = {key: value for key, value in options.items() if key not in _SECRET_OPTIONS}
+    options = {key: value for key, value in options.items() if not _is_secret_option(key)}
 
     symbols = _table(document, SYMBOLS_TABLE, path)
     feeds: list[SymbolFeed] = []
@@ -187,11 +235,11 @@ def _parse(document: dict[str, Any], path: Path) -> MarketDataPlan:
         if any(feed.symbol == symbol for feed in feeds):
             raise ValueError(f"{path}: {symbol} has two entries; one symbol is one subscription")
 
-        timeframes = _timeframes(entry, path, where) or default_timeframes
+        timeframes = _timeframes(entry, path, where) or list(DEFAULT_TIMEFRAMES)
         feeds.append(
             SymbolFeed(
                 symbol=symbol,
-                market=_market(entry, symbol, path, where),
+                market=_market(entry, path, where),
                 timeframes=tuple(timeframes),
             )
         )
@@ -200,12 +248,28 @@ def _parse(document: dict[str, Any], path: Path) -> MarketDataPlan:
         log.warning(
             "Market-data plan %s lists no enabled symbol — ingestion will subscribe to none", path
         )
-    return MarketDataPlan(
-        feeds=tuple(feeds),
-        signal_timeframe=signal_timeframe,
-        options=options,
-        source=path,
-    )
+    return MarketDataPlan(feeds=tuple(feeds), options=options, source=path, sources=(path,))
+
+
+def _warn_on_retired_keys(document: dict[str, Any], path: Path) -> None:
+    """``[feed]`` and a top-level ``signal_timeframe`` are no longer read.
+
+    ``[feed]`` carried a default timeframe list and the signal bar. Timeframes
+    are stated under each ``[symbols.*]`` now, and the bar a strategy decides on
+    is ``QTE_ENGINE__SIGNAL_TIMEFRAME`` — one value for the whole engine, not a
+    per-plan one. Obeying half of a stale plan silently is exactly the "looks
+    like it still says that" failure this module exists to avoid, so a leftover
+    key is called out rather than dropped without a word.
+    """
+    for key in _RETIRED_KEYS:
+        if key in document:
+            where = "[feed]" if key == "feed" else f"top-level {key!r}"
+            log.warning(
+                "%s in %s is no longer read — put timeframes under each [symbols.*] "
+                "and set QTE_ENGINE__SIGNAL_TIMEFRAME in .env",
+                where,
+                path,
+            )
 
 
 def _table(document: dict[str, Any], name: str, path: Path) -> dict[str, Any]:
@@ -230,16 +294,16 @@ def _timeframes(entry: dict[str, Any], path: Path, where: str) -> list[str]:
         raise ValueError(f"{path}: [{where}].timeframes — {exc}") from exc
 
 
-def _market(entry: dict[str, Any], symbol: str, path: Path, where: str) -> Market:
-    """The symbol's market, stated or inferred.
+def _market(entry: dict[str, Any], path: Path, where: str) -> Market:
+    """The symbol's market, which the entry must state.
 
     Stating it is the point of writing the symbol down: ``BTCUSD`` is a crypto
-    pair on an exchange and an FX CFD on a broker's book, and the guess decides
-    which socket the provider opens.
+    pair on an exchange and an FX CFD on a broker's book, and only the operator
+    knows which socket the provider should open.
     """
     market = entry.get("market")
     if market is None:
-        return infer_market(symbol)
+        raise ValueError(f'{path}: [{where}] must set market = "fx" or "crypto"')
     if market not in ("fx", "crypto"):
         raise ValueError(f'{path}: [{where}].market must be "fx" or "crypto", got {market!r}')
     return market

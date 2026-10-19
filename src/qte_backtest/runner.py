@@ -7,7 +7,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from qte_backtest.data_store import ParquetStore
+from qte_backtest.costs import CostProfiles, resolve_costs
+from qte_backtest.data_store import load_history
 from qte_backtest.db import BacktestRepository
 from qte_backtest.execution import CostModel
 from qte_backtest.replay import BacktestEngine
@@ -18,6 +19,7 @@ from qte_shared.strategies.mapping import SymbolMapping
 from qte_shared.strategies.plugin_loader import StrategyLoader
 from qte_shared.strategies.signal_factory import BracketPolicy
 from qte_shared.strategies.sizing import PositionSizer
+from qte_shared.strategies.strategy_settings import resolve_weekend_flat
 
 log = get_logger(__name__)
 
@@ -26,16 +28,27 @@ log = get_logger(__name__)
 class BacktestRequest:
     strategy: str
     symbol: str
-    timeframe: str = "M15"
+    timeframe: str
+    #: The parquet to replay, named outright. See
+    #: :func:`qte_backtest.data_store.load_history` for why it is not derived.
+    history_file: Path
     start: datetime | None = None
     end: datetime | None = None
     params: dict[str, Any] = field(default_factory=dict)
-    spread: float = 0.0
-    slippage: float = 0.0
-    #: Defaulted from ``QTE_ACCOUNT__*`` so a run with no flags is priced and
-    #: capitalised the way the live account is. Pass a value to override one
-    #: without disturbing the rest.
-    commission_per_unit: float = field(default_factory=lambda: settings.account.commission_per_unit)
+    #: Fill costs, ``None`` for "not stated" — which is what lets the cost
+    #: profile for this symbol win over the account-wide fallback. A number
+    #: here is the operator overriding both, for this run only. See
+    #: :mod:`qte_backtest.costs` for the whole order of precedence.
+    spread: float | None = None
+    slippage: float | None = None
+    commission_per_unit: float | None = None
+    #: Which account type to price this run at — a profile in
+    #: :attr:`~qte_shared.config.AccountSettings.costs_file`. ``None`` takes
+    #: the file's ``default_profile``, then ``QTE_ACCOUNT__COST_PROFILE``.
+    cost_profile: str | None = None
+    #: The profile file itself, when a caller wants one other than the
+    #: configured ``QTE_ACCOUNT__COSTS_FILE``.
+    costs_file: Path | None = None
     contract_size: float = field(default_factory=lambda: settings.account.contract_size)
     #: Fallback size for an entry the risk sizer could not size (no stop).
     quantity: float = 1.0
@@ -49,7 +62,7 @@ class BacktestRequest:
     #: the report object is built either way, because the diagnostics are worth
     #: having in the return value even when nothing lands on disk.
     report_dir: Path | None = None
-    report_formats: tuple[str, ...] = ("json", "md")
+    report_formats: tuple[str, ...] = ("json", "md", "html")
     report_include_signals: bool = True
 
 
@@ -57,7 +70,6 @@ async def run_backtest(
     request: BacktestRequest,
     *,
     strategies_dir: Path | None = None,
-    parquet_dir: Path | None = None,
 ) -> BacktestReport:
     """Load the strategy and its history, replay it, and diagnose the outcome.
 
@@ -72,16 +84,44 @@ async def run_backtest(
     # the command line would be the only way to reproduce production, and
     # forgetting it would silently measure a different book.
     params = {**_mapped_params(request), **request.params}
-    strategy = loader.load_one(request.strategy, params)
+    # `find` rather than `load_one`: the replay needs the settings the mounted
+    # repository declared beside the class — the weekend window the live runner
+    # would enforce — or it would measure a strategy trading a Friday evening
+    # the runner closes it out of.
+    discovered = loader.find(request.strategy)
+    # The pair's `use_weekend_flat`, if the mapping or `--param` set one, decides
+    # whether that window is enforced — resolved exactly as the runner resolves it.
+    weekend_flat = resolve_weekend_flat(discovered.settings.weekend_flat, params)
+    strategy = discovered.instantiate(params)
 
-    store = ParquetStore(parquet_dir)
-    frame = store.load(request.symbol, request.timeframe, request.start, request.end)
+    frame = load_history(
+        request.history_file,
+        request.symbol,
+        request.timeframe,
+        request.start,
+        request.end,
+    )
     log.info(
-        "Replaying %s on %s %s — %d bars",
+        "Replaying %s on %s %s — %d bars from %s",
         strategy.name,
         request.symbol,
         request.timeframe,
         len(frame),
+        request.history_file,
+    )
+
+    # What this symbol costs to trade, from the operator's cost profile rather
+    # than from one account-wide number — the flags still win, for a run that
+    # deliberately prices something else. See :mod:`qte_backtest.costs`.
+    costs = resolve_costs(
+        request.symbol,
+        profiles=CostProfiles.load(request.costs_file or settings.account.costs_file),
+        profile=request.cost_profile or settings.account.cost_profile,
+        flags={
+            "spread": request.spread,
+            "slippage": request.slippage,
+            "commission_per_unit": request.commission_per_unit,
+        },
     )
 
     engine = BacktestEngine(
@@ -89,9 +129,9 @@ async def run_backtest(
         symbol=request.symbol,
         timeframe=request.timeframe,
         costs=CostModel(
-            spread=request.spread,
-            slippage=request.slippage,
-            commission_per_unit=request.commission_per_unit,
+            spread=costs.spread,
+            slippage=costs.slippage,
+            commission_per_unit=costs.commission_per_unit,
             contract_size=request.contract_size,
         ),
         starting_equity=request.starting_equity,
@@ -100,9 +140,10 @@ async def run_backtest(
         sizer=PositionSizer.from_settings(params, risk_percent=request.risk_percent).replace(
             capital=request.starting_equity, contract_size=request.contract_size
         ),
+        weekend_flat=weekend_flat,
     )
     result = engine.run(frame)
-    report = build_report(result)
+    report = build_report(result, cost_origin=costs.origin)
 
     critical = report.severity_counts()["critical"]
     if critical:
@@ -140,16 +181,22 @@ async def run_backtest(
 
 
 def _mapped_params(request: BacktestRequest) -> dict[str, Any]:
-    """This pair's overrides from ``config/strategies_mapping.toml``, if any.
+    """This pair's parameters from ``config/strategies_mapping.toml``, if any.
 
-    A missing table is normal — a fresh clone has none — and an unmapped pair
-    is normal too: backtesting a symbol before deciding to trade it is the
-    usual order of events. Both mean "no overrides", not an error.
+    The strategy's ``[strategies.<name>]`` defaults, with this pair's
+    ``[symbols.<symbol>.params.<name>]`` overrides merged on top — the same two
+    layers the runner applies, so a backtest measures the book that is actually
+    configured. A missing table is normal — a fresh clone has none — and an
+    unmapped pair is normal too: backtesting a symbol before deciding to trade
+    it is the usual order of events. Both mean "no overrides", not an error.
     """
     mapping = SymbolMapping.load(settings.engine.mapping_file)
     if not mapping:
         return {}
-    mapped = mapping.params_for(request.symbol, request.strategy)
+    mapped = {
+        **mapping.defaults_for(request.strategy),
+        **mapping.params_for(request.symbol, request.strategy),
+    }
     if mapped:
         log.info(
             "Applying %s overrides from %s for %s/%s",

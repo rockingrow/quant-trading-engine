@@ -92,6 +92,41 @@ def request_for(days: int, timeframe: str = "M15") -> HistoryRequest:
     ).normalized()
 
 
+# The bucket still forming. Found by the 2026-09-10 production audit: asked for
+# history up to today, Tiingo answered with the bar it was still building, and
+# stored as closed it shadowed the real close of that bucket.
+
+
+async def test_the_bucket_still_forming_is_not_returned_as_a_bar(capped):
+    capped(cap=5000)
+    clock_reading = pd.Timestamp("2026-03-01T10:07:00Z").to_pydatetime()
+    history_source = TiingoHistorySource(
+        TiingoSettings(api_key="test-key"), utc_clock=lambda: clock_reading
+    )
+
+    history = await history_source.fetch(request_for(days=0))
+
+    assert history.index[-1] == pd.Timestamp("2026-03-01T09:45:00Z")
+    assert history.attrs["timeframe"] == "M15"
+
+
+def test_a_bar_whose_bucket_ended_exactly_now_is_kept():
+    from qte_shared.interfaces import drop_unfinished_bars
+
+    bar_index = pd.DatetimeIndex(
+        pd.to_datetime(["2026-03-01T09:45:00Z", "2026-03-01T10:00:00Z"]), name="open_time"
+    )
+    history = pd.DataFrame(
+        {"open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 0.0}, index=bar_index
+    )
+
+    finished = drop_unfinished_bars(
+        history, "M15", pd.Timestamp("2026-03-01T10:00:00Z").to_pydatetime()
+    )
+
+    assert list(finished.index) == [pd.Timestamp("2026-03-01T09:45:00Z")]
+
+
 # ── Paging ────────────────────────────────────────────────────────────────
 
 

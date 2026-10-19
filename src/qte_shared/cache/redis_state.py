@@ -12,6 +12,7 @@ Postgres stays the audit trail; nothing here is a system of record.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from typing import Any
 
 import redis.asyncio as redis
@@ -19,8 +20,72 @@ import redis.asyncio as redis
 from qte_shared.config import settings
 from qte_shared.logging_setup import get_logger
 from qte_shared.models import Candle, OpenPosition, Tick
+from qte_shared.state_scope import stamp_in_scope
+from qte_shared.timeframes import CLOCK_TOLERANCE
 
 log = get_logger(__name__)
+
+STAGE_CLOSED_CANDLE = """
+local previous = redis.call('GET', KEYS[4])
+if previous and tonumber(previous) >= tonumber(ARGV[2]) then return 0 end
+local history_type = redis.call('TYPE', KEYS[1]).ok
+local outbox_type = redis.call('TYPE', KEYS[2]).ok
+if (history_type ~= 'none' and history_type ~= 'list') or
+   (outbox_type ~= 'none' and outbox_type ~= 'list') then
+    return redis.error_reply('Candle history and outbox must be lists')
+end
+local opened = redis.call('GET', KEYS[3])
+local remove_open = false
+if opened then
+    local decoded, stored = pcall(cjson.decode, opened)
+    if not decoded or type(stored) ~= 'table' then
+        return redis.error_reply('Open candle must contain valid JSON')
+    end
+    local candle = cjson.decode(ARGV[1])
+    remove_open = stored.open_time == candle.open_time
+end
+redis.call('RPUSH', KEYS[1], ARGV[1])
+redis.call('LTRIM', KEYS[1], -tonumber(ARGV[3]), -1)
+if tonumber(ARGV[4]) > 0 then redis.call('EXPIRE', KEYS[1], ARGV[4]) end
+redis.call('RPUSH', KEYS[2], ARGV[1])
+redis.call('SET', KEYS[4], ARGV[2])
+if remove_open then redis.call('DEL', KEYS[3]) end
+return 1
+"""
+
+
+#: Swap a merged candle window in, but only if the live path has not staged a
+#: close since it was read.
+#:
+#: The ordering is decided in Python, where ``open_time`` is a real datetime;
+#: Lua only swaps. That split is deliberate — stored bars carry their open time
+#: as an ISO-8601 string, and sorting those lexicographically inside Redis would
+#: be a guess about the serialiser's width, not a comparison.
+#:
+#: What it guards against is the one other writer of this list: a live close
+#: landing between the read and the rewrite, which a blind rewrite would drop.
+#: The staging watermark is the right token to check, because that writer always
+#: moves it. Checking the list's length instead would not work — pushing a bar
+#: onto an already-trimmed list leaves the length unchanged.
+MERGE_HISTORY_CANDLES = """
+local history_type = redis.call('TYPE', KEYS[1]).ok
+if history_type ~= 'none' and history_type ~= 'list' then
+    return redis.error_reply('Candle history must be a list')
+end
+local staged = redis.call('GET', KEYS[2])
+if staged == false then staged = '' end
+if staged ~= ARGV[1] then return -1 end
+redis.call('DEL', KEYS[1])
+-- One RPUSH per bar rather than `unpack(ARGV, 5)`: a full window is thousands
+-- of entries and Lua's stack is not.
+for index = 5, #ARGV do
+    redis.call('RPUSH', KEYS[1], ARGV[index])
+end
+redis.call('LTRIM', KEYS[1], -tonumber(ARGV[2]), -1)
+if tonumber(ARGV[3]) > 0 then redis.call('EXPIRE', KEYS[1], ARGV[3]) end
+redis.call('SET', KEYS[2], ARGV[4])
+return redis.call('LLEN', KEYS[1])
+"""
 
 
 class RedisState:
@@ -28,7 +93,8 @@ class RedisState:
 
     def __init__(self, url: str | None = None, prefix: str | None = None) -> None:
         self._url = url or settings.redis.url
-        self._prefix = prefix or settings.redis.key_prefix
+        self._scope = settings.state_scope
+        self._prefix = f"{prefix or settings.redis.key_prefix}:{self._scope.namespace}"
         self._client: redis.Redis | None = None
 
     @property
@@ -52,14 +118,77 @@ class RedisState:
     def key(self, *parts: str) -> str:
         return ":".join((self._prefix, *parts))
 
+    # ── Runner ownership ──────────────────────────────────────────────
+
+    async def claim_runner(self, owner_id: str) -> bool:
+        """Allow one runner per state namespace, without automatic lease expiry.
+
+        A paused process must not outlive a lease and resume alongside a new
+        writer. After an unclean exit an operator must first stop that process
+        and explicitly remove the stale ownership key before restarting.
+        """
+        return bool(await self.client.set(self.key("runner", "owner"), owner_id, nx=True))
+
+    async def reclaim_runner(self, instance_token: str, owner_id: str) -> bool:
+        """Replace a claim left by an earlier process of the same container.
+
+        The caller must be that container's PID 1: its PID namespace died with
+        the previous PID 1, so a holder carrying this instance token cannot
+        still be running. Any other holder is left alone, and the claim still
+        never expires.
+        """
+        return bool(
+            await self.client.eval(
+                "local holder = redis.call('GET', KEYS[1]) "
+                "if holder and string.sub(holder, 1, string.len(ARGV[1])) == ARGV[1] then "
+                "redis.call('SET', KEYS[1], ARGV[2]) return 1 else return 0 end",
+                1,
+                self.key("runner", "owner"),
+                f"{instance_token}:",
+                owner_id,
+            )
+        )
+
+    async def runner_owner(self) -> str | None:
+        """The current claim's holder, for the operator and the refusal message."""
+        return await self.client.get(self.key("runner", "owner"))
+
+    async def owns_runner(self, owner_id: str) -> bool:
+        return await self.client.get(self.key("runner", "owner")) == owner_id
+
+    async def release_runner(self, owner_id: str) -> bool:
+        """Release only our own claim, never a replacement runner's claim."""
+        return bool(
+            await self.client.eval(
+                "if redis.call('GET', KEYS[1]) == ARGV[1] then "
+                "return redis.call('DEL', KEYS[1]) else return 0 end",
+                1,
+                self.key("runner", "owner"),
+                owner_id,
+            )
+        )
+
     # ── Ticks ─────────────────────────────────────────────────────────
 
     async def set_last_tick(self, tick: Tick) -> None:
+        tick = stamp_in_scope(tick, self._scope)
         await self.client.set(self.key("tick", tick.symbol), tick.model_dump_json())
 
     async def get_last_tick(self, symbol: str) -> Tick | None:
         raw = await self.client.get(self.key("tick", symbol))
-        return Tick.model_validate_json(raw) if raw else None
+        if not raw:
+            return None
+        tick = Tick.model_validate_json(raw)
+        if not self._scope.accepts(tick.origin):
+            return None
+        if tick.ts.tzinfo is None or (
+            not tick.origin.synthetic and tick.ts > datetime.now(UTC) + CLOCK_TOLERANCE
+        ):
+            return None
+        return tick
+
+    async def discard_last_tick(self, symbol: str) -> None:
+        await self.client.delete(self.key("tick", symbol))
 
     # ── Candles ───────────────────────────────────────────────────────
 
@@ -69,6 +198,7 @@ class RedisState:
         Newest is pushed on the right and the list trimmed from the left, so
         :meth:`get_candles` can return oldest-first without reversing.
         """
+        candle = stamp_in_scope(candle, self._scope)
         limit = max_len or settings.redis.candle_history
         key = self.key("candles", candle.symbol, candle.timeframe)
         pipe = self.client.pipeline()
@@ -79,7 +209,7 @@ class RedisState:
         await pipe.execute()
 
     async def stage_closed_candle(self, candle: Candle, max_len: int | None = None) -> None:
-        """Persist a closed candle and enqueue its event in one Redis transaction.
+        """Persist and enqueue a close atomically, once per series/open time.
 
         The resampler has already retired the bucket by the time this is
         called.  If NATS is unavailable, the queue is therefore the only place
@@ -87,20 +217,19 @@ class RedisState:
         queue append in one transaction also prevents a restart from seeing a
         candle in one representation but not the other.
         """
-        limit = max_len or settings.redis.candle_history
-        history = self.key("candles", candle.symbol, candle.timeframe)
-        outbox = self.key("outbox", "candles")
-        pipe = self.client.pipeline(transaction=True)
-        pipe.rpush(history, candle.model_dump_json())
-        pipe.ltrim(history, -limit, -1)
-        if settings.redis.ttl_seconds:
-            pipe.expire(history, settings.redis.ttl_seconds)
-        pipe.rpush(outbox, candle.model_dump_json())
-        # A quiet-market flush may close the only builder without a following
-        # tick to overwrite this key.  Leaving it behind would resurrect an
-        # already-closed bar after a restart.
-        pipe.delete(self.key("open_candle", candle.symbol, candle.timeframe))
-        await pipe.execute()
+        candle = stamp_in_scope(candle, self._scope)
+        await self.client.eval(
+            STAGE_CLOSED_CANDLE,
+            4,
+            self.key("candles", candle.symbol, candle.timeframe),
+            self.key("outbox", "candles"),
+            self.key("open_candle", candle.symbol, candle.timeframe),
+            self.key("staged", candle.symbol, candle.timeframe),
+            candle.model_dump_json(),
+            candle.open_time.timestamp(),
+            max_len or settings.redis.candle_history,
+            settings.redis.ttl_seconds,
+        )
 
     async def peek_pending_candle(self) -> Candle | None:
         """Oldest closed candle whose NATS event has not been acknowledged."""
@@ -136,7 +265,7 @@ class RedisState:
         if not candles:
             return 0
         limit = max_len or settings.redis.candle_history
-        retained = candles[-limit:]
+        retained = [stamp_in_scope(candle, self._scope) for candle in candles[-limit:]]
         key = self.key("candles", symbol, timeframe)
         pipe = self.client.pipeline()
         pipe.delete(key)
@@ -146,8 +275,104 @@ class RedisState:
         await pipe.execute()
         return len(retained)
 
+    async def merge_history_candles(
+        self,
+        symbol: str,
+        timeframe: str,
+        candles: list[Candle],
+        max_len: int | None = None,
+        attempts: int = 3,
+    ) -> int:
+        """Merge warm-up history into the stored window by open time.
+
+        This is the one write that is allowed to place a bar *behind* the
+        staging watermark, and it exists because :meth:`stage_closed_candle`
+        cannot. That watermark is a single number, so to the live path any bar
+        at or below it is a duplicate replay — which is the correct reading of a
+        forward-only feed, and the wrong one for a vendor replaying the history
+        a window is missing. The bars missing from a half-filled window are
+        precisely the old ones, so staging would reject exactly what is needed.
+
+        Merging rather than replacing: a batch may end before the newest bar
+        Redis already holds, when the vendor's replay is a moment behind the
+        live stream. Keyed by open time, with the incoming bar winning a tie,
+        no live close is ever lost to a warm-up that arrived after it.
+
+        The watermark is then raised to the newest bar merged, but never
+        lowered — dropping it back would reopen the duplicate window it is there
+        to close. Returns how many bars the window holds afterwards.
+        """
+        if not candles:
+            return 0
+        limit = max_len or settings.redis.candle_history
+        incoming = {
+            candle.open_time: stamp_in_scope(candle, self._scope).model_dump_json()
+            for candle in candles
+        }
+        history_key = self.key("candles", symbol, timeframe)
+        staged_key = self.key("staged", symbol, timeframe)
+        newest_incoming = max(incoming).timestamp()
+        for attempt in range(1, attempts + 1):
+            # One transaction, so the window and the watermark cannot disagree:
+            # the watermark read here is what the swap below is checked against.
+            reader = self.client.pipeline(transaction=True)
+            reader.lrange(history_key, 0, -1)
+            reader.get(staged_key)
+            stored_raw, staged = await reader.execute()
+            # Stored payloads are carried over byte for byte rather than
+            # re-serialised, so a merge never rewrites a bar it did not change.
+            merged = {Candle.model_validate_json(item).open_time: item for item in stored_raw}
+            merged.update(incoming)
+            ordered = [merged[open_time] for open_time in sorted(merged)][-limit:]
+            watermark = max(float(staged or 0.0), newest_incoming)
+            written = int(
+                await self.client.eval(
+                    MERGE_HISTORY_CANDLES,
+                    2,
+                    history_key,
+                    staged_key,
+                    staged or "",
+                    limit,
+                    settings.redis.ttl_seconds,
+                    repr(watermark),
+                    *ordered,
+                )
+            )
+            if written >= 0:
+                log.info(
+                    "Merged %d warm-up bar(s) into %s %s: the window now holds %d, newest "
+                    "staged %s",
+                    len(incoming),
+                    symbol,
+                    timeframe,
+                    written,
+                    watermark,
+                )
+                return written
+            log.info(
+                "A close was staged for %s %s while its warm-up batch was being merged; "
+                "retrying (attempt %d of %d)",
+                symbol,
+                timeframe,
+                attempt,
+                attempts,
+            )
+        # Losing the race `attempts` times means the feed is staging closes
+        # faster than a window can be merged, which no retry count fixes. The
+        # batch is re-sendable, so say so and let the caller carry on.
+        log.warning(
+            "Gave up merging %d warm-up bar(s) into %s %s after %d attempts — the window "
+            "keeps changing underneath. It stays as it is; resend the batch.",
+            len(incoming),
+            symbol,
+            timeframe,
+            attempts,
+        )
+        return 0
+
     async def set_open_candle(self, candle: Candle) -> None:
         """Persist the bar currently being built so a restart mid-bar resumes it."""
+        candle = stamp_in_scope(candle, self._scope)
         await self.client.set(
             self.key("open_candle", candle.symbol, candle.timeframe),
             candle.model_dump_json(),
@@ -157,10 +382,63 @@ class RedisState:
         raw = await self.client.get(self.key("open_candle", symbol, timeframe))
         return Candle.model_validate_json(raw) if raw else None
 
+    async def pending_candles(self) -> list[Candle]:
+        """Every staged close still waiting in the outbox, oldest first."""
+        staged = await self.client.lrange(self.key("outbox", "candles"), 0, -1)
+        return [Candle.model_validate_json(staged_json) for staged_json in staged]
+
+    # ── Candle state provenance ───────────────────────────────────────
+    #
+    # Redis outlives a change of market-data provider, and bars one provider
+    # wrote are not market history for another. See
+    # :mod:`qte_ingestion.state_guard`.
+
+    async def get_history_provider(self) -> str | None:
+        """The provider whose feed last wrote the candle state, if recorded."""
+        return await self.client.get(self.key("history", "provider"))
+
+    async def set_history_provider(self, provider_name: str) -> None:
+        await self.client.set(self.key("history", "provider"), provider_name)
+
+    async def discard_candle_state(self, symbol: str, timeframe: str) -> None:
+        """Forget one pair's closed history and its open bar. Positions stay."""
+        await self.client.delete(
+            self.key("candles", symbol, timeframe),
+            self.key("open_candle", symbol, timeframe),
+            self.key("staged", symbol, timeframe),
+        )
+
+    async def discard_candle_outbox(self) -> None:
+        """Drop every staged close that has not been published yet."""
+        await self.client.delete(self.key("outbox", "candles"))
+
+    # ── Decision watermark ────────────────────────────────────────────
+    #
+    # The open time of the newest bar each (strategy, symbol, timeframe) was fed.
+    # Closes published while a runner was down or still starting are the bars
+    # newer than this; see ``StrategyRunner._catch_up``.
+
+    async def get_decided_open_time(
+        self, strategy: str, symbol: str, timeframe: str
+    ) -> datetime | None:
+        stored = await self.client.get(self.key("decided", strategy, symbol, timeframe))
+        return datetime.fromisoformat(stored) if stored else None
+
+    async def set_decided_open_time(
+        self, strategy: str, symbol: str, timeframe: str, open_time: datetime
+    ) -> None:
+        await self.client.set(
+            self.key("decided", strategy, symbol, timeframe), open_time.isoformat()
+        )
+
     # ── Strategy cycle state ──────────────────────────────────────────
     #
-    # One hash per strategy, one field per symbol, holding the whole
-    # :class:`~qte_shared.models.OpenPosition` as JSON. The size matters as
+    # One hash per strategy, one field per cycle — ``SYMBOL|SIGNAL_UXID`` —
+    # holding the whole :class:`~qte_shared.models.OpenPosition` as JSON. A pair
+    # allowed several cycles has several fields; one allowed a single cycle has
+    # at most one. A field named by the bare symbol predates this layout and is
+    # still read, so a runner upgraded mid-trade keeps the position it holds;
+    # the next write of that cycle moves it to its own field. The size matters as
     # much as the id: a TP1 that closed the entry's full quantity ends the
     # cycle, and a runner that reloaded only the uxid could not tell that from
     # a partial. Redis runs with AOF on, so a restart loses at most the last
@@ -174,22 +452,56 @@ class RedisState:
         the broker renders the exit as an unrelated trade instead of closing
         the entry's broadcast.
         """
+        if position.state_namespace not in (None, self._scope.namespace):
+            raise ValueError("Cannot persist a position from another state namespace")
+        position = position.model_copy(update={"state_namespace": self._scope.namespace})
+        hash_key = self.key("cycle", position.strategy)
         await self.client.hset(
-            self.key("cycle", position.strategy), position.symbol, position.model_dump_json()
+            hash_key,
+            cycle_field(position.symbol, position.signal_uxid),
+            position.model_dump_json(),
         )
+        await self._drop_legacy_field(hash_key, position.symbol, position.signal_uxid)
+
+    async def _drop_legacy_field(self, hash_key: str, symbol: str, signal_uxid: str) -> None:
+        """Remove the pre-cycle-field record of *signal_uxid*, if it is still there."""
+        legacy = _decode_position(
+            await self.client.hget(hash_key, symbol), strategy="", symbol=symbol
+        )
+        if legacy is not None and legacy.signal_uxid == signal_uxid:
+            await self.client.hdel(hash_key, symbol)
+
+    async def get_open_positions_for(self, strategy: str, symbol: str) -> list[OpenPosition]:
+        """Every cycle *strategy* holds on *symbol*, oldest first."""
+        stored = await self.client.hgetall(self.key("cycle", strategy))
+        found: dict[str, OpenPosition] = {}
+        for field_name, raw in (stored or {}).items():
+            if cycle_symbol(field_name) != symbol:
+                continue
+            position = _decode_position(raw, strategy=strategy, symbol=symbol)
+            self._validate_position_scope(position)
+            if position is not None:
+                found.setdefault(position.signal_uxid, position)
+        return sorted(found.values(), key=lambda position: _as_sortable(position.opened_at))
 
     async def get_open_position(self, strategy: str, symbol: str) -> OpenPosition | None:
-        raw = await self.client.hget(self.key("cycle", strategy), symbol)
-        return _decode_position(raw, strategy=strategy, symbol=symbol)
+        """The most recent cycle on *symbol* — the whole book for a single-cycle pair."""
+        positions = await self.get_open_positions_for(strategy, symbol)
+        return positions[-1] if positions else None
+
+    def _validate_position_scope(self, position: OpenPosition | None) -> None:
+        if position is not None and position.state_namespace != self._scope.namespace:
+            raise ValueError("Stored position has missing or foreign state provenance")
 
     async def get_open_positions(self, strategy: str) -> dict[str, OpenPosition]:
-        """Every cycle *strategy* holds, keyed by symbol."""
+        """Every cycle *strategy* holds, keyed by ``signal_uxid``."""
         stored = await self.client.hgetall(self.key("cycle", strategy))
         positions = {}
-        for symbol, raw in (stored or {}).items():
-            position = _decode_position(raw, strategy=strategy, symbol=symbol)
+        for field_name, raw in (stored or {}).items():
+            position = _decode_position(raw, strategy=strategy, symbol=cycle_symbol(field_name))
+            self._validate_position_scope(position)
             if position is not None:
-                positions[symbol] = position
+                positions[position.signal_uxid] = position
         return positions
 
     async def set_open_cycle(self, strategy: str, symbol: str, uxid: str) -> None:
@@ -207,7 +519,18 @@ class RedisState:
         return position.signal_uxid if position else None
 
     async def clear_open_cycle(self, strategy: str, symbol: str) -> None:
-        await self.client.hdel(self.key("cycle", strategy), symbol)
+        """Forget every cycle *strategy* holds on *symbol*."""
+        hash_key = self.key("cycle", strategy)
+        stored = await self.client.hgetall(hash_key)
+        fields = [name for name in (stored or {}) if cycle_symbol(name) == symbol]
+        if fields:
+            await self.client.hdel(hash_key, *fields)
+
+    async def clear_open_position(self, strategy: str, symbol: str, signal_uxid: str) -> None:
+        """Forget one cycle — the others on the pair stay open."""
+        hash_key = self.key("cycle", strategy)
+        await self.client.hdel(hash_key, cycle_field(symbol, signal_uxid))
+        await self._drop_legacy_field(hash_key, symbol, signal_uxid)
 
     # ── Generic flags (shadow mode, kill switch, …) ───────────────────
 
@@ -223,6 +546,24 @@ class RedisState:
             return bool(await self.client.ping())
         except Exception:
             return False
+
+
+#: Separates the symbol from the cycle id in a cycle hash field.
+CYCLE_FIELD_SEPARATOR = "|"
+
+
+def cycle_field(symbol: str, signal_uxid: str) -> str:
+    """The hash field one cycle is stored under."""
+    return f"{symbol}{CYCLE_FIELD_SEPARATOR}{signal_uxid}"
+
+
+def cycle_symbol(field_name: str) -> str:
+    """The symbol a cycle field belongs to — the whole name for a legacy field."""
+    return field_name.split(CYCLE_FIELD_SEPARATOR, 1)[0]
+
+
+def _as_sortable(moment: Any) -> str:
+    return moment.isoformat() if moment is not None else ""
 
 
 def _decode_position(raw: str | None, *, strategy: str, symbol: str) -> OpenPosition | None:

@@ -17,6 +17,7 @@ __strategies__/                  ← mount point, git-ignored, read-only in the 
 │   │   ├── contract.py          ← the engine's contract, restated — no engine import
 │   │   ├── indicators.py        ← ema/atr/crossover, pandas + numpy only
 │   │   ├── my_edge.py           ← the strategy class: one method per broker action
+│   │   ├── settings.py          ← what the engine enforces around it (weekend flat)
 │   │   └── _helpers.py          ← leading `_` — never mistaken for a strategy
 │   └── tests/
 │       └── test_my_edge.py      ← `tests/` is never walked by the plugin scan
@@ -40,7 +41,10 @@ Then, in order:
    for, and no two strategies mounted here may share it;
 3. write `_rule()`. That is the only method with a hole in it;
 4. publish it from `manifest.py` by adding it to `ALIASES`;
-5. `make audit` from the engine root, then backtest it.
+5. declare its market's weekend window in `src/<package>/settings.py`, under the
+   same alias — when the instrument shuts on Friday and when it reopens. The
+   engine does the closing; see below;
+6. `make audit` from the engine root, then backtest it.
 
 Its dependencies are not automatic: the runner imports plugins into its own
 process, so whatever the repo needs has to be installed alongside the engine.
@@ -85,7 +89,7 @@ that is the whole dependency story:
 uv add pandas-ta --project __strategies__/my-strategies
 ```
 
-## The two files that matter
+## The three files that matter
 
 **`manifest.py`** is the integration. The engine walks one level into
 `__strategies__/`, imports this file *by path*, calls `load_all()` and takes
@@ -108,6 +112,30 @@ As shipped, `_rule()` returns `False`, so this template loads, audits and
 backtests end to end without ever emitting a signal. That is deliberate — a
 template that traded the moment it was mounted is one nobody could safely leave
 in place.
+
+**`settings.py`** is the part the engine acts on rather than asks about. A
+`param` is a knob the *edge* is tuned on and it belongs to the strategy; what
+goes here is a property of the instrument's calendar, which every strategy on
+that instrument shares. Today that is the weekend flat: declare `flat_from` and
+`flat_until` — a weekday and a wall-clock time, `"FRI 20:00"` to `"SUN 22:00"` —
+and inside that window the engine refuses new entries and closes any open
+position with a `FLAT`, in the backtest and in the live runner alike. Exits are
+never blocked.
+
+Declare it rather than implement it. A strategy that owned the cut-off itself
+would be a strategy the next one could forget to copy, and a protection you can
+lose by omission is not one. Two things follow from that:
+
+- the times are read on the operator's clock, not yours —
+  `QTE_ENGINE__WEEKEND_FLAT_TIMEZONE`, default `UTC`. Write them in UTC unless
+  you know the deployment's zone, and pick a cut-off that exists on the broker's
+  Friday calendar with room to spare: one after the last Friday bar never fires;
+- a setting that will not parse stops that strategy loading, rather than
+  silently reverting to "off". `make audit` reports what the engine made of
+  this file.
+
+A repo with no `settings.py`, and a strategy missing from the table, keep the
+engine's defaults — which is no weekend flat at all.
 
 ## Checking it
 

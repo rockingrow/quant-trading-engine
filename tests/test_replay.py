@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pandas as pd
 import pytest
 
 from qte_backtest.execution import CostModel, ExitReason
-from qte_backtest.replay import BacktestEngine
+from qte_backtest.replay import BacktestEngine, sample_market
 from qte_shared.models import SignalAction
 from qte_shared.strategies.strategy_base import (
     IntentResult,
@@ -53,6 +55,43 @@ class AlwaysLongStrategy(BuyOnceStrategy):
         return super().on_candle_closed(df, context)
 
 
+def test_a_tp2_only_position_survives_one_r_and_closes_in_full_at_its_target():
+    class SecondTargetOnly(StrategyBase):
+        name = "SECOND_TARGET_ONLY"
+        warmup = 1
+
+        def on_candle_closed(self, candles, context):
+            if len(candles) == 1:
+                return SignalIntent(
+                    action=SignalAction.LONG,
+                    price=100.0,
+                    sl=90.0,
+                    tp2=150.0,
+                    move_sl_to_be=False,
+                )
+            return None
+
+    timestamps = pd.date_range("2026-01-05", periods=3, freq="15min", tz="UTC")
+    candles = pd.DataFrame(
+        {
+            "open": [100.0, 100.0, 110.0],
+            "high": [100.0, 112.0, 150.0],
+            "low": [99.0, 99.0, 109.0],
+            "close": [100.0, 110.0, 149.0],
+            "volume": 1.0,
+        },
+        index=timestamps,
+    )
+    result = BacktestEngine(SecondTargetOnly(), symbol="USOIL", starting_equity=1000.0).run(candles)
+    assert result.signals[0].position.tp1 is None
+    position = result.positions[0]
+    assert position.tp1 is None
+    assert len(position.legs) == 1
+    assert position.legs[0].reason is ExitReason.TP2
+    assert position.closed_at == timestamps[2]
+    assert position.legs[0].quantity == position.quantity
+
+
 def test_the_strategy_only_ever_sees_closed_history(trending_frame):
     seen: list[int] = []
 
@@ -66,7 +105,7 @@ def test_the_strategy_only_ever_sees_closed_history(trending_frame):
             return None
 
     BacktestEngine(Recorder(), symbol="XAUUSD").run(trending_frame)
-    assert seen == list(range(6, len(trending_frame) + 1))
+    assert seen == list(range(5, len(trending_frame) + 1))
 
 
 def test_a_full_run_produces_matching_positions_and_signals(trending_frame):
@@ -93,12 +132,16 @@ def test_metrics_are_computed_over_realised_trades(trending_frame):
     assert "BUY_ONCE" in result.report()
 
 
-def test_a_second_entry_is_rejected_while_a_position_is_open(trending_frame):
-    # Mirrors the worker, which answers REJECTED rather than stacking positions.
+def test_a_second_entry_stacks_beside_the_open_one(trending_frame):
+    # Mirrors the runner, which caps nothing: every entry opens its own cycle.
     result = BacktestEngine(AlwaysLongStrategy(), symbol="XAUUSD").run(trending_frame)
-    assert result.rejected > 0
-    open_at_once = [p for p in result.positions if p.is_open]
-    assert len(open_at_once) == 0
+    assert result.rejected == 0, "nothing is refused for being a further position"
+    assert len(result.positions) > 1, "the entries stacked rather than being dropped"
+    assert len({position.signal_uxid for position in result.positions}) == len(result.positions), (
+        "each cycle got its own id"
+    )
+    open_at_once = [position for position in result.positions if position.is_open]
+    assert len(open_at_once) == 0, "the run still closes its book at the end of the data"
 
 
 def test_a_position_still_open_at_the_end_is_marked_out(trending_frame):
@@ -124,12 +167,56 @@ def test_a_position_still_open_at_the_end_is_marked_out(trending_frame):
     assert result.positions[0].exit_reason == "END_OF_DATA"
 
 
+def test_a_strategys_flat_reason_lands_on_the_closed_position(trending_frame):
+    class FlatWithReason(BuyOnceStrategy):
+        name = "FLAT_WITH_REASON"
+
+        def on_candle_closed(self, df, context):
+            close = float(df["close"].iloc[-1])
+            if not self.fired:
+                self.fired = True
+                self.calls += 1
+                return SignalIntent(
+                    action=SignalAction.LONG,
+                    price=close,
+                    quantity=1.0,
+                    sl=close - 10_000,
+                    tp1=close + 10_000,
+                )
+            if self.calls == 1:
+                self.calls += 1
+                return SignalIntent(action=SignalAction.FLAT, price=close, reason="RSI_REVERSAL")
+            return None
+
+    result = BacktestEngine(FlatWithReason(), symbol="XAUUSD").run(trending_frame)
+    position = result.positions[0]
+    assert position.exit_reason == "FLAT"
+    assert position.exit_note == "RSI_REVERSAL"
+
+
 def test_too_little_history_for_the_warmup_is_an_error(trending_frame):
     class Hungry(BuyOnceStrategy):
         warmup = 10_000
 
     with pytest.raises(ValueError, match="warm-up"):
         BacktestEngine(Hungry(), symbol="XAUUSD").run(trending_frame)
+
+
+def test_exact_warmup_history_allows_one_entry_and_final_liquidation(trending_frame):
+    strategy = BuyOnceStrategy()
+    history = trending_frame.iloc[: strategy.warmup]
+    replay_result = BacktestEngine(
+        strategy,
+        symbol="XAUUSD",
+        costs=CostModel(commission_per_unit=0.25),
+        starting_equity=1000,
+    ).run(history)
+    assert strategy.calls == 1
+    assert len(replay_result.signals) == replay_result.metrics.trades == 1
+    position = replay_result.positions[0]
+    assert position.opened_at == position.closed_at == history.index[-1]
+    assert position.exit_reason == ExitReason.END_OF_DATA
+    assert replay_result.metrics.ending_equity < 1000
 
 
 def test_trade_rows_are_shaped_for_the_audit_table(trending_frame):
@@ -184,3 +271,89 @@ def test_a_strategy_tp1_intent_only_closes_its_configured_share(trending_frame):
     assert position.legs[0].reason is ExitReason.TP1
     shares = [leg.quantity / position.quantity for leg in position.legs]
     assert shares == pytest.approx([0.25, 0.75])
+
+
+# ── The drawable window ──────────────────────────────────────────────────
+
+
+def test_a_short_run_is_carried_at_its_own_timeframe(trending_frame):
+    """The chart of an M15 replay has to be able to look like an M15 chart.
+
+    Pre-aggregating on the way out decides the viewer's resolution for it: rows
+    can always be rolled up afterwards and never un-rolled.
+    """
+    window = sample_market(trending_frame, warmup=5, timeframe="M15")
+
+    assert window.base_timeframe == "M15"
+    assert window.bucket_bars == 1
+    assert len(window.rows) == len(trending_frame)
+
+
+def test_a_long_run_is_still_carried_whole_at_its_own_timeframe():
+    """Five years of M15 is ~120k bars, and the chart still gets every one.
+
+    A row ceiling here used to turn such a run into an H4 chart on which no
+    trade could be inspected; the report is larger on purpose.
+    """
+    moments = pd.date_range("2021-07-05", periods=50_000, freq="15min", tz="UTC")
+    closes = pd.Series(range(len(moments)), index=moments) * 0.0002 + 70.0
+    frame = pd.DataFrame(
+        {"open": closes, "high": closes + 0.1, "low": closes - 0.1, "close": closes},
+        index=moments,
+    )
+    window = sample_market(frame, warmup=150, timeframe="M15")
+
+    assert window.base_timeframe == "M15"
+    assert window.bucket_bars == 1
+    assert len(window.rows) == len(frame)
+
+
+def test_rows_carry_epoch_seconds(trending_frame):
+    window = sample_market(trending_frame, warmup=5, timeframe="M15")
+    first = window.rows[0]
+
+    assert isinstance(first[0], int)
+    assert datetime.fromtimestamp(first[0], tz=UTC) == trending_frame.index[0]
+    assert [row[0] for row in window.rows] == sorted(row[0] for row in window.rows)
+
+
+def test_a_long_run_climbs_to_the_first_timeframe_that_fits(trending_frame):
+    """The ceiling is on rows, not on history: the answer is a coarser bar."""
+    window = sample_market(trending_frame, warmup=5, timeframe="M15", max_rows=120)
+
+    assert window.base_timeframe == "H1"
+    assert window.bucket_bars == 4
+    assert len(window.rows) <= 120
+
+
+def test_aggregation_lands_on_the_calendar_not_on_bar_counts(trending_frame):
+    """An H1 candle covers one real hour, whatever the bars did inside it.
+
+    Counting bars into groups drifts off the clock at the first session break,
+    which is what made the old chart's candles look unevenly spaced.
+    """
+    window = sample_market(trending_frame, warmup=5, timeframe="M15", max_rows=120)
+
+    for row in window.rows:
+        assert row[0] % 3600 == 0
+
+
+def test_an_aggregated_row_keeps_the_range_the_bars_traded(trending_frame):
+    window = sample_market(trending_frame, warmup=5, timeframe="M15", max_rows=120)
+    hour = trending_frame.loc["2026-01-01 01:00":"2026-01-01 01:45"]
+    row = next(row for row in window.rows if row[0] == int(hour.index[0].timestamp()))
+
+    assert row[1] == pytest.approx(hour["open"].iloc[0])
+    assert row[2] == pytest.approx(hour["high"].max())
+    assert row[3] == pytest.approx(hour["low"].min())
+    assert row[4] == pytest.approx(hour["close"].iloc[-1])
+
+
+def test_the_benchmark_anchor_is_the_first_decidable_bar(trending_frame):
+    """Unchanged by the resolution the rows happen to be carried at."""
+    native = sample_market(trending_frame, warmup=5, timeframe="M15")
+    rolled = sample_market(trending_frame, warmup=5, timeframe="M15", max_rows=120)
+
+    assert native.benchmark_close == rolled.benchmark_close
+    assert native.benchmark_from == rolled.benchmark_from
+    assert native.last_close == rolled.last_close

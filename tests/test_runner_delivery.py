@@ -16,8 +16,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from qte_shared.config import settings
 from qte_shared.models import OpenPosition, SignalAction
 from qte_shared.strategies.signal_factory import SignalFactory
+from qte_shared.strategies.signal_serialization import signal_record
 from qte_shared.strategies.sizing import PositionSizer
 from qte_shared.strategies.strategy_base import SignalIntent, StrategyBase
 from qte_strategy_engine.broker_sink import DeliveryResult
@@ -39,6 +41,9 @@ class FailedSink:
     shadow_mode = False
     transport = "nats"
 
+    def set_shadow_mode(self, enabled):
+        self.shadow_mode = enabled
+
     async def send(self, signal, *, delivery_id=None):
         return DeliveryResult(status="failed", transport="nats", detail="no ack")
 
@@ -51,9 +56,23 @@ class RecordingSignals:
 
     async def stage_signal(self, signal, **delivery):
         delivery_id = str(uuid.uuid4())
-        metadata = {**delivery, "delivery_id": delivery_id, "delivery_status": "pending"}
+        metadata = {**delivery, "delivery_id": delivery_id, "delivery_status": "prepared"}
         self.rows.append((signal, metadata))
         self._by_id[delivery_id] = metadata
+        self.pending.append(
+            SimpleNamespace(
+                namespace=settings.state_scope.namespace,
+                id=uuid.UUID(delivery_id),
+                created_at=datetime.now(UTC),
+                strategy=signal.strategy,
+                symbol=signal.symbol,
+                payload={"payload": signal_record(signal)},
+                inputs={"__qte_outbox__": delivery.get("recovery_context", {})},
+                delivery_status="prepared",
+                transport=delivery["transport"],
+                shadow=delivery["shadow"],
+            )
+        )
         return delivery_id
 
     async def mark_delivery(self, delivery_id, *, status, error=None):
@@ -66,12 +85,37 @@ class RecordingSignals:
                 row.delivery_error = error
         return True
 
-    async def pending_deliveries(self, *, statuses=("pending", "unknown")):
-        return [row for row in self.pending if row.delivery_status in set(statuses)]
+    async def pending_deliveries(
+        self,
+        page_limit=100,
+        *,
+        statuses=("prepared", "pending", "unknown", "sent_pending", "shadow_pending"),
+        after_cursor=None,
+        include_ids=(),
+    ):
+        candidates = sorted(self.pending, key=lambda record: (record.created_at, record.id))
+        return [
+            record
+            for record in candidates
+            if (record.delivery_status in statuses or str(record.id) in include_ids)
+            and (after_cursor is None or (record.created_at, record.id) > after_cursor)
+        ][:page_limit]
 
     @staticmethod
     def recovery_context(row):
         return row.inputs.get("__qte_outbox__", {})
+
+    async def get_delivery(self, delivery_id):
+        return next((record for record in self.pending if str(record.id) == delivery_id), None)
+
+    async def cycle_timeframes(self, cycle_ids):
+        """The timeframe each staged signal was published on, by cycle id."""
+        wanted = set(cycle_ids)
+        return {
+            signal.signal_uxid: signal.timeframe
+            for signal, _ in self.rows
+            if signal.signal_uxid in wanted and signal.timeframe
+        }
 
 
 class RecordingBus:
@@ -84,6 +128,9 @@ class RecordingBus:
 
 async def test_failed_entry_delivery_does_not_create_a_ghost_live_cycle():
     runner = StrategyRunner(sink=FailedSink())
+    runner.state = FakeState()
+    runner.state.owner_id = runner._owner_id
+    runner._ownership_acquired = True
     runner.signals = RecordingSignals()
     runner.bus = RecordingBus()
     factory = SignalFactory("DELIVERY_PROBE", timeframe="M15", token="test")
@@ -116,6 +163,9 @@ class AcceptingSink:
     def __init__(self):
         self.delivery_ids = []
 
+    def set_shadow_mode(self, enabled):
+        self.shadow_mode = enabled
+
     async def send(self, signal, *, delivery_id=None):
         self.delivery_ids.append(delivery_id)
         return DeliveryResult(status="sent", transport="nats")
@@ -127,15 +177,57 @@ class FakeState:
     def __init__(self, held: dict | None = None) -> None:
         self.held = dict(held or {})
         self.cleared: list[tuple[str, str]] = []
+        self.flags = {}
+        self.owner_id = None
+
+    async def get_flag(self, flag_name, default=None):
+        return self.flags.get(flag_name, default)
+
+    async def set_flag(self, flag_name, flag_value):
+        self.flags[flag_name] = flag_value
+
+    async def claim_runner(self, owner_id):
+        if self.owner_id is not None:
+            return False
+        self.owner_id = owner_id
+        return True
+
+    async def reclaim_runner(self, instance_token, owner_id):
+        if self.owner_id is None or not self.owner_id.startswith(f"{instance_token}:"):
+            return False
+        self.owner_id = owner_id
+        return True
+
+    async def runner_owner(self):
+        return self.owner_id
+
+    async def owns_runner(self, owner_id):
+        return self.owner_id == owner_id
+
+    async def release_runner(self, owner_id):
+        if self.owner_id != owner_id:
+            return False
+        self.owner_id = None
+        return True
 
     async def get_open_position(self, strategy, symbol):
         return self.held.get((strategy, symbol))
+
+    async def get_open_positions_for(self, strategy, symbol):
+        held = self.held.get((strategy, symbol))
+        return [held] if held is not None else []
 
     async def set_open_position(self, position):
         self.held[(position.strategy, position.symbol)] = position
 
     async def clear_open_cycle(self, strategy, symbol):
         self.held.pop((strategy, symbol), None)
+        self.cleared.append((strategy, symbol))
+
+    async def clear_open_position(self, strategy, symbol, signal_uxid):
+        held = self.held.get((strategy, symbol))
+        if held is not None and held.signal_uxid == signal_uxid:
+            self.held.pop((strategy, symbol))
         self.cleared.append((strategy, symbol))
 
 
@@ -149,14 +241,27 @@ class FakePositions:
     async def get(self, strategy, symbol):
         return self.held.get((strategy, symbol))
 
+    async def list_for(self, strategy, symbol):
+        held = self.held.get((strategy, symbol))
+        return [held] if held is not None else []
+
     async def upsert(self, position):
         self.held[(position.strategy, position.symbol)] = position
         return True
 
-    async def clear(self, strategy, symbol):
-        self.held.pop((strategy, symbol), None)
+    async def clear(self, strategy, symbol, signal_uxid=None):
+        held = self.held.get((strategy, symbol))
+        if held is not None and signal_uxid in (None, held.signal_uxid):
+            self.held.pop((strategy, symbol))
         self.cleared.append((strategy, symbol))
         return True
+
+    async def list_open(self, strategy=None):
+        return [
+            position
+            for (held_strategy, _), position in self.held.items()
+            if strategy is None or held_strategy == strategy
+        ]
 
 
 def _runner(state=None, positions=None, sink=None):
@@ -164,6 +269,8 @@ def _runner(state=None, positions=None, sink=None):
     runner.signals = RecordingSignals()
     runner.bus = RecordingBus()
     runner.state = state or FakeState()
+    runner.state.owner_id = runner._owner_id
+    runner._ownership_acquired = True
     runner.positions = positions or FakePositions()
     return runner
 
@@ -283,11 +390,49 @@ async def test_a_signal_is_not_sent_when_the_durable_outbox_cannot_be_written():
     assert slot.factory.open_cycle("XAUUSD") is None
 
 
+class RecordingTelegram:
+    """Stands in for the lifecycle notifier: records, sends nothing."""
+
+    def __init__(self) -> None:
+        self.noted = []
+
+    def note_signal(self, signal, *, delivery_id, delivery_status, transport, detail=None):
+        self.noted.append((signal.position.action, delivery_status, delivery_id, detail))
+
+
+async def test_every_delivered_action_is_handed_to_the_telegram_notifier():
+    """One queued update per action, so the cycle's message can be edited."""
+    runner, slot = _runner(), _slot()
+    runner.telegram = RecordingTelegram()
+
+    await _enter(runner, slot)
+    await _close(runner, slot, SignalAction.TP2, 2350.0)
+
+    assert [(action, status) for action, status, _, _ in runner.telegram.noted] == [
+        (SignalAction.LONG, "sent"),
+        (SignalAction.TP2, "sent"),
+    ]
+    delivery_ids = [delivery_id for _, _, delivery_id, _ in runner.telegram.noted]
+    assert len(set(delivery_ids)) == 2, "each action carries its own outbox id"
+
+
+async def test_a_failed_delivery_is_reported_to_the_chat_with_its_reason():
+    """The chat must show the action the broker refused, not hide it."""
+    runner, slot = _runner(sink=FailedSink()), _slot()
+    runner.telegram = RecordingTelegram()
+
+    await _enter(runner, slot)
+
+    [(action, status, _, detail)] = runner.telegram.noted
+    assert (action, status, detail) == (SignalAction.LONG, "failed", "no ack")
+
+
 # ── Restoring after a restart ────────────────────────────────────────────
 
 
 def _held(**kwargs) -> OpenPosition:
     defaults = {
+        "state_namespace": settings.state_scope.namespace,
         "signal_uxid": "9F2C4B7E18A3D605",
         "strategy": "DELIVERY_PROBE",
         "symbol": "XAUUSD",
@@ -349,10 +494,14 @@ async def test_startup_replays_a_pending_signal_with_its_original_delivery_id():
     intent = SignalIntent(action=SignalAction.LONG, price=2334.50, sl=2329.50)
     signal = source.factory.build(intent, symbol="XAUUSD", moment=MOMENT, commit=False)
     row = SimpleNamespace(
+        namespace=settings.state_scope.namespace,
         id=delivery_id,
+        created_at=datetime.now(UTC),
+        strategy=signal.strategy,
+        symbol=signal.symbol,
         payload=signal.to_envelope(),
         inputs={"__qte_outbox__": source.factory.pending_delivery_context("XAUUSD")},
-        delivery_status="pending",
+        delivery_status="prepared",
         delivery_error=None,
         transport="nats",
         shadow=False,
@@ -382,7 +531,11 @@ async def test_a_pending_shadow_signal_cannot_turn_live_during_recovery():
         commit=False,
     )
     row = SimpleNamespace(
+        namespace=settings.state_scope.namespace,
         id=delivery_id,
+        created_at=datetime.now(UTC),
+        strategy=signal.strategy,
+        symbol=signal.symbol,
         payload=signal.to_envelope(),
         inputs={"__qte_outbox__": source.factory.pending_delivery_context("XAUUSD")},
         delivery_status="pending",
@@ -398,8 +551,9 @@ async def test_a_pending_shadow_signal_cannot_turn_live_during_recovery():
     await runner._recover_pending_deliveries()
 
     assert sink.delivery_ids == []
-    assert row.delivery_status == "shadow"
-    assert slot.factory.open_cycle("XAUUSD") == signal.signal_uxid
+    assert row.delivery_status == "pending"
+    assert slot.factory.open_cycle("XAUUSD") is None
+    assert slot.key in runner._uncertain_pairs
 
 
 def test_replaying_the_same_partial_close_does_not_reduce_position_twice():
@@ -423,3 +577,98 @@ def test_replaying_the_same_partial_close_does_not_reduce_position_twice():
     factory.commit(partial, delivery_id="partial-id")
 
     assert factory.open_position("XAUUSD").remaining == remaining
+
+
+@pytest.fixture(autouse=True)
+def live_state_scope(monkeypatch):
+    """Exercise broker paths with an explicitly selected live book and fake transports."""
+    from qte_shared.config import settings
+
+    monkeypatch.setattr(settings, "env", "prod")
+    monkeypatch.setattr(settings.state_config, "execution_mode", "live")
+
+
+class RecordingStatus:
+    """Stands in for the service UP/DOWN announcement."""
+
+    def __init__(self) -> None:
+        self.announced: list[str] = []
+
+    async def announce_started(self, details=None):
+        self.announced.append("UP")
+
+    async def announce_stopped(self, details=None, *, reason=None):
+        self.announced.append("DOWN")
+
+    async def aclose(self):
+        pass
+
+    def describe(self) -> str:
+        return "test"
+
+
+class RecordingEvents:
+    """The audit trail, without a database behind it."""
+
+    def __init__(self) -> None:
+        self.recorded: list[str] = []
+
+    async def record_event(self, *, service, event, payload=None):
+        self.recorded.append(event)
+
+
+class ClosingStub:
+    """Anything the shutdown path only closes."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def close(self):
+        self.closed = True
+
+    async def stop(self, **keywords):
+        self.closed = True
+
+    async def aclose(self):
+        self.closed = True
+
+
+async def test_a_shutdown_tells_the_chat_the_service_went_down():
+    """`make stop` has to produce a message, not just a quiet container exit."""
+    runner = _runner()
+    runner._ownership_acquired = False
+    runner.events = RecordingEvents()
+    runner.status = RecordingStatus()
+    runner.bus = ClosingStub()
+    runner.sink = ClosingStub()
+    runner.telegram = ClosingStub()
+    runner.telegram_errors = ClosingStub()
+    runner.state = ClosingStub()
+
+    await runner._close_resources(record_event=True)
+
+    assert runner.events.recorded == ["stopped"]
+    assert runner.status.announced == ["DOWN"]
+    assert runner.telegram.closed and runner.telegram_errors.closed and runner.sink.closed
+
+
+async def test_the_announcement_survives_a_chat_that_cannot_be_reached():
+    """A Telegram outage must not stop a runner from shutting down."""
+
+    class FailingStatus(RecordingStatus):
+        async def announce_stopped(self, details=None, *, reason=None):
+            raise RuntimeError("Bot API is unreachable")
+
+    runner = _runner()
+    runner._ownership_acquired = False
+    runner.events = RecordingEvents()
+    runner.status = FailingStatus()
+    runner.bus = ClosingStub()
+    runner.sink = ClosingStub()
+    runner.telegram = ClosingStub()
+    runner.telegram_errors = ClosingStub()
+    runner.state = ClosingStub()
+
+    await runner._close_resources(record_event=False)
+
+    assert runner.sink.closed, "shutdown carried on past the failed announcement"

@@ -23,6 +23,7 @@ and then simply not sent. It is the phase-6 paper-trading switch.
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
 
 import httpx
@@ -31,6 +32,7 @@ from qte_shared.bus import NatsBus, Subjects
 from qte_shared.config import settings
 from qte_shared.logging_setup import get_logger
 from qte_shared.models import BrokerSignal
+from qte_shared.strategies.signal_serialization import authenticated_signal, signal_record
 
 log = get_logger(__name__)
 
@@ -59,7 +61,12 @@ class BrokerSink:
         shadow_mode: bool | None = None,
     ) -> None:
         self.transport = transport or settings.broker.transport
-        self.shadow_mode = settings.broker.shadow_mode if shadow_mode is None else shadow_mode
+        self._scope = settings.state_scope
+        self.shadow_mode = (
+            self._scope.is_paper
+            or settings.broker.force_shadow_mode
+            or (settings.broker.shadow_mode if shadow_mode is None else shadow_mode)
+        )
         self._bus = bus
         self._owns_bus = bus is None
         self._http: httpx.AsyncClient | None = None
@@ -96,6 +103,7 @@ class BrokerSink:
             self._bus = None
 
     def set_shadow_mode(self, enabled: bool) -> None:
+        enabled = enabled or self._scope.is_paper or settings.broker.force_shadow_mode
         log.warning(
             "Shadow mode %s",
             "ENABLED — signals will NOT reach the broker"
@@ -115,7 +123,11 @@ class BrokerSink:
         """
         signal.validate_shape()
 
-        if self.shadow_mode:
+        if not self._scope.is_paper and (self.shadow_mode or settings.broker.force_shadow_mode):
+            return DeliveryResult(
+                status="failed", transport=self.transport, detail="Live delivery is paused"
+            )
+        if self._scope.is_paper:
             log.info(
                 "SHADOW %s %s %s price=%s qty=%s sl=%s tp1=%s tp2=%s uxid=%s",
                 signal.strategy,
@@ -179,7 +191,7 @@ class BrokerSink:
         # second trade command.
         ack = await self._bus.publish_jetstream(
             subject,
-            signal.to_envelope(),
+            {"payload": authenticated_signal(signal, settings.broker.token)},
             msg_id=delivery_id or signal_delivery_id(signal),
             timeout=settings.broker.publish_timeout,
         )
@@ -193,13 +205,14 @@ class BrokerSink:
             raise RuntimeError("Broker sink was not started")
         response = await self._http.post(
             "/secret/webhook",
-            json=signal.model_dump(mode="json"),
+            json=authenticated_signal(signal, settings.broker.token),
             headers={"Idempotency-Key": delivery_id or signal_delivery_id(signal)},
         )
         response.raise_for_status()
-        return f"http {response.status_code} {response.json()}"
+        return f"http {response.status_code}"
 
 
 def signal_delivery_id(signal: BrokerSignal) -> str:
     """Deterministic fallback id for callers that do not own an outbox row."""
-    return hashlib.sha256(signal.model_dump_json().encode()).hexdigest()
+    serialized = json.dumps(signal_record(signal), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode()).hexdigest()

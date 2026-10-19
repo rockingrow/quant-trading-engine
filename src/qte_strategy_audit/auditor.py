@@ -142,7 +142,11 @@ def _load_failures(failures: list[LoadFailure]) -> list[Finding]:
             severity=Severity.ERROR,
             subject=failure.path.name,
             message=failure.detail,
-            fix=(
+            # The loader knows better than this default for some failures — a
+            # settings table that would not parse is not fixed by reinstalling
+            # anything — so it may carry its own fix line.
+            fix=failure.fix
+            or (
                 "if it is a missing import, install the plugin repo's dependencies with "
                 "`make strategy-mount STRATEGY=<name>` - they are imported into the "
                 "runner's own process"

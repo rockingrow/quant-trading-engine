@@ -21,6 +21,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from qte_shared.state_scope import MarketDataOrigin
+
 # ── Correlation ids ───────────────────────────────────────────────────────
 
 #: The broker accepts exactly 16 uppercase alphanumeric characters and 422s on
@@ -61,6 +63,7 @@ class Tick(BaseModel):
     ask: float | None = None
     last: float | None = None
     volume: float = 0.0
+    origin: MarketDataOrigin | None = None
 
     @property
     def price(self) -> float:
@@ -94,6 +97,7 @@ class Candle(BaseModel):
     volume: float = 0.0
     tick_count: int = 0
     is_closed: bool = True
+    origin: MarketDataOrigin | None = None
 
 
 class CandleClosedEvent(BaseModel):
@@ -328,6 +332,7 @@ class OpenPosition(BaseModel):
     """
 
     model_config = ConfigDict(allow_inf_nan=False)
+    state_namespace: str | None = None
 
     signal_uxid: str
     strategy: str = ""
