@@ -1,6 +1,6 @@
 [project]
 name = "quant-trading-engine"
-version = "0.1.0"
+version = "0.1.1"
 description = "Data-driven quant trading engine for backtesting and executing proprietary strategies via integrated data providers (Tiingo first), featuring full trade lifecycle management and external signal routing."
 readme = "README.md"
 # Pinned to 3.13, and the reason is not this repo's own dependencies — they are
