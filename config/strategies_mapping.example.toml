@@ -43,15 +43,11 @@ use_equity_sizing = false
 # declared default; true on a strategy that declares no window stops the pair
 # from starting. Applies to the backtest too.
 use_weekend_flat = true
-# Read by the engine, not the strategy: how many trade cycles this strategy may
-# hold on one symbol at once. Off, the pair holds one position and a second
-# entry is refused. On, it may hold up to max_open_cycles positions side by
-# side, each under its own signal_uxid with its own bracket, and every close
-# names the cycle it closes. The broker worker must run a hedging account, or
-# the positions merge. Applies to the backtest too, and a pair may restate
-# either key under [symbols.<symbol>.params.<strategy>].
-allow_multiple_cycles = false
-max_open_cycles = 1
+# There is no cycle cap. A pair holds as many trade cycles at once as its
+# strategy opens, each under its own signal_uxid with its own bracket, and every
+# close names the cycle it closes. The broker worker must run a hedging account,
+# or the positions merge. The retired allow_multiple_cycles and max_open_cycles
+# keys are ignored if an old mapping file still carries them.
 # Read by the engine, not the strategy: how many closed candles this strategy
 # collects before it may decide anything. Omit it to keep the count the
 # strategy's own code declares, which is the safe default — what it really
@@ -109,10 +105,8 @@ strategies = ["EXAMPLE_FX_M15_V1"]
 # [symbols.XAUUSD.params.SIGNAL_SIMULATOR_LIFECYCLE_V1]
 # timeframe = "M1"
 # use_weekend_flat = false
-# # One cycle per pair re-enters on the bar after each exit; three or more
-# # lets it enter on every bar while earlier cycles are still being walked.
-# allow_multiple_cycles = true
-# max_open_cycles = 3
+# # It enters on every bar, stacking cycles while earlier ones are still
+# # being walked — nothing caps how many it holds at once.
 # # TP1 must leave something for TP2 / R_SL to close.
 # tp1_qty_percent = 50
 # # outcome = "sl"          # force one path: tp1_tp2 | sl | tp1_rsl

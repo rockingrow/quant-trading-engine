@@ -248,6 +248,13 @@ __marimo__/
 # The market-data plan: which symbols are actually subscribed, at what size of
 # window. Same rule as the routing table — the template is tracked, the real
 # file is not. `make tiingo`, `make mt5` and `make simulator` write them.
+# What a backtest charges a fill, per symbol and per account type. The broker
+# and account type an operator trades is theirs; the template beside it carries
+# the schema and the measured numbers the audits use.
+/config/costs.toml
+/config/costs.*.toml
+!/config/costs.example.toml
+
 /config/data_providers/tiingo.toml
 /config/data_providers/mt5.toml
 /config/data_providers/binance.toml

@@ -2104,8 +2104,12 @@ function contextPanel(view) {
         ["Commission per unit", num(costs.commission_per_unit, 5)],
         ["Contract size", num(costs.contract_size, 2)],
         ["Round-trip cost", num(costs.round_trip_cost, 5)],
+        // Which account type priced the three numbers above, so two runs of one
+        // strategy are not left looking identical in everything but the prices.
+        ["Cost profile", costs.profile],
         ["Signals emitted", num((view.activity || {}).signals_emitted, 0)],
         ["Rejected entries", num((view.activity || {}).rejected_entries, 0)],
+        ["Rejected closes", num((view.activity || {}).rejected_closes, 0)],
         ...params.map(([key, value]) => [`param · ${key}`, String(value)]),
       ].map(([key, value]) =>
         h("div", {}, h("span", { class: "k", text: key }), h("span", { class: "v", text: value === undefined || value === null ? NA : value }))

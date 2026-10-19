@@ -124,10 +124,11 @@ def test_flat_asks_only_the_entries(trending_frame):
     assert strategy.asked == list(ENTRY_SIGNAL_ORDER)
 
 
-def test_holding_a_position_asks_only_the_exits(trending_frame):
+def test_holding_a_position_asks_the_exits_and_then_the_entries(trending_frame):
+    """Holding is not a block: nothing caps the cycles a pair may stack."""
     strategy = Recorder()
     strategy.on_candle_closed(trending_frame, context(open_uxid="CYCLE-1"))
-    assert strategy.asked == list(EXIT_SIGNAL_ORDER)
+    assert strategy.asked == list(EXIT_SIGNAL_ORDER) + list(ENTRY_SIGNAL_ORDER)
 
 
 def test_the_first_entry_that_answers_wins(trending_frame):
@@ -144,7 +145,7 @@ def test_every_exit_is_asked_even_after_one_answers(trending_frame):
     strategy = Recorder(fires=("r_sl", "tp1"))
     intents = as_intents(strategy.on_candle_closed(trending_frame, context(open_uxid="C1")))
 
-    assert strategy.asked == list(EXIT_SIGNAL_ORDER)
+    assert strategy.asked == list(EXIT_SIGNAL_ORDER) + list(ENTRY_SIGNAL_ORDER)
     assert [intent.action for intent in intents] == [SignalAction.R_SL, SignalAction.TP1]
 
 

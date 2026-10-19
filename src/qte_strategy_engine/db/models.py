@@ -76,10 +76,9 @@ class SignalAudit(Base):
 class OpenPositionRow(Base):
     """One trade cycle live on a (strategy, symbol) pair.
 
-    A pair holds one row, or up to ``max_open_cycles`` when its mapping sets
-    ``allow_multiple_cycles``. That limit is the signal factory's to enforce —
-    it depends on configuration the database cannot see — so the table only
-    guarantees the rule that holds everywhere: one row per cycle id.
+    A pair holds one row per cycle it has open, and nothing caps how many that
+    is: a strategy stacks as many cycles as it fires. The table guarantees the
+    one rule that holds everywhere — one row per cycle id.
 
     Mirrors :class:`qte_shared.models.OpenPosition`. ``state`` carries the whole
     record so a field added there does not need a migration to be persisted;
@@ -117,7 +116,7 @@ class OpenPositionRow(Base):
     state: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
 
     __table_args__ = (
-        # Every cycle a pair holds — one, or several with allow_multiple_cycles.
+        # Every cycle a pair holds, however many that is.
         Index("ix_open_positions_pair", "namespace", "strategy", "symbol"),
         # One row per cycle id. The broker groups a whole trade by
         # `signal_uxid`, so two rows sharing one would let a close on either

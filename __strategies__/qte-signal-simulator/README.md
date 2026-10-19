@@ -29,8 +29,6 @@ strategies = ["SIGNAL_SIMULATOR_LIFECYCLE_V1"]
 
 [symbols.XAUUSD.params.SIGNAL_SIMULATOR_LIFECYCLE_V1]
 timeframe = "M1"                # must be a bar ingestion produces for XAUUSD
-# allow_multiple_cycles = true  # with max_open_cycles >= 3: an entry on every bar
-# max_open_cycles = 3
 # outcome = "sl"                # force one path
 # weights = [1, 1, 1]           # tp1_tp2, sl, tp1_rsl
 # seed = 0

@@ -194,16 +194,17 @@ which is exactly why it is a table of its own rather than a column on `signals`.
 ## Why a stale position is flushed on start
 
 Remembering a cycle across a restart is the right answer, and it has a failure
-mode of its own. One `(strategy, symbol)` pair holds one cycle at a time, or
-`max_open_cycles` when its mapping sets `allow_multiple_cycles` —
-`SignalFactory._prepare_entry` refusing an entry over that limit. That rule is what makes a
-long outage expensive rather than merely inconvenient: the row survives, the
-pair comes back still believing it holds that cycle, and every entry the
-strategy proposes from then on is refused. The pair is locked, and the position
-it is locked on was sized against a bracket the market left behind hours ago.
+mode of its own. Nothing caps how many cycles a `(strategy, symbol)` pair
+holds, so a long outage does not lock the pair out of trading — it leaves it
+carrying positions nobody is deciding on. The rows survive, the pair comes back
+still believing it holds them, and each was sized against a bracket the market
+left behind hours ago. Every later entry is then sized against an account those
+ghosts are still charged to, and each one's bracket sits at the broker waiting
+on a level that stopped meaning anything.
 
 So the runner closes what has gone stale, on start, with `R_SL` — a terminal
-action, so the cycle ends and the pair is free. `R_SL` rather than `FLAT`
+action, so the cycle ends and the book is back to what is really being
+managed. `R_SL` rather than `FLAT`
 because `FLAT` means "close everything on this strategy" and this closes exactly
 one cycle, named by its `signal_uxid`. It goes out through the ordinary `_emit`
 path, so it is staged in the durable outbox, delivered and audited like any
@@ -218,8 +219,8 @@ treated as what it is, a leftover. `0` restores the unconditional behaviour for
 an operator who wants it, and `QTE_RUNNER__FLUSH_STALE_POSITIONS=warn` lists
 what a first `close` run would do without doing it.
 
-**It decides from the slots, not from the table.** What locks a pair is the
-cycle `_restore_position` put on its slot, and that came from Redis in
+**It decides from the slots, not from the table.** What a pair believes it
+holds is the cycle `_restore_position` put on its slot, and that came from Redis in
 preference to Postgres. The two can disagree: `_persist_position` writes Redis
 first, and `OpenPositionRepository.upsert` swallows its own failure by design,
 so a cycle can live in the cache and not in the table. A flush driven by the
@@ -713,6 +714,38 @@ Listed in the README. The one worth repeating: when a bar's range covers both
 the stop and the target, the simulator takes the **stop**. Without tick data
 there is no ordering, and assuming the favourable one is precisely how a losing
 strategy backtests profitably.
+
+## Why fill costs live in a profile file, not in the environment
+
+`QTE_ACCOUNT__SPREAD` is one number for the whole engine, and a cost is not a
+property of an engine: gold's measured median spread is 0.25, oil's is 0.04,
+BTCUSDT's is around 20. Whichever number that variable holds is therefore wrong
+for every symbol but one — and the engine's shipped default, 0.04, is oil's.
+
+Passing `--spread` per run moves the problem rather than solving it. The flag
+has to be remembered on every invocation, by every script and every agent, and
+forgetting it does not fail: it prices gold six times too cheaply and reports
+"0.04" with the same confidence it would report a number somebody chose.
+
+So the three costs move into `config/costs.toml`, keyed by symbol and grouped
+into profiles — one profile per account type, because an account type is a whole
+cost model and not a spread. A Standard account hides its fee inside the spread
+and charges no commission; a Zero/Raw account quotes a tighter spread and bills
+the commission separately. Both are plausible deployments of the same strategy,
+and `--cost-profile` is how one run answers for both.
+
+Three consequences worth stating:
+
+- **Each cost resolves on its own** — flag, then the symbol's table, then the
+  profile's `defaults`, then `QTE_ACCOUNT__*`. A profile stating only a spread
+  keeps the account's slippage rather than silently zeroing it.
+- **The report records which layer won**, per cost, in `costs.sources`, beside
+  the profile's name. A price nobody can trace is a result nobody can reproduce,
+  and two runs that differ only in account type are otherwise indistinguishable
+  on disk.
+- **Nothing here reaches the live path.** The runner's fills come from the
+  broker, so the module sits in `qte_backtest` — by the rule that what only one
+  service uses does not belong in `qte_shared`.
 
 ## Why the repo root is searched for, not counted
 

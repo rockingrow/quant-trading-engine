@@ -175,22 +175,23 @@ def test_invalid_entry_does_not_leave_a_ghost_open_cycle():
     assert factory.open_cycle("XAUUSD") is None
 
 
-def test_a_second_entry_cannot_orphan_the_open_cycle():
+def test_a_second_entry_opens_its_own_cycle_beside_the_first():
+    """Nothing caps the book, so the second entry stacks rather than being refused."""
     factory = _factory()
     first = factory.build(
         SignalIntent(action=SignalAction.LONG, price=2000.0, quantity=1.0, sl=1990.0),
         symbol="XAUUSD",
         moment=NOW,
     )
+    second = factory.build(
+        SignalIntent(action=SignalAction.LONG, price=2001.0, quantity=1.0, sl=1991.0),
+        symbol="XAUUSD",
+        moment=NOW,
+    )
 
-    with pytest.raises(ValueError, match="close the current position"):
-        factory.build(
-            SignalIntent(action=SignalAction.LONG, price=2001.0, quantity=1.0, sl=1991.0),
-            symbol="XAUUSD",
-            moment=NOW,
-        )
-
-    assert factory.open_cycle("xauusd") == first.signal_uxid
+    assert second.signal_uxid != first.signal_uxid
+    assert factory.open_cycles("xauusd") == (first.signal_uxid, second.signal_uxid)
+    assert factory.open_cycle("xauusd") == second.signal_uxid, "the most recent"
 
 
 # ── Sizing ───────────────────────────────────────────────────────────────

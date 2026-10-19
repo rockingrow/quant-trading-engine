@@ -472,7 +472,12 @@ QTE_ACCOUNT__COMMISSION_PER_UNIT=0.0 # backtest cost, charged each side
 QTE_ACCOUNT__SPREAD=0.0              # full bid/ask distance, each side pays half
 QTE_ACCOUNT__SLIPPAGE=0.0            # on top of half the spread, each side
 QTE_ACCOUNT__CONTRACT_SIZE=1.0
+QTE_ACCOUNT__COST_PROFILE=           # which profile in config/costs.toml prices a fill
 ```
+
+Those three costs are the *last* layer: one spread for the whole engine is
+wrong as soon as a second symbol is replayed, so state them per symbol in
+`config/costs.toml` instead — see [the cost profiles](#cost-profiles) below.
 
 The capital is **fixed for a run**; it does not compound. Sizing off running
 equity would make later trades depend on earlier P&L, so two backtests differing
@@ -570,7 +575,7 @@ session times, weekend gaps and volume, and choosing between them by convention
 is how a run measures a book nobody meant to test.
 
 A run starts from `QTE_ACCOUNT__CAPITAL` (default **$1,000**) and prices its
-fills with `QTE_ACCOUNT__COMMISSION_PER_UNIT`, so P&L, max drawdown and profit
+fills from the cost profile below, so P&L, max drawdown and profit
 factor are figures about a real balance rather than about one arbitrary unit.
 Entries are risk-sized against that capital exactly as the live runner sizes
 them, and the pair's overrides in `config/strategies_mapping.toml` apply here
@@ -583,6 +588,41 @@ Net PnL           378.79   (fees 0.00)
 Profit factor     1.294
 Max drawdown      243.31  (18.50%)
 ```
+
+#### Cost profiles
+
+What a fill costs is a property of the symbol and the account type, not of a
+run — gold's measured spread is **0.25**, oil's is **0.04**, BTCUSDT's is around
+**20** — so the three numbers live in `config/costs.toml`, one table per symbol
+inside one profile per account type:
+
+```bash
+make costs    # copy config/costs.example.toml into place; git-ignored
+```
+
+```toml
+default_profile = "exness_standard"
+
+[profiles.exness_standard.symbols.XAUUSD]
+spread = 0.25                 # measured median: 0.20 (2023-24), 0.16 (2025), 0.26 (2026)
+slippage = 0.0
+commission_per_unit = 0.0
+
+[profiles.exness_zero.symbols.XAUUSD]
+spread = 0.05                 # tighter spread, commission billed separately
+slippage = 0.0
+commission_per_unit = 0.035
+```
+
+A Standard account hides its fee inside the spread; a Zero/Raw account quotes a
+tighter spread and bills commission. Whether an edge survives both is a real
+question, and `--cost-profile exness_zero` answers it without editing anything.
+Each cost resolves on its own, highest precedence first: `--spread` /
+`--slippage` / `--commission` on the command line, then
+`[profiles.<name>.symbols.<SYMBOL>]`, then that profile's `defaults`, then
+`QTE_ACCOUNT__*`. Every report records which layer won for each number, under
+`costs.profile` and `costs.sources`, so a run's prices can be traced rather
+than guessed at.
 
 The fill simulator is deliberately pessimistic — it is meant to disprove a
 strategy, not flatter one:

@@ -1,11 +1,10 @@
 """Several trade cycles on one (strategy, symbol) pair, each with its own ``signal_uxid``.
 
-Off by default: a pair holds one cycle and a second entry is refused, which is
-what every driver did before ``allow_multiple_cycles`` existed. Switched on in the
-mapping table, a pair holds up to ``max_open_cycles`` positions A, B, C side by
-side. Each keeps its own bracket, each close names the cycle it closes, and the
-factory, the replay and the runner all agree on the limit because all three read
-it from the same pair params.
+Nothing caps the count: a pair holds positions A, B, C side by side for as long
+as its strategy keeps firing entries. Each keeps its own bracket and each close
+names the cycle it closes. The factory, the replay and the runner all stack them
+the same way, so a replay still predicts what the runner does. The only entry
+still refused is one reusing the id of a cycle already open.
 """
 
 from __future__ import annotations
@@ -30,18 +29,18 @@ from qte_shared.strategies.strategy_base import (
     StrategyContext,
 )
 from qte_shared.strategies.strategy_settings import (
-    SINGLE_CYCLE,
-    CyclePolicy,
+    RETIRED_CYCLE_PARAMS,
     WeekendFlatPolicy,
     WeeklyMoment,
-    resolve_cycle_policy,
 )
 from qte_strategy_engine.runner import StrategySlot
 
 SYMBOL = "XAUUSD"
 STRATEGY_NAME = "MULTI_PROBE"
 MOMENT = datetime(2026, 5, 1, tzinfo=UTC)
-MULTIPLE = {"allow_multiple_cycles": True, "max_open_cycles": 3}
+#: A mapping file still carrying the retired cycle-cap keys. They are ignored,
+#: never refused — a leftover key must not stop a runner from starting.
+RETIRED = {"allow_multiple_cycles": True, "max_open_cycles": 3}
 
 
 def factory_for(params: dict | None = None) -> SignalFactory:
@@ -64,60 +63,53 @@ def close(action: SignalAction, uxid: str | None = None) -> SignalIntent:
     return SignalIntent(action=action, price=2005.0, signal_uxid=uxid)
 
 
-# ── The policy ──────────────────────────────────────────────────────────
-
-
-def test_a_pair_that_says_nothing_holds_one_cycle():
-    assert resolve_cycle_policy({}) is SINGLE_CYCLE
-    assert SINGLE_CYCLE.limit == 1
-
-
-def test_the_limit_applies_only_when_multiple_cycles_are_allowed():
-    assert resolve_cycle_policy(MULTIPLE) == CyclePolicy(True, 3)
-    assert resolve_cycle_policy(MULTIPLE).limit == 3
-    assert resolve_cycle_policy({"max_open_cycles": 3}).limit == 1
+# ── The retired cap keys ────────────────────────────────────────────────
 
 
 @pytest.mark.parametrize(
     "params",
     [
+        RETIRED,
         {"allow_multiple_cycles": "yes"},
         {"allow_multiple_cycles": True, "max_open_cycles": 0},
-        {"allow_multiple_cycles": True, "max_open_cycles": 2.5},
-        {"allow_multiple_cycles": True, "max_open_cycles": True},
+        {"max_open_cycles": 2.5},
     ],
 )
-def test_a_value_that_cannot_be_honoured_is_refused(params):
-    with pytest.raises(ValueError):
-        resolve_cycle_policy(params)
+def test_a_retired_cap_key_is_ignored_rather_than_refused(params):
+    """Whatever an old mapping file says, the pair stacks cycles and starts."""
+    factory = factory_for(params)
+    for uxid in ("A000000000000001", "B000000000000002"):
+        factory.build(entry(uxid), symbol=SYMBOL, moment=MOMENT)
+    assert factory.open_cycles(SYMBOL) == ("A000000000000001", "B000000000000002")
+
+
+def test_a_retired_cap_key_never_reaches_the_broker_payload():
+    factory = factory_for({**RETIRED, "atr_period": 14})
+    assert set(factory.inputs) == {"atr_period"}
+    assert RETIRED_CYCLE_PARAMS == {"allow_multiple_cycles", "max_open_cycles"}
 
 
 # ── The factory ─────────────────────────────────────────────────────────
 
 
-def test_a_single_cycle_pair_still_refuses_a_second_entry():
+def test_a_pair_that_says_nothing_stacks_a_second_entry():
     factory = factory_for()
-    factory.build(entry(), symbol=SYMBOL, moment=MOMENT)
-    with pytest.raises(ValueError, match="would replace open cycle"):
-        factory.build(entry(), symbol=SYMBOL, moment=MOMENT)
+    factory.build(entry("A000000000000001"), symbol=SYMBOL, moment=MOMENT)
+    factory.build(entry("B000000000000002"), symbol=SYMBOL, moment=MOMENT)
+    assert factory.open_cycles(SYMBOL) == ("A000000000000001", "B000000000000002")
 
 
-def test_a_multiple_cycle_pair_holds_up_to_its_limit_and_no_more():
-    factory = factory_for(MULTIPLE)
-    for uxid in ("A000000000000001", "B000000000000002", "C000000000000003"):
+def test_a_pair_keeps_stacking_past_any_former_limit():
+    factory = factory_for()
+    uxids = tuple(f"{letter}000000000000001" for letter in "ABCDEFG")
+    for uxid in uxids:
         factory.build(entry(uxid), symbol=SYMBOL, moment=MOMENT)
-    assert factory.open_cycles(SYMBOL) == (
-        "A000000000000001",
-        "B000000000000002",
-        "C000000000000003",
-    )
-    assert factory.open_cycle(SYMBOL) == "C000000000000003", "the most recent"
-    with pytest.raises(ValueError, match="at most 3"):
-        factory.build(entry("D000000000000004"), symbol=SYMBOL, moment=MOMENT)
+    assert factory.open_cycles(SYMBOL) == uxids
+    assert factory.open_cycle(SYMBOL) == uxids[-1], "the most recent"
 
 
 def test_an_entry_without_an_id_gets_a_fresh_one():
-    factory = factory_for(MULTIPLE)
+    factory = factory_for()
     first = factory.build(entry(), symbol=SYMBOL, moment=MOMENT)
     second = factory.build(entry(), symbol=SYMBOL, moment=MOMENT)
     assert first.signal_uxid != second.signal_uxid
@@ -125,14 +117,14 @@ def test_an_entry_without_an_id_gets_a_fresh_one():
 
 
 def test_an_open_cycle_id_cannot_be_reused():
-    factory = factory_for(MULTIPLE)
+    factory = factory_for()
     factory.build(entry("A000000000000001"), symbol=SYMBOL, moment=MOMENT)
     with pytest.raises(ValueError, match="reuses open cycle id"):
         factory.build(entry("A000000000000001"), symbol=SYMBOL, moment=MOMENT)
 
 
 def test_each_close_touches_only_the_cycle_it_names():
-    factory = factory_for(MULTIPLE)
+    factory = factory_for()
     for uxid in ("A000000000000001", "B000000000000002", "C000000000000003"):
         factory.build(entry(uxid), symbol=SYMBOL, moment=MOMENT)
     before_b = factory.open_position(SYMBOL, "B000000000000002").remaining
@@ -150,7 +142,7 @@ def test_each_close_touches_only_the_cycle_it_names():
 
 
 def test_each_cycle_keeps_its_own_partial():
-    factory = factory_for(MULTIPLE)
+    factory = factory_for()
     factory.build(entry("A000000000000001"), symbol=SYMBOL, moment=MOMENT)
     factory.build(entry("B000000000000002"), symbol=SYMBOL, moment=MOMENT)
     full = factory.open_position(SYMBOL, "A000000000000001").quantity
@@ -163,7 +155,7 @@ def test_each_cycle_keeps_its_own_partial():
 
 
 def test_an_unnamed_close_is_refused_while_several_cycles_are_open():
-    factory = factory_for(MULTIPLE)
+    factory = factory_for()
     factory.build(entry("A000000000000001"), symbol=SYMBOL, moment=MOMENT)
     factory.build(entry("B000000000000002"), symbol=SYMBOL, moment=MOMENT)
     with pytest.raises(ValueError, match="names no cycle"):
@@ -171,7 +163,7 @@ def test_an_unnamed_close_is_refused_while_several_cycles_are_open():
 
 
 def test_an_unnamed_close_still_reaches_the_only_open_cycle():
-    factory = factory_for(MULTIPLE)
+    factory = factory_for()
     factory.build(entry("A000000000000001"), symbol=SYMBOL, moment=MOMENT)
     closing = factory.build(close(SignalAction.R_SL), symbol=SYMBOL, moment=MOMENT)
     assert closing.signal_uxid == "A000000000000001"
@@ -181,16 +173,13 @@ def test_an_unnamed_close_still_reaches_the_only_open_cycle():
 # ── The strategy contract ───────────────────────────────────────────────
 
 
-def test_can_open_counts_the_cycles_the_driver_reported():
+def test_the_context_reports_the_cycles_without_a_cap_beside_them():
     context = StrategyContext(symbol=SYMBOL, timeframe="M15", now=MOMENT)
-    assert context.can_open
-    context.open_uxid = "A000000000000001"
-    assert not context.can_open, "a driver that only set open_uxid holds one"
+    assert context.open_uxids == ()
     context.open_uxids = ("A000000000000001", "B000000000000002")
-    context.max_open_cycles = 3
-    assert context.can_open
-    context.open_uxids = ("A000000000000001", "B000000000000002", "C000000000000003")
-    assert not context.can_open
+    assert context.open_uxids == ("A000000000000001", "B000000000000002")
+    assert not hasattr(context, "max_open_cycles"), "the cap is gone from the contract"
+    assert not hasattr(context, "can_open")
 
 
 class OneOfEach(SignalStrategy):
@@ -212,7 +201,7 @@ class OneOfEach(SignalStrategy):
         return SignalIntent(action=SignalAction.SL, signal_uxid=context.open_uxids[0])
 
 
-def test_the_dispatcher_asks_for_an_entry_beside_the_exits_while_room_is_left():
+def test_the_dispatcher_asks_for_an_entry_beside_the_exits_however_many_are_open():
     strategy = OneOfEach()
     context = StrategyContext(
         symbol=SYMBOL,
@@ -220,13 +209,13 @@ def test_the_dispatcher_asks_for_an_entry_beside_the_exits_while_room_is_left():
         now=MOMENT,
         open_uxid="A000000000000001",
         open_uxids=("A000000000000001",),
-        max_open_cycles=2,
     )
     actions = [intent.action for intent in strategy.on_candle_closed(pd.DataFrame(), context)]
     assert actions == [SignalAction.SL, SignalAction.LONG]
-    context.max_open_cycles = 1
+    context.open_uxids = tuple(f"{letter}000000000000001" for letter in "ABCDEF")
+    context.open_uxid = context.open_uxids[-1]
     actions = [intent.action for intent in strategy.on_candle_closed(pd.DataFrame(), context)]
-    assert actions == [SignalAction.SL], "a single-cycle pair is never asked while holding"
+    assert actions == [SignalAction.SL, SignalAction.LONG], "holding never blocks the entry"
 
 
 # ── The replay ──────────────────────────────────────────────────────────
@@ -293,24 +282,76 @@ def replay(params: dict, closes: list[float], **engine_options) -> tuple:
     return engine.run(bars(closes)), strategy
 
 
-def test_the_replay_holds_one_cycle_by_default():
-    result, strategy = replay({}, [2000.0] * 8)
-    assert result.rejected == 3
-    assert strategy.seen[1] == ("CYCLE00000000000",)
-    assert [position.signal_uxid for position in result.positions] == ["CYCLE00000000000"]
+class ClosesWithoutNaming(StrategyBase):
+    """Fills four entries, then keeps emitting a close that names no cycle.
+
+    An unnamed close is ambiguous once more than one cycle is open, so the
+    factory refuses it — the one close-side rejection there is.
+    """
+
+    name = STRATEGY_NAME
+    timeframe = "M15"
+    warmup = 1
+    max_history = 5
+
+    def __init__(self, params=None):
+        super().__init__(params)
+        self.bar_number = -1
+
+    def on_candle_closed(self, candles_frame, context):
+        self.bar_number += 1
+        price = float(candles_frame["close"].iloc[-1])
+        if self.bar_number <= 3:
+            return SignalIntent(
+                action=SignalAction.LONG,
+                price=price,
+                sl=price - 50,
+                tp2=price + 50,
+                signal_uxid=f"CYCLE{self.bar_number:011d}",
+            )
+        return SignalIntent(action=SignalAction.TP2, price=price)
 
 
-def test_the_replay_holds_every_cycle_up_to_the_limit_and_closes_them_by_name():
-    result, strategy = replay(MULTIPLE, [2000.0] * 8)
-    assert result.rejected == 1, "the fourth entry is over the limit of three"
-    assert strategy.seen[3] == ("CYCLE00000000000", "CYCLE00000000001", "CYCLE00000000002")
-    assert strategy.seen[5] == ("CYCLE00000000000", "CYCLE00000000002"), (
-        "only the named cycle closed"
+def test_a_refused_close_is_counted_apart_from_the_refused_entries():
+    """``rejected`` is read as a share of the entries that filled, so only entries go in it."""
+    strategy = ClosesWithoutNaming()
+    engine = BacktestEngine(
+        strategy,
+        symbol=SYMBOL,
+        timeframe="M15",
+        starting_equity=1000.0,
+        sizer=PositionSizer(capital=1000.0, risk_percent=1.0),
     )
+    result = engine.run(bars([2000.0] * 8))
+
+    assert len(result.positions) == 4, "every entry filled"
+    assert result.rejected == 0, "no entry was refused"
+    assert result.rejected_closes > 0, "the unnamed closes were refused"
+    # The ratio the ENTRIES_REJECTED finding reads must not see them: it is a
+    # share of the entries that filled, which a refused close says nothing about.
+    assert result.rejected / (result.metrics.trades + result.rejected) == 0.0
+
+
+def test_the_replay_holds_every_cycle_the_strategy_opens_and_closes_them_by_name():
+    result, strategy = replay({}, [2000.0] * 8)
+    assert result.rejected == 0, "nothing is refused for being a further position"
+    assert strategy.seen[1] == ("CYCLE00000000000",)
+    assert strategy.seen[4] == (
+        "CYCLE00000000000",
+        "CYCLE00000000001",
+        "CYCLE00000000002",
+        "CYCLE00000000003",
+    ), "all four entries stacked"
+    assert strategy.seen[5] == (
+        "CYCLE00000000000",
+        "CYCLE00000000002",
+        "CYCLE00000000003",
+    ), "only the named cycle closed"
     assert [position.signal_uxid for position in result.positions] == [
         "CYCLE00000000000",
         "CYCLE00000000001",
         "CYCLE00000000002",
+        "CYCLE00000000003",
     ]
     closed_by_strategy = result.positions[1]
     assert closed_by_strategy.exit_reason == "TP2"
@@ -319,11 +360,11 @@ def test_the_replay_holds_every_cycle_up_to_the_limit_and_closes_them_by_name():
 
 def test_each_cycle_is_closed_by_its_own_bracket_or_by_name():
     # Each entry rests its stop 50 below and its target 50 above. Cycle 0
-    # (2000) reaches its target on bar 2; that frees room, so bar 3 opens
-    # cycle 3 at 2080. Cycle 1 is closed by name on bar 4, and the fall to 2025
-    # on bar 5 stops out cycles 2 and 3 (stops at 2030) but no other.
+    # (2000) reaches its target on bar 2; bar 3 opens cycle 3 at 2080. Cycle 1
+    # is closed by name on bar 4, and the fall to 2025 on bar 5 stops out
+    # cycles 2 and 3 (stops at 2030) but no other.
     closes = [2000.0, 2040.0, 2080.0, 2080.0, 2080.0, 2025.0, 2025.0]
-    result, strategy = replay(MULTIPLE, closes)
+    result, strategy = replay({}, closes)
     by_id = {position.signal_uxid: position for position in result.positions}
     assert by_id["CYCLE00000000000"].exit_reason == "TP2"
     # Its target, 2090, is never reached: this TP2 is the strategy's, by name.
@@ -340,7 +381,7 @@ def test_the_weekend_flat_closes_every_cycle_by_name():
         flat_from=WeeklyMoment(weekday=4, minute_of_day=17 * 60),
         flat_until=WeeklyMoment(weekday=6, minute_of_day=22 * 60),
     )
-    strategy = ScriptedCycles(MULTIPLE)
+    strategy = ScriptedCycles({})
     engine = BacktestEngine(
         strategy,
         symbol=SYMBOL,
@@ -419,7 +460,7 @@ class SilentStrategy(StrategyBase):
 
 
 def multi_slot() -> StrategySlot:
-    return StrategySlot(SilentStrategy(), SYMBOL, factory_for(MULTIPLE))
+    return StrategySlot(SilentStrategy(), SYMBOL, factory_for())
 
 
 def stored(uxid: str, opened_minutes_ago: int) -> OpenPosition:
@@ -467,15 +508,13 @@ async def test_the_runner_restores_every_cycle_a_pair_holds():
     assert set(runner.state.cycles) == set(held), "Postgres re-seeded Redis"
 
 
-async def test_the_context_reports_every_cycle_and_the_limit():
+async def test_the_context_reports_every_cycle_a_pair_holds():
     strategy_slot = multi_slot()
     for uxid in ("A000000000000001", "B000000000000002"):
         strategy_slot.factory.restore_position(stored(uxid, 10))
     context = _runner()._strategy_context(strategy_slot, MOMENT)
     assert context.open_uxids == ("A000000000000001", "B000000000000002")
     assert context.open_uxid == "B000000000000002"
-    assert context.max_open_cycles == 3
-    assert context.can_open
 
 
 async def test_the_runner_weekend_flat_names_every_cycle():

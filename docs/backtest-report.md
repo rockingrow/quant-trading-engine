@@ -24,10 +24,10 @@ uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --timeframe M15 \
 | `run` | Strategy, class, module, params, warm-up, starting equity and the `risk_percent` every quantity was sized at. |
 | `data` | Bar count, first and last bar, decision-eligible bars including the warm-up boundary, gap count. |
 | `market` | The OHLC window of the replayed history for drawing — normally the run's own bars — plus the buy-and-hold basis, the one thing the trades cannot re-derive. |
-| `costs` | Spread, slippage, commission, contract size, derived round-trip cost. |
+| `costs` | Spread, slippage, commission, contract size, derived round-trip cost — and where each came from: `profile` names the account type in `config/costs.toml` that priced the run, `profile_file` the file it was read from, and `sources` says per key whether it came from a `flag`, `profile.symbols`, `profile.defaults` or the `account` fallback. All three are null/empty for a run priced entirely from `QTE_ACCOUNT__*`. |
 | `metrics` | Currency **and** R-multiple statistics, excursion averages, exit-reason counts, direction split, exposure, streaks, equity curve. |
 | `diagnostics` | Findings, most severe first, each with its threshold, its evidence and one concrete change. |
-| `activity` | Trades taken, entries rejected, signals emitted. |
+| `activity` | Trades taken, entries rejected, closes rejected, signals emitted. `rejected_entries` and `rejected_closes` are the intents the signal factory refused to build a payload from, counted apart because only the first has the entries that did fill to be read against. Neither counts anything refused for being a second position: nothing caps the cycles a pair stacks. |
 | `trades` | Every trade — entry, exit, bars held, initial risk, R-multiple, MAE/MFE, and each partial leg. `exit_note` (also on each leg) is the strategy's own explanation for that close, taken verbatim from `SignalIntent.reason`; null on a bracket fill, since the strategy is never consulted when a TP/SL level is simply touched. |
 | `signals` | Broker trading fields the run would have published; authentication token omitted. |
 

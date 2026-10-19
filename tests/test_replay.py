@@ -132,12 +132,16 @@ def test_metrics_are_computed_over_realised_trades(trending_frame):
     assert "BUY_ONCE" in result.report()
 
 
-def test_a_second_entry_is_rejected_while_a_position_is_open(trending_frame):
-    # Mirrors the worker, which answers REJECTED rather than stacking positions.
+def test_a_second_entry_stacks_beside_the_open_one(trending_frame):
+    # Mirrors the runner, which caps nothing: every entry opens its own cycle.
     result = BacktestEngine(AlwaysLongStrategy(), symbol="XAUUSD").run(trending_frame)
-    assert result.rejected > 0
-    open_at_once = [p for p in result.positions if p.is_open]
-    assert len(open_at_once) == 0
+    assert result.rejected == 0, "nothing is refused for being a further position"
+    assert len(result.positions) > 1, "the entries stacked rather than being dropped"
+    assert len({position.signal_uxid for position in result.positions}) == len(result.positions), (
+        "each cycle got its own id"
+    )
+    open_at_once = [position for position in result.positions if position.is_open]
+    assert len(open_at_once) == 0, "the run still closes its book at the end of the data"
 
 
 def test_a_position_still_open_at_the_end_is_marked_out(trending_frame):

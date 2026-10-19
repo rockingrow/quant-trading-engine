@@ -40,6 +40,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from qte_backtest.costs import CostOrigin
 from qte_backtest.diagnostics import CRITICAL, INFO, WARNING, DiagnosticContext, Finding, diagnose
 from qte_backtest.execution import SimulatedPosition
 from qte_backtest.replay import BacktestResult
@@ -97,9 +98,11 @@ READING_GUIDE = {
         "to the broker and does not change this number."
     ),
     "single_position": (
-        "The engine holds at most one position per symbol, mirroring the live worker, "
-        "which answers REJECTED rather than stacking. rejected_entries counts signals "
-        "dropped for that reason."
+        "The engine stacks as many cycles per symbol as the strategy opens, mirroring the "
+        "live runner, which caps nothing either. rejected_entries counts entry intents the "
+        "factory refused to build a payload from — never an entry refused for being a "
+        "second position. Closes it refused are rejected_closes, counted apart because a "
+        "share of the entries that filled says nothing about them."
     ),
     "market_and_benchmark": (
         "The market block is the OHLC window kept so the run can be *drawn*. rows are "
@@ -128,6 +131,11 @@ class BacktestReport:
     result: BacktestResult
     findings: list[Finding] = field(default_factory=list)
     generated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    #: Which cost profile priced the fills, and which layer supplied each
+    #: number — see :mod:`qte_backtest.costs`. Empty for a report built around
+    #: a hand-made engine, which is what a test does; the keys are written
+    #: either way, so a consumer reads one shape.
+    cost_origin: CostOrigin = field(default_factory=CostOrigin)
 
     # ── Assembly ──────────────────────────────────────────────────────
 
@@ -163,6 +171,7 @@ class BacktestReport:
                 "commission_per_unit": result.costs.commission_per_unit,
                 "contract_size": result.costs.contract_size,
                 "round_trip_cost": round(result.costs.spread + 2 * result.costs.slippage, 8),
+                **self.cost_origin.to_dict(),
             },
             "metrics": metrics.to_dict(),
             "diagnostics": {
@@ -172,6 +181,7 @@ class BacktestReport:
             "activity": {
                 "trades_taken": metrics.trades,
                 "rejected_entries": result.rejected,
+                "rejected_closes": result.rejected_closes,
                 "signals_emitted": len(result.signals),
             },
             "trades": [
@@ -275,7 +285,11 @@ class BacktestReport:
             f"| Excursion | avg MAE {_fmt(metrics.average_mae_r, '{:.2f}R')}, "
             f"avg MFE {_fmt(metrics.average_mfe_r, '{:.2f}R')} |",
             f"| Exits | {_exit_summary(metrics.exit_reasons)} |",
+            f"| Costs | spread {result.costs.spread:g}, slippage {result.costs.slippage:g}, "
+            f"commission {result.costs.commission_per_unit:g} per unit — "
+            f"{self.cost_origin.summary()} |",
             f"| Rejected entries | {result.rejected} |",
+            f"| Rejected closes | {result.rejected_closes} |",
             "",
         ]
 
@@ -360,8 +374,15 @@ class BacktestReport:
         return written
 
 
-def build_report(result: BacktestResult) -> BacktestReport:
-    """Run the diagnostics over *result* and wrap both into a report."""
+def build_report(
+    result: BacktestResult, *, cost_origin: CostOrigin | None = None
+) -> BacktestReport:
+    """Run the diagnostics over *result* and wrap both into a report.
+
+    *cost_origin* is where the fill costs came from, which only the driver that
+    resolved them knows. Omitting it leaves the report saying so rather than
+    implying an account type nobody chose.
+    """
     findings = diagnose(
         DiagnosticContext(
             metrics=result.metrics,
@@ -373,7 +394,11 @@ def build_report(result: BacktestResult) -> BacktestReport:
             data_gaps=result.data_gaps,
         )
     )
-    return BacktestReport(result=result, findings=findings)
+    return BacktestReport(
+        result=result,
+        findings=findings,
+        cost_origin=cost_origin or CostOrigin(),
+    )
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
