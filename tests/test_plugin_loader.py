@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from qte_shared.strategies import plugin_loader
 from qte_shared.strategies.mount_manifest import MOUNT_MANIFEST_FILENAME, MountManifest
 from qte_shared.strategies.plugin_loader import StrategyLoader, load_strategies
 
@@ -515,3 +516,42 @@ def test_an_entry_for_a_repo_that_is_gone_is_harmless(manifest_repo):
     )
 
     assert [entry.name for entry in load_strategies(manifest_repo)] == ["GOLD_EDGE_V1"]
+
+
+# ── SKIPPED_REPOSITORIES: bundles this deployment does not want ──────────
+
+
+def test_a_skipped_repository_is_never_imported(manifest_repo, monkeypatch):
+    """The operator's standing choice, not a verdict about the code."""
+    monkeypatch.setattr(
+        plugin_loader, "SKIPPED_REPOSITORIES", frozenset({"my-strategies"}), raising=True
+    )
+
+    assert load_strategies(manifest_repo) == []
+
+
+def test_a_skipped_repository_is_hidden_from_the_audit_too(manifest_repo, monkeypatch):
+    """Unlike a failed mount: an unmapped strategy is a warning, and
+    QTE_RUNNER__AUDIT_ON_START=strict refuses to start on one."""
+    monkeypatch.setattr(
+        plugin_loader, "SKIPPED_REPOSITORIES", frozenset({"my-strategies"}), raising=True
+    )
+
+    assert StrategyLoader(manifest_repo).collect() == []
+
+
+def test_skipping_one_repository_leaves_its_neighbour_alone(manifest_repo, monkeypatch):
+    (manifest_repo / "my_edge.py").write_text(STRATEGY_SOURCE, encoding="utf-8")
+    monkeypatch.setattr(
+        plugin_loader, "SKIPPED_REPOSITORIES", frozenset({"my-strategies"}), raising=True
+    )
+
+    assert [entry.name for entry in load_strategies(manifest_repo)] == ["MY_EDGE"]
+
+
+def test_a_skipped_name_that_is_not_mounted_is_not_an_error(plugin_dir, monkeypatch):
+    monkeypatch.setattr(
+        plugin_loader, "SKIPPED_REPOSITORIES", frozenset({"never-cloned"}), raising=True
+    )
+
+    assert [entry.name for entry in load_strategies(plugin_dir)] == ["MY_EDGE"]
