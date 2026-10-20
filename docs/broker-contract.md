@@ -116,9 +116,10 @@ QTE normalises rather than rejecting, so either spelling round-trips.)
 ## The trade cycle
 
 **As many cycles per (strategy, symbol) as the strategy opens.** Nothing caps
-the count: an entry that fires while positions are already open stacks another
-one beside them, both live and in the backtest, so a replay still predicts what
-live trading does.
+the count per pair: an entry that fires while positions are already open stacks
+another one beside them, both live and in the backtest, so a replay still
+predicts what live trading does. The one ceiling that exists is on the account
+as a whole, is off by default, and is described [below](#the-one-ceiling-and-why-it-is-on-the-account).
 
 Each is its own cycle: its own `signal_uxid`, minted on its entry, and its own
 bracket. Every `TP1`/`TP2`/`SL`/`R_SL`/`FLAT` carries the `signal_uxid` of the
@@ -128,6 +129,44 @@ worker must keep the positions apart by that id, on a hedging account: a netting
 account would merge them into one position and lose every bracket but the last.
 The only entry QTE still refuses is one reusing the id of a cycle already
 open.
+
+### The one ceiling, and why it is on the account
+
+`QTE_ACCOUNT__MAX_OPEN_POSITIONS` caps how many positions the runner will hold
+across **every strategy and symbol together**. `0`, the default, means uncapped
+and nothing above changes.
+
+It exists because the account has a limit of its own and QTE cannot see it. The
+worker that places the orders counts every active position on the account,
+whatever strategy or symbol it belongs to, and refuses an entry past its own
+limit. QTE never hears about that refusal — the publish was acked, the webhook
+returned 200, and the order was declined two hops later with nothing coming
+back (see [What QTE does not do](#what-qte-does-not-do)). The cycle stays in
+QTE's book, and from then on its `TP1`/`TP2`/`SL`/`R_SL` go out on schedule
+against a position the account does not hold.
+
+So this setting is QTE's **copy of a number it cannot read**. Set it to
+whatever the account actually enforces, and change the two together; leaving it
+at `0` keeps the behaviour where the engine can overrun the account silently.
+
+Three things to know about it:
+
+* **It is not a per-pair cap.** Pairs each stay inside their own book and
+  overrun the account between them, which is exactly the case a per-pair cap
+  cannot see. Nothing limits one pair's cycles.
+* **Closes always pass.** Only entries are refused. A full book must never trap
+  a position that needs getting out of.
+* **First come, first served.** With the book full, the pair whose bar closes
+  first takes the slot. There is no priority between strategies.
+
+A refused entry is logged at `WARNING` and written to the engine's events table
+as `entry_refused_account_full`, naming the count and the ceiling — a book that
+has gone quiet is always visible in the log, never silent.
+
+The backtest has no counterpart to this and cannot have one: a replay runs a
+single strategy, and the ceiling is a property of the account that the whole
+book shares. A configured ceiling therefore makes the traded book a subset of
+the replayed one, which is why the default is off.
 
 A cycle ends on `TP2`, `SL`, `R_SL` or `FLAT` — and also on a `TP1` that happens
 to close the entry's whole quantity. A strategy taking "50%" of a position that

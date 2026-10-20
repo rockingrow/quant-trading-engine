@@ -183,6 +183,19 @@ class AccountSettings(BaseSettings):
     max_quantity: float = 0.0
     #: Decimals a sized quantity is rounded to before it reaches the wire.
     quantity_precision: int = 4
+    #: How many positions the broker account holds at once, counted across
+    #: every strategy and symbol together. ``0`` means uncapped, and is the
+    #: default: an engine that has not been told its account's limit must not
+    #: invent one. Above zero, the runner refuses an entry that would exceed it
+    #: — see :meth:`qte_strategy_engine.runner.StrategyRunner._emit`.
+    #:
+    #: **This is the engine's copy of a number it cannot read.** The limit is
+    #: enforced downstream, by the worker that places the orders, and the
+    #: engine has no channel to the account: an entry refused there is simply
+    #: never placed, nothing comes back, and the engine goes on managing a
+    #: cycle the account does not hold. Set this to whatever the account
+    #: actually enforces, and change the two together.
+    max_open_positions: int = Field(default=0, ge=0)
 
 
 class RedisSettings(BaseSettings):

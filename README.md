@@ -383,6 +383,40 @@ passing is not even imported. Fix what the audit found and mount it again.
 `make strategies` lists what the engine can see; `uv run qte-strategy-mount
 --show` lists what the mount recorded.
 
+### Skipping a mounted bundle you do not want to trade
+
+A bundle can be mounted, audited and perfectly healthy and still be something
+this deployment has no use for — the `_boilerplate` reference, a simulator
+harness. `strategies.toml` cannot say that: `false` there means *failed the
+audit*, the deploy step then freezes none of that repo's dependencies, and the
+file is regenerated on the next `make strategy-mount` anyway.
+
+That choice lives in code instead, in `SKIPPED_REPOSITORIES` in
+[`src/qte_shared/strategies/plugin_loader.py`](src/qte_shared/strategies/plugin_loader.py):
+
+```python
+SKIPPED_REPOSITORIES = frozenset(
+    {
+        # The plugin-shape reference, not a tradable edge.
+        "_boilerplate",
+        # Exercises the position lifecycle against the simulator; mapped to no
+        # symbol in production, so loading it only adds a startup warning.
+        "qte-signal-simulator",
+    }
+)
+```
+
+Nothing under a listed directory is imported, by the runner or by the backtest,
+and nothing in it is audited either. That second part is the reason both names
+are in there: a loaded strategy that no symbol maps to is an audit *warning*,
+and `QTE_RUNNER__AUDIT_ON_START=strict` refuses to start on a warning — so with
+these two skipped the pre-flight audit reports four strategies, zero errors and
+zero warnings instead of two warnings that block the start.
+
+**Comment a name out to load that bundle again.** Nothing else has to change:
+the clone stays where it is and its line in `strategies.toml` keeps its
+verdict, so `make strategy-mount` does not have to run again.
+
 > Why a manifest, why the contract is structural rather than nominal, why the
 > weekend flat is the engine's job rather than a strategy's, and why the
 > interface is seven methods rather than one:
@@ -473,6 +507,7 @@ QTE_ACCOUNT__SPREAD=0.0              # full bid/ask distance, each side pays hal
 QTE_ACCOUNT__SLIPPAGE=0.0            # on top of half the spread, each side
 QTE_ACCOUNT__CONTRACT_SIZE=1.0
 QTE_ACCOUNT__COST_PROFILE=           # which profile in config/costs.toml prices a fill
+QTE_ACCOUNT__MAX_OPEN_POSITIONS=0    # account-wide position ceiling; 0 = uncapped
 ```
 
 Those three costs are the *last* layer: one spread for the whole engine is
@@ -483,11 +518,24 @@ The capital is **fixed for a run**; it does not compound. Sizing off running
 equity would make later trades depend on earlier P&L, so two backtests differing
 by one early trade could not be compared.
 
-**One trade cycle per (strategy, symbol) at a time.** `signal_uxid` is that
-cycle: an entry mints it and every close reuses it, which is how the broker
-groups a whole trade into one broadcast. A second entry while one is open is
-refused before it reaches the wire, mirroring the worker, which answers
-`REJECTED` rather than stacking.
+**As many trade cycles per (strategy, symbol) as the strategy opens.**
+`signal_uxid` is the cycle: an entry mints it and every close reuses it, which
+is how the broker groups a whole trade into one broadcast. An entry that fires
+while positions are already open stacks another one beside them, in the
+backtest and live alike, each with its own id and its own bracket. The only
+entry refused on these grounds is one reusing the id of a cycle already open.
+
+**One ceiling, and it is on the account rather than the pair.**
+`QTE_ACCOUNT__MAX_OPEN_POSITIONS` caps how many positions the runner holds
+across every strategy and symbol together; `0`, the default, means uncapped.
+It is the engine's copy of a limit the broker account enforces and the engine
+cannot read: the worker that places the orders counts every active position on
+the account and refuses an entry past its own limit, and that refusal never
+comes back here — so without the ceiling the engine goes on managing a cycle
+the account does not hold, sending its `TP1`/`TP2`/`SL` on schedule. Set it to
+whatever the account enforces. Closes are never refused, a refusal is logged
+and recorded as `entry_refused_account_full`, and the backtest has no
+counterpart to it, which is why it is off by default.
 
 A cycle ends on `TP2`, `SL`, `R_SL` or `FLAT` — **and on a `TP1` that closes the
 entry's whole quantity**. Because that decision needs the sizes, the runner
