@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Account-wide open-position ceiling** — `QTE_ACCOUNT__MAX_OPEN_POSITIONS`
+  limits the runner's open cycles across every strategy and symbol together;
+  `0`, the default, keeps entries uncapped. Entries in flight reserve capacity
+  so concurrent pairs cannot both take the last slot. Excess entries are
+  refused before broker delivery, logged at `WARNING`, and recorded as
+  `entry_refused_account_full`; closing signals remain unaffected by the
+  ceiling. Set this to match the downstream account limit: it counts the
+  runner's own book, not broker-confirmed or manually opened positions.
+  Backtests remain unchanged, so enabling the ceiling can make the traded book
+  a subset of the replayed one.
+
+### Changed
+
+- **Skip reference and simulator bundles during discovery and audit** —
+  `SKIPPED_REPOSITORIES` in `qte_shared.strategies.plugin_loader` excludes
+  `_boilerplate` and `qte-signal-simulator`, preventing their unused-strategy
+  warnings from blocking strict startup. Remove a name from the set to load
+  and audit that bundle again; its clone and mount verdict remain intact.
+- Update the README and broker/simulator documentation to describe the
+  account-wide ceiling, bundle exclusions, and existing support for multiple
+  trade cycles per strategy/symbol pair.
+
 ## [0.1.1] - 2026-10-19
 
 ### Added

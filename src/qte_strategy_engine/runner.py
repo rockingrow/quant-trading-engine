@@ -32,6 +32,13 @@ decide the same things; the periodic sweep that also flattens between bars is
 the one part with no replay counterpart, and it only fires at moments a backtest
 has no bar for.
 
+``QTE_ACCOUNT__MAX_OPEN_POSITIONS`` is the runner's other own decision, and this
+one has no replay counterpart at all: a backtest replays one strategy and the
+ceiling counts every strategy and symbol on the account together. It is off by
+default for that reason — a configured ceiling makes the traded book a subset of
+the replayed one, which is a divergence an operator chooses knowingly because
+the account enforces its own limit whatever the engine believes.
+
 Position state is written twice on purpose. The cycle a pair is holding goes to
 Redis (hot, read on every bar) *and* to Postgres (durable), and boot prefers
 Redis and falls back to the table. A re-provisioned cache would otherwise be
@@ -213,6 +220,10 @@ class StrategyRunner:
         self._tasks: list[asyncio.Task[Any]] = []
         self._uncertain_pairs: set[tuple[str, str]] = set()
         self._unconfirmed_staging: set[tuple[str, str]] = set()
+        #: Entries past the account ceiling but not yet in any slot's book.
+        #: See :meth:`_emit`; without it two pairs closing a bar on the same
+        #: boundary would each read the book before the other had grown.
+        self._entries_in_flight = 0
         self._pending_results: dict[str, DeliveryResult] = {}
         #: Which pairs may not be decided on. Read from Redis, so a restart
         #: during a pause comes back paused.
@@ -1609,6 +1620,104 @@ class StrategyRunner:
     # ── Emission ──────────────────────────────────────────────────────
 
     async def _emit(
+        self,
+        slot: StrategySlot,
+        intent: SignalIntent,
+        fallback_price: float | None,
+        moment: datetime,
+    ) -> None:
+        """Deliver one intent, holding a slot against the account ceiling.
+
+        Entries only. A close is never held up by a full book: a position that
+        cannot be got out of is a worse failure than one more than the account
+        wanted, and every close here is closing something the book already has.
+
+        The reservation is what makes the ceiling hold. Two pairs whose bars
+        close on the same boundary are two tasks inside this method at once,
+        and neither one's entry reaches a book until several awaits later —
+        both would read the same count and both would open. Counting the
+        entries in flight closes that window, and ``finally`` gives the slot
+        straight back to an intent the factory refused or a delivery that never
+        landed. A committed entry is briefly counted twice, in its book and in
+        flight, which errs towards refusing rather than overfilling.
+        """
+        if intent.action.is_entry:
+            # Before the ceiling, not after it: `_check_ownership` is the kill
+            # switch, and a refusal is itself an effect — it writes an audit
+            # row. A runner that has lost its claim must find that out here
+            # rather than go quiet behind a full book.
+            await self._check_ownership()
+            if await self._account_is_full(slot, intent):
+                return
+            self._entries_in_flight += 1
+            try:
+                await self._emit_intent(slot, intent, fallback_price, moment)
+            finally:
+                self._entries_in_flight -= 1
+            return
+        await self._emit_intent(slot, intent, fallback_price, moment)
+
+    async def _account_is_full(self, slot: StrategySlot, intent: SignalIntent) -> bool:
+        """Whether one more position would exceed what the account will hold.
+
+        ``QTE_ACCOUNT__MAX_OPEN_POSITIONS`` is the engine's copy of a limit the
+        broker account enforces across every strategy and symbol *together* —
+        the worker that places the orders counts them all as one budget. Zero,
+        the default, means the engine was never told the number and does not
+        invent one.
+
+        It is a ceiling on the account and not on a pair. A per-pair cap would
+        not help: the pairs in a mapping each stay inside their own book and
+        overrun the account between them.
+
+        The count is this process's own book, summed over every slot in memory
+        — the same source :meth:`_flush_stale_positions` treats as
+        authoritative, and no database round trip on the trade path. So it
+        counts what *this engine* opened, not what the account holds: a
+        position placed by hand, or an entry the worker refused for some other
+        reason, is invisible here. This keeps the engine inside its own budget;
+        it does not prove the two books equal. Only execution feedback could,
+        and the engine deliberately does not subscribe to it — see
+        ``docs/broker-contract.md``.
+
+        Refused out loud, deliberately. The per-pair cap that used to live
+        upstream of here skipped its bar in silence, which made a book that had
+        quietly stopped trading unreadable in the logs.
+        """
+        ceiling = settings.account.max_open_positions
+        if ceiling <= 0:
+            return False
+        held = (
+            sum(len(other.factory.open_cycles(other.symbol)) for other in self.slots)
+            + self._entries_in_flight
+        )
+        if held < ceiling:
+            return False
+        log.warning(
+            "Refused %s for %s %s: the account already holds %d position(s) against a "
+            "ceiling of %d (QTE_ACCOUNT__MAX_OPEN_POSITIONS), counted across every "
+            "strategy and symbol together",
+            intent.action.value,
+            slot.strategy.name,
+            slot.symbol,
+            held,
+            ceiling,
+        )
+        await self.events.record_event(
+            service=SERVICE_NAME,
+            event="entry_refused_account_full",
+            level="WARNING",
+            payload={
+                "strategy": slot.strategy.name,
+                "symbol": slot.symbol,
+                "action": intent.action.value,
+                "open_positions": held,
+                "ceiling": ceiling,
+            },
+        )
+        return True
+
+    async def _emit_intent(
         self,
         slot: StrategySlot,
         intent: SignalIntent,
