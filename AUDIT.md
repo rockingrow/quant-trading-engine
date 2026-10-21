@@ -107,17 +107,49 @@ line to be understood costs a reader (and an agent) a file jump every time.
 
 ---
 
-## 4. Pull requests always target `dev`
+## 4. Work on a prefixed branch; pull requests always target `dev`
 
+- **Never commit onto a long-lived branch.** `dev`, `stage`, `prod` and
+  `master` change only by merging a pull request. No implementation — code,
+  tests, docs, configuration, not even a one-line fix — is committed or pushed
+  to them directly.
+- **Branch off `dev`**, so the PR diff contains only your work, and name the
+  branch `<prefix>/<kebab-case-topic>`, for example
+  `feature/account-open-position-ceiling`:
+
+  | Prefix | For |
+  | --- | --- |
+  | `feature/` | New behaviour or a new capability |
+  | `hotfix/` | A fix for something broken |
+  | `chore/` | Tooling, configuration, dependencies, docs and these rules |
+  | `audit/` | Changes that come out of an audit or a backtest study |
+
+- Started editing on one of the four by mistake? Create the branch before you
+  commit: `git switch -c <prefix>/<topic>` carries the working tree across.
 - **Base branch is `dev`.** Every PR, without exception:
   `gh pr create --base dev --head <your-branch>`.
-- **Branch off `dev`** as well, so the PR diff contains only your work.
 - `master` receives changes only through a release merge from `dev`, performed
   by the maintainer. Never open a PR into `master`.
 - Opening the PR is the user's call (rule 1); prepare the branch and wait.
-- PR title and body follow rule 1 and rule 2: English, no agent footers, no
-  session links. The body states what changed, why, and how it was verified —
-  paste the `make check` result.
+- PR title and body follow rule 1 and rule 2: English, and no generated-by
+  footer — no `Generated with Claude Code`, no `🤖`, no `Co-Authored-By:` line —
+  and no session links. The body states what changed, why, and how it was
+  verified — paste the `make check` result.
+
+**Why:** `dev` is what every branch is cut from and `master` is what gets
+released. A commit landed straight on either skips review and drags unrelated
+work into the next branch's diff. The prefix tells a reviewer what kind of
+change to expect before opening it.
+
+**Check before committing, and after opening the PR:**
+
+```bash
+git branch --show-current | grep -Eq '^(dev|stage|prod|master)$' \
+  && echo "PROTECTED BRANCH — git switch -c <prefix>/<topic>" || echo "branch ok"
+gh pr view --json title,body -q '.title + "\n" + .body' \
+  | grep -Eiq 'claude|anthropic|codex|generated with|co-authored-by|assisted-by|🤖' \
+  && echo "FORBIDDEN FOOTER — edit the PR" || echo "PR text ok"
+```
 
 ---
 
@@ -187,4 +219,8 @@ only as JSON is one nobody reviews.
       audits in `data/audits/`, both git-ignored (rule 5)
 - [ ] Every backtest has its HTML dashboard beside its JSON (rule 6)
 - [ ] Commit message is English with no generated-by footer (rule 1)
-- [ ] PR base branch is `dev` (rule 4)
+- [ ] Work sits on a `feature/`, `hotfix/`, `chore/` or `audit/` branch cut
+      from `dev` — nothing committed to `dev`, `stage`, `prod` or `master`
+      (rule 4)
+- [ ] PR base branch is `dev`, and its title and body carry no generated-by
+      footer (rule 4)
