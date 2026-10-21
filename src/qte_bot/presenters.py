@@ -16,9 +16,11 @@ import html
 from datetime import UTC, datetime
 from typing import Any
 
+from qte_bot.mounts import MountedRepository
 from qte_bot.pagination import page_footer
 from qte_bot.tables import marked, render_table
 from qte_shared.config import settings
+from qte_shared.notifications.telegram_sink import boxed, clipped
 from qte_strategy_engine.db import ClosedCycle
 
 NO_RUNNER = (
@@ -35,8 +37,13 @@ def escaped(value: Any) -> str:
     return html.escape(str(value), quote=False)
 
 
-def moment(value: Any) -> str:
-    """A timestamp as the chat shows it, or an em dash when there is none."""
+def moment(value: Any, *, full: bool = False) -> str:
+    """A timestamp as the chat shows it, or an em dash when there is none.
+
+    ``full`` adds the year, the seconds and the zone, the way a notification
+    stamps an event — for a moment that has to be told apart from one a few
+    minutes away, such as the second a build was made.
+    """
     if value is None:
         return "—"
     if not isinstance(value, datetime):
@@ -46,7 +53,8 @@ def moment(value: Any) -> str:
             return escaped(value)
     if value.tzinfo is None:
         value = value.replace(tzinfo=UTC)
-    return value.astimezone(settings.telegram.display_zone).strftime("%m-%d %H:%M")
+    pattern = "%Y-%m-%d %H:%M:%S %Z" if full else "%m-%d %H:%M"
+    return value.astimezone(settings.telegram.display_zone).strftime(pattern)
 
 
 def header(title: str, namespace: str) -> str:
@@ -151,6 +159,130 @@ def _why_not_ready(row: dict[str, Any], status: dict[str, Any]) -> str:
     if status.get("delivery_paused"):
         return "live delivery is paused (shadow mode)"
     return "unknown"
+
+
+#: The rule between a box's sections, the same one a position notification uses.
+BOX_DIVIDER = "-----------"
+
+#: Where one message ends and the next begins. The Bot API rejects a body past
+#: 4096 characters whole, so a long mount is sent as several messages rather
+#: than risking the one; this leaves room for the header and the footer.
+MAX_MESSAGE_CHARS = 3500
+
+#: Strategies listed inside one box before the rest is counted instead. A
+#: repository's alias table is whatever its owner wrote, and nothing bounds it.
+MAX_STRATEGIES_PER_BOX = 40
+
+#: How much of a parse error a box repeats; it is library text, not ours.
+MAX_PROBLEM_CHARS = 120
+
+
+def _bundle_lines(repository: MountedRepository) -> list[str]:
+    """The build a repository's ``BUNDLE_VERSION.json`` describes, one fact a line.
+
+    A folder with no stamp keeps one honest line rather than a column of
+    blanks: a checkout that was never built has no version, and that is a fact
+    about it, not a gap in the message.
+    """
+    stamp = repository.bundle
+    if stamp is None:
+        if repository.bundle_problem:
+            reason = clipped(escaped(repository.bundle_problem), MAX_PROBLEM_CHARS)
+            return [f"⚠️ BUNDLE_VERSION.json unreadable: {reason}"]
+        return ["Version: — (no BUNDLE_VERSION.json)"]
+
+    def text(key: str) -> str:
+        value = stamp.get(key)
+        return escaped(value) if value not in (None, "") else "—"
+
+    tree = stamp.get("tree")
+    dirty = stamp.get("dirty")
+    if dirty is None:
+        dirty_text = "—"
+    else:
+        dirty_text = "⚠️ yes" if dirty else "no"
+    return [
+        f"Version: {text('version')}",
+        f"Built: {moment(stamp.get('built_at') or None, full=True)}",
+        f"Branch: {text('branch')} | Commit: {text('commit')}",
+        # The full tree hash is forty characters and the version token already
+        # carries its first eight; a phone shows the same eight here.
+        f"Tree: {escaped(str(tree)[:8]) if tree else '—'} | Content: {text('content')}",
+        f"Mode: {text('mode')} | Dirty: {dirty_text}",
+    ]
+
+
+def _strategy_lines(repository: MountedRepository) -> list[str]:
+    """What the repository publishes, from the mount record."""
+    if not repository.recorded:
+        return ["Strategies: not in strategies.toml", "Run: make strategy-mount"]
+    if not repository.strategies:
+        return ["Strategies: none published"]
+    names = sorted(repository.strategies)
+    lines = [f"Strategies ({len(names)}):"]
+    for name in names[:MAX_STRATEGIES_PER_BOX]:
+        if repository.strategies[name]:
+            lines.append(f"🟢 {escaped(name)}")
+        else:
+            lines.append(f"🔴 {escaped(name)} (failed audit)")
+    if len(names) > MAX_STRATEGIES_PER_BOX:
+        lines.append(f"… {len(names) - MAX_STRATEGIES_PER_BOX} more")
+    return lines
+
+
+def strategy_box(repository: MountedRepository) -> str:
+    """One mounted repository as one box: its build, then what it publishes."""
+    lines = [
+        f"[📦 {escaped(repository.name)}]",
+        BOX_DIVIDER,
+        *_bundle_lines(repository),
+        BOX_DIVIDER,
+        *_strategy_lines(repository),
+        BOX_DIVIDER,
+    ]
+    return "\n".join(lines)
+
+
+def strategy_bundles(repositories: list[MountedRepository], namespace: str) -> list[str]:
+    """``/strategies``: one box per mounted repository, in as many messages as fit.
+
+    The boxes are separate ``<pre>`` blocks inside one message, joined the way
+    a position notification joins its sections: Telegram's parser does not
+    allow a ``<pre>`` inside a ``<pre>``, so each seam closes one and opens the
+    next. What is read is the disk — ``/runner`` is the process's own account
+    of what it loaded — and the footer says so.
+    """
+    title = header("Strategies", namespace)
+    if not repositories:
+        return [
+            f"{title}\n\nNo strategy repository is mounted in <code>__strategies__/</code>. "
+            "Clone one in and run <code>make strategy-mount</code>."
+        ]
+
+    messages: list[str] = []
+    boxes: list[str] = []
+    used = len(title)
+    for repository in repositories:
+        box = strategy_box(repository)
+        if boxes and used + len(box) > MAX_MESSAGE_CHARS:
+            messages.append(_boxes_message(title if not messages else "", boxes))
+            boxes, used = [], 0
+        boxes.append(box)
+        used += len(box)
+    messages.append(_boxes_message(title if not messages else "", boxes))
+
+    count = len(repositories)
+    footer = (
+        f"{count} {'repository' if count == 1 else 'repositories'} · read from disk — "
+        "<code>/runner</code> shows what is loaded"
+    )
+    messages[-1] += f"\n{footer}"
+    return messages
+
+
+def _boxes_message(title: str, boxes: list[str]) -> str:
+    body = boxed("\n</pre>\n<pre>".join(boxes))
+    return f"{title}\n{body}" if title else body
 
 
 def open_positions(positions: list[dict[str, Any]], namespace: str) -> str:

@@ -10,6 +10,7 @@ belongs there.
 __strategies__/                  ← mount point, git-ignored, read-only in the container
 ├── _boilerplate/                ← you are here (committed, on purpose)
 │   ├── manifest.py              ← the only file the engine looks for
+│   ├── BUNDLE_VERSION.json      ← which build is deployed (example values; optional)
 │   ├── pyproject.toml           ← its own deps and its own release cycle
 │   ├── uv.lock                  ← what `make strategy-requirements` freezes for the image
 │   ├── src/boilerplate/
@@ -35,6 +36,9 @@ git init                    # it is a repository, not a folder
 
 Then, in order:
 
+0. delete `BUNDLE_VERSION.json`. Its values are an example of what a build
+   writes, not a description of your repository; your own build writes the real
+   one (see below);
 1. rename `src/boilerplate/` to your package and `MyEdge` to your strategy;
 2. set `name` on the class — it **is** the NATS subject the broker's workers
    subscribe to (`SIGNALS.<name>`), so it has to match what they are configured
@@ -136,6 +140,20 @@ lose by omission is not one. Two things follow from that:
 
 A repo with no `settings.py`, and a strategy missing from the table, keep the
 engine's defaults — which is no weekend flat at all.
+
+## The build stamp: `BUNDLE_VERSION.json`
+
+When a repository is deployed to a server, a `BUNDLE_VERSION.json` goes with it,
+**at the root of the repository, beside `manifest.py`**. It records which build
+is there — `version`, `built_at`, `branch`, `commit`, `tree`, `content`, `dirty`
+and `mode` — and the engine's `/strategies` Telegram command prints it as one
+box per repository, with the strategies the repository publishes underneath.
+
+The file in this folder holds example values, so the shape is visible; it
+describes no real build, and this folder is never listed by `/strategies`
+anyway. Your repository's own build writes the real one. The file is optional:
+a checkout that was never built has none, and is listed with the version left
+blank. The keys are in the engine's README, under "Which build is deployed".
 
 ## Checking it
 

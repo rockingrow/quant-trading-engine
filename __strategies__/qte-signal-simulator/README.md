@@ -48,3 +48,11 @@ make backtest STRATEGY=SIGNAL_SIMULATOR_LIFECYCLE_V1 SYMBOL=XAUUSD TF=M15 FILE=.
 ```
 
 The broker's workers must subscribe to `SIGNALS.SIGNAL_SIMULATOR_LIFECYCLE_V1`.
+
+## `BUNDLE_VERSION.json`
+
+Like every strategy folder, this one carries a build stamp at its root, beside
+`manifest.py`. The values here are an example of what a build writes (the keys
+are in the engine's README, under "Which build is deployed"); they describe no
+real build. The engine's `/strategies` command never lists this folder, since
+it is a template the loader skips.
