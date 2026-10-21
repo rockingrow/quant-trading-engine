@@ -1,6 +1,6 @@
 """Everything the bot asks the engine, in one place.
 
-Three sources, picked by what the question actually is:
+Four sources, picked by what the question actually is:
 
 * **NATS request/reply** for anything only a *running* process knows or can do
   — how full a strategy's in-memory window is, closing a position, re-asking a
@@ -13,6 +13,10 @@ Three sources, picked by what the question actually is:
 * **Postgres** for the book: open positions, and the closed cycles behind
   ``/closed``. Both answer without a runner, which is deliberate — "what am I
   holding" is the question you most want answered when the runner is down.
+* **The ``__strategies__/`` mount** for which build of each strategy
+  repository is deployed — its ``BUNDLE_VERSION.json`` — and what it
+  publishes. Read from disk, so it answers without a runner and without
+  importing a line of private code.
 
 Every method is best-effort and returns ``None`` (or an empty page) when the
 engine cannot be reached, so a handler renders "could not reach the runner"
@@ -21,8 +25,10 @@ instead of a traceback in the chat.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
+from qte_bot.mounts import MountedRepository, scan_mounted_repositories
 from qte_shared.bar_gate import BAR_GATE_FLAG, BarGate
 from qte_shared.bus import NatsBus, Subjects
 from qte_shared.cache import RedisState
@@ -123,6 +129,18 @@ class EngineClient:
             return await self._state.get_history_provider()
         except Exception:
             return None
+
+    # ── The mount ─────────────────────────────────────────────────────
+
+    async def mounted_repositories(self) -> list[MountedRepository]:
+        """The strategy repositories on disk, with the build each one carries.
+
+        Read from the ``__strategies__/`` mount every service container
+        shares, not asked of the runner: the question is which build was
+        deployed, and a runner that is down — or still holding the build it
+        imported before the deploy — would answer a different one.
+        """
+        return await asyncio.to_thread(scan_mounted_repositories, settings.engine.strategies_dir)
 
     # ── Postgres ──────────────────────────────────────────────────────
 

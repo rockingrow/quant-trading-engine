@@ -17,6 +17,7 @@ from aiogram.types import BotCommand
 COMMANDS = [
     BotCommand(command="redis", description="Warm-up bars held per symbol"),
     BotCommand(command="runner", description="Strategies and whether they can decide"),
+    BotCommand(command="strategies", description="Mounted strategy repos and their build"),
     BotCommand(command="positions", description="Open positions"),
     BotCommand(command="closed", description="Recently closed positions"),
     BotCommand(command="flat", description="Close positions: all | SYMBOL | STRATEGY"),
@@ -32,6 +33,7 @@ HELP = """<b>QTE engine</b> — book <code>{namespace}</code>
 <b>Look</b>
 /redis — bars held per symbol and timeframe, and the newest one
 /runner — every strategy, its window, and whether it can decide on the next bar
+/strategies — each mounted strategy repository: the build deployed and what it publishes
 /positions — what is open right now
 /closed — positions that are over, newest first
 

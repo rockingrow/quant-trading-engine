@@ -417,6 +417,65 @@ zero warnings instead of two warnings that block the start.
 the clone stays where it is and its line in `strategies.toml` keeps its
 verdict, so `make strategy-mount` does not have to run again.
 
+### Which build is deployed: `BUNDLE_VERSION.json`
+
+Every strategy folder carries the stamp of its own build, at its root beside
+`manifest.py`:
+
+```
+__strategies__/
+├── my-strategies/
+│   ├── manifest.py
+│   ├── BUNDLE_VERSION.json     ← which build of this folder is deployed
+│   └── src/…
+└── other-strategies/
+    ├── manifest.py
+    └── BUNDLE_VERSION.json     ← its own, not shared with its neighbour
+```
+
+One per strategy folder, never one for `__strategies__/` as a whole: each
+repository is built and deployed on its own, so two of them can be on different
+builds at once. The **strategy repository's build writes it** and a deploy to
+the production server always carries it along, which makes it the deploy
+tracklog. The engine never writes it; it only reads it, to answer
+[`/strategies`](#steering-the-engine-from-telegram).
+
+```json
+{
+  "branch": "dev",
+  "built_at": "2026-10-20T01:29:14Z",
+  "commit": "1185c39",
+  "content": "e9d4e243285de83e",
+  "dirty": true,
+  "mode": "minified",
+  "tree": "e5e209e41d1180cc98e1e5ce203b875651b7352b",
+  "version": "20261020T012914Z-1185c39-e5e209e4-dirty"
+}
+```
+
+| Key | What it is |
+| --- | --- |
+| `version` | one comparable token for the build: time, commit, tree, and `-dirty` when it applies |
+| `built_at` | ISO 8601 UTC, to the second |
+| `branch`, `commit` | where it was built from |
+| `tree` | git tree hash of the built sources — survives an amend, which a commit hash does not |
+| `content` | digest of the code as shipped — the only key that still describes a build made from a dirty tree |
+| `dirty` | whether the tree had uncommitted changes, which makes `commit` and `tree` unreliable |
+| `mode` | `minified` or `bytecode` |
+
+The file is **optional**. A checkout that was never built has none, and a folder
+without it is still listed by `/strategies` — with every strategy it publishes
+and the version left blank. A file that exists but is not valid JSON is flagged
+in the message instead of being skipped, and neither case stops the engine: the
+stamp is a label, and nothing is loaded or refused because of it.
+
+The two committed templates, [`_boilerplate`](__strategies__/_boilerplate/BUNDLE_VERSION.json)
+and [`qte-signal-simulator`](__strategies__/qte-signal-simulator/BUNDLE_VERSION.json),
+carry the example above so the shape is visible. They are in
+`SKIPPED_REPOSITORIES`, so `/strategies` never lists them; if you copy one to
+start your own repository, delete the copied stamp until your build writes a real
+one.
+
 > Why a manifest, why the contract is structural rather than nominal, why the
 > weekend flat is the engine's job rather than a strategy's, and why the
 > interface is seven methods rather than one:
@@ -999,7 +1058,7 @@ never stops a service from stopping.
 
 ## Steering the engine from Telegram
 
-The notifications above are one-way. The bot is the other half: nine commands
+The notifications above are one-way. The bot is the other half: ten commands
 for looking at a running engine and steering it, shaped after
 `algo-trading-broker`'s own bot so the two read alike — the same monospace
 tables, the same Prev/Next paging, the same confirmation in front of anything
@@ -1020,6 +1079,7 @@ because only one process may poll `getUpdates` for a token at a time.
 | --- | --- |
 | `/redis` | Bars held per symbol and timeframe, and the newest one |
 | `/runner` | Every strategy, its window, and whether it can decide on the next bar |
+| `/strategies` | Each mounted strategy repository as a box: the build its `BUNDLE_VERSION.json` records and the strategies it publishes |
 | `/positions` | What is open: symbol, timeframe, strategy, `signal_uxid`, opened |
 | `/closed` | Positions that are over, newest first, paged |
 | `/flat all \| SYMBOL \| STRATEGY` | Closes positions, after a confirmation |
@@ -1027,6 +1087,17 @@ because only one process may poll `getUpdates` for a token at a time.
 | `/allow all \| SYMBOL \| STRATEGY` | Resumes deciding |
 | `/warmup all \| SYMBOL` | Asks the vendor for the warm-up window again |
 | `/flush all \| SYMBOL` | Drops the warm-up bars Redis holds |
+
+`/strategies` is the one command that asks neither the runner nor a database. It
+scans the `__strategies__/` mount and, for every strategy folder, prints one
+box: the build from that folder's
+[`BUNDLE_VERSION.json`](#which-build-is-deployed-bundle_versionjson) and the
+strategies the last `make strategy-mount` recorded for it, each marked as
+passing or failing its audit. The two template folders are left out. It reports
+what is **on disk**, which is not always what is running: a deploy replaces files
+under a runner that keeps executing the code it already imported until it
+restarts, so after a deploy restart the runner, then check `/runner` for what it
+actually loaded.
 
 Three things are worth knowing before you use the last five:
 
@@ -1047,7 +1118,8 @@ Three things are worth knowing before you use the last five:
 There is no HTTP control plane and this adds none: the bot asks the running
 services over NATS request/reply — the same actions `qte-control` uses — and
 reads Redis and Postgres directly for `/redis`, `/positions` and `/closed`, so
-those three still answer when the runner is down.
+those three still answer when the runner is down — as does `/strategies`, which
+reads the mounted directory.
 
 ---
 
@@ -1248,6 +1320,10 @@ make audit-strict                    # fails on anything the runner would skip
 make start-prod
 make logs
 ```
+
+Whatever deploys a strategy folder to the server should copy its
+`BUNDLE_VERSION.json` along with it, inside that folder — the file is how
+`/strategies` tells you afterwards which build is there.
 
 `make logs` streams what the *current* containers have written, so a recreate
 takes that history with it. Each long-running service therefore also writes its

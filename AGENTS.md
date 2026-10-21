@@ -98,6 +98,7 @@ package; never scan from the repository root.
 | Strategy contract and its seven methods | `src/qte_shared/strategies/strategy_base.py` |
 | Strategy discovery and manifests | `src/qte_shared/strategies/plugin_loader.py` |
 | What `make strategy-mount` recorded, per strategy | `src/qte_shared/strategies/mount_manifest.py`, `__strategies__/strategies.toml` |
+| The build stamp each strategy folder carries at its root (written by that repo's build, read by `/strategies`; examples in the two templates) | `__strategies__/<folder>/BUNDLE_VERSION.json`, README "Which build is deployed" |
 | Per-strategy settings a repo declares; the weekend flat; the mapping's `warmup` override | `src/qte_shared/strategies/strategy_settings.py`, each repo's `settings.py` |
 | Intent to broker payload | `src/qte_shared/strategies/signal_factory.py` |
 | Position sizing and account risk | `src/qte_shared/strategies/sizing.py` |
@@ -117,7 +118,8 @@ package; never scan from the repository root.
 | Live feed, resampling, Redis and NATS | `src/qte_ingestion/{service,resampler}.py` |
 | Live loop, broker delivery, control CLI | `src/qte_strategy_engine/{runner,broker_sink,preflight,control}.py` |
 | `make status` / `qte-control status`: read-only probes of Redis, Postgres, NATS, runner, ingestion, MT5 ingester, broker | `src/qte_strategy_engine/connectivity.py`, `tests/test_connectivity.py` |
-| Operator's Telegram bot: the nine commands, tables, paging | `src/qte_bot/`, `QTE_BOT__*` |
+| Operator's Telegram bot: the ten commands, tables, paging | `src/qte_bot/`, `QTE_BOT__*` |
+| `/strategies`: the mount scanned on disk, each folder's `BUNDLE_VERSION.json` and published strategies, one box per folder | `src/qte_bot/mounts.py`, `presenters.strategy_bundles`, `tests/test_bot_strategies.py` |
 | Control plane the bot and `qte-control` both call (NATS request/reply) | `_on_control_message` in `src/qte_strategy_engine/runner.py` and `src/qte_ingestion/service.py`, `Subjects.{engine,ingestion}_control` |
 | Pausing decisions per symbol/strategy (`/prevent`, `/allow`) | `src/qte_shared/bar_gate.py` |
 | Telegram position-lifecycle message: one per cycle, edited in place | `src/qte_strategy_engine/telegram_notify.py` |

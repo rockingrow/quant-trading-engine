@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`/strategies` — the build deployed in each strategy folder, from Telegram.**
+  The bot scans `__strategies__/` and answers with one box per strategy
+  repository: the stamp from the `BUNDLE_VERSION.json` at the folder's root
+  (`version`, `built_at`, `branch`, `commit`, `tree`, `content`, `mode`,
+  `dirty`) and every strategy the mount record lists for it, each marked as
+  passing or failing its audit. A folder without the file is listed all the
+  same, with the version blank; an unreadable one is flagged in its box. The
+  two template folders (`SKIPPED_REPOSITORIES`) are never listed. It reads the
+  mounted directory, so it answers with the runner down and reports what is on
+  disk, not what the runner has loaded — `/runner` still answers that. A mount
+  too large for one message is split across several. `_boilerplate` and
+  `qte-signal-simulator` now carry an example `BUNDLE_VERSION.json`, and the
+  README documents where the file lives and what its keys mean.
+
 - **Account-wide open-position ceiling** — `QTE_ACCOUNT__MAX_OPEN_POSITIONS`
   limits the runner's open cycles across every strategy and symbol together;
   `0`, the default, keeps entries uncapped. Entries in flight reserve capacity
