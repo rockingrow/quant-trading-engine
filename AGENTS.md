@@ -21,16 +21,23 @@ Digest, binding on every change. AUDIT.md holds the rationale, the exception
 table and the check commands; read it before you commit or open a PR.
 
 1. **Commits**: only when the user asks. English, imperative, 72-char subject
-   at most. **No AI attribution of any kind** — no `Generated with Claude
-   Code`, no `Co-Authored-By: Claude`, no ChatGPT/Codex footer, no session link.
+   at most. **No AI attribution of any kind**, in a commit message or in a PR
+   title or body — no `Generated with Claude Code`, no `🤖`, no
+   `Co-Authored-By: Claude`, no ChatGPT/Codex footer, no session link.
 2. **English** for comments, docstrings, identifiers, log and exception strings,
    and every committed Markdown file.
 3. **Names**: explicit and **at least 6 characters** (`candles` not `df`,
    `bar_count` not `n`). Exceptions only for `self`/`cls`/`_`, names fixed by an
    external contract (`tp1`, `sl`, OHLC columns) and whole-word market terms
    (`bid`, `atr`). Do not rename legacy variables the task does not touch.
-4. **Pull requests always target `dev`** — `gh pr create --base dev`. Never
-   `master`. Opening the PR is the user's call.
+4. **Never commit onto `dev`, `stage`, `prod` or `master`.** Every
+   implementation — code, tests, docs, config, even a one-line fix — goes on its
+   own branch cut from `dev` and named `<prefix>/<kebab-case-topic>`:
+   `feature/` new behaviour, `hotfix/` a fix for something broken, `chore/`
+   tooling, config, docs and these rules, `audit/` changes from an audit or a
+   study. The four long-lived branches change only by a merged PR. **Pull
+   requests always target `dev`** — `gh pr create --base dev`. Never `master`.
+   Opening the PR is the user's call.
 5. **Artefacts**: backtest output to `data/reports/`, audits to `data/audits/`
    (`YYYY-MM-DD-<topic>.md`) — both git-ignored and local-only, never pushed to
    GitHub. Never into `docs/` or the repository root. **One session, one
