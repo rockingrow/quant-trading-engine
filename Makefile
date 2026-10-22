@@ -304,15 +304,42 @@ build: strategy-requirements ## Rebuild every service image, in every profile
 build-prod: strategy-requirements ## Rebuild every production service image (no dev simulator)
 	docker compose build db-migrate data-ingestion strategy-runner telegram-bot
 
-up: market-plan strategy-requirements ## Start the application stack without the dev simulator
+# Every image runs as uid 10001 (`USER qte`), and the Dockerfile chowns /app to
+# it at build time — but a bind mount replaces that directory with the host's,
+# which carries the host's ownership. `logs/` is tracked, so a fresh clone
+# belongs to whoever cloned the repo, never to 10001: the container cannot
+# create its daily file, `logging_setup` drops the file sink with one warning
+# and the stack trades on with console logs only, leaving `logs/` empty. Docker
+# Desktop hides it (its mounts ignore ownership), so this only ever bites on a
+# Linux host — which is where the logs are actually needed, `docker logs` being
+# all a recreated container leaves behind.
+#
+# Ownership goes to 10001 with the host user's group kept writable, so reading
+# and `git pull` still work on the host. The chown runs in a throwaway root
+# container to spare the operator a sudo, and only where ownership is enforced.
+# Never fatal: a stack that cannot fix its log directory still has to start.
+CONTAINER_UID := 10001
+
+log-directory: ## Let the containers' uid write the bind-mounted logs/ directory
+	@[ "$$(uname -s)" = "Linux" ] || exit 0; \
+	mkdir -p logs; \
+	[ "$$(stat -c %u logs)" = "$(CONTAINER_UID)" ] && exit 0; \
+	if docker run --rm -v "$(CURDIR)/logs:/mount" alpine:3 \
+		sh -c "chown -R $(CONTAINER_UID):$$(id -g) /mount && chmod -R g+rwX /mount" >/dev/null 2>&1; then \
+		echo "logs/ is now writable by uid $(CONTAINER_UID) (the containers' user)"; \
+	else \
+		echo "Could not give uid $(CONTAINER_UID) write access to logs/ - the services will log to the console only" >&2; \
+	fi
+
+up: market-plan strategy-requirements log-directory ## Start the application stack without the dev simulator
 	docker compose $(COMPOSE_PROFILE) up -d --build
 
-start: market-plan strategy-requirements ## Start app images; migration completes before apps boot
+start: market-plan strategy-requirements log-directory ## Start app images; migration completes before apps boot
 	docker compose $(COMPOSE_PROFILE) up -d --build
 	@echo "Stack is up. Data-ingestion / strategy-runner block until db-migrate exits 0."
 	@echo "For the simulator and source mounts, use make dev."
 
-start-prod: market-plan strategy-requirements ## Build and start production services with QTE_ENV=prod
+start-prod: market-plan strategy-requirements log-directory ## Build and start production services with QTE_ENV=prod
 	docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build db-migrate data-ingestion strategy-runner $(TAILSCALE_SERVICES) $(TELEGRAM_BOT_SERVICES)
 
 # `--profile tailscale` whatever the switch says: a stack started with it on
@@ -323,7 +350,7 @@ stop: ## Stop the stack (volumes survive) — alias of `down`
 down: ## Stop the stack (volumes survive)
 	docker compose --profile tailscale down
 
-restart: market-plan strategy-requirements ## Recreate ingestion and runner, preserving the simulator clock
+restart: market-plan strategy-requirements log-directory ## Recreate ingestion and runner, preserving the simulator clock
 	docker compose up -d --build --no-deps --force-recreate data-ingestion strategy-runner
 
 # ── Live-editing dev loop ──────────────────────────────────────────────
@@ -335,7 +362,7 @@ restart: market-plan strategy-requirements ## Recreate ingestion and runner, pre
 
 DEV_COMPOSE := -f docker-compose.yml -f docker-compose.dev.yml --profile dev $(COMPOSE_PROFILE)
 
-dev: market-plan strategy-requirements ## `start` with src/ bind-mounted for live editing
+dev: market-plan strategy-requirements log-directory ## `start` with src/ bind-mounted for live editing
 	docker compose $(DEV_COMPOSE) up -d --build
 
 dev-restart: ## Reload ingestion and runner code, preserving the simulator clock
@@ -542,7 +569,7 @@ owner-clear: ## Remove a stale runner claim after an unclean exit (refuses while
 	uv run qte-control owner clear
 
 .PHONY: help install install-dev lock test lint format check tiingo mt5 binance simulator market-plan \
-	build build-prod up start stop down restart dev dev-restart logs logging logging-broker nuke tailscale-status \
+	build build-prod log-directory up start stop down restart dev dev-restart logs logging logging-broker nuke tailscale-status \
 	strategy-mount strategy-audit strategy-requirements strategy-test strategies audit audit-strict strategy-mapping \
 	db-upgrade db-downgrade db-revision db-current db-history db-check \
 	download backtest chart reports csv-import costs \
