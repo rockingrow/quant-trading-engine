@@ -465,6 +465,88 @@ def test_no_mapping_file_means_no_mapping_findings(repo, tmp_path):
     assert not codes(report) & {"mapped-to-nothing", "unmapped-strategy"}
 
 
+# ── Strategies a repository keeps disabled ───────────────────────────────
+
+#: The manifest above, keeping a second, retired strategy out of service.
+DISABLING_MANIFEST = (
+    MANIFEST
+    + """
+
+    def load_disabled():
+        return ["GOLD_EDGE_RETIRED"]
+"""
+)
+
+
+@pytest.fixture
+def repo_with_one_off(repo: Path) -> Path:
+    write(repo / "my-strategies", {"manifest.py": DISABLING_MANIFEST})
+    return repo
+
+
+def test_a_disabled_strategy_is_listed_as_off_and_never_audited(repo_with_one_off):
+    """Switching a strategy off is not a defect: listed, not a finding."""
+    report = audit_of(repo_with_one_off)
+
+    assert [entry.name for entry in report.strategies] == ["GOLD_EDGE_V1"]
+    assert report.disabled == {
+        "GOLD_EDGE_RETIRED": repo_with_one_off / "my-strategies" / "manifest.py"
+    }
+    assert report.ok and not report.all_findings
+    assert report.exit_code(strict=True) == 0
+
+
+def test_the_reports_name_what_is_off(repo_with_one_off):
+    report = audit_of(repo_with_one_off)
+
+    text = report.to_text()
+    assert "[ off] GOLD_EDGE_RETIRED" in text
+    assert text.endswith("1 strategies, 0 errors, 0 warnings, 1 disabled")
+    text.encode("ascii")
+    assert "`GOLD_EDGE_RETIRED`" in report.to_markdown()
+    payload = report.as_dict()
+    assert payload["counts"]["disabled"] == 1
+    assert [entry["name"] for entry in payload["disabled"]] == ["GOLD_EDGE_RETIRED"]
+
+
+def test_a_mapping_entry_its_repository_disabled_fails_as_disabled(repo_with_one_off, tmp_path):
+    """Still a failure — the table and the repository disagree — but not a typo."""
+    table = mapping_file(
+        tmp_path, '[symbols.XAUUSD]\nstrategies = ["GOLD_EDGE_V1", "GOLD_EDGE_RETIRED"]\n'
+    )
+    report = audit_of(repo_with_one_off, mapping=table)
+
+    finding = next(f for f in report.all_findings if f.code == "mapped-to-disabled")
+    assert finding.subject == "GOLD_EDGE_RETIRED"
+    assert finding.severity is Severity.ERROR
+    assert "keeps disabled" in finding.message and "XAUUSD" in finding.message
+    assert "ALIASES" in finding.fix
+    assert "mapped-to-nothing" not in codes(report)
+    assert not report.ok
+
+
+def test_dropping_the_disabled_strategy_from_the_table_passes_strict(repo_with_one_off, tmp_path):
+    """What the runner's strict pre-flight needs before it will start."""
+    table = mapping_file(tmp_path, '[symbols.XAUUSD]\nstrategies = ["GOLD_EDGE_V1"]\n')
+    report = audit_of(repo_with_one_off, mapping=table)
+
+    assert report.exit_code(strict=True) == 0
+    assert "unmapped-strategy" not in codes(report), "an off strategy is not an unused one"
+
+
+def test_a_repository_that_publishes_and_disables_one_alias_fails(repo):
+    write(
+        repo / "my-strategies",
+        {"manifest.py": DISABLING_MANIFEST.replace("GOLD_EDGE_RETIRED", "GOLD_EDGE_V1")},
+    )
+    report = audit_of(repo)
+
+    assert report.strategies == []
+    finding = next(f for f in report.all_findings if f.code == "load-failed")
+    assert "both name GOLD_EDGE_V1" in finding.message
+    assert not report.ok
+
+
 # ── Rendering ────────────────────────────────────────────────────────────
 
 
@@ -482,7 +564,8 @@ def test_the_json_report_is_serialisable_and_says_whether_it_passed(repo):
     payload = json.loads(json.dumps(audit_of(repo).as_dict()))
 
     assert payload["ok"] is True
-    assert payload["counts"] == {"strategies": 1, "errors": 0, "warnings": 0}
+    assert payload["counts"] == {"strategies": 1, "errors": 0, "warnings": 0, "disabled": 0}
+    assert payload["disabled"] == []
     assert payload["strategies"][0]["name"] == "GOLD_EDGE_V1"
 
 

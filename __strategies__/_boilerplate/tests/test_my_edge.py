@@ -12,6 +12,7 @@ walks, so nothing in here can be mistaken for a strategy.
 
 from __future__ import annotations
 
+import importlib.util
 import re
 import sys
 from datetime import UTC, datetime
@@ -173,3 +174,35 @@ def test_the_repo_imports_nothing_from_the_engine() -> None:
         if forbidden.search(path.read_text())
     }
     assert not offenders, f"engine imports leaked into the strategy core: {offenders}"
+
+
+# ── The manifest: what is published, and what is kept out of service ────
+
+
+def _manifest():
+    """``manifest.py`` the way the engine reaches it: by file path, no package around it."""
+    path = Path(__file__).resolve().parents[1] / "manifest.py"
+    spec = importlib.util.spec_from_file_location("boilerplate_manifest_under_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_an_alias_is_published_or_disabled_never_both() -> None:
+    manifest = _manifest()
+    assert not set(manifest.ALIASES) & set(manifest.DISABLED)
+    assert set(manifest.load_all()) == set(manifest.ALIASES)
+    assert manifest.load_disabled() == sorted(manifest.DISABLED)
+
+
+def test_a_disabled_strategy_is_handed_over_as_off_and_refused_by_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Moving a line into ``DISABLED`` is the whole switch."""
+    manifest = _manifest()
+    monkeypatch.setitem(manifest.DISABLED, "QTE_BOILERPLATE_OFF", MyEdge)
+    assert "QTE_BOILERPLATE_OFF" in manifest.load_disabled()
+    assert "QTE_BOILERPLATE_OFF" not in manifest.load_all()
+    with pytest.raises(LookupError, match="disabled"):
+        manifest.load("QTE_BOILERPLATE_OFF")

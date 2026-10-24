@@ -417,6 +417,58 @@ zero warnings instead of two warnings that block the start.
 the clone stays where it is and its line in `strategies.toml` keeps its
 verdict, so `make strategy-mount` does not have to run again.
 
+### Switching one strategy off: `DISABLED`
+
+`SKIPPED_REPOSITORIES` drops a whole bundle, and it is this deployment's choice.
+Taking **one strategy** out of service is the repository's own choice, so it
+lives in the repository, beside the alias table — the same table twice:
+
+```python
+# __strategies__/my-strategies/manifest.py (or the registry it re-exports)
+ALIASES = {"MT5_GOLD_M15_SCALP": GoldScalp}  # published: the engine loads these
+DISABLED = {"MT5_GOLD_M5_SCALP": GoldEdge}   # kept — code, tests, documents — but off
+
+
+def load_all():
+    return dict(ALIASES)
+
+
+def load_disabled():  # the optional third hook: names only
+    return sorted(DISABLED)
+```
+
+Moving a line from one table to the other is the whole switch. What the engine
+does with the second one:
+
+- it never instantiates a disabled strategy, in the runner or the backtest —
+  `qte-backtest run --strategy <it>` says *disabled by its repository*, not *not
+  found*;
+- `make audit` lists it as `[ off]`, beside the strategies it checked, and counts
+  it in the summary. That is not a finding: switching a strategy off is not a
+  defect, and a strict audit still passes;
+- a mapping table that still routes a symbol to it **is** a failure,
+  `mapped-to-disabled`, and the runner logs it as an `ERROR` naming the
+  repository. The table and the repository disagree about whether it trades, so
+  with `QTE_RUNNER__AUDIT_ON_START=strict` the runner will not start until one of
+  them gives way — take it off the `[symbols.<SYMBOL>].strategies` lists in the
+  same deploy that disables it;
+- an alias in both tables is not loaded and fails the audit; a `load_disabled()`
+  that raises or returns anything but alias strings stops the whole repository,
+  because an off switch that cannot be read must not leave a strategy trading.
+
+Disabling a strategy does not itself close its existing positions. If its
+pair is still mapped, strict startup audit rejects the configuration; when
+startup audit permits it, orphan settlement reports the pair and leaves it
+open. Remove its symbol mapping in the same deploy to retire the pair:
+`QTE_RUNNER__CLOSE_ORPHAN_POSITIONS=close` then attempts a `FLAT` on startup,
+subject to the delivery and recovery guards described below. Manifest code
+still executes during discovery, so imports in the manifest remain the
+repository author's responsibility.
+
+A repository with no `load_disabled()` disables nothing. `_boilerplate` and
+`qte-signal-simulator` carry the hook with an empty `DISABLED` table, so a
+repository copied from either starts with the switch in place.
+
 ### Which build is deployed: `BUNDLE_VERSION.json`
 
 Every strategy folder carries the stamp of its own build, at its root beside
@@ -1239,17 +1291,32 @@ that is down. Every probe is read-only. It runs inside a service container
 (`qte-control status`), because that is where the stack's real namespace and,
 with Tailscale on, the relay to the broker both live.
 
-**Coming back from an outage.** One strategy-symbol pair holds one trade cycle
-at a time, so a position that outlived a long downtime locks that pair: every
-entry the strategy proposes afterwards is refused, against a position whose
-bracket the market left behind hours ago. On start the runner closes anything
-older than `QTE_RUNNER__STALE_POSITION_MAX_AGE` (default one day) with an
-`R_SL`, which ends the cycle and frees the pair. A deploy or a config change
-comes back well inside that window and keeps its positions, which is what the
-Redis and Postgres recovery path is for. Set
-`QTE_RUNNER__FLUSH_STALE_POSITIONS=warn` to see what a first run would close
-before letting it close anything, `off` to disable it, or the age to `0` to
-close the book on every start. Why it is age-gated rather than unconditional:
+**Coming back from an outage.** Open positions survive a restart by design.
+Every transition is written to Redis *and* to the Postgres `open_positions`
+table, so the runner reloads the cycle on start — from the cache, or from the
+table when the cache came up empty — and the strategy carries on deciding on
+it. Redis runs with AOF on its own volume and the cycle record has no TTL, so a
+container restart, a lost cache or a re-provisioned Redis all keep the book.
+
+Age does not close anything unless you ask it to:
+`QTE_RUNNER__FLUSH_STALE_POSITIONS` is `off` by default, because a strategy
+that holds a cycle until its own exit condition is met can be right to carry
+one for days. Set it to `warn` to see what a `close` run would flatten, or
+`close` with `QTE_RUNNER__STALE_POSITION_MAX_AGE` for the old age-gated
+behaviour.
+
+What *is* closed on start is the cycle your mapping table no longer claims —
+a strategy dropped from a symbol's `strategies` list, or a symbol carrying
+`enabled = false`. Nothing decides on those: no slot holds them, no bar reaches
+them, and their size is still charged against the account on every later
+sizing. `QTE_RUNNER__CLOSE_ORPHAN_POSITIONS` (default `close`) sends a `FLAT`
+for each, recovering the timeframe the payload needs from the `signals` row
+that opened the cycle. A pair the table *still* claims is reported and never
+closed, however long its slot has been missing — that is a strategy that failed
+to load or a repository that is not mounted, and a half-mounted
+`__strategies__/` must not flatten the book. A refused delivery leaves the row
+in place, so a `FLAT` the broker rejects over a closed weekend is retried at
+the next start. Why these two are separate mechanisms:
 [`docs/architecture.md`](docs/architecture.md).
 
 Everything else the engine knows is a CLI command or a SQL query:

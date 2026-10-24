@@ -1,7 +1,8 @@
 """Entry point the QTE engine imports by file path.
 
 The engine walks one level into ``__strategies__/``, finds this file, imports
-it and calls :func:`load_all` (and :func:`load_settings`). There is no
+it and calls :func:`load_all` (and :func:`load_settings`, and
+:func:`load_disabled` — what the repository keeps out of service). There is no
 ``qss`` on ``sys.path`` when that happens, so ``src/`` is put there first — the
 mounted checkout is the install.
 """
@@ -20,7 +21,17 @@ if str(_SOURCE_ROOT) not in sys.path:
     # the operator deployed and will edit.
     sys.path.insert(0, str(_SOURCE_ROOT))
 
-from qss.registry import ALIASES, aliases, load, load_all  # noqa: E402
+from qss.registry import ALIASES, DISABLED, aliases, load, load_all, load_disabled  # noqa: E402
 from qss.settings import SETTINGS, load_settings  # noqa: E402
 
-__all__ = ["ALIASES", "REPO_ROOT", "SETTINGS", "aliases", "load", "load_all", "load_settings"]
+__all__ = [
+    "ALIASES",
+    "DISABLED",
+    "REPO_ROOT",
+    "SETTINGS",
+    "aliases",
+    "load",
+    "load_all",
+    "load_disabled",
+    "load_settings",
+]

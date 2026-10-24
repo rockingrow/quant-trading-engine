@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from qte_shared.strategies.mapping import DEFAULTS_TABLE, SYMBOLS_TABLE, Pairing, SymbolMapping
 from qte_shared.strategies.plugin_loader import (
+    DISABLED_HOOK,
     EXCLUDED_DIRECTORIES,
     MANIFEST_DEPTH,
     MANIFEST_FILENAMES,
@@ -28,8 +29,10 @@ from qte_shared.strategies.plugin_loader import (
     Candidate,
     LoadedStrategy,
     LoadFailure,
+    StrategyDirectory,
     StrategyLoader,
     load_strategies,
+    read_strategy_directory,
 )
 from qte_shared.strategies.signal_factory import BracketPolicy, SignalFactory
 from qte_shared.strategies.sizing import (
@@ -72,6 +75,7 @@ from qte_shared.strategies.strategy_base import (
 
 __all__ = [
     "DEFAULTS_TABLE",
+    "DISABLED_HOOK",
     "ENTRY_SIGNAL_ORDER",
     "EQUITY_SIZING_KEY",
     "EXCLUDED_DIRECTORIES",
@@ -103,6 +107,7 @@ __all__ = [
     "SignalStrategy",
     "StrategyBase",
     "StrategyContext",
+    "StrategyDirectory",
     "StrategyLike",
     "StrategyLoader",
     "SymbolMapping",
@@ -117,6 +122,7 @@ __all__ = [
     "looks_like_a_strategy",
     "missing_signal_methods",
     "overrides_on_tick",
+    "read_strategy_directory",
     "resolve_use_equity_sizing",
     "tick_price",
 ]

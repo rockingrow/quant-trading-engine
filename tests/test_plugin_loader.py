@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import sys
 import textwrap
 from pathlib import Path
 
 import pytest
 
+from qte_shared.config import REPO_ROOT
 from qte_shared.strategies import plugin_loader
 from qte_shared.strategies.mount_manifest import MOUNT_MANIFEST_FILENAME, MountManifest
-from qte_shared.strategies.plugin_loader import StrategyLoader, load_strategies
+from qte_shared.strategies.plugin_loader import (
+    StrategyLoader,
+    load_strategies,
+    read_strategy_directory,
+)
 
 STRATEGY_SOURCE = textwrap.dedent(
     """
@@ -555,3 +561,156 @@ def test_a_skipped_name_that_is_not_mounted_is_not_an_error(plugin_dir, monkeypa
     )
 
     assert [entry.name for entry in load_strategies(plugin_dir)] == ["MY_EDGE"]
+
+
+# ── Strategies a repository keeps disabled ───────────────────────────────
+#
+# The third manifest hook. A repository moves an alias from its ALIASES table
+# to DISABLED and hands the names over through ``load_disabled()``: the engine
+# never loads them, and knows them for what they are.
+
+
+def edit_manifest(
+    manifest_repo: Path, appended: str, *, publish: str = '{"GOLD_EDGE_V1": GoldEdge}'
+) -> Path:
+    """Rewrite the repo's ``ALIASES`` and append a hook to its manifest."""
+    path = manifest_repo / "my-strategies" / "strategies.py"
+    text = path.read_text(encoding="utf-8").replace(
+        'ALIASES = {"GOLD_EDGE_V1": GoldEdge}', f"ALIASES = {publish}"
+    )
+    path.write_text(text + "\n" + textwrap.dedent(appended).lstrip(), encoding="utf-8")
+    return path
+
+
+SWITCHED_OFF = """
+    DISABLED = {"GOLD_EDGE_V1": GoldEdge}
+
+
+    def load_disabled():
+        return sorted(DISABLED)
+"""
+
+
+def test_a_strategy_its_repository_disabled_is_never_loaded(manifest_repo):
+    manifest = edit_manifest(manifest_repo, SWITCHED_OFF, publish="{}")
+    loader = StrategyLoader(manifest_repo)
+
+    assert loader.discover() == []
+    assert loader.disabled_by_repository == {"GOLD_EDGE_V1": manifest}
+    assert loader.failures == [], "switching a strategy off is not a defect"
+
+
+def test_a_disabled_strategy_is_refused_by_name_not_reported_missing(manifest_repo):
+    """A backtest of it would measure something nobody may deploy."""
+    edit_manifest(manifest_repo, SWITCHED_OFF, publish="{}")
+
+    with pytest.raises(LookupError, match="disabled by its repository") as refused:
+        StrategyLoader(manifest_repo).find("GOLD_EDGE_V1")
+    assert "not found" not in str(refused.value)
+
+
+def test_a_repository_without_the_hook_disables_nothing(manifest_repo):
+    """Every repository mounted before the hook existed is in this case."""
+    loader = StrategyLoader(manifest_repo)
+
+    assert [entry.name for entry in loader.discover()] == ["GOLD_EDGE_V1"]
+    assert loader.disabled_by_repository == {}
+
+
+def test_disabling_one_strategy_leaves_its_sibling_running(manifest_repo):
+    """The hook names aliases only; a disabled one need not even import."""
+    manifest = edit_manifest(
+        manifest_repo,
+        """
+        def load_disabled():
+            return ["GOLD_EDGE_RETIRED"]
+        """,
+    )
+    loader = StrategyLoader(manifest_repo)
+
+    assert [entry.name for entry in loader.discover()] == ["GOLD_EDGE_V1"]
+    assert loader.disabled_by_repository == {"GOLD_EDGE_RETIRED": manifest}
+
+
+def test_an_alias_published_and_disabled_at_once_is_not_loaded(manifest_repo, caplog):
+    """Off is the side a contradiction fails on — loudly, so the audit refuses it."""
+    edit_manifest(
+        manifest_repo,
+        """
+        def load_disabled():
+            return ["GOLD_EDGE_V1"]
+        """,
+    )
+    loader = StrategyLoader(manifest_repo)
+    with caplog.at_level("ERROR"):
+        assert loader.discover() == []
+
+    assert "GOLD_EDGE_V1" in loader.disabled_by_repository
+    assert [failure.reason for failure in loader.failures] == [
+        "load_all() and load_disabled() both name GOLD_EDGE_V1"
+    ]
+    assert "publishes and disables" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "hook",
+    [
+        "load_disabled = ['GOLD_EDGE_RETIRED']",
+        "def load_disabled():\n    raise RuntimeError('boom')",
+        "def load_disabled():\n    return 'GOLD_EDGE_RETIRED'",
+        "def load_disabled():\n    return [42]",
+    ],
+    ids=["not-callable", "raises", "a-bare-string", "not-strings"],
+)
+def test_an_unreadable_off_switch_stops_the_whole_repository(manifest_repo, hook, caplog):
+    """Falling back to "nothing disabled" could put a switched-off strategy back on."""
+    edit_manifest(manifest_repo, hook)
+    loader = StrategyLoader(manifest_repo)
+    with caplog.at_level("ERROR"):
+        assert loader.discover() == []
+
+    assert len(loader.failures) == 1
+    assert loader.failures[0].fix == plugin_loader.DISABLED_FIX
+    assert loader.disabled_by_repository == {}
+
+
+def test_the_engine_reads_what_loads_and_what_is_off_in_one_pass(manifest_repo):
+    manifest = edit_manifest(
+        manifest_repo,
+        """
+        def load_disabled():
+            return ["GOLD_EDGE_RETIRED"]
+        """,
+    )
+    directory = read_strategy_directory(manifest_repo)
+
+    assert [entry.name for entry in directory.loaded] == ["GOLD_EDGE_V1"]
+    assert directory.disabled == {"GOLD_EDGE_RETIRED": manifest}
+    assert [entry.name for entry in load_strategies(manifest_repo)] == ["GOLD_EDGE_V1"]
+
+
+@pytest.mark.parametrize(
+    ("bundle", "published"),
+    [
+        ("_boilerplate", "QTE_BOILERPLATE_M15"),
+        ("qte-signal-simulator", "SIGNAL_SIMULATOR_LIFECYCLE_V1"),
+    ],
+)
+def test_the_bundled_repositories_carry_the_disabled_pattern(bundle, published):
+    """The template a strategy repository is copied from shows the whole shape.
+
+    Both bundles keep their strategy published and their ``DISABLED`` table
+    empty, and both expose the hook — a repository copied from either starts
+    with the switch in place. They stay in ``SKIPPED_REPOSITORIES`` for a
+    deployment, which is why each is loaded here from its own root.
+    """
+    root = REPO_ROOT / "__strategies__" / bundle
+    loader = StrategyLoader(root)
+
+    assert [entry.name for entry in loader.discover()] == [published]
+    assert loader.failures == []
+    assert loader.disabled_by_repository == {}
+    module = sys.modules["__strategies__.manifest"]
+    assert callable(getattr(module, plugin_loader.DISABLED_HOOK, None))
+    assert module.load_disabled() == []
+    assert module.DISABLED == {}

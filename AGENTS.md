@@ -96,7 +96,7 @@ package; never scan from the repository root.
 | --- | --- |
 | Wire models, enums, candles, ticks, `SignalIntent` | `src/qte_shared/models.py` |
 | Strategy contract and its seven methods | `src/qte_shared/strategies/strategy_base.py` |
-| Strategy discovery and manifests | `src/qte_shared/strategies/plugin_loader.py` |
+| Strategy discovery and manifests: the `load_all` / `load_settings` / `load_disabled` hooks, `SKIPPED_REPOSITORIES` | `src/qte_shared/strategies/plugin_loader.py` |
 | What `make strategy-mount` recorded, per strategy | `src/qte_shared/strategies/mount_manifest.py`, `__strategies__/strategies.toml` |
 | The build stamp each strategy folder carries at its root (written by that repo's build, read by `/strategies`; examples in the two templates) | `__strategies__/<folder>/BUNDLE_VERSION.json`, README "Which build is deployed" |
 | Per-strategy settings a repo declares; the weekend flat; the mapping's `warmup` override | `src/qte_shared/strategies/strategy_settings.py`, each repo's `settings.py` |

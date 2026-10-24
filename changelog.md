@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`DISABLED` — switching one strategy off from its own repository.** A
+  manifest may expose a third optional hook, `load_disabled()`, returning the
+  aliases its repository keeps (code, tests, documents) but has taken out of
+  service — by convention a `DISABLED` table beside `ALIASES`, the same shape, so
+  moving a line between the two is the switch. The loader never instantiates those
+  strategies and records them (`StrategyLoader.disabled_by_repository`,
+  `read_strategy_directory()`); the backtest refuses one by name; the audit lists
+  each as `[ off]` and counts it (`counts.disabled`, `disabled` in the JSON)
+  without a finding; a mapping table that still names one fails as
+  `mapped-to-disabled` rather than `mapped-to-nothing`, and the runner's `ERROR`
+  says the repository disabled it. An alias in both tables, or a hook that does
+  not read, fails the audit and is not loaded — an unreadable off switch stops
+  the whole repository. `_boilerplate` and `qte-signal-simulator` carry the hook
+  with an empty table as the pattern to copy; `SKIPPED_REPOSITORIES` still skips
+  them as bundles. A repository without the hook disables nothing. Existing positions remain
+  protected while their pair is still mapped; removing the mapping makes them
+  eligible for the startup orphan settlement described below.
+
 - **`/strategies` — the build deployed in each strategy folder, from Telegram.**
   The bot scans `__strategies__/` and answers with one box per strategy
   repository: the stamp from the `BUNDLE_VERSION.json` at the folder's root
@@ -36,14 +54,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **The stale-position flush now waits a day, not an hour** — the default of
-  `QTE_RUNNER__STALE_POSITION_MAX_AGE` moves from `3600` to `86400` seconds. An
-  outage nobody can attend to — overnight, a weekend, a host that needs hands —
-  regularly runs past an hour, and an `R_SL` fired then closed positions that
-  were still the right ones. A deploy or a config change still comes back far
-  inside the window and keeps its positions, as before. Set the variable back
-  to `3600` to restore the old behaviour, or `QTE_RUNNER__FLUSH_STALE_POSITIONS`
-  to `warn`/`off` to see or disable the flush.
+- **Age no longer closes a position; the mapping table does.**
+  `QTE_RUNNER__FLUSH_STALE_POSITIONS` now defaults to `off`. A strategy that
+  holds a cycle until its own exit condition is met can be right to carry one
+  for days, and the outage the window was meant to catch — overnight, a
+  weekend, a host that needs hands — outlasts any window worth setting, so the
+  old default closed positions that were still correct. Nothing is lost by it:
+  every transition is already written to Redis *and* to `open_positions`, and
+  the runner reloads the cycle from either on start. Set the variable to
+  `warn`, or to `close` with `QTE_RUNNER__STALE_POSITION_MAX_AGE` (back to
+  `3600`), for the old age-gated behaviour.
+
+  In its place, **an open cycle the mapping table no longer claims is closed on
+  start** — a strategy dropped from a symbol's `strategies` list, or a symbol
+  carrying `enabled = false`. Nothing decides on those and their size is still
+  charged against the account on every later sizing.
+  `QTE_RUNNER__CLOSE_ORPHAN_POSITIONS` (`off`/`warn`/`close`, default `close`)
+  sends one `FLAT` per cycle through the durable outbox, recovering the
+  timeframe the broker payload needs from the `signals` row that opened it, and
+  clears Redis and Postgres only on a confirmed send — so a `FLAT` the broker
+  rejects over a closed weekend is retried at the next start. A pair the table
+  **still** claims is reported and never closed, however long its slot has been
+  missing: that is a strategy that failed to load or a repository that is not
+  mounted, and a half-mounted `__strategies__/` must not flatten the book. With
+  no mapping table at all nothing is closed. An orphan whose earlier delivery
+  remains unreconciled is left open without sending another command; recovery
+  keeps that pair blocked across restarts, including an `unknown` FLAT result.
+  Previously such a row was only
+  logged as an error, on the mistaken grounds that no timeframe could be
+  recovered for it.
 
 - **Skip reference and simulator bundles during discovery and audit** —
   `SKIPPED_REPOSITORIES` in `qte_shared.strategies.plugin_loader` excludes
