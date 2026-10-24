@@ -124,7 +124,8 @@ as a whole, is off by default, and is described [below](#the-one-ceiling-and-why
 Each is its own cycle: its own `signal_uxid`, minted on its entry, and its own
 bracket. Every `TP1`/`TP2`/`SL`/`R_SL`/`FLAT` carries the `signal_uxid` of the
 one cycle it closes — QTE refuses an unnamed close while more than one is open,
-and the weekend flat and the stale-position flush send one close per cycle. The
+and the weekend flat, the start-up orphan close and the optional stale-position
+flush each send one close per cycle. The
 worker must keep the positions apart by that id, on a hedging account: a netting
 account would merge them into one position and lose every bracket but the last.
 The only entry QTE still refuses is one reusing the id of a cycle already

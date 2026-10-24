@@ -19,6 +19,7 @@ from qte_shared.config import settings
 from qte_shared.logging_setup import get_logger
 from qte_shared.strategies.mapping import SymbolMapping
 from qte_shared.strategies.plugin_loader import (
+    DISABLED_HOOK,
     MANIFEST_FILENAMES,
     Candidate,
     LoadFailure,
@@ -84,11 +85,16 @@ class StrategyAuditor:
         findings.extend(_duplicate_names(audits))
         findings.extend(_repos_without_a_manifest(directory, candidates))
 
+        disabled = dict(loader.disabled_by_repository)
         mapping = self._load_mapping(findings)
-        findings.extend(_mapping_findings(mapping, audits))
+        findings.extend(_mapping_findings(mapping, audits, disabled))
 
         return AuditReport(
-            directory=directory, strategies=audits, findings=findings, mapping=mapping
+            directory=directory,
+            strategies=audits,
+            findings=findings,
+            mapping=mapping,
+            disabled=disabled,
         )
 
     def _load_mapping(self, findings: list[Finding]) -> SymbolMapping:
@@ -223,7 +229,9 @@ def _repos_without_a_manifest(directory: Path, candidates: list[Candidate]) -> l
     return findings
 
 
-def _mapping_findings(mapping: SymbolMapping, audits: list[StrategyAudit]) -> list[Finding]:
+def _mapping_findings(
+    mapping: SymbolMapping, audits: list[StrategyAudit], disabled: dict[str, Path]
+) -> list[Finding]:
     """Does the table name things that exist, and does everything found get used?
 
     Both directions matter and they fail differently. A name in the table that
@@ -231,12 +239,35 @@ def _mapping_findings(mapping: SymbolMapping, audits: list[StrategyAudit]) -> li
     like a strategy that found no setups. A strategy nothing maps to means code
     was deployed and never called — harmless, but almost always the half of a
     rename that was forgotten.
+
+    A name its repository keeps disabled is as much an error as a missing one —
+    the table and the repository disagree about whether it trades, and the
+    deploy should not go out until one of them gives way — but it gets its own
+    code and fix, because nothing about it is misspelt.
     """
     if not mapping:
         return []
 
     published = {entry.name for entry in audits}
     findings = [
+        Finding(
+            code="mapped-to-disabled",
+            severity=Severity.ERROR,
+            subject=name,
+            message=(
+                f"the mapping table sends {', '.join(mapping.symbols_for(name))} to {name!r}, "
+                f"which its repository keeps disabled ({DISABLED_HOOK} in {disabled[name]})"
+            ),
+            fix=(
+                f"remove it from the [symbols.<SYMBOL>].strategies lists in {mapping.source}, "
+                "or move it back into its repository's ALIASES"
+            ),
+            source=mapping.source,
+        )
+        for name in mapping.strategies
+        if name not in published and name in disabled
+    ]
+    findings += [
         Finding(
             code="mapped-to-nothing",
             severity=Severity.ERROR,
@@ -249,7 +280,7 @@ def _mapping_findings(mapping: SymbolMapping, audits: list[StrategyAudit]) -> li
             source=mapping.source,
         )
         for name in mapping.strategies
-        if name not in published
+        if name not in published and name not in disabled
     ]
     findings += [
         Finding(

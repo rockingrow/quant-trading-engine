@@ -105,6 +105,16 @@ it subclassed a strategy base. A repo without a manifest still works: every
 collected, which is the right shape for one loose file and the wrong one for a
 repository.
 
+Switching a strategy **off** without deleting it is the same table, twice:
+`ALIASES` holds what is published and `DISABLED`, beside it, what the repo keeps —
+code, tests, documents — but has taken out of service. `load_disabled()` hands
+the engine the second list. The engine then never imports a disabled strategy,
+`make audit` lists it as `[ off]` instead of missing, `load()` refuses it by name,
+and a mapping table that still routes a symbol to it fails the audit with
+`mapped-to-disabled` until one of the two is changed. Moving its line back into
+`ALIASES` — and its entry back into `settings.py` — returns it to service. An alias
+in both tables is refused outright.
+
 **`my_edge.py`** is the contract: `long`, `short`, `tp1`, `tp2` and `sl` are
 required, `r_sl` and `flat` are optional and shown anyway. Decisions read only
 `df` — OHLCV indexed by candle open time in UTC, oldest first, last row always

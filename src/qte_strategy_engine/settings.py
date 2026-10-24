@@ -68,17 +68,38 @@ class RunnerSettings(BaseSettings):
     #:   off     leave the table alone.
     #:   warn    report what would be closed, send nothing — look before acting.
     #:   close   send R_SL for it, which ends the cycle and frees the pair.
-    flush_stale_positions: Literal["off", "warn", "close"] = "close"
+    #:
+    #: Off by default. Age is not evidence that a position is wrong: a strategy
+    #: that holds a cycle until its own exit condition is met can be right to
+    #: carry one for days, and an outage nobody can attend to -- overnight, a
+    #: weekend, a host that needs hands -- outlasts any window worth setting.
+    #: Closing a cycle the strategy would still be managing costs more than
+    #: leaving it, and what genuinely has nobody deciding on it is closed by
+    #: ``close_orphan_positions`` below on a surer test than age.
+    flush_stale_positions: Literal["off", "warn", "close"] = "off"
     #: How old a position has to be, in seconds since its last transition,
-    #: before the flush above counts it as stale. The restart this protects
-    #: against is the long one; a deploy or a config change comes back inside
-    #: this window and keeps its positions, which is what the Redis/Postgres
-    #: recovery path exists for. Zero makes every open position stale, which is
-    #: the unconditional flush. The default is one day, because an outage an
-    #: operator cannot attend to -- overnight, a weekend, a host that needs
-    #: hands -- regularly runs longer than an hour, and flushing a position
-    #: that is still the right one costs more than holding it a while.
-    stale_position_max_age: float = Field(default=86400.0, ge=0)
+    #: before the flush above counts it as stale. Read only when that mode is
+    #: not ``off``. The restart it protects against is the long one; a deploy or
+    #: a config change comes back inside this window and keeps its positions,
+    #: which is what the Redis/Postgres recovery path exists for. Zero makes
+    #: every open position stale, which is the unconditional flush.
+    stale_position_max_age: float = Field(default=3600.0, ge=0)
+    #: What to do on start about an open cycle the mapping table no longer
+    #: claims — a strategy dropped from a symbol's list, or a symbol carrying
+    #: ``enabled = false``. Nothing decides on those: no slot holds them, no
+    #: bar reaches them, and their size is still charged against the account on
+    #: every later sizing. Unlike the age flush above this is not a guess —
+    #: the operator's own table says the pair is retired.
+    #:
+    #:   off     leave the table alone, report it as today.
+    #:   warn    report what would be closed, send nothing.
+    #:   close   send FLAT for it, which ends the cycle.
+    #:
+    #: A pair the table still claims is never closed here, however long its
+    #: slot has been missing: that is a strategy that failed to load or a
+    #: repository that is not mounted, and a half-mounted
+    #: ``__strategies__/`` must not flatten the book.
+    close_orphan_positions: Literal["off", "warn", "close"] = "close"
 
 
 runner_settings = RunnerSettings()

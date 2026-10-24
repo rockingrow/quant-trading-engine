@@ -52,14 +52,19 @@ def record_repository(directory: Path, repository: str) -> MountManifest:
 
     passed = sorted(name for name, ok in verdicts.items() if ok)
     failed = sorted(name for name, ok in verdicts.items() if not ok)
+    # A strategy the repository keeps disabled is never audited, so it gets no
+    # verdict and drops out of the record — said here, so its absence is read
+    # as a choice rather than as a strategy that vanished.
     log.info(
-        "Recorded %s in %s: %s passing (%s), %s failing (%s)",
+        "Recorded %s in %s: %s passing (%s), %s failing (%s), %s disabled by the repository (%s)",
         repository,
         path,
         len(passed),
         ", ".join(passed) or "none",
         len(failed),
         ", ".join(failed) or "none",
+        len(report.disabled),
+        ", ".join(sorted(report.disabled)) or "none",
     )
     return manifest
 

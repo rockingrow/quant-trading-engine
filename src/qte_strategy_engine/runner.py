@@ -60,8 +60,9 @@ import asyncio
 import contextlib
 import json
 from collections import defaultdict, deque
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -86,7 +87,7 @@ from qte_shared.models import (
 from qte_shared.notifications import ServiceStatusNotifier, TelegramErrorNotifier
 from qte_shared.providers import get_provider_class
 from qte_shared.strategies.mapping import SymbolMapping
-from qte_shared.strategies.plugin_loader import load_strategies
+from qte_shared.strategies.plugin_loader import DISABLED_HOOK, read_strategy_directory
 from qte_shared.strategies.signal_factory import BracketPolicy, SignalFactory
 from qte_shared.strategies.signal_serialization import signal_record
 from qte_shared.strategies.sizing import PositionSizer
@@ -215,6 +216,13 @@ class StrategyRunner:
         )
         self._ownership_acquired = False
         self.slots: list[StrategySlot] = []
+        #: Every ``(strategy, symbol)`` the mapping table declares, whether or
+        #: not a slot was built for it, and ``None`` when no table was read.
+        #: :meth:`_settle_orphan_positions` needs the declaration and not the
+        #: slots: a pair missing from both is retired, while one the table
+        #: still claims is a strategy that failed to load, and those two call
+        #: for opposite answers.
+        self._declared_pairs: set[tuple[str, str]] | None = None
         self._by_subject: dict[tuple[str, str], list[StrategySlot]] = defaultdict(list)
         self._stopping = asyncio.Event()
         self._tasks: list[asyncio.Task[Any]] = []
@@ -270,6 +278,9 @@ class StrategyRunner:
             # subscriptions below, so no live close races the flush and no
             # strategy is ever asked to decide a bar against a stale position.
             await self._flush_stale_positions()
+            # Independent of the flush above and of its mode: one closes what is
+            # merely old, this closes what the mapping table no longer claims.
+            await self._settle_orphan_positions()
             # Every slot is held while the subscriptions go live and the missed
             # closes are replayed. A close that arrives meanwhile waits for the
             # replay, then finds its bar already fed and is ignored, so no bar is
@@ -417,11 +428,20 @@ class StrategyRunner:
         happened before the table existed — see :mod:`qte_shared.strategies.mapping`.
         """
         mapping = SymbolMapping.load(settings.engine.mapping_file)
-        discovered = load_strategies(settings.engine.strategies_dir)
+        directory = read_strategy_directory(settings.engine.strategies_dir)
+        discovered = directory.loaded
+        # Read from the pairings rather than from the file, so a symbol carrying
+        # `enabled = false` is already absent: the parser drops those, and a
+        # disabled symbol is exactly a pair the operator retired.
+        self._declared_pairs = (
+            {(pairing.strategy, pairing.symbol.upper()) for pairing in mapping.pairings}
+            if mapping
+            else None
+        )
         if mapping:
             loaded_names = [entry.name for entry in discovered]
-            self._warn_on_unmapped(mapping, loaded_names)
-            self._warn_on_unused_strategy_defaults(mapping, loaded_names)
+            self._warn_on_unmapped(mapping, loaded_names, directory.disabled)
+            self._warn_on_unused_strategy_defaults(mapping, loaded_names, directory.disabled)
 
         for entry in discovered:
             defaults = mapping.defaults_for(entry.name)
@@ -497,39 +517,71 @@ class StrategyRunner:
                 )
 
     @staticmethod
-    def _warn_on_unmapped(mapping: SymbolMapping, loaded: list[str]) -> None:
+    def _warn_on_unmapped(
+        mapping: SymbolMapping, loaded: list[str], disabled: Mapping[str, Path]
+    ) -> None:
         """Say so when the table names a strategy the loader never found.
 
         Almost always a typo or a stale name after a rename, and the symptom
         without this line is a symbol that quietly trades nothing — which reads
         exactly like a strategy that found no setups.
+
+        A strategy its repository disabled is still an error here — the table
+        and the repository disagree about whether it trades — but it is named
+        as such, because the fix is a deliberate edit to one of the two rather
+        than a hunt for the misspelling.
         """
         unknown = [name for name in mapping.strategies if name not in set(loaded)]
-        if unknown:
+        switched_off = sorted(name for name in unknown if name in disabled)
+        missing = sorted(name for name in unknown if name not in disabled)
+        if switched_off:
+            log.error(
+                "Mapping table %s names %s, which %s keeps disabled (%s). Those symbols will "
+                "not run it: remove it from the table, or move it back into that "
+                "repository's ALIASES.",
+                mapping.source,
+                ", ".join(switched_off),
+                ", ".join(sorted({str(disabled[name]) for name in switched_off})),
+                DISABLED_HOOK,
+            )
+        if missing:
             log.error(
                 "Mapping table %s names %s, which %s did not publish. Those symbols will "
                 "trade nothing. Available: %s",
                 mapping.source,
-                ", ".join(sorted(unknown)),
+                ", ".join(missing),
                 settings.engine.strategies_dir,
                 ", ".join(sorted(loaded)) or "none",
             )
 
     @staticmethod
-    def _warn_on_unused_strategy_defaults(mapping: SymbolMapping, loaded: list[str]) -> None:
+    def _warn_on_unused_strategy_defaults(
+        mapping: SymbolMapping, loaded: list[str], disabled: Mapping[str, Path]
+    ) -> None:
         """Say so when ``[strategies.<name>]`` names a strategy nobody publishes.
 
         Unlike an unmapped pairing this trades nothing wrong — the defaults are
         simply never read — but a typo here means an intended ``risk_percent``
-        override silently does not apply, so it is worth a line.
+        override silently does not apply, so it is worth a line. One for a
+        strategy its repository disabled waits, unread, for it to come back.
         """
         unknown = [name for name in mapping.strategy_defaults if name not in set(loaded)]
-        if unknown:
+        switched_off = sorted(name for name in unknown if name in disabled)
+        missing = sorted(name for name in unknown if name not in disabled)
+        if switched_off:
+            log.warning(
+                "Mapping table %s has [strategies.*] defaults for %s, which its repository "
+                "keeps disabled (%s) — they apply to nothing until it is back in ALIASES.",
+                mapping.source,
+                ", ".join(switched_off),
+                DISABLED_HOOK,
+            )
+        if missing:
             log.warning(
                 "Mapping table %s has [strategies.*] defaults for %s, which %s did not "
                 "publish — those defaults will not apply anywhere.",
                 mapping.source,
-                ", ".join(sorted(unknown)),
+                ", ".join(missing),
                 settings.engine.strategies_dir,
             )
 
@@ -788,22 +840,29 @@ class StrategyRunner:
     # ── Stale positions ───────────────────────────────────────────────
 
     async def _flush_stale_positions(self) -> None:
-        """Close what an outage left open, so nothing is left unmanaged.
+        """Close a cycle whose last transition is older than the window, if asked to.
 
-        A pair stacks as many cycles as its strategy opens, so rows that
-        survived a long downtime are not a lock on new entries any more. They
-        are still positions whose brackets the market left behind hours ago,
-        with nothing deciding on them and their size counted against the
-        account on every later sizing. Each stale cycle is closed on its own.
+        Off by default, and opt-in for a reason: age is not evidence. A strategy
+        that holds a cycle until its own exit condition is met can be right to
+        carry one for days, and an outage nobody can attend to outlasts any
+        window worth setting — so the operator who wants the old behaviour asks
+        for it with ``QTE_RUNNER__FLUSH_STALE_POSITIONS``. What genuinely has
+        nobody deciding on it is closed by :meth:`_settle_orphan_positions`
+        instead, on the mapping table rather than on a clock.
 
-        Age is what separates that from an ordinary restart. A deploy comes back
-        inside ``QTE_RUNNER__STALE_POSITION_MAX_AGE`` and keeps its positions,
-        which is what the Redis/Postgres recovery path is for; anything older is
-        closed with ``R_SL``, a terminal action, so the cycle ends and the pair
-        is free. Zero makes every open position stale.
+        When it is on, a position past ``QTE_RUNNER__STALE_POSITION_MAX_AGE``
+        is closed with ``R_SL``, a terminal action, so the cycle ends and its
+        size stops being charged against the account on every later sizing. A
+        deploy comes back inside the window and keeps its positions, which is
+        what the Redis/Postgres recovery path is for. Zero makes every open
+        position stale.
 
         ``warn`` reports and sends nothing, which is how to see what a first
         ``close`` run would do before letting it do it.
+
+        The duplicate-id check below runs in every mode, ``off`` included: two
+        pairs holding one ``signal_uxid`` is a correctness problem rather than
+        a staleness one, and nothing else on the boot path would catch it.
         """
         mode = runner_settings.flush_stale_positions
         # What locks a pair is the cycle `_restore_position` put on its slot,
@@ -817,10 +876,10 @@ class StrategyRunner:
             for strategy_slot in self.slots
             for position in strategy_slot.factory.positions_for(strategy_slot.symbol)
         ]
-        # The table is still read, for the two things the slots cannot show:
-        # rows belonging to no running strategy, and duplicate cycle ids across
-        # the whole namespace. Best-effort — `list_open` reports its own
-        # failures and answers with an empty list.
+        # The table is still read, for the one thing the slots cannot show:
+        # duplicate cycle ids across the whole namespace. Rows belonging to no
+        # running strategy are `_settle_orphan_positions`' business. Best-effort
+        # — `list_open` reports its own failures and answers with an empty list.
         listed = await self.positions.list_open()
         # Whatever the mode: a duplicated cycle id is a correctness problem
         # rather than a staleness one, and "off" must not hide it. Checked over
@@ -828,7 +887,6 @@ class StrategyRunner:
         self._verify_position_uxids(self.slots, listed)
         if mode == "off":
             return
-        self._report_orphan_positions(listed)
 
         max_age = runner_settings.stale_position_max_age
         moment = datetime.now(UTC)
@@ -867,27 +925,107 @@ class StrategyRunner:
             if mode == "close":
                 await self._close_stale_position(strategy_slot, position)
 
-    def _report_orphan_positions(self, listed: list[OpenPosition]) -> None:
-        """Name every table row belonging to a strategy this runner is not driving.
+    async def _settle_orphan_positions(self) -> None:
+        """Close, or report, every stored cycle no running strategy decides on.
 
-        Reported and not closed: :class:`OpenPosition` records no timeframe and
-        the broker payload requires one, so the engine cannot build a truthful
-        signal for a strategy it is not running. An error rather than a note,
-        because nobody else will ever close these either — the strategy was
-        unmapped or removed while it still held a position.
+        The mapping table is the authority, not the slots. A pair missing from
+        both was retired by the operator — dropped from a symbol's
+        ``strategies`` list, or its symbol given ``enabled = false`` — and
+        nothing will ever decide on its cycle again: no slot holds it, no bar
+        reaches it, and its size is charged against the account on every later
+        sizing. ``QTE_RUNNER__CLOSE_ORPHAN_POSITIONS`` says what to do about
+        that, and ``close`` ends the cycle with ``FLAT``.
+
+        A pair the table *still* claims is reported and never closed, however
+        long its slot has been missing. That is not a retirement, it is a
+        strategy that failed to load or a repository that is not mounted, and
+        the two are indistinguishable from the slots alone. Reading the
+        declaration instead is what stops a half-mounted ``__strategies__/``
+        from flattening the whole book on one bad deploy.
+
+        With no mapping table at all nothing declared any intent — the symbols
+        come off each strategy's own class — so every orphan is reported and
+        none is closed.
+
+        Unlike :meth:`_flush_stale_positions` this does not consult age. The
+        table saying a pair is gone is evidence; a position being old is not.
         """
-        driven = {strategy_slot.key for strategy_slot in self.slots}
-        for position in listed:
-            if (position.strategy, position.symbol) in driven:
+        mode = runner_settings.close_orphan_positions
+        orphans = await self._orphan_positions(True, None, None)
+        if not orphans:
+            return
+        moment = datetime.now(UTC)
+        for position in orphans:
+            pair = (position.strategy, position.symbol.upper())
+            if self._declared_pairs is None:
+                log.error(
+                    "Open position %s %s uxid=%s belongs to no running strategy, and no "
+                    "mapping table was read — nothing declares whether it is retired, so "
+                    "it is left alone. Map the strategy again and restart, or close it "
+                    "with /flat.",
+                    position.strategy,
+                    position.symbol,
+                    position.signal_uxid,
+                )
                 continue
-            log.error(
-                "Open position %s %s uxid=%s belongs to no running strategy — this "
-                "runner cannot close it. Map the strategy again and restart, or "
-                "reconcile the position with the broker and delete the row.",
+            if pair in self._declared_pairs:
+                log.error(
+                    "Open position %s %s uxid=%s is still mapped in %s but no slot was "
+                    "built for it — the strategy did not load, or its repository is not "
+                    "mounted. Left open on purpose: a missing mount is not a retirement. "
+                    "Fix the mount and restart, or close it with /flat.",
+                    position.strategy,
+                    position.symbol,
+                    position.signal_uxid,
+                    settings.engine.mapping_file,
+                )
+                continue
+            if mode == "off":
+                log.error(
+                    "Open position %s %s uxid=%s belongs to no mapped strategy — this "
+                    "runner is not closing it (QTE_RUNNER__CLOSE_ORPHAN_POSITIONS=off). "
+                    "Nobody else will either.",
+                    position.strategy,
+                    position.symbol,
+                    position.signal_uxid,
+                )
+                continue
+            if pair in self._uncertain_pairs:
+                # The same guard the age flush keeps, and it matters more here:
+                # `_recover_pending_deliveries` cannot reconcile a pair it has
+                # no slot for, so it leaves it blocked. Sending over that would
+                # put a second command against one cycle whose first one may
+                # already have reached the broker — and, since an unconfirmed
+                # close keeps the row, it would do so again on every start.
+                log.error(
+                    "Not closing orphan cycle %s on %s %s: a delivery of its own is still "
+                    "unreconciled and no slot drives the pair the outbox would need to "
+                    "settle it. Reconcile it with the broker and delete the row, or map "
+                    "the strategy again so the outbox can finish.",
+                    position.signal_uxid,
+                    position.strategy,
+                    position.symbol,
+                )
+                continue
+            log.warning(
+                "Open cycle %s on %s %s belongs to no mapped strategy — %s",
+                position.signal_uxid,
                 position.strategy,
                 position.symbol,
-                position.signal_uxid,
+                "closing it with FLAT" if mode == "close" else "would close it with FLAT",
             )
+            if mode != "close":
+                continue
+            refusal = await self._flatten_orphan_cycle(position, moment)
+            if refusal is not None:
+                log.error(
+                    "Could not close orphan cycle %s on %s %s: %s. The row stays, so the "
+                    "next start tries again.",
+                    position.signal_uxid,
+                    position.strategy,
+                    position.symbol,
+                    refusal,
+                )
 
     async def _close_stale_position(
         self, strategy_slot: StrategySlot, position: OpenPosition
@@ -1500,9 +1638,13 @@ class StrategyRunner:
         marked in the outbox, and only then reconciled locally.
 
         ``timeframe`` comes from the signals that opened the cycle — the broker
-        payload requires one and :class:`OpenPosition` carries none. Without it
-        no truthful payload exists, so the row is refused with that said rather
-        than closed with a guess.
+        payload requires one and :class:`OpenPosition` carries none, so it is
+        read back from ``signals`` rather than stored twice where the two copies
+        could disagree. Without it no truthful payload exists, so the row is
+        refused with that said rather than closed with a guess.
+
+        Both callers land here: the operator's ``/flat`` and, on start,
+        :meth:`_settle_orphan_positions`.
 
         Local state is dropped only on a confirmed ``sent`` whose outbox
         checkpoint also landed. A failed or ambiguous delivery, or a checkpoint
@@ -1556,7 +1698,7 @@ class StrategyRunner:
             )
             return "the stored position cannot be expressed as a broker payload"
         log.warning(
-            "Operator FLAT on an unmapped strategy: closing %s on %s uxid=%s",
+            "FLAT on an unmapped strategy: closing %s on %s uxid=%s",
             position.strategy,
             position.symbol,
             position.signal_uxid,

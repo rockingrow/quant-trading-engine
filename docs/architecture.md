@@ -191,63 +191,92 @@ in Postgres answers that question and the runner re-seeds Redis from it. That
 table is the only mutable row QTE keeps — everything else there is append-only —
 which is exactly why it is a table of its own rather than a column on `signals`.
 
-## Why a stale position is flushed on start
+## Why age does not close a position, and the mapping table does
 
-Remembering a cycle across a restart is the right answer, and it has a failure
-mode of its own. Nothing caps how many cycles a `(strategy, symbol)` pair
-holds, so a long outage does not lock the pair out of trading — it leaves it
-carrying positions nobody is deciding on. The rows survive, the pair comes back
-still believing it holds them, and each was sized against a bracket the market
-left behind hours ago. Every later entry is then sized against an account those
-ghosts are still charged to, and each one's bracket sits at the broker waiting
-on a level that stopped meaning anything.
+Remembering a cycle across a restart is the right answer, and for a while the
+engine paired it with a second rule: a position whose last transition was older
+than a window had outlived an outage, so close it. That rule is off by default
+now, and the reasoning is worth keeping because it is a trap worth naming.
 
-So the runner closes what has gone stale, on start, with `R_SL` — a terminal
-action, so the cycle ends and the book is back to what is really being
-managed. `R_SL` rather than `FLAT`
-because `FLAT` means "close everything on this strategy" and this closes exactly
-one cycle, named by its `signal_uxid`. It goes out through the ordinary `_emit`
-path, so it is staged in the durable outbox, delivered and audited like any
-strategy exit and inherits every guard there.
+**Age is not evidence.** A strategy that holds a cycle until its own exit
+condition is met can be right to carry one for days — the position untouched
+since Tuesday is the position still working. And the outage the rule was meant
+to catch is exactly the one nobody can shorten: overnight, a weekend, a host
+that needs hands on it. Any window short enough to catch a real outage is short
+enough to flatten a position that was still correct, and the loss is silent —
+an `R_SL` in the audit trail looks like a decision. So
+`QTE_RUNNER__FLUSH_STALE_POSITIONS` defaults to `off`, and the operator who
+wants the old behaviour asks for it, with `warn` first to see what it would do.
 
-**Age is the whole design.** An unconditional flush would close the book on
-every deploy, and would make most of the recovery machinery above pointless —
-the runner would be carefully restoring a cycle it is about to close. So
-`QTE_RUNNER__STALE_POSITION_MAX_AGE` draws the line: inside it, nothing changes
-and the position is restored exactly as before; outside it, the position is
-treated as what it is, a leftover. `0` restores the unconditional behaviour for
-an operator who wants it, and `QTE_RUNNER__FLUSH_STALE_POSITIONS=warn` lists
-what a first `close` run would do without doing it.
+Nothing is lost by turning it off, because the durability it was compensating
+for is real. `_persist_position` writes every transition to Redis *and* to
+`open_positions`; `_restore_position` reads the cache first and the table behind
+it, re-seeding the cache so the next boot is a hit; Redis runs with AOF on its
+own volume and the cycle hash carries no TTL. A restart, a lost cache and a
+re-provisioned Redis all come back holding the book.
 
-**It decides from the slots, not from the table.** What a pair believes it
-holds is the cycle `_restore_position` put on its slot, and that came from Redis in
-preference to Postgres. The two can disagree: `_persist_position` writes Redis
-first, and `OpenPositionRepository.upsert` swallows its own failure by design,
-so a cycle can live in the cache and not in the table. A flush driven by the
-table would skip exactly that pair and leave it locked — the failure it was
-added to prevent. The table is still read, for the two things the slots cannot
-show: rows belonging to no running strategy, and duplicate ids across the whole
-namespace.
+**What does get closed on start is what the mapping table no longer claims.**
+This is the case the age rule was reaching for and missing. A pair dropped from
+a symbol's `strategies` list, or a symbol given `enabled = false`, leaves a row
+that nothing will ever decide on again: no slot holds it, no bar reaches it, and
+its size is charged against the account on every later sizing. The operator's
+own table is the evidence the clock never was.
+`QTE_RUNNER__CLOSE_ORPHAN_POSITIONS` says what to do, and `close` — the default
+— ends the cycle with `FLAT`.
 
-Two things it deliberately does not do. It skips a pair whose delivery the
-outbox has not reconciled, because flushing over an ambiguous send would
-manufacture a second command against the same cycle. And it does not close a
-position belonging to a strategy this runner is not driving — `OpenPosition`
-records no timeframe and the broker payload needs one, so the engine cannot
-speak for a strategy it is not running. That case is logged as an error rather
-than swallowed, because nobody else will ever close it either.
+**It reads the declaration, not the slots.** A pair the table still claims but
+has no slot for is not a retirement: the strategy failed to load, or its
+repository is not mounted. From the slots alone those two are the same
+observation, and closing on it would mean one bad deploy flattens the whole
+book. So an orphan whose pair is still declared is reported and left open, and
+with no mapping table at all — the fallback where each strategy keeps the
+symbols on its own class — nothing is closed, because nothing declared any
+intent.
+
+`FLAT` rather than `R_SL` here, through `_flatten_orphan_cycle`, which the
+operator's `/flat` already uses. It builds the payload by hand instead of
+through a `SignalFactory`, because there is no factory for an unmapped strategy
+and minting one would need the mapping entry that is precisely what is gone.
+The `timeframe` the broker payload requires comes from the `signals` row that
+opened the cycle — `OpenPosition` carries none, and reading it back beats
+storing it twice where the two copies could disagree. Without that row no
+truthful payload exists, so the cycle is refused with that said rather than
+closed with a guess. Local state is dropped only on a confirmed send whose
+outbox checkpoint also landed, so a `FLAT` the broker rejects — a closed market
+over a weekend — leaves the row in place and the next start tries again. A book
+that forgot a position the broker still carries is worse than one that still
+shows it.
+
+One orphan it will not touch is a pair whose own delivery the outbox has not
+reconciled. `_recover_pending_deliveries` cannot settle a pair it has no slot
+for, so it leaves it blocked; sending over that would put a second command
+against one cycle whose first may already have reached the broker, and because
+an unconfirmed close keeps the row it would do so again at every start. That
+one is reported and left for an operator.
+
+When the age flush *is* enabled, it closes with `R_SL`, named by the cycle's
+`signal_uxid`, because `FLAT` means "close everything on this strategy" and
+that path is closing exactly one cycle of a strategy still running. It also
+skips a pair whose delivery the outbox has not reconciled, since flushing over
+an ambiguous send would manufacture a second command against one cycle. And it
+decides from the slots rather than the table, deliberately: what a pair
+believes it holds is the cycle `_restore_position` put on its slot, which came
+from Redis in preference to Postgres, and the two can disagree —
+`_persist_position` writes Redis first and `OpenPositionRepository.upsert`
+swallows its own failure by design. A flush driven by the table would skip
+exactly the pair that is only in the cache.
 
 The same section of the boot sequence enforces the other direction of the pair
-rule: two pairs must never hold one `signal_uxid`. The broker groups a whole
-trade by that id, so a close on either pair would close the other's position and
-nothing in the audit trail would explain the loss.
-`uq_open_positions_uxid` makes it impossible to write; the startup check catches
-rows that predate the constraint or were inserted by hand, and it refuses to
-start rather than warning, because every entry and exit on either pair is unsafe
-until an operator says which one is real. It reads the restored slots as well as
-the table, because `list_open` answers with an empty list when it could not read
-at all — a check resting on the table alone would pass on no data the first time
-Postgres was slow to accept connections.
+rule, in every mode including `off`: two pairs must never hold one
+`signal_uxid`. The broker groups a whole trade by that id, so a close on either
+pair would close the other's position and nothing in the audit trail would
+explain the loss. `uq_open_positions_uxid` makes it impossible to write; the
+startup check catches rows that predate the constraint or were inserted by
+hand, and it refuses to start rather than warning, because every entry and exit
+on either pair is unsafe until an operator says which one is real. It reads the
+restored slots as well as the table, because `list_open` answers with an empty
+list when it could not read at all — a check resting on the table alone would
+pass on no data the first time Postgres was slow to accept connections.
 
 ## Why the strategy returns intents instead of publishing
 

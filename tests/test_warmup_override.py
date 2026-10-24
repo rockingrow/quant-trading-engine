@@ -137,13 +137,14 @@ def test_a_slot_with_an_override_warms_on_the_overridden_count():
 @pytest.fixture
 def mapped_runner(monkeypatch, tmp_path):
     """A runner whose loader publishes one strategy declaring ``warmup = 10``."""
-    from qte_shared.strategies.plugin_loader import LoadedStrategy
+    from qte_shared.strategies.plugin_loader import LoadedStrategy, StrategyDirectory
 
     monkeypatch.setattr(
-        "qte_strategy_engine.runner.load_strategies",
-        lambda *args, **kwargs: [
-            LoadedStrategy(name=Edge.name, cls=Edge, source=tmp_path / "edge.py")
-        ],
+        "qte_strategy_engine.runner.read_strategy_directory",
+        lambda *args, **kwargs: StrategyDirectory(
+            loaded=[LoadedStrategy(name=Edge.name, cls=Edge, source=tmp_path / "edge.py")],
+            disabled={},
+        ),
     )
     return runner_module.StrategyRunner()
 
