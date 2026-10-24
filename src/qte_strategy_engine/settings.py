@@ -74,8 +74,11 @@ class RunnerSettings(BaseSettings):
     #: against is the long one; a deploy or a config change comes back inside
     #: this window and keeps its positions, which is what the Redis/Postgres
     #: recovery path exists for. Zero makes every open position stale, which is
-    #: the unconditional flush.
-    stale_position_max_age: float = Field(default=3600.0, ge=0)
+    #: the unconditional flush. The default is one day, because an outage an
+    #: operator cannot attend to -- overnight, a weekend, a host that needs
+    #: hands -- regularly runs longer than an hour, and flushing a position
+    #: that is still the right one costs more than holding it a while.
+    stale_position_max_age: float = Field(default=86400.0, ge=0)
 
 
 runner_settings = RunnerSettings()

@@ -1243,7 +1243,7 @@ with Tailscale on, the relay to the broker both live.
 at a time, so a position that outlived a long downtime locks that pair: every
 entry the strategy proposes afterwards is refused, against a position whose
 bracket the market left behind hours ago. On start the runner closes anything
-older than `QTE_RUNNER__STALE_POSITION_MAX_AGE` (default one hour) with an
+older than `QTE_RUNNER__STALE_POSITION_MAX_AGE` (default one day) with an
 `R_SL`, which ends the cycle and frees the pair. A deploy or a config change
 comes back well inside that window and keeps its positions, which is what the
 Redis and Postgres recovery path is for. Set

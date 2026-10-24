@@ -36,6 +36,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The stale-position flush now waits a day, not an hour** — the default of
+  `QTE_RUNNER__STALE_POSITION_MAX_AGE` moves from `3600` to `86400` seconds. An
+  outage nobody can attend to — overnight, a weekend, a host that needs hands —
+  regularly runs past an hour, and an `R_SL` fired then closed positions that
+  were still the right ones. A deploy or a config change still comes back far
+  inside the window and keeps its positions, as before. Set the variable back
+  to `3600` to restore the old behaviour, or `QTE_RUNNER__FLUSH_STALE_POSITIONS`
+  to `warn`/`off` to see or disable the flush.
+
 - **Skip reference and simulator bundles during discovery and audit** —
   `SKIPPED_REPOSITORIES` in `qte_shared.strategies.plugin_loader` excludes
   `_boilerplate` and `qte-signal-simulator`, preventing their unused-strategy

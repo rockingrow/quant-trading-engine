@@ -34,6 +34,7 @@ from qte_shared.strategies.signal_factory import SignalFactory
 from qte_shared.strategies.sizing import PositionSizer
 from qte_shared.strategies.strategy_base import StrategyBase
 from qte_strategy_engine.runner import StrategyRunner, StrategySlot
+from qte_strategy_engine.settings import RunnerSettings
 
 STRATEGY_NAME = "STALE_PROBE"
 SYMBOL = "XAUUSD"
@@ -202,6 +203,14 @@ async def test_a_fresh_cycle_survives_a_quick_restart(monkeypatch):
 
     assert emitted(runner) == []
     assert strategy_slot.factory.open_cycle(SYMBOL) == CYCLE_UXID
+
+
+def test_the_default_window_is_one_day():
+    """An unattended outage -- overnight, a weekend, a host that needs hands --
+    runs well past an hour, and a position flushed then was often still the
+    right one. The default has to outlast the outage nobody can shorten."""
+    field = RunnerSettings.model_fields["stale_position_max_age"]
+    assert field.default == 86400.0
 
 
 async def test_a_zero_window_closes_regardless_of_age(monkeypatch):
