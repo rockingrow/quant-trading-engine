@@ -558,6 +558,15 @@ publishing that to a signal channel because an operator filled in only one of
 the two lists would be a configuration mistake the code should not make
 possible.
 
+The traffic in the other direction is a leak rather than a loop. The Bot API
+carries the token in the request path and `httpx` logs every request's full URL
+at `INFO`, so the default deployment used to write the token to the console and
+to a daily file nothing prunes. `qte_shared/logging_setup.py` formats both of
+its handlers through a formatter that rewrites `/bot<token>` out of the
+finished line, which keeps the per-request lines useful, covers a traceback
+that quotes the same URL, and does not depend on an operator picking a log
+level.
+
 ## Why only two services announce themselves
 
 `make start` brings up Redis, Postgres, NATS, ingestion, the runner and
