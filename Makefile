@@ -114,9 +114,16 @@ check: lint test ## Lint and test — what CI runs
 # file that must exist before `make up`/`make start` will run, even if it lists
 # nothing. `qte-strategy-mount --show` prints what it holds.
 #
-# strategy-requirements freezes the repos that still have a passing strategy,
-# and the engine's loader skips the strategies that failed: one whose deps
-# never reached the image must not be imported and traded inside it.
+# strategy-requirements resolves the repos that still have a passing strategy
+# *together*, and the engine's loader skips the strategies that failed: one
+# whose deps never reached the image must not be imported and traded inside it.
+# Each repo's own lockfile is deliberately not concatenated: they are locked
+# independently, so a Dependabot bump of pandas in one leaves the others on the
+# old pin and the image build fails on `pandas==a` against `pandas==b`. Instead
+# the repos' declared dependencies are compiled in one pass, constrained by the
+# engine's own uv.lock, so a package the engine already ships keeps the
+# engine's version and the rest follow it. The image is Linux on 3.13, so that is
+# the one platform resolved, whatever host runs the make.
 #
 # Audit runs *after* install, not before: the commonest audit failure is a
 # missing third-party import, which is exactly what installing fixes, so
@@ -182,16 +189,25 @@ strategy-requirements: ## Freeze deps for one (STRATEGY=<name>) or every mounted
 		: > deploy/strategy-requirements.txt; \
 		exit 0; \
 	fi; \
-	tmp=$$(mktemp); \
+	manifests=""; \
 	for name in $$names; do \
 		repo="$(STRATEGIES_DIR)/$$name"; \
 		if [ -f "$$repo/pyproject.toml" ]; then \
-			uv export --project "$$repo" --no-dev --no-emit-project \
-				--format requirements-txt >> "$$tmp"; \
+			manifests="$$manifests $$repo/pyproject.toml"; \
 		else \
 			echo "No strategy repo at $$repo - skipping"; \
 		fi; \
 	done; \
+	if [ -z "$$manifests" ]; then \
+		: > deploy/strategy-requirements.txt; \
+		exit 0; \
+	fi; \
+	tmp=$$(mktemp); pins=$$(mktemp); \
+	uv export --frozen --no-dev --all-extras --no-emit-project --no-hashes \
+		--format requirements-txt > "$$pins"; \
+	uv pip compile $$manifests -c "$$pins" --python-platform linux --python-version 3.13 \
+		--no-header --quiet -o "$$tmp"; \
+	rm -f "$$pins"; \
 	mv "$$tmp" deploy/strategy-requirements.txt; \
 	echo "Wrote deploy/strategy-requirements.txt from: $$names"
 
