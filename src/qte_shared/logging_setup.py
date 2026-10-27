@@ -31,17 +31,48 @@ Nothing here deletes anything: files accumulate one per service per day, the
 same as ``algo-trading-ingester``'s ``logs/``. Rotation at midnight happens
 without a restart, on the clock the timestamps in the lines use — the images
 run UTC, so in practice the stamp is a UTC date.
+
+**Bot API tokens never reach either sink.** The Telegram Bot API puts the token
+in the request path, and ``httpx`` logs every request's full URL at ``INFO``,
+so an untouched default deployment writes the bot token into the console *and*
+into a file that is never pruned. Both handlers here format through
+:class:`RedactingFormatter`, which rewrites ``/bot<token>`` out of the finished
+line. Quieting the ``httpx`` logger to ``WARNING`` would have been smaller, but
+it trades away the per-request lines that make a failed send readable and still
+leaks the moment anything else logs such a URL — a traceback from a timed-out
+send, say. Redacting on the way out needs no operator to have chosen the right
+level, and it holds at ``QTE_LOG_LEVEL=DEBUG`` too.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
 
 _FORMAT = "%(asctime)s %(levelname)-8s [%(name)s] %(message)s"
+
+#: ``https://api.telegram.org/bot<token>/sendMessage`` — everything between
+#: ``/bot`` and the next separator is the secret. Matching the path rather than
+#: the token's own shape keeps this working if Telegram ever changes the shape.
+_TOKEN_IN_BOT_URL = re.compile(r"(?<=/bot)[^/\s\"']+")
+_REDACTED = "<redacted>"
+
+
+class RedactingFormatter(logging.Formatter):
+    """Formats as usual, then strips Bot API tokens out of the finished line.
+
+    Redacting the formatted string rather than the record covers every part of
+    a line at once — the message, its arguments, and an exception traceback
+    that quotes the request URL — and leaves the record itself untouched for
+    any other handler.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        return _TOKEN_IN_BOT_URL.sub(_REDACTED, super().format(record))
 
 #: Directory the daily files go in. Empty disables them.
 LOG_DIRECTORY_VARIABLE = "QTE_LOG_DIR"
@@ -101,7 +132,7 @@ def _configure_console(level: str) -> None:
     if _console_handler is not None:
         return
     handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(logging.Formatter(_FORMAT))
+    handler.setFormatter(RedactingFormatter(_FORMAT))
     root = logging.getLogger()
     # Replaces whatever a library installed, but keeps the file handlers this
     # module owns — the console is not always configured first.
@@ -134,7 +165,7 @@ def _configure_file(service: str) -> None:
             LOG_DIRECTORY_VARIABLE,
         )
         return
-    handler.setFormatter(logging.Formatter(_FORMAT))
+    handler.setFormatter(RedactingFormatter(_FORMAT))
     logging.getLogger().addHandler(handler)
     _file_handlers[service] = handler
     log.info(

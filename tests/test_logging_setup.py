@@ -2,7 +2,8 @@
 
 What is pinned here is the part an operator depends on after the fact: that a
 service's day ends up in a file of its own, that two services never share one,
-and that nothing about the file can stop the service from running.
+that nothing about the file can stop the service from running, and that a
+Telegram bot token never lands in either sink.
 """
 
 from __future__ import annotations
@@ -157,3 +158,38 @@ def test_the_file_carries_the_same_lines_as_the_console(tmp_path):
     assert "delivery paused" in body
     assert "not at INFO" not in body
     assert "WARNING" in body and "[qte_strategy_engine.runner]" in body
+
+
+FAKE_TOKEN = "123456789:AAFfakeTokenForTestsOnly_0123456789a"
+BOT_REQUEST = (
+    f"HTTP Request: POST https://api.telegram.org/bot{FAKE_TOKEN}/sendMessage "
+    '"HTTP/1.1 200 OK"'
+)
+
+
+@pytest.mark.parametrize("level", ["INFO", "DEBUG"])
+def test_a_bot_api_token_reaches_neither_the_console_nor_the_file(tmp_path, capsys, level):
+    # httpx logs every request's full URL, and the Bot API puts the token in
+    # the path. At INFO that is a default deployment; DEBUG must not be worse.
+    configure_logging(level=level, service="strategy-runner")
+    logging.getLogger("httpx").log(getattr(logging, level), BOT_REQUEST)
+
+    console = capsys.readouterr().err
+    body = (tmp_path / "logs" / stamped("strategy-runner")).read_text(encoding="utf-8")
+    for emitted in (console, body):
+        assert FAKE_TOKEN not in emitted
+        assert "/bot<redacted>/sendMessage" in emitted
+
+
+def test_a_token_quoted_by_a_traceback_is_redacted_too(tmp_path, capsys):
+    # A failed send raises with the request URL in it; the formatter renders
+    # that traceback, so it has to be covered by the same pass.
+    configure_logging(service="strategy-runner")
+    try:
+        raise RuntimeError(f"timed out: https://api.telegram.org/bot{FAKE_TOKEN}/sendMessage")
+    except RuntimeError:
+        get_logger("qte_shared.notifications.telegram_sink").exception("send failed")
+
+    body = (tmp_path / "logs" / stamped("strategy-runner")).read_text(encoding="utf-8")
+    assert FAKE_TOKEN not in body
+    assert FAKE_TOKEN not in capsys.readouterr().err
