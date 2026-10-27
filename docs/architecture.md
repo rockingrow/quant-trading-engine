@@ -134,7 +134,30 @@ Three things keep that rule from turning every unclean exit into an outage:
 
 - **A shutdown that is allowed to finish.** `strategy-runner` sets
   `stop_grace_period: 60s`. Docker's default kills ten seconds after SIGTERM,
-  before the runner has drained NATS and released the claim.
+  before the runner has drained NATS and released the claim. The targets that
+  take a stack down honour that, and none of them derives the project name it
+  acts on: the name differs between the base file and the production overlay,
+  so a derived one addressed the wrong stack — `make stop` silently stopped
+  nothing, and `make restart` was worse, because `up` creates, so it built a
+  second, dev-named half-stack beside the live one. They take the name from
+  `PROJECT=`, else `COMPOSE_PROJECT_NAME` (which outranks the files' own
+  `name:`, and is how `docs/simulator.md` has an operator run a second
+  rehearsal stack), and only otherwise ask the daemon for the one running
+  `qte-` project. `make stop` and `make down` then stop the runner first, on
+  its full grace period and while Redis and NATS still answer, before
+  bringing the rest of the project down. `make restart` has to build, so it
+  needs the compose files and not just the name; it reads back the ones
+  compose stamped on the project's containers, which both applies the right
+  overlay and lets `up --force-recreate` read `stop_grace_period` out of
+  them. With more than one stack up they refuse and ask for `PROJECT=<name>`
+  rather than guess which was meant, and `restart` refuses too when one
+  project holds containers from two different file sets — with `QTE_ENV=prod`
+  in `.env` the base file alone resolves to the same project name as the
+  overlay, and recreating the runner on the wrong set would drop `QTE_ENV`
+  back to dev against production's Redis namespace and volumes. `restart`
+  asks all of that in a pre-flight ahead of its own prerequisites, so a
+  recreate that cannot happen refuses in about a second rather than after the
+  two minutes `strategy-requirements` spends resolving every strategy repo.
 - **The same container takes its own claim back.** A container's PID namespace
   dies with its PID 1, so a runner that *is* PID 1 knows every earlier process
   of that container is gone. Its owner id carries a random token kept on the
