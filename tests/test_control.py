@@ -220,6 +220,7 @@ def wire_owner(monkeypatch, redis, bus):
 def test_the_parser_accepts_the_owner_commands():
     parser = control.build_parser()
     assert parser.parse_args(["owner", "status"]).operation == "status"
+    assert parser.parse_args(["owner", "check"]).operation == "check"
     assert parser.parse_args(["owner", "clear", "--yes"]).yes is True
     with pytest.raises(SystemExit):
         parser.parse_args(["owner", "delete"])
@@ -230,6 +231,58 @@ async def test_owner_status_names_the_key_and_its_holder(monkeypatch, capsys):
     await control._show_runner_owner()
     output = capsys.readouterr().out
     assert "qte:test:runner:owner" in output and "stale-owner" in output
+
+
+# ── owner check: what the deploy asks before it rebuilds the runner ─────
+
+
+async def test_the_check_passes_when_no_claim_is_held(monkeypatch):
+    wire_owner(monkeypatch, OwnedRedis(), PingBus())
+    assert await control._check_runner_owner() == 0
+
+
+async def test_the_check_passes_while_the_runner_that_owns_it_answers(monkeypatch):
+    # The normal state mid-deploy: the runner about to be replaced still owns
+    # the namespace it is handing over, and releases it on the way out.
+    redis = OwnedRedis("live-owner")
+    wire_owner(monkeypatch, redis, PingBus(runner_reply={"owner_id": "live-owner"}))
+    assert await control._check_runner_owner() == 0
+    assert redis.holder == "live-owner", "a read-only check must change nothing"
+
+
+async def test_the_check_reports_a_claim_no_runner_answers_for(monkeypatch, capsys):
+    redis = OwnedRedis("stale-owner")
+    wire_owner(monkeypatch, redis, PingBus())
+    assert await control._check_runner_owner() == 1
+    reported = capsys.readouterr().err
+    assert "stale-owner" in reported
+    assert "make owner-clear YES=1" in reported
+    assert redis.holder == "stale-owner", "the check must not clear anything itself"
+
+
+@pytest.mark.parametrize(
+    "bus", [PingBus(fail=True), PingBus(failure=ConnectionError("connection lost mid-request"))]
+)
+async def test_an_unverifiable_check_does_not_block_the_deploy(monkeypatch, capsys, bus):
+    # Refusing here would be circular: the deploy is what brings NATS back up.
+    wire_owner(monkeypatch, OwnedRedis("stale-owner"), bus)
+    assert await control._check_runner_owner() == 0
+    assert "not checked" in capsys.readouterr().out
+
+
+async def test_a_check_that_cannot_reach_redis_does_not_block_the_deploy(monkeypatch, capsys):
+    class UnreachableRedis(OwnedRedis):
+        async def connect(self):
+            raise ConnectionError("Redis is not up yet")
+
+    redis = UnreachableRedis("stale-owner")
+    wire_owner(monkeypatch, redis, PingBus())
+    assert await control._check_runner_owner() == 0
+    assert "not checked" in capsys.readouterr().out
+    assert redis.closed, "the check closed the client it opened"
+
+
+# ── owner clear ─────────────────────────────────────────────────────────
 
 
 async def test_clearing_without_a_claim_changes_nothing(monkeypatch, capsys):

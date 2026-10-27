@@ -150,14 +150,26 @@ Three things keep that rule from turning every unclean exit into an outage:
   its holder. `qte-control owner clear` refuses while any runner answers a ping
   or while NATS cannot be reached, asks for the namespace to be typed back, and
   deletes only the holder it displayed. A paused or hung runner does not answer
-  a ping, so the operator still has to know that none is left. Run it where the
-  namespace is the running stack's — in production `QTE_ENV=prod` comes from the
-  compose overlay, not from `.env`:
+  a ping, so the operator still has to know that none is left. `--yes` (or
+  `make owner-clear YES=1`) skips the typed namespace and nothing else — that
+  prompt needs a TTY, which a `make` run from a deploy script does not always
+  have, and without one the clear reads an empty line and aborts. Run it where
+  the namespace is the running stack's — in production `QTE_ENV=prod` comes from
+  the compose overlay, not from `.env`:
 
   ```bash
   docker compose -f docker-compose.yml -f docker-compose.prod.yml \
     run --rm --no-deps strategy-runner qte-control owner clear
   ```
+
+- **A deploy that says so before the build.** `make start-prod` runs
+  `qte-control owner check` first, which exits 1 when a claim is held that no
+  runner answers for. Without it the refusal arrives as a crash loop minutes
+  into the build, by which time the container that could explain it is gone. A
+  claim whose runner answers is the normal state mid-deploy and passes, and an
+  unreachable Redis or NATS reports nothing rather than blocking — the deploy is
+  what brings those back up. `SKIP_OWNER_CHECK=1` is for the incident where
+  ingestion has to be redeployed while the runner's claim is still stale.
 
 A refused start logs `Runner ownership is already held` with the namespace and
 the holder, and records an `ownership_refused` event at `ERROR`; the container
@@ -165,6 +177,15 @@ then restarts into the same refusal about once a minute. Alert on either — the
 log line, or `SELECT ... WHERE event = 'ownership_refused'` on the audit event
 table. `ownership_reclaimed` and `runner_owner_cleared` are recorded at
 `WARNING`.
+
+A shutdown releases the claim only when every resource closed cleanly: an
+uncertain cleanup keeps it, because a queued callback must not run alongside the
+next owner. That retention is deliberate but it used to be silent, which left
+the next refusal with nothing to explain it once the container and its log were
+gone. It now logs `Retaining the runner ownership claim` and records
+`ownership_retained` at `WARNING` with the owner id and namespace — so the
+reason for a stale claim is in the audit table rather than in a container that
+no longer exists.
 
 Ingestion keeps each retired candle, including its partial-bar repair state,
 until Redis acknowledges staging. It retries that batch before retiring more

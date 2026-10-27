@@ -2209,6 +2209,26 @@ class StrategyRunner:
             except Exception:
                 cleanup_failed = True
                 log.exception("Could not release runner ownership")
+        elif self._ownership_acquired:
+            # Retaining the claim is the decision above, but it was silent: the
+            # next start reports only that a claim is held, and by then this
+            # container — and the cleanup failure that explains it — is gone
+            # with its logs. Name it here, and record it where it outlives the
+            # container.
+            log.warning(
+                "Retaining the runner ownership claim because shutdown cleanup failed "
+                "owner_id=%s namespace=%s — the next container is refused until "
+                "`qte-control owner clear` removes it",
+                self._owner_id,
+                self._scope.namespace,
+            )
+            with contextlib.suppress(Exception):
+                await self.events.record_event(
+                    service=SERVICE_NAME,
+                    event="ownership_retained",
+                    level="WARNING",
+                    payload={"owner_id": self._owner_id, "namespace": self._scope.namespace},
+                )
         try:
             await self.state.close()
         except Exception:

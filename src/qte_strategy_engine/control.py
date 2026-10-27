@@ -26,6 +26,7 @@ import argparse
 import asyncio
 import json
 import sys
+from typing import NoReturn
 
 from nats.errors import NoRespondersError
 from nats.errors import TimeoutError as NatsTimeoutError
@@ -70,8 +71,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     owner.add_argument(
         "operation",
-        choices=["status", "clear"],
-        help="status = show who holds the claim; clear = remove a stale claim",
+        choices=["status", "check", "clear"],
+        help="status = show who holds the claim; check = exit 1 when a claim is held that "
+        "no runner answers for; clear = remove a stale claim",
     )
     owner.add_argument(
         "--yes",
@@ -183,18 +185,35 @@ async def _ping() -> None:
         await bus.close()
 
 
+class _Unverifiable(Exception):
+    """A dependency was unreachable, so nothing about a claim could be ruled out.
+
+    Raised rather than exited on, because what it means belongs to the caller:
+    clearing a claim has to refuse, while the deploy pre-flight has no stale
+    claim to report and must not block the deploy that brings the dependency
+    back up.
+    """
+
+
+def _die_unverifiable(unverifiable: _Unverifiable) -> NoReturn:
+    """Fail the way every other unreachable dependency here does."""
+    _die(f"{unverifiable} — nothing was changed.", unverifiable.__cause__ or unverifiable)
+
+
 async def _read_runner_owner(redis_state: RedisState) -> str | None:
     try:
         await redis_state.connect()
         return await redis_state.runner_owner()
     except Exception as exc:
-        _die(f"Could not reach Redis at {settings.redis.url} — nothing was changed.", exc)
+        raise _Unverifiable(f"Could not reach Redis at {settings.redis.url}") from exc
 
 
 async def _show_runner_owner() -> None:
     redis_state = RedisState()
     try:
         holder = await _read_runner_owner(redis_state)
+    except _Unverifiable as unverifiable:
+        _die_unverifiable(unverifiable)
     finally:
         await redis_state.close()
     print(f"State namespace: {settings.state_scope.namespace}")
@@ -212,11 +231,9 @@ async def _answering_runner() -> dict | None:
     try:
         await control_bus.connect()
     except Exception as exc:
-        _die(
-            f"Could not reach NATS at {settings.nats.url}, so no runner could be ruled out "
-            "— nothing was changed.",
-            exc,
-        )
+        raise _Unverifiable(
+            f"Could not reach NATS at {settings.nats.url}, so no runner could be ruled out"
+        ) from exc
     try:
         return await control_bus.request(
             Subjects().engine_control(), {"action": "ping"}, timeout=2.0
@@ -225,9 +242,50 @@ async def _answering_runner() -> dict | None:
         return None
     except Exception as exc:
         # Anything else is a broken request, not an absent runner.
-        _die("The runner ping failed, so no runner could be ruled out — nothing was changed.", exc)
+        raise _Unverifiable("The runner ping failed, so no runner could be ruled out") from exc
     finally:
         await control_bus.close()
+
+
+async def _check_runner_owner() -> int:
+    """Report a claim that no runner answers for, before a deploy rebuilds one.
+
+    A deploy that rebuilds the runner image recreates its container, and the
+    container instance token an automatic reclaim needs does not survive that.
+    So a claim an unclean exit left behind refuses every new container, and the
+    refusal surfaces as a crash loop minutes after the build began. Checking
+    first turns that into one message naming the remedy.
+
+    A claim whose runner answers is the normal state mid-deploy: the runner
+    about to be replaced still owns the namespace. An unreachable dependency
+    reports nothing and does not block — the deploy is what brings it back up.
+    """
+    namespace = settings.state_scope.namespace
+    redis_state = RedisState()
+    try:
+        holder = await _read_runner_owner(redis_state)
+    except _Unverifiable as unverifiable:
+        print(f"Runner ownership not checked: {unverifiable}")
+        return 0
+    finally:
+        await redis_state.close()
+    if holder is None:
+        return 0
+    try:
+        runner_reply = await _answering_runner()
+    except _Unverifiable as unverifiable:
+        print(f"Runner ownership not checked: {unverifiable}")
+        return 0
+    if runner_reply is not None:
+        return 0
+    print(
+        f"The runner ownership claim for {namespace} is held by {holder}, and no runner "
+        "answers for it.\nThe next strategy-runner container will be refused until it is "
+        "cleared. Confirm no runner process for this namespace is left on any host, then:\n"
+        "    make owner-clear YES=1",
+        file=sys.stderr,
+    )
+    return 1
 
 
 async def _clear_runner_owner(*, assume_yes: bool) -> None:
@@ -276,6 +334,8 @@ async def _clear_runner_owner(*, assume_yes: bool) -> None:
                 "The claim changed while this command ran — another runner took it. "
                 "Nothing was removed."
             )
+    except _Unverifiable as unverifiable:
+        _die_unverifiable(unverifiable)
     finally:
         await redis_state.close()
 
@@ -296,7 +356,7 @@ async def _show_status() -> int:
     return connectivity.exit_code(reports)
 
 
-def _die(message: str, exc: Exception) -> None:
+def _die(message: str, exc: BaseException) -> NoReturn:
     """Fail the way a CLI should: one line of what went wrong, no traceback.
 
     An operator reaching for the kill switch needs to know which dependency is
@@ -320,6 +380,8 @@ def main() -> None:
     if args.command == "owner":
         if args.operation == "status":
             asyncio.run(_show_runner_owner())
+        elif args.operation == "check":
+            raise SystemExit(asyncio.run(_check_runner_owner()))
         else:
             asyncio.run(_clear_runner_owner(assume_yes=args.yes))
         return

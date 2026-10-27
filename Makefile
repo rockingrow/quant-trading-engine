@@ -355,7 +355,7 @@ start: market-plan strategy-requirements log-directory ## Start app images; migr
 	@echo "Stack is up. Data-ingestion / strategy-runner block until db-migrate exits 0."
 	@echo "For the simulator and source mounts, use make dev."
 
-start-prod: market-plan strategy-requirements log-directory ## Build and start production services with QTE_ENV=prod
+start-prod: owner-preflight market-plan strategy-requirements log-directory ## Build and start production services with QTE_ENV=prod
 	docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build db-migrate data-ingestion strategy-runner $(TAILSCALE_SERVICES) $(TELEGRAM_BOT_SERVICES)
 
 # `--profile tailscale` whatever the switch says: a stack started with it on
@@ -581,8 +581,28 @@ ping: ## Ask the running runners to identify themselves
 owner-status: ## Show which runner holds the ownership claim for this namespace
 	uv run qte-control owner status
 
-owner-clear: ## Remove a stale runner claim after an unclean exit (refuses while a runner answers)
-	uv run qte-control owner clear
+owner-check: ## Report a claim no runner answers for; exit 1 when one is stale
+	uv run qte-control owner check
+
+# YES=1 skips the typed-namespace prompt and nothing else: the refusal while a
+# runner answers the ping, and the compare-and-delete against the holder it
+# printed, both still apply. It is here because that prompt needs a TTY, and a
+# `make` run from a deploy script or an agent terminal does not always have
+# one — without it the clear reads an empty line and aborts.
+owner-clear: ## Remove a stale runner claim after an unclean exit (YES=1 skips the prompt)
+	uv run qte-control owner clear $(if $(YES),--yes,)
+
+# A claim an unclean exit left behind refuses every new runner container, and
+# the refusal only shows up as a crash loop minutes after the build started —
+# by which time the container that could explain it is gone. Checked before the
+# build instead. SKIP_OWNER_CHECK=1 is for the incident where ingestion has to
+# be redeployed while the runner's claim is still stale.
+owner-preflight:
+	@if [ -n "$(SKIP_OWNER_CHECK)" ]; then \
+		echo "Runner ownership check skipped (SKIP_OWNER_CHECK is set)"; \
+	else \
+		uv run qte-control owner check; \
+	fi
 
 .PHONY: help install install-dev lock test lint format check tiingo mt5 binance simulator market-plan \
 	build build-prod log-directory up start stop down restart dev dev-restart logs logging logging-broker nuke tailscale-status \
@@ -590,4 +610,5 @@ owner-clear: ## Remove a stale runner claim after an unclean exit (refuses while
 	db-upgrade db-downgrade db-revision db-current db-history db-check \
 	download backtest chart reports csv-import costs \
 	sim sim-status sim-replay warmup warmup-cache sim-bar bar signal sim-walk sim-stop sim-reset sim-watch \
-	status shadow-status shadow-on shadow-off ping owner-status owner-clear
+	status shadow-status shadow-on shadow-off ping owner-status owner-check owner-clear \
+	owner-preflight
