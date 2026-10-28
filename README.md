@@ -613,6 +613,7 @@ the pair's own value in `config/strategies_mapping.toml`, falling back to
 ```bash
 QTE_ACCOUNT__CAPITAL=1000.0          # the account, and what a % of risk is a % of
 QTE_ACCOUNT__RISK_PERCENT=1.0        # fallback when a pair states none
+QTE_ACCOUNT__MAX_RISK_PERCENT=0.0    # ceiling on any one entry's risk_percent; 0 = none
 QTE_ACCOUNT__COMMISSION_PER_UNIT=0.0 # backtest cost, charged each side
 QTE_ACCOUNT__SPREAD=0.0              # full bid/ask distance, each side pays half
 QTE_ACCOUNT__SLIPPAGE=0.0            # on top of half the spread, each side
@@ -620,6 +621,11 @@ QTE_ACCOUNT__CONTRACT_SIZE=1.0
 QTE_ACCOUNT__COST_PROFILE=           # which profile in config/costs.toml prices a fill
 QTE_ACCOUNT__MAX_OPEN_POSITIONS=0    # account-wide position ceiling; 0 = uncapped
 ```
+
+A pair whose mapping sets `dynamic_risk = true` is sized at the `risk_percent`
+its strategy states on each entry instead, never above the pair's
+`max_risk_percent` (unset, the pair's own `risk_percent`) or the account
+ceiling — see `docs/broker-contract.md`, *Sizing*.
 
 Those three costs are the *last* layer: one spread for the whole engine is
 wrong as soon as a second symbol is replayed, so state them per symbol in

@@ -18,7 +18,11 @@ The factory owns four things a strategy is deliberately not allowed to:
   strategy that sized itself against a notional one would trade a book nobody
   configured. A strategy's own proposal survives as a *proportion*: the ratio
   between what QTE sent and what it asked for is remembered on the cycle, and
-  every close it emits is scaled by that ratio.
+  every close it emits is scaled by that ratio. The entry's ``risk_percent`` is
+  settled here too — the pair's own, or on a ``dynamic_risk`` pair the one the
+  strategy stated, within the ceiling — and written back onto the payload and
+  every close of the cycle, so the figure a worker reads is always the one the
+  quantity was sized at.
 * **Timeframe spelling.** QTE says ``M15``; the broker's contract says ``"15"``.
 
 **As many cycles per (strategy, symbol) as the strategy fires.** The factory
@@ -36,8 +40,10 @@ Redis and Postgres so a restart resumes the cycle instead of orphaning it.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from datetime import datetime
+from math import isclose
 from typing import Any
 
 from qte_shared.logging_setup import get_logger
@@ -138,14 +144,14 @@ class SignalFactory:
         # hands over the pair's whole params dict, and `warmup` in there gates
         # when this engine starts deciding — it says nothing about the trade, so
         # publishing it would widen the broker contract for no reader.
-        self.inputs = {
-            key: value for key, value in (inputs or {}).items() if key not in PORT_ONLY_PARAMS
-        }
+        self.inputs = _without_port_only(inputs or {})
         #: Risk sizing for this pair. Built from ``QTE_ACCOUNT__*`` and the
         #: pair's own params, so the mapping table's ``risk_percent`` is
-        #: honoured without every caller having to dig it out.
+        #: honoured without every caller having to dig it out. Read off the
+        #: unfiltered params: ``dynamic_risk`` and ``max_risk_percent`` are
+        #: port-only, kept off the payload but not off the sizer.
         self.sizer = sizer or PositionSizer.from_settings(
-            self.inputs, risk_percent=self.bracket.risk_percent
+            inputs, risk_percent=self.bracket.risk_percent
         )
         #: Size when sizing inputs are missing. Rejected sizes never fall back.
         #: ``None`` keeps the strategy proposal, subject to the account ceiling.
@@ -335,7 +341,7 @@ class SignalFactory:
             signal_uxid=uxid,
             position=intent.to_position_block(),
             indicators={**(indicators or {}), **intent.indicators},
-            inputs={**self.inputs, **intent.inputs},
+            inputs=_without_port_only({**self.inputs, **intent.inputs}),
             token=self.token,
         )
         signal.validate_shape()
@@ -352,16 +358,29 @@ class SignalFactory:
                 f"{intent.action.value} for {symbol} reuses open cycle id {intent.signal_uxid}"
             )
         self.bracket.apply(intent)
-        if intent.risk_percent is None:
-            intent.risk_percent = self.sizer.risk_percent
+        requested = intent.risk_percent
+        intent.risk_percent = self.sizer.risk_for(requested)
+        if requested is not None and not isclose(requested, intent.risk_percent):
+            # Capping a dynamic pair's request is the ceiling doing its job; a
+            # static pair overruling its strategy means the two disagree.
+            log.log(
+                logging.INFO if self.sizer.dynamic_risk else logging.WARNING,
+                "Entry for %s asked for risk_percent=%s; sized at %s (dynamic_risk=%s, ceiling=%s)",
+                symbol,
+                requested,
+                intent.risk_percent,
+                self.sizer.dynamic_risk,
+                self.sizer.max_risk_percent,
+            )
         self._size_entry(intent, symbol)
         return intent.signal_uxid or new_uxid()
 
     def _size_entry(self, intent: SignalIntent, symbol: str) -> None:
         """Replace the strategy's proposal with the account's own size.
 
-        The ratio between the two is stashed rather than written to the book
-        straight away: :meth:`build` may still reject this entry, and a scale
+        Sized at ``intent.risk_percent``, which :meth:`_prepare_entry` has
+        already settled. The ratio between the two sizes is stashed rather than
+        written to the book straight away: :meth:`build` may still reject this entry, and a scale
         left behind for a cycle that never opened would rescale the *next*
         one's closes. :meth:`commit` picks it up when the entry actually lands.
         """
@@ -372,7 +391,7 @@ class SignalFactory:
             # strategy-side guard into a live entry; leave it, and
             # `validate_shape()` rejects the payload as it always has.
             return
-        sized = self.sizer.size(intent.price, intent.sl)
+        sized = self.sizer.size(intent.price, intent.sl, risk_percent=intent.risk_percent)
         if sized is None:
             if proposed is None and self.default_quantity is not None:
                 intent.quantity = self.default_quantity
@@ -427,7 +446,14 @@ class SignalFactory:
         Everything here is filled only where the strategy said nothing — a
         strategy managing its own exit is describing the trade *now*, and now
         is the more recent truth.
+
+        ``risk_percent`` is the exception: the entry's was settled by the sizer,
+        not taken from the strategy, so what a strategy states on its close is
+        the risk it would ask for now rather than the one this cycle was sized
+        at, and the cycle's always wins when it is known.
         """
+        if position.risk_percent is not None:
+            intent.risk_percent = position.risk_percent
         for name in (
             "risk_percent",
             "tp1_percent",
@@ -486,6 +512,16 @@ def _still_running(intent: SignalIntent, position: OpenPosition) -> bool | None:
     if position.remaining is None or intent.quantity is None:
         return None
     return position.remaining - abs(intent.quantity) > QUANTITY_EPSILON
+
+
+def _without_port_only(inputs: Mapping[str, Any]) -> dict[str, Any]:
+    """*inputs* minus the keys that configure the port rather than the edge.
+
+    Applied to what the payload finally carries, not only to the pair's params:
+    a strategy that echoes its own params in ``intent.inputs`` would otherwise
+    hand the broker ``warmup`` or ``dynamic_risk`` through the back door.
+    """
+    return {key: value for key, value in inputs.items() if key not in PORT_ONLY_PARAMS}
 
 
 __all__ = ["BracketPolicy", "SignalFactory"]

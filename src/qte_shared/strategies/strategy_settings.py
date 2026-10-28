@@ -60,6 +60,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from qte_shared.logging_setup import get_logger
+from qte_shared.strategies.sizing import DYNAMIC_RISK_KEY, MAX_RISK_PERCENT_KEY
 
 log = get_logger(__name__)
 
@@ -375,9 +376,12 @@ WARMUP_PARAM = "warmup"
 #: Mapping-table keys the *engine* consumes. They configure the port rather than
 #: the edge, so :class:`~qte_shared.strategies.signal_factory.SignalFactory`
 #: keeps them out of a payload's ``inputs`` block — a worker has no use for the
-#: bar count a signal was gated behind, nor for a retired cycle cap, and the
-#: broker contract stays as ``docs/broker-contract.md`` documents it.
-PORT_ONLY_PARAMS = frozenset({WARMUP_PARAM}) | RETIRED_CYCLE_PARAMS
+#: bar count a signal was gated behind, nor for a retired cycle cap, nor for the
+#: switch and ceiling that decided the ``risk_percent`` the payload already
+#: states, and the broker contract stays as ``docs/broker-contract.md`` documents it.
+PORT_ONLY_PARAMS = (
+    frozenset({WARMUP_PARAM, DYNAMIC_RISK_KEY, MAX_RISK_PERCENT_KEY}) | RETIRED_CYCLE_PARAMS
+)
 
 
 def resolve_warmup(

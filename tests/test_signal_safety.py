@@ -53,6 +53,30 @@ def test_invalid_budgets_cannot_fall_back_to_a_strategy_quantity(risk_percent):
         )
 
 
+@pytest.mark.parametrize("requested_risk", [0, -1, float("nan"), float("inf")])
+@pytest.mark.parametrize("proposed", [None, 10.0])
+def test_a_dynamic_pair_rejects_an_unusable_stated_risk_without_fallback(requested_risk, proposed):
+    factory = SignalFactory(
+        "RISK_PROBE",
+        sizer=PositionSizer(capital=1000, risk_percent=1, dynamic_risk=True, max_risk_percent=5),
+        default_quantity=0.01,
+    )
+    with pytest.raises(ValueError, match="finite and positive"):
+        factory.build(
+            SignalIntent(
+                action=SignalAction.LONG,
+                price=2000,
+                sl=1990,
+                quantity=proposed,
+                risk_percent=requested_risk,
+            ),
+            symbol="XAUUSD",
+            moment=TEST_MOMENT,
+        )
+    assert factory.open_positions() == {}
+    assert factory.pending_delivery_context("XAUUSD") == {"scale": 1.0}
+
+
 @pytest.mark.parametrize(
     "configuration",
     [{"capital": -1}, {"contract_size": 0}, {"max_quantity": -1}, {"precision": -1}],
