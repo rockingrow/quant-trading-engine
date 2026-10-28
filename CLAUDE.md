@@ -21,6 +21,25 @@ other.
 - Reports and audits are deliverables, not chat output: write them to
   `data/reports/` and `data/audits/` per AUDIT.md rule 5.
 
+## Working in a worktree
+
+A worktree session (`.claude/worktrees/*`) has its own git-ignored `data/`, and
+it disappears with the worktree. Backtest output must not end up there.
+
+- Every backtest report — JSON, Markdown, HTML dashboard, chart assets — is
+  written under the **main checkout's**
+  `data\reports\YYYY-MM-DD-<topic>\`
+  (AUDIT.md rule 5 still applies: one session, one subfolder).
+- Pass that absolute path to the run (`qte-backtest run --report <DIR>`, or set
+  `QTE_ENGINE__REPORTS_DIR` when going through `make backtest`), so the process
+  writes there itself. A bare `--report` falls back to the worktree's own
+  `data/reports/`, which is the case to avoid. The
+  Write/Edit hook that refuses edits into the main checkout does not apply to
+  files a backtest process produces.
+- Never leave a report in the worktree's own `data/reports/`. If one was
+  produced there by mistake, move it to the main checkout before handing back.
+- Audits (`data/audits/`) are not covered by this rule.
+
 ## Where to slow down
 
 Use plan mode, and confirm the approach, before editing:
