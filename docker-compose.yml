@@ -90,7 +90,7 @@ x-app: &app
 
 services:
   redis-cache:
-    image: redis:7-alpine
+    image: redis:8-alpine
     restart: unless-stopped
     # AOF on: hot state (open cycles, the warm-up window) has to survive a
     # restart, and losing the cycle id of an open position means the engine

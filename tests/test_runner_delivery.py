@@ -10,6 +10,7 @@ table — because an empty cache is otherwise indistinguishable from being flat.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -612,9 +613,11 @@ class RecordingEvents:
 
     def __init__(self) -> None:
         self.recorded: list[str] = []
+        self.details: list[dict] = []
 
-    async def record_event(self, *, service, event, payload=None):
+    async def record_event(self, *, service, event, level="INFO", payload=None):
         self.recorded.append(event)
+        self.details.append({"event": event, "level": level, "payload": payload})
 
 
 class ClosingStub:
@@ -672,3 +675,64 @@ async def test_the_announcement_survives_a_chat_that_cannot_be_reached():
     await runner._close_resources(record_event=False)
 
     assert runner.sink.closed, "shutdown carried on past the failed announcement"
+
+
+class OwnedState(ClosingStub):
+    """State that records whether the shutdown released the ownership claim."""
+
+    def __init__(self, owner_id) -> None:
+        super().__init__()
+        self.owner_id = owner_id
+        self.released: list[str] = []
+
+    async def release_runner(self, owner_id):
+        self.released.append(owner_id)
+        self.owner_id = None
+        return True
+
+
+def _shutdown_runner(sink=None):
+    runner = _runner()
+    runner.state = OwnedState(runner._owner_id)
+    runner.events = RecordingEvents()
+    runner.status = RecordingStatus()
+    runner.bus = ClosingStub()
+    runner.sink = sink or ClosingStub()
+    runner.telegram = ClosingStub()
+    runner.telegram_errors = ClosingStub()
+    return runner
+
+
+async def test_a_clean_shutdown_releases_the_ownership_claim():
+    """The release is what lets the next container start without an operator."""
+    runner = _shutdown_runner()
+
+    await runner._close_resources(record_event=False)
+
+    assert runner.state.released == [runner._owner_id]
+    assert "ownership_retained" not in runner.events.recorded
+
+
+async def test_a_failed_cleanup_keeps_the_claim_and_records_why(caplog):
+    """Retaining the claim is deliberate; losing the reason with the container is not.
+
+    The next start reports only that a claim is held. Without this the operator
+    has nothing left to explain it: the container whose log carried the cleanup
+    failure is gone by the time the refusal shows up.
+    """
+
+    class FailingSink(ClosingStub):
+        async def stop(self, **keywords):
+            raise RuntimeError("the broker client would not close")
+
+    runner = _shutdown_runner(sink=FailingSink())
+
+    with caplog.at_level(logging.WARNING):
+        await runner._close_resources(record_event=False)
+
+    assert runner.state.released == [], "a failed cleanup must not release the claim"
+    retained = [entry for entry in runner.events.details if entry["event"] == "ownership_retained"]
+    assert retained, "the retained claim left no audit row"
+    assert retained[0]["level"] == "WARNING"
+    assert retained[0]["payload"]["owner_id"] == runner._owner_id
+    assert "qte-control owner clear" in caplog.text

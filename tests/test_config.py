@@ -10,9 +10,16 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy.engine import make_url
 
-from qte_shared.config import REPO_ROOT, PostgresSettings, _find_repo_root, settings
+from qte_shared.config import (
+    REPO_ROOT,
+    AccountSettings,
+    PostgresSettings,
+    _find_repo_root,
+    settings,
+)
 
 MARKER = '[project]\nname = "x"\n\n[tool.qte]\nrepo-root = true\n'
 
@@ -109,3 +116,17 @@ def test_test_process_does_not_inherit_operator_credentials_or_deployment_mode()
     assert settings.broker.shadow_mode is True
     assert settings.account.capital == 1000
     assert not any(plan.exists() for plan in settings.market_data.plan_files.values())
+
+
+def test_the_account_risk_ceiling_is_off_unless_the_environment_sets_it(monkeypatch):
+    monkeypatch.delenv("QTE_ACCOUNT__MAX_RISK_PERCENT", raising=False)
+    assert AccountSettings().max_risk_percent == 0.0
+    monkeypatch.setenv("QTE_ACCOUNT__MAX_RISK_PERCENT", "4.5")
+    assert AccountSettings().max_risk_percent == pytest.approx(4.5)
+
+
+@pytest.mark.parametrize("unusable", ["-1", "nan", "inf"])
+def test_an_unusable_account_risk_ceiling_is_refused(monkeypatch, unusable):
+    monkeypatch.setenv("QTE_ACCOUNT__MAX_RISK_PERCENT", unusable)
+    with pytest.raises(ValidationError):
+        AccountSettings()

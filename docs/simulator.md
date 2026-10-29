@@ -164,7 +164,11 @@ make strategy-mount
 The example demonstrates EMA crossover entries with ATR brackets, not a
 strategy to trade. `strategy-mount` writes `__strategies__/strategies.toml`,
 required before building even with no private repo. A fresh checkout also
-contains the inert `_boilerplate` repo; mounting it is harmless.
+contains the inert `_boilerplate` repo; mounting it is harmless, and the loader
+skips it anyway — it is listed in `SKIPPED_REPOSITORIES` in
+`src/qte_shared/strategies/plugin_loader.py`, together with
+`qte-signal-simulator`. Comment a name out there if you want that bundle
+loaded.
 
 Create `config/strategies_mapping.toml` with this **complete** content:
 
@@ -178,8 +182,11 @@ make strategies
 make audit
 ```
 
-Expect `QTE_EXAMPLE_EMA_ATR` to load and **zero audit errors**. A warning that
-`QTE_BOILERPLATE_M15` is mapped to no symbol is expected.
+Expect `QTE_EXAMPLE_EMA_ATR` to load and **zero audit errors**.
+`QTE_BOILERPLATE_M15` is not reported at all: its bundle is skipped, so it is
+neither loaded nor audited. Uncomment it in `SKIPPED_REPOSITORIES` and the
+audit warns that it is mapped to no symbol — which
+`QTE_RUNNER__AUDIT_ON_START=strict` would refuse to start on.
 
 Do not use `make strategy-mapping` unchanged here: its general template names
 unrelated placeholders on several symbols. Editing only XAUUSD still leaves

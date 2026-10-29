@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from qte_shared.config import settings
 from qte_shared.models import SignalAction, is_valid_uxid
 from qte_shared.strategies.signal_factory import BracketPolicy, SignalFactory
 from qte_shared.strategies.sizing import PositionSizer
@@ -290,6 +291,154 @@ def test_use_equity_sizing_does_not_change_the_size():
         for state in (True, False)
     }
     assert sized[True] == sized[False] == pytest.approx(6.0)
+
+
+# ── Risk per entry on a dynamic_risk pair ────────────────────────────────
+#
+# The payload's risk_percent is always the one the quantity was sized at: the
+# pair's own on a static pair, the strategy's — within the ceiling — on a
+# dynamic one. A worker that sizes from risk_percent then lands where QTE did.
+
+
+def _dynamic(max_risk_percent: float = 5.0) -> SignalFactory:
+    return SignalFactory(
+        "MT5_GOLD_SCALP",
+        timeframe="M5",
+        token="",
+        sizer=PositionSizer(
+            capital=1000.0,
+            risk_percent=3.0,
+            dynamic_risk=True,
+            max_risk_percent=max_risk_percent,
+        ),
+    )
+
+
+def test_a_dynamic_pair_sizes_the_entry_at_the_risk_its_strategy_states():
+    signal = _dynamic().build(
+        SignalIntent(action=SignalAction.LONG, price=2334.50, sl=2329.50, risk_percent=2.0),
+        symbol="XAUUSD",
+        moment=NOW,
+    )
+    assert signal.position.quantity == pytest.approx(4.0)
+    assert signal.position.risk_percent == pytest.approx(2.0)
+
+
+def test_a_dynamic_pair_caps_the_request_and_says_so_on_the_payload():
+    signal = _dynamic(max_risk_percent=5.0).build(
+        SignalIntent(action=SignalAction.LONG, price=2334.50, sl=2329.50, risk_percent=9.0),
+        symbol="XAUUSD",
+        moment=NOW,
+    )
+    assert signal.position.quantity == pytest.approx(10.0)
+    assert signal.position.risk_percent == pytest.approx(5.0)
+
+
+def test_a_dynamic_entry_stating_no_risk_is_sized_at_the_base():
+    signal = _dynamic().build(
+        SignalIntent(action=SignalAction.LONG, price=2334.50, sl=2329.50),
+        symbol="XAUUSD",
+        moment=NOW,
+    )
+    assert signal.position.quantity == pytest.approx(6.0)
+    assert signal.position.risk_percent == pytest.approx(3.0)
+
+
+def test_a_static_pair_states_the_risk_it_sized_at_not_the_one_asked_for():
+    # Before, the payload carried 5 while the quantity was sized at 3, and a
+    # worker sizing from risk_percent would have opened the bigger position.
+    signal = _priced().build(
+        SignalIntent(action=SignalAction.LONG, price=2334.50, sl=2329.50, risk_percent=5.0),
+        symbol="XAUUSD",
+        moment=NOW,
+    )
+    assert signal.position.quantity == pytest.approx(6.0)
+    assert signal.position.risk_percent == pytest.approx(3.0)
+
+
+def test_a_close_on_a_dynamic_pair_restates_the_risk_the_cycle_was_sized_at():
+    factory = _dynamic()
+    _open(factory, quantity=2.0, risk_percent=2.0)
+    close_signal = factory.build(
+        SignalIntent(action=SignalAction.SL, price=2329.50, quantity=2.0, risk_percent=3.0),
+        symbol="XAUUSD",
+        moment=NOW,
+    )
+    assert close_signal.position.risk_percent == pytest.approx(2.0)
+    assert close_signal.position.quantity == pytest.approx(4.0)
+
+
+def test_a_close_on_a_static_pair_restates_the_risk_the_cycle_was_sized_at():
+    # The entry asked for 5 and was sized at the pair's 3; a close still stating
+    # 5 would tell a re-syncing worker about a trade that was never opened.
+    factory = _priced()
+    _open(factory, quantity=3.0, risk_percent=5.0)
+    close_signal = factory.build(
+        SignalIntent(action=SignalAction.SL, price=2329.50, quantity=3.0, risk_percent=5.0),
+        symbol="XAUUSD",
+        moment=NOW,
+    )
+    assert close_signal.position.risk_percent == pytest.approx(3.0)
+
+
+@pytest.mark.parametrize("dynamic_risk", [False, True])
+@pytest.mark.parametrize("unusable", ["2", float("nan"), float("inf"), True])
+def test_a_stated_risk_that_is_not_a_finite_number_is_dropped_not_sized(dynamic_risk, unusable):
+    # ValueError is what both drivers drop an intent on; anything else would
+    # abort a replay or escape the runner's candle handler.
+    factory = SignalFactory(
+        "S",
+        timeframe="M5",
+        token="",
+        sizer=PositionSizer(
+            capital=1000.0,
+            risk_percent=3.0,
+            dynamic_risk=dynamic_risk,
+            max_risk_percent=5.0 if dynamic_risk else None,
+        ),
+    )
+    with pytest.raises(ValueError, match="risk_percent must be"):
+        factory.build(
+            SignalIntent(
+                action=SignalAction.LONG, price=2334.50, sl=2329.50, risk_percent=unusable
+            ),
+            symbol="XAUUSD",
+            moment=NOW,
+        )
+    assert factory.open_positions() == {}
+
+
+def test_port_only_keys_a_strategy_echoes_in_its_own_inputs_stay_off_the_payload():
+    # A strategy that reports its whole params dict hands the factory the pair's
+    # warmup, dynamic_risk and max_risk_percent back through intent.inputs.
+    echoed = {"atr_len": 14, "warmup": 120, "dynamic_risk": True, "max_risk_percent": 5.0}
+    signal = _dynamic().build(
+        SignalIntent(
+            action=SignalAction.LONG, price=2334.50, sl=2329.50, risk_percent=2.0, inputs=echoed
+        ),
+        symbol="XAUUSD",
+        moment=NOW,
+    )
+    assert signal.inputs == {"atr_len": 14}
+
+
+def test_the_switch_and_ceiling_size_the_pair_but_stay_off_the_payload(monkeypatch):
+    monkeypatch.setattr(settings.account, "max_risk_percent", 0.0)
+    factory = SignalFactory(
+        "S",
+        timeframe="M5",
+        token="",
+        inputs={"risk_percent": 3.0, "dynamic_risk": True, "max_risk_percent": 5.0},
+    )
+    assert factory.sizer.dynamic_risk is True
+    assert factory.sizer.max_risk_percent == pytest.approx(5.0)
+    signal = factory.build(
+        SignalIntent(action=SignalAction.LONG, price=2334.50, sl=2329.50, risk_percent=4.0),
+        symbol="XAUUSD",
+        moment=NOW,
+    )
+    assert signal.position.risk_percent == pytest.approx(4.0)
+    assert signal.inputs == {"risk_percent": 3.0}
 
 
 # ── Closes are expressed in the size QTE actually holds ──────────────────

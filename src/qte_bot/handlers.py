@@ -81,6 +81,14 @@ async def show_runner(message: Message, engine: EngineClient) -> None:
     await message.answer(presenters.runner_status(status))
 
 
+@router.message(Command("strategies"))
+async def show_strategies(message: Message, engine: EngineClient) -> None:
+    repositories = await engine.mounted_repositories()
+    # Several messages when the mount is large; each is a complete set of boxes.
+    for body in presenters.strategy_bundles(repositories, engine.namespace):
+        await message.answer(body)
+
+
 @router.message(Command("positions"))
 async def show_positions(message: Message, engine: EngineClient) -> None:
     positions = await engine.open_positions()

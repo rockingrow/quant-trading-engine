@@ -21,16 +21,23 @@ Digest, binding on every change. AUDIT.md holds the rationale, the exception
 table and the check commands; read it before you commit or open a PR.
 
 1. **Commits**: only when the user asks. English, imperative, 72-char subject
-   at most. **No AI attribution of any kind** — no `Generated with Claude
-   Code`, no `Co-Authored-By: Claude`, no ChatGPT/Codex footer, no session link.
+   at most. **No AI attribution of any kind**, in a commit message or in a PR
+   title or body — no `Generated with Claude Code`, no `🤖`, no
+   `Co-Authored-By: Claude`, no ChatGPT/Codex footer, no session link.
 2. **English** for comments, docstrings, identifiers, log and exception strings,
    and every committed Markdown file.
 3. **Names**: explicit and **at least 6 characters** (`candles` not `df`,
    `bar_count` not `n`). Exceptions only for `self`/`cls`/`_`, names fixed by an
    external contract (`tp1`, `sl`, OHLC columns) and whole-word market terms
    (`bid`, `atr`). Do not rename legacy variables the task does not touch.
-4. **Pull requests always target `dev`** — `gh pr create --base dev`. Never
-   `master`. Opening the PR is the user's call.
+4. **Never commit onto `dev`, `stage`, `prod` or `master`.** Every
+   implementation — code, tests, docs, config, even a one-line fix — goes on its
+   own branch cut from `dev` and named `<prefix>/<kebab-case-topic>`:
+   `feature/` new behaviour, `hotfix/` a fix for something broken, `chore/`
+   tooling, config, docs and these rules, `audit/` changes from an audit or a
+   study. The four long-lived branches change only by a merged PR. **Pull
+   requests always target `dev`** — `gh pr create --base dev`. Never `master`.
+   Opening the PR is the user's call.
 5. **Artefacts**: backtest output to `data/reports/`, audits to `data/audits/`
    (`YYYY-MM-DD-<topic>.md`) — both git-ignored and local-only, never pushed to
    GitHub. Never into `docs/` or the repository root. **One session, one
@@ -41,6 +48,12 @@ table and the check commands; read it before you commit or open a PR.
    of `--report` and `make backtest`; never narrow `--report-format` to drop
    `html`, and write it into the session subfolder of rule 5. Research scripts pass `formats=("json", "md", "html")`, and a JSON
    without its page gets one from `make chart REPORT=<file>.json`.
+7. **Changelog before the PR**: every PR updates `changelog.md` on its own
+   branch before it is opened. The entry goes under `## [Unreleased]`, below the
+   Keep a Changelog heading that fits it (`### Added`, `### Changed`,
+   `### Removed`, `### Fixed`, `### Security`), newest first. No `[Unreleased]`
+   section yet: create it above the newest release; never rename it to a
+   version. English, and no private strategy logic, defaults or results.
 
 ## Working approach
 
@@ -52,12 +65,6 @@ table and the check commands; read it before you commit or open a PR.
   existing architecture.
 - Do not add or upgrade production dependencies unless the task requires it;
   say why when you do.
-- **Record a user-visible change in [changelog.md](changelog.md)** before the
-  branch is proposed for a PR — behaviour, a new `QTE_*` variable, a new
-  command, a fixed bug. Keep a Changelog format, newest first, under
-  `## [Unreleased]` until a release names it. Say *why* it changed and what it
-  cost, as the existing entries do; a one-line "fixed Redis timeout" is not an
-  entry. Internal refactors, test-only changes and docs edits need none.
 - Never expose, commit or copy secrets from `.env`, credentials, tokens, or
   private strategy data.
 
@@ -95,8 +102,9 @@ package; never scan from the repository root.
 | --- | --- |
 | Wire models, enums, candles, ticks, `SignalIntent` | `src/qte_shared/models.py` |
 | Strategy contract and its seven methods | `src/qte_shared/strategies/strategy_base.py` |
-| Strategy discovery and manifests | `src/qte_shared/strategies/plugin_loader.py` |
+| Strategy discovery and manifests: the `load_all` / `load_settings` / `load_disabled` hooks, `SKIPPED_REPOSITORIES` | `src/qte_shared/strategies/plugin_loader.py` |
 | What `make strategy-mount` recorded, per strategy | `src/qte_shared/strategies/mount_manifest.py`, `__strategies__/strategies.toml` |
+| The build stamp each strategy folder carries at its root (written by that repo's build, read by `/strategies`; examples in the two templates) | `__strategies__/<folder>/BUNDLE_VERSION.json`, README "Which build is deployed" |
 | Per-strategy settings a repo declares; the weekend flat; the mapping's `warmup` override | `src/qte_shared/strategies/strategy_settings.py`, each repo's `settings.py` |
 | Intent to broker payload | `src/qte_shared/strategies/signal_factory.py` |
 | Position sizing and account risk | `src/qte_shared/strategies/sizing.py` |
@@ -116,7 +124,8 @@ package; never scan from the repository root.
 | Live feed, resampling, Redis and NATS | `src/qte_ingestion/{service,resampler}.py` |
 | Live loop, broker delivery, control CLI | `src/qte_strategy_engine/{runner,broker_sink,preflight,control}.py` |
 | `make status` / `qte-control status`: read-only probes of Redis, Postgres, NATS, runner, ingestion, MT5 ingester, broker | `src/qte_strategy_engine/connectivity.py`, `tests/test_connectivity.py` |
-| Operator's Telegram bot: the nine commands, tables, paging | `src/qte_bot/`, `QTE_BOT__*` |
+| Operator's Telegram bot: the ten commands, tables, paging | `src/qte_bot/`, `QTE_BOT__*` |
+| `/strategies`: the mount scanned on disk, each folder's `BUNDLE_VERSION.json` and published strategies, one box per folder | `src/qte_bot/mounts.py`, `presenters.strategy_bundles`, `tests/test_bot_strategies.py` |
 | Control plane the bot and `qte-control` both call (NATS request/reply) | `_on_control_message` in `src/qte_strategy_engine/runner.py` and `src/qte_ingestion/service.py`, `Subjects.{engine,ingestion}_control` |
 | Pausing decisions per symbol/strategy (`/prevent`, `/allow`) | `src/qte_shared/bar_gate.py` |
 | Telegram position-lifecycle message: one per cycle, edited in place | `src/qte_strategy_engine/telegram_notify.py` |

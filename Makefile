@@ -114,9 +114,16 @@ check: lint test ## Lint and test — what CI runs
 # file that must exist before `make up`/`make start` will run, even if it lists
 # nothing. `qte-strategy-mount --show` prints what it holds.
 #
-# strategy-requirements freezes the repos that still have a passing strategy,
-# and the engine's loader skips the strategies that failed: one whose deps
-# never reached the image must not be imported and traded inside it.
+# strategy-requirements resolves the repos that still have a passing strategy
+# *together*, and the engine's loader skips the strategies that failed: one
+# whose deps never reached the image must not be imported and traded inside it.
+# Each repo's own lockfile is deliberately not concatenated: they are locked
+# independently, so a Dependabot bump of pandas in one leaves the others on the
+# old pin and the image build fails on `pandas==a` against `pandas==b`. Instead
+# the repos' declared dependencies are compiled in one pass, constrained by the
+# engine's own uv.lock, so a package the engine already ships keeps the
+# engine's version and the rest follow it. The image is Linux on 3.13, so that is
+# the one platform resolved, whatever host runs the make.
 #
 # Audit runs *after* install, not before: the commonest audit failure is a
 # missing third-party import, which is exactly what installing fixes, so
@@ -182,16 +189,25 @@ strategy-requirements: ## Freeze deps for one (STRATEGY=<name>) or every mounted
 		: > deploy/strategy-requirements.txt; \
 		exit 0; \
 	fi; \
-	tmp=$$(mktemp); \
+	manifests=""; \
 	for name in $$names; do \
 		repo="$(STRATEGIES_DIR)/$$name"; \
 		if [ -f "$$repo/pyproject.toml" ]; then \
-			uv export --project "$$repo" --no-dev --no-emit-project \
-				--format requirements-txt >> "$$tmp"; \
+			manifests="$$manifests $$repo/pyproject.toml"; \
 		else \
 			echo "No strategy repo at $$repo - skipping"; \
 		fi; \
 	done; \
+	if [ -z "$$manifests" ]; then \
+		: > deploy/strategy-requirements.txt; \
+		exit 0; \
+	fi; \
+	tmp=$$(mktemp); pins=$$(mktemp); \
+	uv export --frozen --no-dev --all-extras --no-emit-project --no-hashes \
+		--format requirements-txt > "$$pins"; \
+	uv pip compile $$manifests -c "$$pins" --python-platform linux --python-version 3.13 \
+		--no-header --quiet -o "$$tmp"; \
+	rm -f "$$pins"; \
 	mv "$$tmp" deploy/strategy-requirements.txt; \
 	echo "Wrote deploy/strategy-requirements.txt from: $$names"
 
@@ -304,27 +320,223 @@ build: strategy-requirements ## Rebuild every service image, in every profile
 build-prod: strategy-requirements ## Rebuild every production service image (no dev simulator)
 	docker compose build db-migrate data-ingestion strategy-runner telegram-bot
 
-up: market-plan strategy-requirements ## Start the application stack without the dev simulator
+# Every image runs as uid 10001 (`USER qte`), and the Dockerfile chowns /app to
+# it at build time — but a bind mount replaces that directory with the host's,
+# which carries the host's ownership. `logs/` is tracked, so a fresh clone
+# belongs to whoever cloned the repo, never to 10001: the container cannot
+# create its daily file, `logging_setup` drops the file sink with one warning
+# and the stack trades on with console logs only, leaving `logs/` empty. Docker
+# Desktop hides it (its mounts ignore ownership), so this only ever bites on a
+# Linux host — which is where the logs are actually needed, `docker logs` being
+# all a recreated container leaves behind.
+#
+# Ownership goes to 10001 with the host user's group kept writable, so reading
+# and `git pull` still work on the host. The chown runs in a throwaway root
+# container to spare the operator a sudo, and only where ownership is enforced.
+# Never fatal: a stack that cannot fix its log directory still has to start.
+CONTAINER_UID := 10001
+
+log-directory: ## Let the containers' uid write the bind-mounted logs/ directory
+	@[ "$$(uname -s)" = "Linux" ] || exit 0; \
+	mkdir -p logs; \
+	[ "$$(stat -c %u logs)" = "$(CONTAINER_UID)" ] && exit 0; \
+	if docker run --rm -v "$(CURDIR)/logs:/mount" alpine:3 \
+		sh -c "chown -R $(CONTAINER_UID):$$(id -g) /mount && chmod -R g+rwX /mount" >/dev/null 2>&1; then \
+		echo "logs/ is now writable by uid $(CONTAINER_UID) (the containers' user)"; \
+	else \
+		echo "Could not give uid $(CONTAINER_UID) write access to logs/ - the services will log to the console only" >&2; \
+	fi
+
+up: market-plan strategy-requirements log-directory ## Start the application stack without the dev simulator
 	docker compose $(COMPOSE_PROFILE) up -d --build
 
-start: market-plan strategy-requirements ## Start app images; migration completes before apps boot
+start: market-plan strategy-requirements log-directory ## Start app images; migration completes before apps boot
 	docker compose $(COMPOSE_PROFILE) up -d --build
 	@echo "Stack is up. Data-ingestion / strategy-runner block until db-migrate exits 0."
 	@echo "For the simulator and source mounts, use make dev."
 
-start-prod: market-plan strategy-requirements ## Build and start production services with QTE_ENV=prod
+start-prod: owner-preflight market-plan strategy-requirements log-directory ## Build and start production services with QTE_ENV=prod
 	docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build db-migrate data-ingestion strategy-runner $(TAILSCALE_SERVICES) $(TELEGRAM_BOT_SERVICES)
 
-# `--profile tailscale` whatever the switch says: a stack started with it on
-# and stopped after it was turned off still has its tailnet containers.
-stop: ## Stop the stack (volumes survive) — alias of `down`
-	docker compose --profile tailscale down
+# ── Acting on the stack that is actually running ────────────────────────
+#
+# Every stack this repository starts is one compose project named
+# qte-<env>-<mode>-<provider>, but which name is live depends on the overlay
+# that started it: docker-compose.yml resolves QTE_ENV from the environment and
+# defaults it to dev, while docker-compose.prod.yml hardcodes qte-prod-.
+# `start-prod` passes that overlay and `down` and `restart` did not, so on a
+# production host `make stop` addressed a project that had never existed and
+# left the live stack running, and `make restart` was worse: `up` creates, so
+# it built a second, dev-named half-stack beside the real one. Nothing here
+# derives the name from the variables that disagree; ask the daemon which
+# project is actually up.
+#
+# Addressing a project by name also makes `--profile tailscale` unnecessary:
+# `down` then removes every container carrying the project label, whichever
+# profile started it.
+#
+# Discovery by the `qte-` prefix is a fallback, not the rule: COMPOSE_PROJECT_NAME
+# outranks the compose files' own `name:`, and docs/simulator.md tells an
+# operator to set it in `.env` to run a second, independent rehearsal stack. A
+# stack renamed that way is not called `qte-` anything, so it has to be read
+# rather than guessed — the same way the other `.env` switches here are read,
+# with the environment winning over the file as it does for compose itself.
+COMPOSE_PROJECTS = docker compose ls --all --quiet 2>/dev/null
+ENV_COMPOSE_PROJECT_NAME := $(shell sed -n 's/^COMPOSE_PROJECT_NAME=//p' .env 2>/dev/null | tail -n1 | sed 's/[[:space:]]*\#.*//' | tr -d '\r"' | tr -d "' ")
+TARGET_PROJECT := $(or $(PROJECT),$(COMPOSE_PROJECT_NAME),$(ENV_COMPOSE_PROJECT_NAME))
 
-down: ## Stop the stack (volumes survive)
-	docker compose --profile tailscale down
+# Shared by `down` and `restart`: leaves the chosen name in $$project, empty
+# when nothing is running at all. It refuses rather than guessing when the
+# choice is ambiguous or a requested project is not there, but it never exits
+# on "nothing running" — `down` has nothing left to do and `restart` has to
+# fail, and that difference is the caller's to make, not this snippet's.
+define resolve_qte_project
+	projects="$$($(COMPOSE_PROJECTS) || true)"; \
+	project=""; \
+	if [ -n "$(TARGET_PROJECT)" ]; then \
+		if ! printf '%s\n' "$$projects" | grep -qxF "$(TARGET_PROJECT)"; then \
+			echo "No running compose project named $(TARGET_PROJECT). Running now:" >&2; \
+			printf '%s\n' "$$projects" | sed '/^$$/d; s/^/  /' >&2; \
+			exit 1; \
+		fi; \
+		project="$(TARGET_PROJECT)"; \
+	else \
+		candidates=$$(printf '%s\n' "$$projects" | grep '^qte-' || true); \
+		if [ "$$(printf '%s\n' "$$candidates" | sed '/^$$/d' | wc -l)" -gt 1 ]; then \
+			echo "More than one qte- stack is running - name the one to act on with PROJECT=<name>:" >&2; \
+			printf '  %s\n' $$candidates >&2; \
+			exit 1; \
+		fi; \
+		project="$$candidates"; \
+	fi;
+endef
 
-restart: market-plan strategy-requirements ## Recreate ingestion and runner, preserving the simulator clock
-	docker compose up -d --build --no-deps --force-recreate data-ingestion strategy-runner
+# `docker stop` sends SIGKILL ten seconds after SIGTERM, and a `down` addressed
+# by project name alone cannot read stop_grace_period out of the compose file.
+# Keep this in step with strategy-runner's stop_grace_period in
+# docker-compose.yml: killed before it has drained NATS and released its Redis
+# ownership claim, the runner strands the claim and the next deploy is refused
+# until an operator clears it.
+RUNNER_STOP_TIMEOUT := 60
+
+stop: down ## Stop the running stack, dev or prod (volumes survive) — alias of `down`
+
+# Sequential on purpose. The runner goes first, on its full grace period and
+# while Redis and NATS still answer, so it can release its ownership claim;
+# only then does the rest of the project come down. `down` on its own stops
+# services in reverse dependency order, but on the default ten-second timeout.
+#
+# A failed release stops the teardown instead of being overrun by it: `down`
+# would SIGKILL the runner ten seconds in and strand the claim, and because
+# this is one shell whose status is its last command, make would report that
+# as a clean stop. Leaving the stack up is the recoverable half of that
+# choice. The one-off containers `docker compose run` leaves behind carry the
+# same service label, so they are excluded — stopping one releases nothing,
+# and two ids here used to be passed to `docker stop` as a single argument,
+# which failed outright.
+down: ## Stop the running stack, dev or prod (volumes survive)
+	@$(resolve_qte_project) \
+	if [ -z "$$project" ]; then \
+		echo "No compose project is running - nothing to stop"; \
+		exit 0; \
+	fi; \
+	echo "Stopping $$project"; \
+	runner_ids=$$(docker ps --quiet \
+		--filter "label=com.docker.compose.project=$$project" \
+		--filter "label=com.docker.compose.service=strategy-runner" \
+		--filter "label=com.docker.compose.oneoff=False"); \
+	if [ -n "$$runner_ids" ]; then \
+		echo "  strategy-runner first, up to $(RUNNER_STOP_TIMEOUT)s, so it releases its ownership claim"; \
+		for runner_id in $$runner_ids; do \
+			if ! docker stop --timeout $(RUNNER_STOP_TIMEOUT) "$$runner_id" >/dev/null; then \
+				echo "Could not stop strategy-runner $$runner_id in $$project - $$project is still up" >&2; \
+				echo "Taking the rest down now would SIGKILL it and strand its ownership claim." >&2; \
+				echo "Stop that container by hand, then run make down again." >&2; \
+				exit 1; \
+			fi; \
+		done; \
+	fi; \
+	docker compose -p "$$project" down
+
+# What `restart` needs on top of a project name, in the two snippets below, so
+# that its pre-flight and its recipe decide from the same rules. A recipe is
+# its own shell, so the pre-flight cannot hand anything over; it re-reads, and
+# two docker calls are a second against the two minutes it saves.
+define require_running_project
+	if [ -z "$$project" ]; then \
+		echo "No compose project is running - bring one up with 'make start' or 'make start-prod'" >&2; \
+		exit 1; \
+	fi;
+endef
+
+# Leaves the project's compose file set in the positional parameters, ready to
+# pass straight to `docker compose`. Recreating needs those files and not just
+# the name, because it builds; reading them back is also what restores the
+# grace period, since `up --force-recreate` reads stop_grace_period out of
+# them and the runner gets its 60s to release the ownership claim with no
+# pre-stop step.
+#
+# Every container of the project is asked, not one of them: with QTE_ENV=prod
+# in `.env` the base file alone resolves to the same project name as the
+# production overlay, so one project can hold containers started from two
+# different file sets. Picking either would recreate the runner on the wrong
+# one — dropping the overlay means QTE_ENV falls back to dev against
+# production's Redis namespace and volumes — so a project that disagrees with
+# itself is refused and sent back through `start`/`start-prod`.
+#
+# One-off containers are left out of that vote. `docker compose run` is how
+# docs/architecture.md has an operator clear a stale claim, and one that was
+# not given `--rm` keeps whichever files that single command named — usually
+# not the set the stack runs on. Counting it made `restart` refuse a stack
+# whose real containers all agreed, and tell the operator to take production
+# down over a leftover.
+define resolve_compose_files
+	config_files=$$(docker ps --all \
+		--filter "label=com.docker.compose.project=$$project" \
+		--filter "label=com.docker.compose.oneoff=False" \
+		--format '{{.Label "com.docker.compose.project.config_files"}}' \
+		| sed '/^$$/d' | sort -u); \
+	if [ -z "$$config_files" ]; then \
+		echo "Could not read the compose files that started $$project - bring it up with 'make start' or 'make start-prod' instead" >&2; \
+		exit 1; \
+	fi; \
+	if [ "$$(printf '%s\n' "$$config_files" | wc -l)" -gt 1 ]; then \
+		echo "$$project holds containers started from more than one set of compose files, so which overlay to recreate on is ambiguous:" >&2; \
+		printf '%s\n' "$$config_files" | sed 's/^/  /' >&2; \
+		echo "Bring the whole stack up again with 'make start' or 'make start-prod'." >&2; \
+		exit 1; \
+	fi; \
+	set --; \
+	saved_ifs=$$IFS; IFS=,; \
+	for config_file in $$config_files; do \
+		if [ ! -f "$$config_file" ]; then \
+			IFS=$$saved_ifs; \
+			echo "Compose file $$config_file is no longer there - bring the stack up with 'make start' or 'make start-prod'" >&2; \
+			exit 1; \
+		fi; \
+		set -- "$$@" -f "$$config_file"; \
+	done; \
+	IFS=$$saved_ifs;
+endef
+
+# Every refusal `restart` can reach, asked first and silent when it passes.
+# Make runs prerequisites left to right, so this settles in about a second
+# whether the recreate can happen at all, instead of letting
+# strategy-requirements spend two minutes resolving every strategy repo for a
+# restart that then refuses. It carries no `##` line, so `make help` leaves it
+# out: it is a guard, not a target an operator runs.
+restart-preflight:
+	@$(resolve_qte_project) \
+	$(require_running_project) \
+	$(resolve_compose_files)
+
+restart: restart-preflight market-plan strategy-requirements log-directory ## Recreate ingestion and runner on the running stack's own overlay
+	@$(resolve_qte_project) \
+	$(require_running_project) \
+	$(resolve_compose_files) \
+	echo "Recreating data-ingestion and strategy-runner in $$project ($$*)"; \
+	docker compose -p "$$project" "$$@" up -d --build --no-deps --force-recreate \
+		data-ingestion strategy-runner
 
 # ── Live-editing dev loop ──────────────────────────────────────────────
 #
@@ -335,7 +547,7 @@ restart: market-plan strategy-requirements ## Recreate ingestion and runner, pre
 
 DEV_COMPOSE := -f docker-compose.yml -f docker-compose.dev.yml --profile dev $(COMPOSE_PROFILE)
 
-dev: market-plan strategy-requirements ## `start` with src/ bind-mounted for live editing
+dev: market-plan strategy-requirements log-directory ## `start` with src/ bind-mounted for live editing
 	docker compose $(DEV_COMPOSE) up -d --build
 
 dev-restart: ## Reload ingestion and runner code, preserving the simulator clock
@@ -538,13 +750,34 @@ ping: ## Ask the running runners to identify themselves
 owner-status: ## Show which runner holds the ownership claim for this namespace
 	uv run qte-control owner status
 
-owner-clear: ## Remove a stale runner claim after an unclean exit (refuses while a runner answers)
-	uv run qte-control owner clear
+owner-check: ## Report a claim no runner answers for; exit 1 when one is stale
+	uv run qte-control owner check
+
+# YES=1 skips the typed-namespace prompt and nothing else: the refusal while a
+# runner answers the ping, and the compare-and-delete against the holder it
+# printed, both still apply. It is here because that prompt needs a TTY, and a
+# `make` run from a deploy script or an agent terminal does not always have
+# one — without it the clear reads an empty line and aborts.
+owner-clear: ## Remove a stale runner claim after an unclean exit (YES=1 skips the prompt)
+	uv run qte-control owner clear $(if $(YES),--yes,)
+
+# A claim an unclean exit left behind refuses every new runner container, and
+# the refusal only shows up as a crash loop minutes after the build started —
+# by which time the container that could explain it is gone. Checked before the
+# build instead. SKIP_OWNER_CHECK=1 is for the incident where ingestion has to
+# be redeployed while the runner's claim is still stale.
+owner-preflight:
+	@if [ -n "$(SKIP_OWNER_CHECK)" ]; then \
+		echo "Runner ownership check skipped (SKIP_OWNER_CHECK is set)"; \
+	else \
+		uv run qte-control owner check; \
+	fi
 
 .PHONY: help install install-dev lock test lint format check tiingo mt5 binance simulator market-plan \
-	build build-prod up start stop down restart dev dev-restart logs logging logging-broker nuke tailscale-status \
+	build build-prod log-directory up start stop down restart restart-preflight dev dev-restart logs logging logging-broker nuke tailscale-status \
 	strategy-mount strategy-audit strategy-requirements strategy-test strategies audit audit-strict strategy-mapping \
 	db-upgrade db-downgrade db-revision db-current db-history db-check \
 	download backtest chart reports csv-import costs \
 	sim sim-status sim-replay warmup warmup-cache sim-bar bar signal sim-walk sim-stop sim-reset sim-watch \
-	status shadow-status shadow-on shadow-off ping owner-status owner-clear
+	status shadow-status shadow-on shadow-off ping owner-status owner-check owner-clear \
+	owner-preflight

@@ -25,7 +25,7 @@ from qte_backtest.replay import BacktestEngine
 from qte_shared.config import settings
 from qte_shared.models import SignalAction
 from qte_shared.strategies.signal_factory import SignalFactory
-from qte_shared.strategies.sizing import PositionSizer
+from qte_shared.strategies.sizing import DYNAMIC_RISK_KEY, MAX_RISK_PERCENT_KEY, PositionSizer
 from qte_shared.strategies.strategy_base import SignalIntent, candles_to_frame
 from qte_shared.strategies.strategy_settings import (
     PORT_ONLY_PARAMS,
@@ -137,13 +137,14 @@ def test_a_slot_with_an_override_warms_on_the_overridden_count():
 @pytest.fixture
 def mapped_runner(monkeypatch, tmp_path):
     """A runner whose loader publishes one strategy declaring ``warmup = 10``."""
-    from qte_shared.strategies.plugin_loader import LoadedStrategy
+    from qte_shared.strategies.plugin_loader import LoadedStrategy, StrategyDirectory
 
     monkeypatch.setattr(
-        "qte_strategy_engine.runner.load_strategies",
-        lambda *args, **kwargs: [
-            LoadedStrategy(name=Edge.name, cls=Edge, source=tmp_path / "edge.py")
-        ],
+        "qte_strategy_engine.runner.read_strategy_directory",
+        lambda *args, **kwargs: StrategyDirectory(
+            loaded=[LoadedStrategy(name=Edge.name, cls=Edge, source=tmp_path / "edge.py")],
+            disabled={},
+        ),
     )
     return runner_module.StrategyRunner()
 
@@ -299,4 +300,6 @@ def test_the_payload_carries_the_pairs_params_but_not_the_warmup():
     assert WARMUP_PARAM not in factory.inputs
     assert WARMUP_PARAM not in signal.inputs
     assert signal.inputs["risk_percent"] == 1.0
-    assert PORT_ONLY_PARAMS == {WARMUP_PARAM} | RETIRED_CYCLE_PARAMS
+    assert PORT_ONLY_PARAMS == (
+        {WARMUP_PARAM, DYNAMIC_RISK_KEY, MAX_RISK_PERCENT_KEY} | RETIRED_CYCLE_PARAMS
+    )

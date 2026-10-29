@@ -134,7 +134,30 @@ Three things keep that rule from turning every unclean exit into an outage:
 
 - **A shutdown that is allowed to finish.** `strategy-runner` sets
   `stop_grace_period: 60s`. Docker's default kills ten seconds after SIGTERM,
-  before the runner has drained NATS and released the claim.
+  before the runner has drained NATS and released the claim. The targets that
+  take a stack down honour that, and none of them derives the project name it
+  acts on: the name differs between the base file and the production overlay,
+  so a derived one addressed the wrong stack — `make stop` silently stopped
+  nothing, and `make restart` was worse, because `up` creates, so it built a
+  second, dev-named half-stack beside the live one. They take the name from
+  `PROJECT=`, else `COMPOSE_PROJECT_NAME` (which outranks the files' own
+  `name:`, and is how `docs/simulator.md` has an operator run a second
+  rehearsal stack), and only otherwise ask the daemon for the one running
+  `qte-` project. `make stop` and `make down` then stop the runner first, on
+  its full grace period and while Redis and NATS still answer, before
+  bringing the rest of the project down. `make restart` has to build, so it
+  needs the compose files and not just the name; it reads back the ones
+  compose stamped on the project's containers, which both applies the right
+  overlay and lets `up --force-recreate` read `stop_grace_period` out of
+  them. With more than one stack up they refuse and ask for `PROJECT=<name>`
+  rather than guess which was meant, and `restart` refuses too when one
+  project holds containers from two different file sets — with `QTE_ENV=prod`
+  in `.env` the base file alone resolves to the same project name as the
+  overlay, and recreating the runner on the wrong set would drop `QTE_ENV`
+  back to dev against production's Redis namespace and volumes. `restart`
+  asks all of that in a pre-flight ahead of its own prerequisites, so a
+  recreate that cannot happen refuses in about a second rather than after the
+  two minutes `strategy-requirements` spends resolving every strategy repo.
 - **The same container takes its own claim back.** A container's PID namespace
   dies with its PID 1, so a runner that *is* PID 1 knows every earlier process
   of that container is gone. Its owner id carries a random token kept on the
@@ -150,14 +173,26 @@ Three things keep that rule from turning every unclean exit into an outage:
   its holder. `qte-control owner clear` refuses while any runner answers a ping
   or while NATS cannot be reached, asks for the namespace to be typed back, and
   deletes only the holder it displayed. A paused or hung runner does not answer
-  a ping, so the operator still has to know that none is left. Run it where the
-  namespace is the running stack's — in production `QTE_ENV=prod` comes from the
-  compose overlay, not from `.env`:
+  a ping, so the operator still has to know that none is left. `--yes` (or
+  `make owner-clear YES=1`) skips the typed namespace and nothing else — that
+  prompt needs a TTY, which a `make` run from a deploy script does not always
+  have, and without one the clear reads an empty line and aborts. Run it where
+  the namespace is the running stack's — in production `QTE_ENV=prod` comes from
+  the compose overlay, not from `.env`:
 
   ```bash
   docker compose -f docker-compose.yml -f docker-compose.prod.yml \
     run --rm --no-deps strategy-runner qte-control owner clear
   ```
+
+- **A deploy that says so before the build.** `make start-prod` runs
+  `qte-control owner check` first, which exits 1 when a claim is held that no
+  runner answers for. Without it the refusal arrives as a crash loop minutes
+  into the build, by which time the container that could explain it is gone. A
+  claim whose runner answers is the normal state mid-deploy and passes, and an
+  unreachable Redis or NATS reports nothing rather than blocking — the deploy is
+  what brings those back up. `SKIP_OWNER_CHECK=1` is for the incident where
+  ingestion has to be redeployed while the runner's claim is still stale.
 
 A refused start logs `Runner ownership is already held` with the namespace and
 the holder, and records an `ownership_refused` event at `ERROR`; the container
@@ -165,6 +200,15 @@ then restarts into the same refusal about once a minute. Alert on either — the
 log line, or `SELECT ... WHERE event = 'ownership_refused'` on the audit event
 table. `ownership_reclaimed` and `runner_owner_cleared` are recorded at
 `WARNING`.
+
+A shutdown releases the claim only when every resource closed cleanly: an
+uncertain cleanup keeps it, because a queued callback must not run alongside the
+next owner. That retention is deliberate but it used to be silent, which left
+the next refusal with nothing to explain it once the container and its log were
+gone. It now logs `Retaining the runner ownership claim` and records
+`ownership_retained` at `WARNING` with the owner id and namespace — so the
+reason for a stale claim is in the audit table rather than in a container that
+no longer exists.
 
 Ingestion keeps each retired candle, including its partial-bar repair state,
 until Redis acknowledges staging. It retries that batch before retiring more
@@ -191,63 +235,92 @@ in Postgres answers that question and the runner re-seeds Redis from it. That
 table is the only mutable row QTE keeps — everything else there is append-only —
 which is exactly why it is a table of its own rather than a column on `signals`.
 
-## Why a stale position is flushed on start
+## Why age does not close a position, and the mapping table does
 
-Remembering a cycle across a restart is the right answer, and it has a failure
-mode of its own. Nothing caps how many cycles a `(strategy, symbol)` pair
-holds, so a long outage does not lock the pair out of trading — it leaves it
-carrying positions nobody is deciding on. The rows survive, the pair comes back
-still believing it holds them, and each was sized against a bracket the market
-left behind hours ago. Every later entry is then sized against an account those
-ghosts are still charged to, and each one's bracket sits at the broker waiting
-on a level that stopped meaning anything.
+Remembering a cycle across a restart is the right answer, and for a while the
+engine paired it with a second rule: a position whose last transition was older
+than a window had outlived an outage, so close it. That rule is off by default
+now, and the reasoning is worth keeping because it is a trap worth naming.
 
-So the runner closes what has gone stale, on start, with `R_SL` — a terminal
-action, so the cycle ends and the book is back to what is really being
-managed. `R_SL` rather than `FLAT`
-because `FLAT` means "close everything on this strategy" and this closes exactly
-one cycle, named by its `signal_uxid`. It goes out through the ordinary `_emit`
-path, so it is staged in the durable outbox, delivered and audited like any
-strategy exit and inherits every guard there.
+**Age is not evidence.** A strategy that holds a cycle until its own exit
+condition is met can be right to carry one for days — the position untouched
+since Tuesday is the position still working. And the outage the rule was meant
+to catch is exactly the one nobody can shorten: overnight, a weekend, a host
+that needs hands on it. Any window short enough to catch a real outage is short
+enough to flatten a position that was still correct, and the loss is silent —
+an `R_SL` in the audit trail looks like a decision. So
+`QTE_RUNNER__FLUSH_STALE_POSITIONS` defaults to `off`, and the operator who
+wants the old behaviour asks for it, with `warn` first to see what it would do.
 
-**Age is the whole design.** An unconditional flush would close the book on
-every deploy, and would make most of the recovery machinery above pointless —
-the runner would be carefully restoring a cycle it is about to close. So
-`QTE_RUNNER__STALE_POSITION_MAX_AGE` draws the line: inside it, nothing changes
-and the position is restored exactly as before; outside it, the position is
-treated as what it is, a leftover. `0` restores the unconditional behaviour for
-an operator who wants it, and `QTE_RUNNER__FLUSH_STALE_POSITIONS=warn` lists
-what a first `close` run would do without doing it.
+Nothing is lost by turning it off, because the durability it was compensating
+for is real. `_persist_position` writes every transition to Redis *and* to
+`open_positions`; `_restore_position` reads the cache first and the table behind
+it, re-seeding the cache so the next boot is a hit; Redis runs with AOF on its
+own volume and the cycle hash carries no TTL. A restart, a lost cache and a
+re-provisioned Redis all come back holding the book.
 
-**It decides from the slots, not from the table.** What a pair believes it
-holds is the cycle `_restore_position` put on its slot, and that came from Redis in
-preference to Postgres. The two can disagree: `_persist_position` writes Redis
-first, and `OpenPositionRepository.upsert` swallows its own failure by design,
-so a cycle can live in the cache and not in the table. A flush driven by the
-table would skip exactly that pair and leave it locked — the failure it was
-added to prevent. The table is still read, for the two things the slots cannot
-show: rows belonging to no running strategy, and duplicate ids across the whole
-namespace.
+**What does get closed on start is what the mapping table no longer claims.**
+This is the case the age rule was reaching for and missing. A pair dropped from
+a symbol's `strategies` list, or a symbol given `enabled = false`, leaves a row
+that nothing will ever decide on again: no slot holds it, no bar reaches it, and
+its size is charged against the account on every later sizing. The operator's
+own table is the evidence the clock never was.
+`QTE_RUNNER__CLOSE_ORPHAN_POSITIONS` says what to do, and `close` — the default
+— ends the cycle with `FLAT`.
 
-Two things it deliberately does not do. It skips a pair whose delivery the
-outbox has not reconciled, because flushing over an ambiguous send would
-manufacture a second command against the same cycle. And it does not close a
-position belonging to a strategy this runner is not driving — `OpenPosition`
-records no timeframe and the broker payload needs one, so the engine cannot
-speak for a strategy it is not running. That case is logged as an error rather
-than swallowed, because nobody else will ever close it either.
+**It reads the declaration, not the slots.** A pair the table still claims but
+has no slot for is not a retirement: the strategy failed to load, or its
+repository is not mounted. From the slots alone those two are the same
+observation, and closing on it would mean one bad deploy flattens the whole
+book. So an orphan whose pair is still declared is reported and left open, and
+with no mapping table at all — the fallback where each strategy keeps the
+symbols on its own class — nothing is closed, because nothing declared any
+intent.
+
+`FLAT` rather than `R_SL` here, through `_flatten_orphan_cycle`, which the
+operator's `/flat` already uses. It builds the payload by hand instead of
+through a `SignalFactory`, because there is no factory for an unmapped strategy
+and minting one would need the mapping entry that is precisely what is gone.
+The `timeframe` the broker payload requires comes from the `signals` row that
+opened the cycle — `OpenPosition` carries none, and reading it back beats
+storing it twice where the two copies could disagree. Without that row no
+truthful payload exists, so the cycle is refused with that said rather than
+closed with a guess. Local state is dropped only on a confirmed send whose
+outbox checkpoint also landed, so a `FLAT` the broker rejects — a closed market
+over a weekend — leaves the row in place and the next start tries again. A book
+that forgot a position the broker still carries is worse than one that still
+shows it.
+
+One orphan it will not touch is a pair whose own delivery the outbox has not
+reconciled. `_recover_pending_deliveries` cannot settle a pair it has no slot
+for, so it leaves it blocked; sending over that would put a second command
+against one cycle whose first may already have reached the broker, and because
+an unconfirmed close keeps the row it would do so again at every start. That
+one is reported and left for an operator.
+
+When the age flush *is* enabled, it closes with `R_SL`, named by the cycle's
+`signal_uxid`, because `FLAT` means "close everything on this strategy" and
+that path is closing exactly one cycle of a strategy still running. It also
+skips a pair whose delivery the outbox has not reconciled, since flushing over
+an ambiguous send would manufacture a second command against one cycle. And it
+decides from the slots rather than the table, deliberately: what a pair
+believes it holds is the cycle `_restore_position` put on its slot, which came
+from Redis in preference to Postgres, and the two can disagree —
+`_persist_position` writes Redis first and `OpenPositionRepository.upsert`
+swallows its own failure by design. A flush driven by the table would skip
+exactly the pair that is only in the cache.
 
 The same section of the boot sequence enforces the other direction of the pair
-rule: two pairs must never hold one `signal_uxid`. The broker groups a whole
-trade by that id, so a close on either pair would close the other's position and
-nothing in the audit trail would explain the loss.
-`uq_open_positions_uxid` makes it impossible to write; the startup check catches
-rows that predate the constraint or were inserted by hand, and it refuses to
-start rather than warning, because every entry and exit on either pair is unsafe
-until an operator says which one is real. It reads the restored slots as well as
-the table, because `list_open` answers with an empty list when it could not read
-at all — a check resting on the table alone would pass on no data the first time
-Postgres was slow to accept connections.
+rule, in every mode including `off`: two pairs must never hold one
+`signal_uxid`. The broker groups a whole trade by that id, so a close on either
+pair would close the other's position and nothing in the audit trail would
+explain the loss. `uq_open_positions_uxid` makes it impossible to write; the
+startup check catches rows that predate the constraint or were inserted by
+hand, and it refuses to start rather than warning, because every entry and exit
+on either pair is unsafe until an operator says which one is real. It reads the
+restored slots as well as the table, because `list_open` answers with an empty
+list when it could not read at all — a check resting on the table alone would
+pass on no data the first time Postgres was slow to accept connections.
 
 ## Why the strategy returns intents instead of publishing
 
@@ -557,6 +630,15 @@ broadcast one. A stack trace carries file paths, symbols and internal state;
 publishing that to a signal channel because an operator filled in only one of
 the two lists would be a configuration mistake the code should not make
 possible.
+
+The traffic in the other direction is a leak rather than a loop. The Bot API
+carries the token in the request path and `httpx` logs every request's full URL
+at `INFO`, so the default deployment used to write the token to the console and
+to a daily file nothing prunes. `qte_shared/logging_setup.py` formats both of
+its handlers through a formatter that rewrites `/bot<token>` out of the
+finished line, which keeps the per-request lines useful, covers a traceback
+that quotes the same URL, and does not depend on an operator picking a log
+level.
 
 ## Why only two services announce themselves
 

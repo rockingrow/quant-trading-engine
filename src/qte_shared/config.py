@@ -73,7 +73,12 @@ load_dotenv(REPO_ROOT / ".env", override=False)
 #: ``sources``: which cost profile priced the fills, and which layer supplied
 #: each number (:mod:`qte_backtest.costs`). Purely additive — every 1.0 key is
 #: still there, with the same meaning — so a minor bump.
-REPORT_SCHEMA_VERSION = "1.1"
+#:
+#: 1.2 — every trade states the ``risk_percent`` it was sized at, and the
+#: ``run`` block says whether the pair sized per entry (``dynamic_risk``) and
+#: under which ceiling (``max_risk_percent``). Additive again: ``run.risk_percent``
+#: keeps its meaning as the pair's base risk.
+REPORT_SCHEMA_VERSION = "1.0"
 
 
 class NatsSettings(BaseSettings):
@@ -163,6 +168,11 @@ class AccountSettings(BaseSettings):
     #: Percent of :attr:`capital` put at risk on one entry when the mapping
     #: table names no ``risk_percent`` for the pair.
     risk_percent: float = 1.0
+    #: Hard ceiling on the ``risk_percent`` any one entry is sized at, on every
+    #: pair. ``0`` means no account ceiling, and is the default. A pair that
+    #: sizes per entry (``dynamic_risk``) also has a ceiling of its own; the
+    #: lower of the two wins — see :mod:`qte_shared.strategies.sizing`.
+    max_risk_percent: float = Field(default=0.0, ge=0, allow_inf_nan=False)
     #: Charged per unit on entry and on every partial exit, each side.
     commission_per_unit: float = 0.0
     #: Full bid/ask distance in price units; each side of a fill pays half.
@@ -183,6 +193,19 @@ class AccountSettings(BaseSettings):
     max_quantity: float = 0.0
     #: Decimals a sized quantity is rounded to before it reaches the wire.
     quantity_precision: int = 4
+    #: How many positions the broker account holds at once, counted across
+    #: every strategy and symbol together. ``0`` means uncapped, and is the
+    #: default: an engine that has not been told its account's limit must not
+    #: invent one. Above zero, the runner refuses an entry that would exceed it
+    #: — see :meth:`qte_strategy_engine.runner.StrategyRunner._emit`.
+    #:
+    #: **This is the engine's copy of a number it cannot read.** The limit is
+    #: enforced downstream, by the worker that places the orders, and the
+    #: engine has no channel to the account: an entry refused there is simply
+    #: never placed, nothing comes back, and the engine goes on managing a
+    #: cycle the account does not hold. Set this to whatever the account
+    #: actually enforces, and change the two together.
+    max_open_positions: int = Field(default=0, ge=0)
 
 
 class RedisSettings(BaseSettings):

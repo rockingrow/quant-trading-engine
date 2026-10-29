@@ -61,7 +61,9 @@ Field-level notes:
 - A close **restates what the entry established** — `risk_percent`,
   `tp1_percent`, `move_sl_to_be` and the scaling block — so a worker reading one
   message can re-sync the trade from it. Anything the strategy sets on the close
-  itself wins; it is describing the trade *now*.
+  itself wins; it is describing the trade *now*. The one exception is
+  `risk_percent`: the close always restates the risk the cycle was sized at,
+  because that figure is the engine's, not the strategy's (see [Sizing](#sizing)).
 
 ## Sizing
 
@@ -77,6 +79,28 @@ Read it as "risk this many currency units if the stop is hit". `risk_percent`
 comes from the pair's entry in `config/strategies_mapping.toml`, falling back to
 `QTE_ACCOUNT__RISK_PERCENT`. `examples/algo-trading-broker/entry.long.json` is
 this arithmetic: $1,000 at 3% over a $5 stop is 6 units.
+
+**The payload's `risk_percent` is always the one the quantity was sized at.** A
+strategy may state a `risk_percent` on its entry, and by default that value is
+overruled by the pair's own. A pair whose mapping sets `dynamic_risk = true`
+is sized at the strategy's value instead, so a strategy can risk less on a
+weaker setup and more on a stronger one:
+
+```toml
+[symbols.XAUUSD.params.SOME_STRATEGY]
+risk_percent     = 3.0    # the base: what an entry stating no risk is sized at
+dynamic_risk     = true   # size each entry at the risk_percent its strategy states
+max_risk_percent = 5.0    # the pair's ceiling; unset, it is risk_percent (lower only)
+```
+
+The entry is sized at `min(stated, max_risk_percent, QTE_ACCOUNT__MAX_RISK_PERCENT)`.
+`QTE_ACCOUNT__MAX_RISK_PERCENT` is an account-wide ceiling over every pair,
+dynamic or not, and `0` (the default) leaves it off. An entry stating a
+`risk_percent` that is not a finite number is refused on every pair, and on a
+dynamic pair so is one that is not positive. It is not sized at a default
+instead. Neither key reaches the payload's `inputs`, even when a strategy echoes
+its params there. A worker that sizes from `risk_percent` itself, and not from
+`quantity`, therefore lands on the same size QTE computed.
 
 The capital is **fixed** — it does not compound as the account moves. Sizing off
 running equity would make a backtest's later trades depend on its own earlier
@@ -116,18 +140,58 @@ QTE normalises rather than rejecting, so either spelling round-trips.)
 ## The trade cycle
 
 **As many cycles per (strategy, symbol) as the strategy opens.** Nothing caps
-the count: an entry that fires while positions are already open stacks another
-one beside them, both live and in the backtest, so a replay still predicts what
-live trading does.
+the count per pair: an entry that fires while positions are already open stacks
+another one beside them, both live and in the backtest, so a replay still
+predicts what live trading does. The one ceiling that exists is on the account
+as a whole, is off by default, and is described [below](#the-one-ceiling-and-why-it-is-on-the-account).
 
 Each is its own cycle: its own `signal_uxid`, minted on its entry, and its own
 bracket. Every `TP1`/`TP2`/`SL`/`R_SL`/`FLAT` carries the `signal_uxid` of the
 one cycle it closes — QTE refuses an unnamed close while more than one is open,
-and the weekend flat and the stale-position flush send one close per cycle. The
+and the weekend flat, the start-up orphan close and the optional stale-position
+flush each send one close per cycle. The
 worker must keep the positions apart by that id, on a hedging account: a netting
 account would merge them into one position and lose every bracket but the last.
 The only entry QTE still refuses is one reusing the id of a cycle already
 open.
+
+### The one ceiling, and why it is on the account
+
+`QTE_ACCOUNT__MAX_OPEN_POSITIONS` caps how many positions the runner will hold
+across **every strategy and symbol together**. `0`, the default, means uncapped
+and nothing above changes.
+
+It exists because the account has a limit of its own and QTE cannot see it. The
+worker that places the orders counts every active position on the account,
+whatever strategy or symbol it belongs to, and refuses an entry past its own
+limit. QTE never hears about that refusal — the publish was acked, the webhook
+returned 200, and the order was declined two hops later with nothing coming
+back (see [What QTE does not do](#what-qte-does-not-do)). The cycle stays in
+QTE's book, and from then on its `TP1`/`TP2`/`SL`/`R_SL` go out on schedule
+against a position the account does not hold.
+
+So this setting is QTE's **copy of a number it cannot read**. Set it to
+whatever the account actually enforces, and change the two together; leaving it
+at `0` keeps the behaviour where the engine can overrun the account silently.
+
+Three things to know about it:
+
+* **It is not a per-pair cap.** Pairs each stay inside their own book and
+  overrun the account between them, which is exactly the case a per-pair cap
+  cannot see. Nothing limits one pair's cycles.
+* **Closes always pass.** Only entries are refused. A full book must never trap
+  a position that needs getting out of.
+* **First come, first served.** With the book full, the pair whose bar closes
+  first takes the slot. There is no priority between strategies.
+
+A refused entry is logged at `WARNING` and written to the engine's events table
+as `entry_refused_account_full`, naming the count and the ceiling — a book that
+has gone quiet is always visible in the log, never silent.
+
+The backtest has no counterpart to this and cannot have one: a replay runs a
+single strategy, and the ceiling is a property of the account that the whole
+book shares. A configured ceiling therefore makes the traded book a subset of
+the replayed one, which is why the default is off.
 
 A cycle ends on `TP2`, `SL`, `R_SL` or `FLAT` — and also on a `TP1` that happens
 to close the entry's whole quantity. A strategy taking "50%" of a position that

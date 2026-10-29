@@ -7,6 +7,133 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`dynamic_risk` — sizing each entry at the risk its strategy states.** A
+  pair whose mapping sets `dynamic_risk = true` is sized at the `risk_percent`
+  the strategy puts on each entry instead of the pair's own, so a strategy can
+  risk less on a setup it trusts less and more on one it trusts more. The entry
+  is sized at the lowest of what the strategy stated, the pair's
+  `max_risk_percent` and `QTE_ACCOUNT__MAX_RISK_PERCENT`. The pair's ceiling
+  defaults to its own `risk_percent`, so the switch alone can only lower risk;
+  the account ceiling covers every pair, dynamic or not, and `0`, the default,
+  leaves it off. Both mapping keys are read strictly and stay off the payload's
+  `inputs`: a `dynamic_risk` that is not a bool, or a `max_risk_percent` that is
+  not a finite number or sits below the pair's `risk_percent`, stops the pair at
+  startup instead of trading it some other way. A stated risk that is not a
+  finite number is refused on every pair, and on a dynamic pair so is one that
+  is not positive; it is never sized at a default. The backtest and the runner
+  share the path, so `--param dynamic_risk=true` replays what the runner would
+  send. Backtest reports move to schema `1.2`: every trade carries the
+  `risk_percent` it was sized at and `run` gains `dynamic_risk` and
+  `max_risk_percent`; R-multiples are per unit and unchanged. Rows written by
+  `qte-backtest run --persist` do not carry the per-trade figure yet.
+
+- **`DISABLED` — switching one strategy off from its own repository.** A
+  manifest may expose a third optional hook, `load_disabled()`, returning the
+  aliases its repository keeps (code, tests, documents) but has taken out of
+  service — by convention a `DISABLED` table beside `ALIASES`, the same shape, so
+  moving a line between the two is the switch. The loader never instantiates those
+  strategies and records them (`StrategyLoader.disabled_by_repository`,
+  `read_strategy_directory()`); the backtest refuses one by name; the audit lists
+  each as `[ off]` and counts it (`counts.disabled`, `disabled` in the JSON)
+  without a finding; a mapping table that still names one fails as
+  `mapped-to-disabled` rather than `mapped-to-nothing`, and the runner's `ERROR`
+  says the repository disabled it. An alias in both tables, or a hook that does
+  not read, fails the audit and is not loaded — an unreadable off switch stops
+  the whole repository. `_boilerplate` and `qte-signal-simulator` carry the hook
+  with an empty table as the pattern to copy; `SKIPPED_REPOSITORIES` still skips
+  them as bundles. A repository without the hook disables nothing. Existing positions remain
+  protected while their pair is still mapped; removing the mapping makes them
+  eligible for the startup orphan settlement described below.
+
+- **`/strategies` — the build deployed in each strategy folder, from Telegram.**
+  The bot scans `__strategies__/` and answers with one box per strategy
+  repository: the stamp from the `BUNDLE_VERSION.json` at the folder's root
+  (`version`, `built_at`, `branch`, `commit`, `tree`, `content`, `mode`,
+  `dirty`) and every strategy the mount record lists for it, each marked as
+  passing or failing its audit. A folder without the file is listed all the
+  same, with the version blank; an unreadable one is flagged in its box. The
+  two template folders (`SKIPPED_REPOSITORIES`) are never listed. It reads the
+  mounted directory, so it answers with the runner down and reports what is on
+  disk, not what the runner has loaded — `/runner` still answers that. A mount
+  too large for one message is split across several. `_boilerplate` and
+  `qte-signal-simulator` now carry an example `BUNDLE_VERSION.json`, and the
+  README documents where the file lives and what its keys mean.
+
+- **Account-wide open-position ceiling** — `QTE_ACCOUNT__MAX_OPEN_POSITIONS`
+  limits the runner's open cycles across every strategy and symbol together;
+  `0`, the default, keeps entries uncapped. Entries in flight reserve capacity
+  so concurrent pairs cannot both take the last slot. Excess entries are
+  refused before broker delivery, logged at `WARNING`, and recorded as
+  `entry_refused_account_full`; closing signals remain unaffected by the
+  ceiling. Set this to match the downstream account limit: it counts the
+  runner's own book, not broker-confirmed or manually opened positions.
+  Backtests remain unchanged, so enabling the ceiling can make the traded book
+  a subset of the replayed one.
+
+### Changed
+
+- **The payload's `risk_percent` is the one the quantity was sized at.** A
+  strategy's stated value used to reach the broker while the quantity was sized
+  at the pair's own, so a worker that sizes from `risk_percent` itself could
+  open a different position from the one QTE sized and recorded. Every entry
+  now states the figure it was sized at, and every close restates its cycle's
+  figure whatever the strategy puts on the close. A pair that has not opted in
+  to `dynamic_risk`, and whose strategy states a `risk_percent` other than the
+  pair's, now sends the pair's with a `WARNING`; a strategy that states the
+  pair's own value sees no change.
+
+- **Port-only params stay off the payload when a strategy echoes them.**
+  `warmup`, and now `dynamic_risk` and `max_risk_percent`, were removed only
+  from the pair's params, so a strategy that reports its own params through
+  `intent.inputs` handed them to the broker anyway. The filter now applies to
+  the merged `inputs` of the signal.
+
+- **Contributors update `changelog.md` before a PR is opened.** New rule 7 in
+  `AUDIT.md`, digested in `AGENTS.md`: the entry goes under `## [Unreleased]`,
+  which is created when it is missing.
+
+- **Age no longer closes a position; the mapping table does.**
+  `QTE_RUNNER__FLUSH_STALE_POSITIONS` now defaults to `off`. A strategy that
+  holds a cycle until its own exit condition is met can be right to carry one
+  for days, and the outage the window was meant to catch — overnight, a
+  weekend, a host that needs hands — outlasts any window worth setting, so the
+  old default closed positions that were still correct. Nothing is lost by it:
+  every transition is already written to Redis *and* to `open_positions`, and
+  the runner reloads the cycle from either on start. Set the variable to
+  `warn`, or to `close` with `QTE_RUNNER__STALE_POSITION_MAX_AGE` (back to
+  `3600`), for the old age-gated behaviour.
+
+  In its place, **an open cycle the mapping table no longer claims is closed on
+  start** — a strategy dropped from a symbol's `strategies` list, or a symbol
+  carrying `enabled = false`. Nothing decides on those and their size is still
+  charged against the account on every later sizing.
+  `QTE_RUNNER__CLOSE_ORPHAN_POSITIONS` (`off`/`warn`/`close`, default `close`)
+  sends one `FLAT` per cycle through the durable outbox, recovering the
+  timeframe the broker payload needs from the `signals` row that opened it, and
+  clears Redis and Postgres only on a confirmed send — so a `FLAT` the broker
+  rejects over a closed weekend is retried at the next start. A pair the table
+  **still** claims is reported and never closed, however long its slot has been
+  missing: that is a strategy that failed to load or a repository that is not
+  mounted, and a half-mounted `__strategies__/` must not flatten the book. With
+  no mapping table at all nothing is closed. An orphan whose earlier delivery
+  remains unreconciled is left open without sending another command; recovery
+  keeps that pair blocked across restarts, including an `unknown` FLAT result.
+  Previously such a row was only
+  logged as an error, on the mistaken grounds that no timeframe could be
+  recovered for it.
+
+- **Skip reference and simulator bundles during discovery and audit** —
+  `SKIPPED_REPOSITORIES` in `qte_shared.strategies.plugin_loader` excludes
+  `_boilerplate` and `qte-signal-simulator`, preventing their unused-strategy
+  warnings from blocking strict startup. Remove a name from the set to load
+  and audit that bundle again; its clone and mount verdict remain intact.
+- Update the README and broker/simulator documentation to describe the
+  account-wide ceiling, bundle exclusions, and existing support for multiple
+  trade cycles per strategy/symbol pair.
+
+
 ### Fixed
 
 - **A Redis connection the container network dropped is detected instead of
@@ -35,6 +162,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Redis's own exceptions are treated this way: the builtin `TimeoutError` would
   also catch a history request the MT5 ingester never answered, and that outage
   must not read as Redis being unreachable at a level nobody is paged for.
+
 
 ## [0.1.1] - 2026-10-19
 

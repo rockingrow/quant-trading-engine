@@ -383,6 +383,151 @@ passing is not even imported. Fix what the audit found and mount it again.
 `make strategies` lists what the engine can see; `uv run qte-strategy-mount
 --show` lists what the mount recorded.
 
+### Skipping a mounted bundle you do not want to trade
+
+A bundle can be mounted, audited and perfectly healthy and still be something
+this deployment has no use for — the `_boilerplate` reference, a simulator
+harness. `strategies.toml` cannot say that: `false` there means *failed the
+audit*, the deploy step then freezes none of that repo's dependencies, and the
+file is regenerated on the next `make strategy-mount` anyway.
+
+That choice lives in code instead, in `SKIPPED_REPOSITORIES` in
+[`src/qte_shared/strategies/plugin_loader.py`](src/qte_shared/strategies/plugin_loader.py):
+
+```python
+SKIPPED_REPOSITORIES = frozenset(
+    {
+        # The plugin-shape reference, not a tradable edge.
+        "_boilerplate",
+        # Exercises the position lifecycle against the simulator; mapped to no
+        # symbol in production, so loading it only adds a startup warning.
+        "qte-signal-simulator",
+    }
+)
+```
+
+Nothing under a listed directory is imported, by the runner or by the backtest,
+and nothing in it is audited either. That second part is the reason both names
+are in there: a loaded strategy that no symbol maps to is an audit *warning*,
+and `QTE_RUNNER__AUDIT_ON_START=strict` refuses to start on a warning — so with
+these two skipped the pre-flight audit reports four strategies, zero errors and
+zero warnings instead of two warnings that block the start.
+
+**Comment a name out to load that bundle again.** Nothing else has to change:
+the clone stays where it is and its line in `strategies.toml` keeps its
+verdict, so `make strategy-mount` does not have to run again.
+
+### Switching one strategy off: `DISABLED`
+
+`SKIPPED_REPOSITORIES` drops a whole bundle, and it is this deployment's choice.
+Taking **one strategy** out of service is the repository's own choice, so it
+lives in the repository, beside the alias table — the same table twice:
+
+```python
+# __strategies__/my-strategies/manifest.py (or the registry it re-exports)
+ALIASES = {"MT5_GOLD_M15_SCALP": GoldScalp}  # published: the engine loads these
+DISABLED = {"MT5_GOLD_M5_SCALP": GoldEdge}   # kept — code, tests, documents — but off
+
+
+def load_all():
+    return dict(ALIASES)
+
+
+def load_disabled():  # the optional third hook: names only
+    return sorted(DISABLED)
+```
+
+Moving a line from one table to the other is the whole switch. What the engine
+does with the second one:
+
+- it never instantiates a disabled strategy, in the runner or the backtest —
+  `qte-backtest run --strategy <it>` says *disabled by its repository*, not *not
+  found*;
+- `make audit` lists it as `[ off]`, beside the strategies it checked, and counts
+  it in the summary. That is not a finding: switching a strategy off is not a
+  defect, and a strict audit still passes;
+- a mapping table that still routes a symbol to it **is** a failure,
+  `mapped-to-disabled`, and the runner logs it as an `ERROR` naming the
+  repository. The table and the repository disagree about whether it trades, so
+  with `QTE_RUNNER__AUDIT_ON_START=strict` the runner will not start until one of
+  them gives way — take it off the `[symbols.<SYMBOL>].strategies` lists in the
+  same deploy that disables it;
+- an alias in both tables is not loaded and fails the audit; a `load_disabled()`
+  that raises or returns anything but alias strings stops the whole repository,
+  because an off switch that cannot be read must not leave a strategy trading.
+
+Disabling a strategy does not itself close its existing positions. If its
+pair is still mapped, strict startup audit rejects the configuration; when
+startup audit permits it, orphan settlement reports the pair and leaves it
+open. Remove its symbol mapping in the same deploy to retire the pair:
+`QTE_RUNNER__CLOSE_ORPHAN_POSITIONS=close` then attempts a `FLAT` on startup,
+subject to the delivery and recovery guards described below. Manifest code
+still executes during discovery, so imports in the manifest remain the
+repository author's responsibility.
+
+A repository with no `load_disabled()` disables nothing. `_boilerplate` and
+`qte-signal-simulator` carry the hook with an empty `DISABLED` table, so a
+repository copied from either starts with the switch in place.
+
+### Which build is deployed: `BUNDLE_VERSION.json`
+
+Every strategy folder carries the stamp of its own build, at its root beside
+`manifest.py`:
+
+```
+__strategies__/
+├── my-strategies/
+│   ├── manifest.py
+│   ├── BUNDLE_VERSION.json     ← which build of this folder is deployed
+│   └── src/…
+└── other-strategies/
+    ├── manifest.py
+    └── BUNDLE_VERSION.json     ← its own, not shared with its neighbour
+```
+
+One per strategy folder, never one for `__strategies__/` as a whole: each
+repository is built and deployed on its own, so two of them can be on different
+builds at once. The **strategy repository's build writes it** and a deploy to
+the production server always carries it along, which makes it the deploy
+tracklog. The engine never writes it; it only reads it, to answer
+[`/strategies`](#steering-the-engine-from-telegram).
+
+```json
+{
+  "branch": "dev",
+  "built_at": "2026-10-20T01:29:14Z",
+  "commit": "1185c39",
+  "content": "e9d4e243285de83e",
+  "dirty": true,
+  "mode": "minified",
+  "tree": "e5e209e41d1180cc98e1e5ce203b875651b7352b",
+  "version": "20261020T012914Z-1185c39-e5e209e4-dirty"
+}
+```
+
+| Key | What it is |
+| --- | --- |
+| `version` | one comparable token for the build: time, commit, tree, and `-dirty` when it applies |
+| `built_at` | ISO 8601 UTC, to the second |
+| `branch`, `commit` | where it was built from |
+| `tree` | git tree hash of the built sources — survives an amend, which a commit hash does not |
+| `content` | digest of the code as shipped — the only key that still describes a build made from a dirty tree |
+| `dirty` | whether the tree had uncommitted changes, which makes `commit` and `tree` unreliable |
+| `mode` | `minified` or `bytecode` |
+
+The file is **optional**. A checkout that was never built has none, and a folder
+without it is still listed by `/strategies` — with every strategy it publishes
+and the version left blank. A file that exists but is not valid JSON is flagged
+in the message instead of being skipped, and neither case stops the engine: the
+stamp is a label, and nothing is loaded or refused because of it.
+
+The two committed templates, [`_boilerplate`](__strategies__/_boilerplate/BUNDLE_VERSION.json)
+and [`qte-signal-simulator`](__strategies__/qte-signal-simulator/BUNDLE_VERSION.json),
+carry the example above so the shape is visible. They are in
+`SKIPPED_REPOSITORIES`, so `/strategies` never lists them; if you copy one to
+start your own repository, delete the copied stamp until your build writes a real
+one.
+
 > Why a manifest, why the contract is structural rather than nominal, why the
 > weekend flat is the engine's job rather than a strategy's, and why the
 > interface is seven methods rather than one:
@@ -468,12 +613,19 @@ the pair's own value in `config/strategies_mapping.toml`, falling back to
 ```bash
 QTE_ACCOUNT__CAPITAL=1000.0          # the account, and what a % of risk is a % of
 QTE_ACCOUNT__RISK_PERCENT=1.0        # fallback when a pair states none
+QTE_ACCOUNT__MAX_RISK_PERCENT=0.0    # ceiling on any one entry's risk_percent; 0 = none
 QTE_ACCOUNT__COMMISSION_PER_UNIT=0.0 # backtest cost, charged each side
 QTE_ACCOUNT__SPREAD=0.0              # full bid/ask distance, each side pays half
 QTE_ACCOUNT__SLIPPAGE=0.0            # on top of half the spread, each side
 QTE_ACCOUNT__CONTRACT_SIZE=1.0
 QTE_ACCOUNT__COST_PROFILE=           # which profile in config/costs.toml prices a fill
+QTE_ACCOUNT__MAX_OPEN_POSITIONS=0    # account-wide position ceiling; 0 = uncapped
 ```
+
+A pair whose mapping sets `dynamic_risk = true` is sized at the `risk_percent`
+its strategy states on each entry instead, never above the pair's
+`max_risk_percent` (unset, the pair's own `risk_percent`) or the account
+ceiling — see `docs/broker-contract.md`, *Sizing*.
 
 Those three costs are the *last* layer: one spread for the whole engine is
 wrong as soon as a second symbol is replayed, so state them per symbol in
@@ -483,11 +635,24 @@ The capital is **fixed for a run**; it does not compound. Sizing off running
 equity would make later trades depend on earlier P&L, so two backtests differing
 by one early trade could not be compared.
 
-**One trade cycle per (strategy, symbol) at a time.** `signal_uxid` is that
-cycle: an entry mints it and every close reuses it, which is how the broker
-groups a whole trade into one broadcast. A second entry while one is open is
-refused before it reaches the wire, mirroring the worker, which answers
-`REJECTED` rather than stacking.
+**As many trade cycles per (strategy, symbol) as the strategy opens.**
+`signal_uxid` is the cycle: an entry mints it and every close reuses it, which
+is how the broker groups a whole trade into one broadcast. An entry that fires
+while positions are already open stacks another one beside them, in the
+backtest and live alike, each with its own id and its own bracket. The only
+entry refused on these grounds is one reusing the id of a cycle already open.
+
+**One ceiling, and it is on the account rather than the pair.**
+`QTE_ACCOUNT__MAX_OPEN_POSITIONS` caps how many positions the runner holds
+across every strategy and symbol together; `0`, the default, means uncapped.
+It is the engine's copy of a limit the broker account enforces and the engine
+cannot read: the worker that places the orders counts every active position on
+the account and refuses an entry past its own limit, and that refusal never
+comes back here — so without the ceiling the engine goes on managing a cycle
+the account does not hold, sending its `TP1`/`TP2`/`SL` on schedule. Set it to
+whatever the account enforces. Closes are never refused, a refusal is logged
+and recorded as `entry_refused_account_full`, and the backtest has no
+counterpart to it, which is why it is off by default.
 
 A cycle ends on `TP2`, `SL`, `R_SL` or `FLAT` — **and on a `TP1` that closes the
 entry's whole quantity**. Because that decision needs the sizes, the runner
@@ -951,7 +1116,7 @@ never stops a service from stopping.
 
 ## Steering the engine from Telegram
 
-The notifications above are one-way. The bot is the other half: nine commands
+The notifications above are one-way. The bot is the other half: ten commands
 for looking at a running engine and steering it, shaped after
 `algo-trading-broker`'s own bot so the two read alike — the same monospace
 tables, the same Prev/Next paging, the same confirmation in front of anything
@@ -972,6 +1137,7 @@ because only one process may poll `getUpdates` for a token at a time.
 | --- | --- |
 | `/redis` | Bars held per symbol and timeframe, and the newest one |
 | `/runner` | Every strategy, its window, and whether it can decide on the next bar |
+| `/strategies` | Each mounted strategy repository as a box: the build its `BUNDLE_VERSION.json` records and the strategies it publishes |
 | `/positions` | What is open: symbol, timeframe, strategy, `signal_uxid`, opened |
 | `/closed` | Positions that are over, newest first, paged |
 | `/flat all \| SYMBOL \| STRATEGY` | Closes positions, after a confirmation |
@@ -979,6 +1145,17 @@ because only one process may poll `getUpdates` for a token at a time.
 | `/allow all \| SYMBOL \| STRATEGY` | Resumes deciding |
 | `/warmup all \| SYMBOL` | Asks the vendor for the warm-up window again |
 | `/flush all \| SYMBOL` | Drops the warm-up bars Redis holds |
+
+`/strategies` is the one command that asks neither the runner nor a database. It
+scans the `__strategies__/` mount and, for every strategy folder, prints one
+box: the build from that folder's
+[`BUNDLE_VERSION.json`](#which-build-is-deployed-bundle_versionjson) and the
+strategies the last `make strategy-mount` recorded for it, each marked as
+passing or failing its audit. The two template folders are left out. It reports
+what is **on disk**, which is not always what is running: a deploy replaces files
+under a runner that keeps executing the code it already imported until it
+restarts, so after a deploy restart the runner, then check `/runner` for what it
+actually loaded.
 
 Three things are worth knowing before you use the last five:
 
@@ -999,7 +1176,8 @@ Three things are worth knowing before you use the last five:
 There is no HTTP control plane and this adds none: the bot asks the running
 services over NATS request/reply — the same actions `qte-control` uses — and
 reads Redis and Postgres directly for `/redis`, `/positions` and `/closed`, so
-those three still answer when the runner is down.
+those three still answer when the runner is down — as does `/strategies`, which
+reads the mounted directory.
 
 ---
 
@@ -1119,17 +1297,32 @@ that is down. Every probe is read-only. It runs inside a service container
 (`qte-control status`), because that is where the stack's real namespace and,
 with Tailscale on, the relay to the broker both live.
 
-**Coming back from an outage.** One strategy-symbol pair holds one trade cycle
-at a time, so a position that outlived a long downtime locks that pair: every
-entry the strategy proposes afterwards is refused, against a position whose
-bracket the market left behind hours ago. On start the runner closes anything
-older than `QTE_RUNNER__STALE_POSITION_MAX_AGE` (default one hour) with an
-`R_SL`, which ends the cycle and frees the pair. A deploy or a config change
-comes back well inside that window and keeps its positions, which is what the
-Redis and Postgres recovery path is for. Set
-`QTE_RUNNER__FLUSH_STALE_POSITIONS=warn` to see what a first run would close
-before letting it close anything, `off` to disable it, or the age to `0` to
-close the book on every start. Why it is age-gated rather than unconditional:
+**Coming back from an outage.** Open positions survive a restart by design.
+Every transition is written to Redis *and* to the Postgres `open_positions`
+table, so the runner reloads the cycle on start — from the cache, or from the
+table when the cache came up empty — and the strategy carries on deciding on
+it. Redis runs with AOF on its own volume and the cycle record has no TTL, so a
+container restart, a lost cache or a re-provisioned Redis all keep the book.
+
+Age does not close anything unless you ask it to:
+`QTE_RUNNER__FLUSH_STALE_POSITIONS` is `off` by default, because a strategy
+that holds a cycle until its own exit condition is met can be right to carry
+one for days. Set it to `warn` to see what a `close` run would flatten, or
+`close` with `QTE_RUNNER__STALE_POSITION_MAX_AGE` for the old age-gated
+behaviour.
+
+What *is* closed on start is the cycle your mapping table no longer claims —
+a strategy dropped from a symbol's `strategies` list, or a symbol carrying
+`enabled = false`. Nothing decides on those: no slot holds them, no bar reaches
+them, and their size is still charged against the account on every later
+sizing. `QTE_RUNNER__CLOSE_ORPHAN_POSITIONS` (default `close`) sends a `FLAT`
+for each, recovering the timeframe the payload needs from the `signals` row
+that opened the cycle. A pair the table *still* claims is reported and never
+closed, however long its slot has been missing — that is a strategy that failed
+to load or a repository that is not mounted, and a half-mounted
+`__strategies__/` must not flatten the book. A refused delivery leaves the row
+in place, so a `FLAT` the broker rejects over a closed weekend is retried at
+the next start. Why these two are separate mechanisms:
 [`docs/architecture.md`](docs/architecture.md).
 
 Everything else the engine knows is a CLI command or a SQL query:
@@ -1200,6 +1393,10 @@ make audit-strict                    # fails on anything the runner would skip
 make start-prod
 make logs
 ```
+
+Whatever deploys a strategy folder to the server should copy its
+`BUNDLE_VERSION.json` along with it, inside that folder — the file is how
+`/strategies` tells you afterwards which build is there.
 
 `make logs` streams what the *current* containers have written, so a recreate
 takes that history with it. Each long-running service therefore also writes its
