@@ -78,7 +78,7 @@ load_dotenv(REPO_ROOT / ".env", override=False)
 #: ``run`` block says whether the pair sized per entry (``dynamic_risk``) and
 #: under which ceiling (``max_risk_percent``). Additive again: ``run.risk_percent``
 #: keeps its meaning as the pair's base risk.
-REPORT_SCHEMA_VERSION = "1.2"
+REPORT_SCHEMA_VERSION = "1.0"
 
 
 class NatsSettings(BaseSettings):
