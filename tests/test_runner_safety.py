@@ -7,6 +7,8 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 from test_runner_catch_up import CandleStore, build_runner, completed_bars
 from test_runner_delivery import (
     FailedSink,
@@ -431,3 +433,83 @@ def live_state_scope(monkeypatch):
     """Select a live book; all broker transports in this suite are test doubles."""
     monkeypatch.setattr(settings, "env", "prod")
     monkeypatch.setattr(settings.state_config, "execution_mode", "live")
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        RedisConnectionError("Connection closed by server"),
+        RedisTimeoutError("Timeout reading from socket"),
+    ],
+)
+async def test_history_sync_survives_a_transient_redis_failure(monkeypatch, caplog, failure):
+    """A dropped connection costs one pass and is logged without a traceback.
+
+    The pass is lost either way; what matters is that the loop keeps running and
+    that the record stays at WARNING, because ERROR is forwarded to Telegram.
+    """
+    runner, _, _ = build_runner(monkeypatch, CandleStore(completed_bars(2)))
+    monkeypatch.setattr(runner_settings, "history_sync_interval", 0.01)
+    recovered = asyncio.Event()
+    attempts = []
+
+    async def flaky_refresh():
+        attempts.append(failure)
+        if len(attempts) == 1:
+            raise failure
+        recovered.set()
+
+    monkeypatch.setattr(runner, "_refresh_shadow_mode", flaky_refresh)
+    monkeypatch.setattr(runner, "_sync_history", lambda strategy_slot: asyncio.sleep(0))
+
+    with caplog.at_level("WARNING"):
+        loop_task = asyncio.create_task(runner._history_sync_loop())
+        try:
+            await asyncio.wait_for(recovered.wait(), timeout=2)
+        finally:
+            runner._stopping.set()
+            loop_task.cancel()
+            await asyncio.gather(loop_task, return_exceptions=True)
+
+    records = [record for record in caplog.records if "History synchronization" in record.message]
+    assert [record.levelname for record in records] == ["WARNING"]
+    assert records[0].exc_info is None
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        ValueError("Stored position has missing or foreign state provenance"),
+        # nats-py raises asyncio.TimeoutError, which is the builtin on 3.13,
+        # when the MT5 ingester never answers a history request. That is an
+        # outage of its own and must not read as Redis being unreachable.
+        TimeoutError(),
+    ],
+    ids=["unexpected_error", "history_request_timeout"],
+)
+async def test_history_sync_still_reports_a_non_redis_failure(monkeypatch, caplog, failure):
+    """Anything that is not a Redis blip keeps its ERROR and its traceback."""
+    runner, _, _ = build_runner(monkeypatch, CandleStore(completed_bars(2)))
+    monkeypatch.setattr(runner_settings, "history_sync_interval", 0.01)
+    reported = asyncio.Event()
+
+    async def broken_refresh():
+        reported.set()
+        raise failure
+
+    monkeypatch.setattr(runner, "_refresh_shadow_mode", broken_refresh)
+
+    with caplog.at_level("WARNING"):
+        loop_task = asyncio.create_task(runner._history_sync_loop())
+        try:
+            await asyncio.wait_for(reported.wait(), timeout=2)
+            await asyncio.sleep(0.05)
+        finally:
+            runner._stopping.set()
+            loop_task.cancel()
+            await asyncio.gather(loop_task, return_exceptions=True)
+
+    records = [record for record in caplog.records if "History synchronization" in record.message]
+    assert records, "An unexpected failure must still be reported"
+    assert records[0].levelname == "ERROR"
+    assert records[0].exc_info is not None
