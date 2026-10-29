@@ -106,7 +106,16 @@ class RedisState:
     async def connect(self) -> None:
         if self._client is not None:
             return
-        self._client = redis.from_url(self._url, decode_responses=True)
+        self._client = redis.from_url(
+            self._url,
+            decode_responses=True,
+            protocol=settings.redis.resp_protocol,
+            socket_timeout=settings.redis.socket_timeout,
+            socket_connect_timeout=settings.redis.socket_connect_timeout,
+            socket_keepalive=True,
+            health_check_interval=settings.redis.health_check_interval,
+            retry_on_timeout=True,
+        )
         await self._client.ping()
         log.info("Redis connected url=%s prefix=%s", self._url, self._prefix)
 

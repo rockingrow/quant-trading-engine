@@ -24,10 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   finite number is refused on every pair, and on a dynamic pair so is one that
   is not positive; it is never sized at a default. The backtest and the runner
   share the path, so `--param dynamic_risk=true` replays what the runner would
-  send. Backtest reports move to schema `1.2`: every trade carries the
-  `risk_percent` it was sized at and `run` gains `dynamic_risk` and
-  `max_risk_percent`; R-multiples are per unit and unchanged. Rows written by
-  `qte-backtest run --persist` do not carry the per-trade figure yet.
+  send. Backtest reports gain keys without a schema bump — `schema_version`
+  stays `1.0`, because the addition is purely additive and a reader written
+  against `1.0` is still correct: every trade carries the `risk_percent` it was
+  sized at and `run` gains `dynamic_risk` and `max_risk_percent`; R-multiples
+  are per unit and unchanged. Rows written by `qte-backtest run --persist` do
+  not carry the per-trade figure yet.
 
 - **`DISABLED` — switching one strategy off from its own repository.** A
   manifest may expose a third optional hook, `load_disabled()`, returning the
@@ -132,6 +134,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Update the README and broker/simulator documentation to describe the
   account-wide ceiling, bundle exclusions, and existing support for multiple
   trade cycles per strategy/symbol pair.
+
+
+### Fixed
+
+- **A Redis connection the container network dropped is detected instead of
+  waited out.** The strategy runner's history sync reported `TimeoutError`
+  tracebacks at `ERROR` against a server answering in 0.16ms: the client
+  inherited redis-py's defaults, with no keepalive and no health check, so a
+  pooled connection the bridge network had killed stayed in the pool looking
+  idle until a command read from it and blocked for the whole read deadline.
+  `RedisState.connect` now declares `socket_keepalive`,
+  `QTE_REDIS__HEALTH_CHECK_INTERVAL` (30s) and `retry_on_timeout`, and the
+  deadline itself (`QTE_REDIS__SOCKET_TIMEOUT`, 15s) is only the last resort —
+  set clear of the slowest legitimate command, because a deadline that cuts a
+  multi-key Lua write short turns a slow staging write into a lost one and
+  ingestion has no retry loop to cover it. Applies to all six services.
+
+- **The client talks RESP2 again.** `redis>=5.0` had resolved to redis-py 8,
+  which enables RESP3 and with it maintenance notifications — a Redis
+  Enterprise feature the OSS server rejects outright (`unknown subcommand
+  'MAINT_NOTIFICATIONS'` on every connect). Nothing here uses RESP3, so
+  `QTE_REDIS__RESP_PROTOCOL` defaults to `2` and the requirement is capped at
+  `redis<9` so a resolve cannot change the client's defaults again.
+
+- **A Redis blip in the history sync is one warning line, not a traceback.**
+  The loop loses that pass and re-reads the flag five seconds later, so the
+  forty-line `ERROR` was noise — and `ERROR` is forwarded to Telegram. Only
+  Redis's own exceptions are treated this way: the builtin `TimeoutError` would
+  also catch a history request the MT5 ingester never answered, and that outage
+  must not read as Redis being unreachable at a level nobody is paged for.
+
 
 ## [0.1.1] - 2026-10-19
 

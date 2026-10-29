@@ -69,15 +69,22 @@ load_dotenv(REPO_ROOT / ".env", override=False)
 #: fixed-count downsampling of them. A reader that fed ``t`` to a date parser
 #: would get a number it cannot parse, which is what a major bump is for.
 #:
-#: 1.1 — the ``costs`` block also states ``profile``, ``profile_file`` and
-#: ``sources``: which cost profile priced the fills, and which layer supplied
-#: each number (:mod:`qte_backtest.costs`). Purely additive — every 1.0 key is
-#: still there, with the same meaning — so a minor bump.
+#: Two sets of keys have been added since, and neither bumped this constant,
+#: because both are purely additive — every 1.0 key is still there with the
+#: same meaning, so a reader written against 1.0 is still correct:
 #:
-#: 1.2 — every trade states the ``risk_percent`` it was sized at, and the
-#: ``run`` block says whether the pair sized per entry (``dynamic_risk``) and
-#: under which ceiling (``max_risk_percent``). Additive again: ``run.risk_percent``
-#: keeps its meaning as the pair's base risk.
+#: * the ``costs`` block also states ``profile``, ``profile_file`` and
+#:   ``sources``: which cost profile priced the fills, and which layer supplied
+#:   each number (:mod:`qte_backtest.costs`);
+#: * every trade states the ``risk_percent`` it was sized at, and the ``run``
+#:   block says whether the pair sized per entry (``dynamic_risk``) and under
+#:   which ceiling (``max_risk_percent``). ``run.risk_percent`` keeps its
+#:   meaning as the pair's base risk.
+#:
+#: So a consumer must read this as a floor, not an inventory: a key it does not
+#: know may be present, and a key it needs may be absent on an older report.
+#: Test against the constant rather than a literal, so a bump stays a one-line
+#: change here.
 REPORT_SCHEMA_VERSION = "1.0"
 
 
@@ -217,6 +224,26 @@ class RedisSettings(BaseSettings):
     key_prefix: str = "qte"
     candle_history: int = 500
     ttl_seconds: int = 0
+    # A pooled connection the container network dropped is indistinguishable
+    # from an idle one until something reads from it. Without a keepalive and a
+    # periodic PING the next command blocks for the whole read deadline before
+    # the client gives up and reconnects, which surfaces as a TimeoutError on a
+    # server answering in under a millisecond.
+    # The deadline is a last resort, not the detector: the keepalive above and
+    # the health check below are what notice a dead connection. So it has to
+    # clear the slowest legitimate command — the multi-key Lua in
+    # :mod:`qte_shared.cache.redis_state`, staging or merging against a history
+    # of ``candle_history`` entries while the server is rewriting its AOF —
+    # because a deadline that cuts one of those turns a slow write into a lost
+    # one, and ingestion has no retry loop to cover it.
+    socket_timeout: float = 15.0
+    socket_connect_timeout: float = 5.0
+    health_check_interval: float = 30.0
+    # RESP3 buys this codebase nothing — no client-side caching, no pub/sub push
+    # handler — and redis-py 8 pairs it with maintenance notifications, a Redis
+    # Enterprise feature the OSS server rejects with "unknown subcommand
+    # MAINT_NOTIFICATIONS". Staying on RESP2 keeps the simpler parser.
+    resp_protocol: int = 2
 
 
 class PostgresSettings(BaseSettings):

@@ -67,6 +67,8 @@ from typing import Any
 from uuid import uuid4
 
 from nats.aio.msg import Msg
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from qte_shared.bar_gate import BAR_GATE_FLAG, BarGate
 from qte_shared.bus import NatsBus, Subjects
@@ -761,6 +763,25 @@ class StrategyRunner:
                         await self._sync_history(strategy_slot)
             except asyncio.CancelledError:
                 raise
+            except (RedisConnectionError, RedisTimeoutError) as transient:
+                # A dropped pooled connection or a read that outran its deadline
+                # costs this tick and nothing else: the next pass five seconds
+                # later re-reads the flag and re-syncs every slot. A traceback
+                # here is noise, and ERROR forwards it to Telegram.
+                #
+                # Only Redis's own exceptions, deliberately. The bare builtin
+                # TimeoutError would also catch a history request/reply that the
+                # MT5 ingester never answered — nats-py raises
+                # asyncio.TimeoutError, which *is* the builtin on 3.13 — and a
+                # dead history provider reported as "Redis was unreachable" at
+                # WARNING is an outage nobody is told about. redis-py converts
+                # its own socket timeouts into RedisTimeoutError, so nothing
+                # this branch is meant for is lost.
+                log.warning(
+                    "History synchronization skipped a pass; Redis was unreachable (%s: %s)",
+                    type(transient).__name__,
+                    transient,
+                )
             except Exception:
                 log.exception("History synchronization failed; retrying at the next interval")
 

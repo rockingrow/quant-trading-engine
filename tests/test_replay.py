@@ -179,7 +179,7 @@ def test_a_dynamic_pair_replays_each_entry_at_its_own_risk(trending_frame):
     assert {position.risk_percent for position in result.positions} == {1.0, 4.0}
 
     payload = build_report(result).to_dict()
-    assert payload["schema_version"] == SCHEMA_VERSION == "1.2"
+    assert payload["schema_version"] == SCHEMA_VERSION
     assert payload["run"]["risk_percent"] == pytest.approx(3.0)
     assert payload["run"]["dynamic_risk"] is True
     assert payload["run"]["max_risk_percent"] == pytest.approx(5.0)

@@ -8,6 +8,7 @@ from fakeredis import FakeServer
 from fakeredis.aioredis import FakeRedis
 from redis.exceptions import ResponseError
 
+from qte_shared.cache import redis_state as redis_state_module
 from qte_shared.cache.redis_state import MERGE_HISTORY_CANDLES, RedisState
 from qte_shared.config import settings
 from qte_shared.models import Candle
@@ -280,3 +281,37 @@ async def test_a_window_that_keeps_changing_is_left_alone_rather_than_half_writt
         assert await candle_state.merge_history_candles("XAUUSD", "M15", [history_candle(-1)]) == 0
     assert "Gave up merging" in caplog.text
     assert await candle_state.count_candles("XAUUSD", "M15") == 1
+
+
+async def test_connect_declares_the_connection_health_options(monkeypatch):
+    """A dropped pooled connection must be detected, not waited out.
+
+    redis-py's defaults leave a connection the container network killed in the
+    pool until a command blocks on it for the whole read deadline. These options
+    are the difference between a reconnect and a ``TimeoutError`` against a
+    server that answers in under a millisecond, so they are asserted rather
+    than left to the client's defaults — which changed under a `>=5.0` floor.
+    """
+    captured = {}
+
+    class ProbeClient:
+        async def ping(self):
+            return True
+
+    def record_from_url(url, **options):
+        captured["url"] = url
+        captured.update(options)
+        return ProbeClient()
+
+    monkeypatch.setattr(redis_state_module.redis, "from_url", record_from_url)
+    storage = RedisState(url="redis://redis-cache:6379/0")
+    await storage.connect()
+
+    assert captured["socket_keepalive"] is True
+    assert captured["retry_on_timeout"] is True
+    assert captured["decode_responses"] is True
+    assert captured["socket_timeout"] > 0
+    assert captured["socket_connect_timeout"] > 0
+    assert captured["health_check_interval"] > 0
+    # RESP3 pairs with maintenance notifications, which the OSS server rejects.
+    assert captured["protocol"] == 2

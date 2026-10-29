@@ -74,6 +74,7 @@ class RedactingFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         return _TOKEN_IN_BOT_URL.sub(_REDACTED, super().format(record))
 
+
 #: Directory the daily files go in. Empty disables them.
 LOG_DIRECTORY_VARIABLE = "QTE_LOG_DIR"
 DEFAULT_LOG_DIRECTORY = "logs"
