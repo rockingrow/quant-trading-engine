@@ -210,6 +210,43 @@ only as JSON is one nobody reviews.
 
 ---
 
+## 7. Update the changelog before you open a pull request
+
+Every pull request carries its own entry in [`changelog.md`](changelog.md),
+committed on the same branch and written **before** the PR is opened — code,
+configuration, documentation, tooling and these rules alike.
+
+- The entry goes under `## [Unreleased]`, below the Keep a Changelog heading
+  that fits it: `### Added`, `### Changed`, `### Removed`, `### Fixed` or
+  `### Security`, newest entry first. Add to the heading when it is already
+  there; add the heading when it is not.
+- **No `## [Unreleased]` section yet?** Create it directly under the intro
+  paragraph, above the newest release, with only the headings you need. Never
+  rename it to a version or a date; that is what cutting a release does.
+- Write it the way its neighbours are written: a bold lead sentence, then what
+  changed, and why it matters to someone who runs the engine. Name every
+  environment variable, mapping key, default and behaviour it touches
+  exactly. Say what an operator has to do about it, if anything.
+- English (rule 2), and no private strategy logic, defaults or results: the
+  file is public.
+- Opening the PR is still the user's call (rule 1). Preparing the entry is part
+  of getting the branch ready for it.
+
+**Why:** the changelog is the one place an operator reads to learn what a
+release does differently. An entry written at release time is rebuilt from
+commit subjects and loses the *why*; written with the branch, it sits next to
+the diff and is reviewed with it.
+
+**Check before opening the PR** (compares the tree to `dev`, so it sees
+committed and uncommitted work alike):
+
+```bash
+git diff --name-only dev | grep -qx 'changelog.md' \
+  && echo "changelog touched" || echo "NO CHANGELOG ENTRY — update changelog.md"
+```
+
+---
+
 ## Before you call the work done
 
 - [ ] `make check` passes (Ruff + pytest)
@@ -224,3 +261,5 @@ only as JSON is one nobody reviews.
       (rule 4)
 - [ ] PR base branch is `dev`, and its title and body carry no generated-by
       footer (rule 4)
+- [ ] `changelog.md` has an entry under `## [Unreleased]`, created if it was
+      missing, before the PR is opened (rule 7)
