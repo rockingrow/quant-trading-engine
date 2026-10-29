@@ -162,8 +162,7 @@ def test_the_file_carries_the_same_lines_as_the_console(tmp_path):
 
 FAKE_TOKEN = "123456789:AAFfakeTokenForTestsOnly_0123456789a"
 BOT_REQUEST = (
-    f"HTTP Request: POST https://api.telegram.org/bot{FAKE_TOKEN}/sendMessage "
-    '"HTTP/1.1 200 OK"'
+    f'HTTP Request: POST https://api.telegram.org/bot{FAKE_TOKEN}/sendMessage "HTTP/1.1 200 OK"'
 )
 
 

@@ -69,15 +69,22 @@ load_dotenv(REPO_ROOT / ".env", override=False)
 #: fixed-count downsampling of them. A reader that fed ``t`` to a date parser
 #: would get a number it cannot parse, which is what a major bump is for.
 #:
-#: 1.1 — the ``costs`` block also states ``profile``, ``profile_file`` and
-#: ``sources``: which cost profile priced the fills, and which layer supplied
-#: each number (:mod:`qte_backtest.costs`). Purely additive — every 1.0 key is
-#: still there, with the same meaning — so a minor bump.
+#: Two sets of keys have been added since, and neither bumped this constant,
+#: because both are purely additive — every 1.0 key is still there with the
+#: same meaning, so a reader written against 1.0 is still correct:
 #:
-#: 1.2 — every trade states the ``risk_percent`` it was sized at, and the
-#: ``run`` block says whether the pair sized per entry (``dynamic_risk``) and
-#: under which ceiling (``max_risk_percent``). Additive again: ``run.risk_percent``
-#: keeps its meaning as the pair's base risk.
+#: * the ``costs`` block also states ``profile``, ``profile_file`` and
+#:   ``sources``: which cost profile priced the fills, and which layer supplied
+#:   each number (:mod:`qte_backtest.costs`);
+#: * every trade states the ``risk_percent`` it was sized at, and the ``run``
+#:   block says whether the pair sized per entry (``dynamic_risk``) and under
+#:   which ceiling (``max_risk_percent``). ``run.risk_percent`` keeps its
+#:   meaning as the pair's base risk.
+#:
+#: So a consumer must read this as a floor, not an inventory: a key it does not
+#: know may be present, and a key it needs may be absent on an older report.
+#: Test against the constant rather than a literal, so a bump stays a one-line
+#: change here.
 REPORT_SCHEMA_VERSION = "1.0"
 
 

@@ -24,10 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   finite number is refused on every pair, and on a dynamic pair so is one that
   is not positive; it is never sized at a default. The backtest and the runner
   share the path, so `--param dynamic_risk=true` replays what the runner would
-  send. Backtest reports move to schema `1.2`: every trade carries the
-  `risk_percent` it was sized at and `run` gains `dynamic_risk` and
-  `max_risk_percent`; R-multiples are per unit and unchanged. Rows written by
-  `qte-backtest run --persist` do not carry the per-trade figure yet.
+  send. Backtest reports gain keys without a schema bump — `schema_version`
+  stays `1.0`, because the addition is purely additive and a reader written
+  against `1.0` is still correct: every trade carries the `risk_percent` it was
+  sized at and `run` gains `dynamic_risk` and `max_risk_percent`; R-multiples
+  are per unit and unchanged. Rows written by `qte-backtest run --persist` do
+  not carry the per-trade figure yet.
 
 - **`DISABLED` — switching one strategy off from its own repository.** A
   manifest may expose a third optional hook, `load_disabled()`, returning the
