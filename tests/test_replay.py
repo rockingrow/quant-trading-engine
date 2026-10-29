@@ -9,7 +9,9 @@ import pytest
 
 from qte_backtest.execution import CostModel, ExitReason
 from qte_backtest.replay import BacktestEngine, sample_market
+from qte_backtest.report import SCHEMA_VERSION, build_report
 from qte_shared.models import SignalAction
+from qte_shared.strategies.sizing import PositionSizer
 from qte_shared.strategies.strategy_base import (
     IntentResult,
     SignalIntent,
@@ -142,6 +144,63 @@ def test_a_second_entry_stacks_beside_the_open_one(trending_frame):
     )
     open_at_once = [position for position in result.positions if position.is_open]
     assert len(open_at_once) == 0, "the run still closes its book at the end of the data"
+
+
+class AlternatingRiskStrategy(AlwaysLongStrategy):
+    """States 1% and 4% on alternate entries, as a confidence-tiered strategy would."""
+
+    name = "ALTERNATING_RISK"
+
+    def __init__(self, params=None):
+        super().__init__(params)
+        self.entry_count = 0
+
+    def on_candle_closed(self, df, context):
+        intent = super().on_candle_closed(df, context)
+        intent.risk_percent = 1.0 if self.entry_count % 2 == 0 else 4.0
+        self.entry_count += 1
+        return intent
+
+
+def test_a_dynamic_pair_replays_each_entry_at_its_own_risk(trending_frame):
+    # $1,000 over the strategy's $5 stop: 1% buys 2 units, 4% buys 8.
+    position_sizer = PositionSizer(
+        capital=1000.0, risk_percent=3.0, dynamic_risk=True, max_risk_percent=5.0
+    )
+    result = BacktestEngine(
+        AlternatingRiskStrategy(), symbol="XAUUSD", starting_equity=1000.0, sizer=position_sizer
+    ).run(trending_frame)
+
+    entries = [signal for signal in result.signals if signal.position.action.is_entry]
+    assert len(result.positions) == len(entries) > 2
+    for position, signal in zip(result.positions, entries, strict=True):
+        assert position.risk_percent == signal.position.risk_percent
+        assert position.quantity == pytest.approx(2.0 if position.risk_percent == 1.0 else 8.0)
+    assert {position.risk_percent for position in result.positions} == {1.0, 4.0}
+
+    payload = build_report(result).to_dict()
+    assert payload["schema_version"] == SCHEMA_VERSION == "1.2"
+    assert payload["run"]["risk_percent"] == pytest.approx(3.0)
+    assert payload["run"]["dynamic_risk"] is True
+    assert payload["run"]["max_risk_percent"] == pytest.approx(5.0)
+    assert [trade["risk_percent"] for trade in payload["trades"]][:2] == [1.0, 4.0]
+    assert (
+        "dynamic risk per entry (base 3.00%, ceiling 5.00%)" in build_report(result).to_markdown()
+    )
+
+
+def test_a_static_pair_replays_every_entry_at_the_pairs_risk(trending_frame):
+    position_sizer = PositionSizer(capital=1000.0, risk_percent=3.0)
+    result = BacktestEngine(
+        AlternatingRiskStrategy(), symbol="XAUUSD", starting_equity=1000.0, sizer=position_sizer
+    ).run(trending_frame)
+
+    assert {position.risk_percent for position in result.positions} == {3.0}
+    assert {position.quantity for position in result.positions} == {6.0}
+    payload = build_report(result).to_dict()
+    assert payload["run"]["dynamic_risk"] is False
+    assert payload["run"]["max_risk_percent"] is None
+    assert "3.00% risk per entry" in build_report(result).to_markdown()
 
 
 def test_a_position_still_open_at_the_end_is_marked_out(trending_frame):

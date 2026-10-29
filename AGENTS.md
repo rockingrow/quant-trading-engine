@@ -48,6 +48,12 @@ table and the check commands; read it before you commit or open a PR.
    of `--report` and `make backtest`; never narrow `--report-format` to drop
    `html`, and write it into the session subfolder of rule 5. Research scripts pass `formats=("json", "md", "html")`, and a JSON
    without its page gets one from `make chart REPORT=<file>.json`.
+7. **Changelog before the PR**: every PR updates `changelog.md` on its own
+   branch before it is opened. The entry goes under `## [Unreleased]`, below the
+   Keep a Changelog heading that fits it (`### Added`, `### Changed`,
+   `### Removed`, `### Fixed`, `### Security`), newest first. No `[Unreleased]`
+   section yet: create it above the newest release; never rename it to a
+   version. English, and no private strategy logic, defaults or results.
 
 ## Working approach
 

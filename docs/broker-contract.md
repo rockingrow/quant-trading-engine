@@ -61,7 +61,9 @@ Field-level notes:
 - A close **restates what the entry established** — `risk_percent`,
   `tp1_percent`, `move_sl_to_be` and the scaling block — so a worker reading one
   message can re-sync the trade from it. Anything the strategy sets on the close
-  itself wins; it is describing the trade *now*.
+  itself wins; it is describing the trade *now*. The one exception is
+  `risk_percent`: the close always restates the risk the cycle was sized at,
+  because that figure is the engine's, not the strategy's (see [Sizing](#sizing)).
 
 ## Sizing
 
@@ -77,6 +79,28 @@ Read it as "risk this many currency units if the stop is hit". `risk_percent`
 comes from the pair's entry in `config/strategies_mapping.toml`, falling back to
 `QTE_ACCOUNT__RISK_PERCENT`. `examples/algo-trading-broker/entry.long.json` is
 this arithmetic: $1,000 at 3% over a $5 stop is 6 units.
+
+**The payload's `risk_percent` is always the one the quantity was sized at.** A
+strategy may state a `risk_percent` on its entry, and by default that value is
+overruled by the pair's own. A pair whose mapping sets `dynamic_risk = true`
+is sized at the strategy's value instead, so a strategy can risk less on a
+weaker setup and more on a stronger one:
+
+```toml
+[symbols.XAUUSD.params.SOME_STRATEGY]
+risk_percent     = 3.0    # the base: what an entry stating no risk is sized at
+dynamic_risk     = true   # size each entry at the risk_percent its strategy states
+max_risk_percent = 5.0    # the pair's ceiling; unset, it is risk_percent (lower only)
+```
+
+The entry is sized at `min(stated, max_risk_percent, QTE_ACCOUNT__MAX_RISK_PERCENT)`.
+`QTE_ACCOUNT__MAX_RISK_PERCENT` is an account-wide ceiling over every pair,
+dynamic or not, and `0` (the default) leaves it off. An entry stating a
+`risk_percent` that is not a finite number is refused on every pair, and on a
+dynamic pair so is one that is not positive. It is not sized at a default
+instead. Neither key reaches the payload's `inputs`, even when a strategy echoes
+its params there. A worker that sizes from `risk_percent` itself, and not from
+`quantity`, therefore lands on the same size QTE computed.
 
 The capital is **fixed** — it does not compound as the account moves. Sizing off
 running equity would make a backtest's later trades depend on its own earlier

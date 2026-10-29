@@ -147,8 +147,13 @@ class BacktestResult:
     starting_equity: float = 0.0
     #: Percent of the starting equity risked per entry. Together with the stop
     #: distance it is what produced every ``quantity`` below, so a reader can
-    #: re-derive the sizing rather than take the trade list on faith.
+    #: re-derive the sizing rather than take the trade list on faith. On a
+    #: ``dynamic_risk`` pair it is the base, and each trade states its own.
     risk_percent: float | None = None
+    #: Whether entries were sized at the risk the strategy stated on each.
+    dynamic_risk: bool = False
+    #: The ceiling on any one entry's ``risk_percent``; ``None`` when uncapped.
+    max_risk_percent: float | None = None
     #: The fallback size an entry that could not be risk-sized — no stop, or a
     #: stop on the entry — was filled at. Also what sizes the buy-and-hold
     #: benchmark, rather than comparing one unit of the market against
@@ -350,6 +355,8 @@ class BacktestEngine:
             strategy_meta=self.strategy.describe(),
             starting_equity=self.starting_equity,
             risk_percent=self.factory.sizer.risk_percent,
+            dynamic_risk=self.factory.sizer.dynamic_risk,
+            max_risk_percent=self.factory.sizer.max_risk_percent,
             quantity=self.default_quantity,
             market=sample_market(frame, warmup, self.timeframe),
         )
@@ -411,6 +418,7 @@ class BacktestEngine:
                 tp1_percent=block.tp1_percent,
                 move_sl_to_be=bool(block.move_sl_to_be),
                 signal_uxid=signal.signal_uxid,
+                risk_percent=block.risk_percent,
             )
             self._open[signal.signal_uxid] = opened
             self.positions.append(opened)

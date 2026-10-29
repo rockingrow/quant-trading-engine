@@ -25,7 +25,7 @@ from qte_backtest.replay import BacktestEngine
 from qte_shared.config import settings
 from qte_shared.models import SignalAction
 from qte_shared.strategies.signal_factory import SignalFactory
-from qte_shared.strategies.sizing import PositionSizer
+from qte_shared.strategies.sizing import DYNAMIC_RISK_KEY, MAX_RISK_PERCENT_KEY, PositionSizer
 from qte_shared.strategies.strategy_base import SignalIntent, candles_to_frame
 from qte_shared.strategies.strategy_settings import (
     PORT_ONLY_PARAMS,
@@ -300,4 +300,6 @@ def test_the_payload_carries_the_pairs_params_but_not_the_warmup():
     assert WARMUP_PARAM not in factory.inputs
     assert WARMUP_PARAM not in signal.inputs
     assert signal.inputs["risk_percent"] == 1.0
-    assert PORT_ONLY_PARAMS == {WARMUP_PARAM} | RETIRED_CYCLE_PARAMS
+    assert PORT_ONLY_PARAMS == (
+        {WARMUP_PARAM, DYNAMIC_RISK_KEY, MAX_RISK_PERCENT_KEY} | RETIRED_CYCLE_PARAMS
+    )

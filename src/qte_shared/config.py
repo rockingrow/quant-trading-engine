@@ -73,7 +73,12 @@ load_dotenv(REPO_ROOT / ".env", override=False)
 #: ``sources``: which cost profile priced the fills, and which layer supplied
 #: each number (:mod:`qte_backtest.costs`). Purely additive — every 1.0 key is
 #: still there, with the same meaning — so a minor bump.
-REPORT_SCHEMA_VERSION = "1.1"
+#:
+#: 1.2 — every trade states the ``risk_percent`` it was sized at, and the
+#: ``run`` block says whether the pair sized per entry (``dynamic_risk``) and
+#: under which ceiling (``max_risk_percent``). Additive again: ``run.risk_percent``
+#: keeps its meaning as the pair's base risk.
+REPORT_SCHEMA_VERSION = "1.0"
 
 
 class NatsSettings(BaseSettings):
@@ -163,6 +168,11 @@ class AccountSettings(BaseSettings):
     #: Percent of :attr:`capital` put at risk on one entry when the mapping
     #: table names no ``risk_percent`` for the pair.
     risk_percent: float = 1.0
+    #: Hard ceiling on the ``risk_percent`` any one entry is sized at, on every
+    #: pair. ``0`` means no account ceiling, and is the default. A pair that
+    #: sizes per entry (``dynamic_risk``) also has a ceiling of its own; the
+    #: lower of the two wins — see :mod:`qte_shared.strategies.sizing`.
+    max_risk_percent: float = Field(default=0.0, ge=0, allow_inf_nan=False)
     #: Charged per unit on entry and on every partial exit, each side.
     commission_per_unit: float = 0.0
     #: Full bid/ask distance in price units; each side of a fill pays half.

@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`dynamic_risk` — sizing each entry at the risk its strategy states.** A
+  pair whose mapping sets `dynamic_risk = true` is sized at the `risk_percent`
+  the strategy puts on each entry instead of the pair's own, so a strategy can
+  risk less on a setup it trusts less and more on one it trusts more. The entry
+  is sized at the lowest of what the strategy stated, the pair's
+  `max_risk_percent` and `QTE_ACCOUNT__MAX_RISK_PERCENT`. The pair's ceiling
+  defaults to its own `risk_percent`, so the switch alone can only lower risk;
+  the account ceiling covers every pair, dynamic or not, and `0`, the default,
+  leaves it off. Both mapping keys are read strictly and stay off the payload's
+  `inputs`: a `dynamic_risk` that is not a bool, or a `max_risk_percent` that is
+  not a finite number or sits below the pair's `risk_percent`, stops the pair at
+  startup instead of trading it some other way. A stated risk that is not a
+  finite number is refused on every pair, and on a dynamic pair so is one that
+  is not positive; it is never sized at a default. The backtest and the runner
+  share the path, so `--param dynamic_risk=true` replays what the runner would
+  send. Backtest reports move to schema `1.2`: every trade carries the
+  `risk_percent` it was sized at and `run` gains `dynamic_risk` and
+  `max_risk_percent`; R-multiples are per unit and unchanged. Rows written by
+  `qte-backtest run --persist` do not carry the per-trade figure yet.
+
 - **`DISABLED` — switching one strategy off from its own repository.** A
   manifest may expose a third optional hook, `load_disabled()`, returning the
   aliases its repository keeps (code, tests, documents) but has taken out of
@@ -53,6 +73,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a subset of the replayed one.
 
 ### Changed
+
+- **The payload's `risk_percent` is the one the quantity was sized at.** A
+  strategy's stated value used to reach the broker while the quantity was sized
+  at the pair's own, so a worker that sizes from `risk_percent` itself could
+  open a different position from the one QTE sized and recorded. Every entry
+  now states the figure it was sized at, and every close restates its cycle's
+  figure whatever the strategy puts on the close. A pair that has not opted in
+  to `dynamic_risk`, and whose strategy states a `risk_percent` other than the
+  pair's, now sends the pair's with a `WARNING`; a strategy that states the
+  pair's own value sees no change.
+
+- **Port-only params stay off the payload when a strategy echoes them.**
+  `warmup`, and now `dynamic_risk` and `max_risk_percent`, were removed only
+  from the pair's params, so a strategy that reports its own params through
+  `intent.inputs` handed them to the broker anyway. The filter now applies to
+  the merged `inputs` of the signal.
+
+- **Contributors update `changelog.md` before a PR is opened.** New rule 7 in
+  `AUDIT.md`, digested in `AGENTS.md`: the entry goes under `## [Unreleased]`,
+  which is created when it is missing.
 
 - **Age no longer closes a position; the mapping table does.**
   `QTE_RUNNER__FLUSH_STALE_POSITIONS` now defaults to `off`. A strategy that
