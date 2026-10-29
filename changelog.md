@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A Redis connection the container network dropped is detected instead of
+  waited out.** The strategy runner's history sync reported `TimeoutError`
+  tracebacks at `ERROR` against a server answering in 0.16ms: the client
+  inherited redis-py's defaults, with no keepalive and no health check, so a
+  pooled connection the bridge network had killed stayed in the pool looking
+  idle until a command read from it and blocked for the whole read deadline.
+  `RedisState.connect` now declares `socket_keepalive`,
+  `QTE_REDIS__HEALTH_CHECK_INTERVAL` (30s) and `retry_on_timeout`, and the
+  deadline itself (`QTE_REDIS__SOCKET_TIMEOUT`, 15s) is only the last resort —
+  set clear of the slowest legitimate command, because a deadline that cuts a
+  multi-key Lua write short turns a slow staging write into a lost one and
+  ingestion has no retry loop to cover it. Applies to all six services.
+
+- **The client talks RESP2 again.** `redis>=5.0` had resolved to redis-py 8,
+  which enables RESP3 and with it maintenance notifications — a Redis
+  Enterprise feature the OSS server rejects outright (`unknown subcommand
+  'MAINT_NOTIFICATIONS'` on every connect). Nothing here uses RESP3, so
+  `QTE_REDIS__RESP_PROTOCOL` defaults to `2` and the requirement is capped at
+  `redis<9` so a resolve cannot change the client's defaults again.
+
+- **A Redis blip in the history sync is one warning line, not a traceback.**
+  The loop loses that pass and re-reads the flag five seconds later, so the
+  forty-line `ERROR` was noise — and `ERROR` is forwarded to Telegram. Only
+  Redis's own exceptions are treated this way: the builtin `TimeoutError` would
+  also catch a history request the MT5 ingester never answered, and that outage
+  must not read as Redis being unreachable at a level nobody is paged for.
+
 ## [0.1.1] - 2026-10-19
 
 ### Added

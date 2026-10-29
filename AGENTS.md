@@ -52,6 +52,12 @@ table and the check commands; read it before you commit or open a PR.
   existing architecture.
 - Do not add or upgrade production dependencies unless the task requires it;
   say why when you do.
+- **Record a user-visible change in [changelog.md](changelog.md)** before the
+  branch is proposed for a PR — behaviour, a new `QTE_*` variable, a new
+  command, a fixed bug. Keep a Changelog format, newest first, under
+  `## [Unreleased]` until a release names it. Say *why* it changed and what it
+  cost, as the existing entries do; a one-line "fixed Redis timeout" is not an
+  entry. Internal refactors, test-only changes and docs edits need none.
 - Never expose, commit or copy secrets from `.env`, credentials, tokens, or
   private strategy data.
 
