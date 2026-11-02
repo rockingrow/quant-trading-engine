@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`make demo-signal` — one open cycle from a real strategy to the broker, for
+  the drill.** It answers a deployment question rather than a trading one:
+  given data a strategy would act on, does a signal still make it all the way
+  out of the engine and into the broker's Telegram notification? Every hop a
+  live signal takes after the strategy is exercised with the pair's own
+  configuration — the mapping table's params and risk, the strategy's warm-up
+  and timeframe, the bracket, the risk sizing, the broker envelope.
+
+  - It publishes on the broker's **`SIGNALS_DEMO.<strategy>`** subject
+    (`ALGO_BROKER__DEMO_SUBJECT_PREFIX`, `Subjects.broker_signal_demo()`),
+    which the broker answers with a Telegram card and nothing else. A
+    different first token, not `SIGNALS.DEMO.*`, on purpose: the broker's
+    JetStream stream captures `SIGNALS.>`, so a demo one token deeper would
+    land in the very buffer its worker fan-out drains.
+  - `make demo-signal` fires every mounted strategy in turn, on the first
+    symbol each is mapped to; `STRATEGY=` and `SYMBOL=` narrow it.
+    `qte-control demo-signal [--strategy] [--symbol]` is the same thing. One
+    envelope that does not reach the broker is reported against that pair
+    (`NOT DELIVERED`) rather than discarding the pairs that did get out, so a
+    NATS drop mid-run does not leave the operator guessing which cards reached
+    Telegram. A failure the drill cannot report around — an unreachable broker,
+    a mistyped `--strategy` — prints one line, like the rest of `qte-control`.
+  - **Ideal data is searched for, not assumed.** A strategy may be
+    trend-following or mean-reverting, so four synthetic regimes are replayed
+    — a clean trend each way and an exhaustion reversal each way — and the
+    first entry one of them produces is what gets published. A strategy that
+    enters on none of them still gets a payload: the drill falls back to a
+    synthetic entry priced off the last bar and says so on the console, since
+    what is being tested is the transport. Declining is not an error and exits
+    `0`; a strategy that **raised** while being driven is reported as `RAISED`
+    and exits `1`, because a crash on a frame of plausible bars is a crash the
+    runner would hit on a real one.
+  - It writes nothing. No Redis, no Postgres, no delivery outbox, no cycle
+    remembered — the `SignalFactory` it builds through is a throwaway — so a
+    running runner's own positions are untouched. Shadow mode is ignored for
+    the same reason: the subject is what keeps orders away from a worker, and
+    a drill that stayed silent in the mode most deployments sit in would
+    never be run.
+
 - **`dynamic_risk` — sizing each entry at the risk its strategy states.** A
   pair whose mapping sets `dynamic_risk = true` is sized at the `risk_percent`
   the strategy puts on each entry instead of the pair's own, so a strategy can

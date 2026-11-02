@@ -83,6 +83,7 @@ make db-upgrade     # Alembic; there is no init script
 make costs          # write config/costs.toml — what a replay charges a fill, per symbol
 make backtest STRATEGY=QTE_EXAMPLE_EMA_ATR SYMBOL=XAUUSD TF=M15 FILE=data/parquet/tiingo/XAUUSD_M15.parquet
 make chart REPORT=data/reports/<file>.json
+make demo-signal   # fire a demo open cycle at the broker, Telegram only [STRATEGY=] [SYMBOL=]
 make help           # every target, one line each
 ```
 
@@ -124,6 +125,7 @@ package; never scan from the repository root.
 | Live feed, resampling, Redis and NATS | `src/qte_ingestion/{service,resampler}.py` |
 | Live loop, broker delivery, control CLI | `src/qte_strategy_engine/{runner,broker_sink,preflight,control}.py` |
 | `make status` / `qte-control status`: read-only probes of Redis, Postgres, NATS, runner, ingestion, MT5 ingester, broker | `src/qte_strategy_engine/connectivity.py`, `tests/test_connectivity.py` |
+| `make demo-signal` / `qte-control demo-signal`: one open cycle per mounted strategy on the broker's demo subject (Telegram only, never a worker) | `src/qte_strategy_engine/demo_signal.py`, `tests/test_demo_signal.py` |
 | Operator's Telegram bot: the ten commands, tables, paging | `src/qte_bot/`, `QTE_BOT__*` |
 | `/strategies`: the mount scanned on disk, each folder's `BUNDLE_VERSION.json` and published strategies, one box per folder | `src/qte_bot/mounts.py`, `presenters.strategy_bundles`, `tests/test_bot_strategies.py` |
 | Control plane the bot and `qte-control` both call (NATS request/reply) | `_on_control_message` in `src/qte_strategy_engine/runner.py` and `src/qte_ingestion/service.py`, `Subjects.{engine,ingestion}_control` |
