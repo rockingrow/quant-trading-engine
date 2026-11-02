@@ -6,8 +6,10 @@ end users who may or may not have linked an account; here every command reads
 or changes a live trading engine, so there is nothing to show someone who is
 not an operator.
 
-Ordered the way the work goes: look first (``/redis`` … ``/closed``), then act
-(``/flat`` … ``/flush``).
+Ordered the way the work goes: look first (``/redis`` … ``/provider``), then
+act (``/flat`` … ``/demo``). ``/demo`` sits with the acting half although it
+changes nothing in this engine: it publishes, and what it publishes reaches the
+operators' Telegram channel.
 """
 
 from __future__ import annotations
@@ -18,6 +20,8 @@ COMMANDS = [
     BotCommand(command="redis", description="Warm-up bars held per symbol"),
     BotCommand(command="runner", description="Strategies and whether they can decide"),
     BotCommand(command="strategies", description="Mounted strategy repos and their build"),
+    BotCommand(command="mapping", description="Which strategies trade which symbols"),
+    BotCommand(command="provider", description="What each data provider is asked to feed"),
     BotCommand(command="positions", description="Open positions"),
     BotCommand(command="closed", description="Recently closed positions"),
     BotCommand(command="flat", description="Close positions: all | SYMBOL | STRATEGY"),
@@ -25,6 +29,7 @@ COMMANDS = [
     BotCommand(command="allow", description="Resume deciding: all | SYMBOL | STRATEGY"),
     BotCommand(command="warmup", description="Re-request warm-up bars: all | SYMBOL"),
     BotCommand(command="flush", description="Drop warm-up bars: all | SYMBOL"),
+    BotCommand(command="demo", description="Fire a demo signal: all | STRATEGY"),
     BotCommand(command="help", description="What each command does"),
 ]
 
@@ -34,6 +39,8 @@ HELP = """<b>QTE engine</b> — book <code>{namespace}</code>
 /redis — bars held per symbol and timeframe, and the newest one
 /runner — every strategy, its window, and whether it can decide on the next bar
 /strategies — each mounted strategy repository: the build deployed and what it publishes
+/mapping — the symbol to strategy table, and the parameters each pair runs with
+/provider — each data provider's plan: the symbols it feeds, and its own knobs
 /positions — what is open right now
 /closed — positions that are over, newest first
 
@@ -43,6 +50,14 @@ HELP = """<b>QTE engine</b> — book <code>{namespace}</code>
 /allow <code>all | SYMBOL | STRATEGY</code> — resume deciding
 /warmup <code>all | SYMBOL</code> — ask the vendor for the warm-up window again
 /flush <code>all | SYMBOL</code> — drop the warm-up bars Redis holds
+/demo <code>all | STRATEGY</code> — fire one demo open cycle per strategy
+
+<b>What /demo is for</b>
+It drives each mounted strategy over ideal candles and publishes what comes
+out on the broker's drill subject, so the broker shows a card and no worker is
+commanded. Nothing is written to Redis, Postgres or the outbox, and a running
+runner is untouched — but every fired strategy puts one card in the channel,
+so name a strategy rather than /demo all when one is all you need.
 
 <b>What /prevent does not do</b>
 Bars keep arriving and keep filling the window; only the decision is skipped,

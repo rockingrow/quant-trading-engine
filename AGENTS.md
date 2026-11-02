@@ -126,7 +126,8 @@ package; never scan from the repository root.
 | Live loop, broker delivery, control CLI | `src/qte_strategy_engine/{runner,broker_sink,preflight,control}.py` |
 | `make status` / `qte-control status`: read-only probes of Redis, Postgres, NATS, runner, ingestion, MT5 ingester, broker | `src/qte_strategy_engine/connectivity.py`, `tests/test_connectivity.py` |
 | `make demo-signal` / `qte-control demo-signal`: one open cycle per mounted strategy on the broker's demo subject (Telegram only, never a worker) | `src/qte_strategy_engine/demo_signal.py`, `tests/test_demo_signal.py` |
-| Operator's Telegram bot: the ten commands, tables, paging | `src/qte_bot/`, `QTE_BOT__*` |
+| Operator's Telegram bot: the thirteen commands, tables, paging | `src/qte_bot/`, `QTE_BOT__*` |
+| `/demo`, `/mapping`, `/provider`: the drill run from the chat, and the two configuration files read back | `fire_demo`/`show_mapping`/`show_providers` in `src/qte_bot/handlers.py`, `tests/test_bot_demo.py`, `tests/test_bot_config.py` |
 | `/strategies`: the mount scanned on disk, each folder's `BUNDLE_VERSION.json` and published strategies, one box per folder | `src/qte_bot/mounts.py`, `presenters.strategy_bundles`, `tests/test_bot_strategies.py` |
 | Control plane the bot and `qte-control` both call (NATS request/reply) | `_on_control_message` in `src/qte_strategy_engine/runner.py` and `src/qte_ingestion/service.py`, `Subjects.{engine,ingestion}_control` |
 | Pausing decisions per symbol/strategy (`/prevent`, `/allow`) | `src/qte_shared/bar_gate.py` |

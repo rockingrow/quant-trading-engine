@@ -1138,6 +1138,8 @@ because only one process may poll `getUpdates` for a token at a time.
 | `/redis` | Bars held per symbol and timeframe, and the newest one |
 | `/runner` | Every strategy, its window, and whether it can decide on the next bar |
 | `/strategies` | Each mounted strategy repository as a box: the build its `BUNDLE_VERSION.json` records and the strategies it publishes |
+| `/mapping` | The symbol → strategy table as the file states it, with each pair's parameters and the per-strategy defaults |
+| `/provider` | Each data provider's plan: the symbols it feeds, their market and timeframes, and the vendor's own knobs |
 | `/positions` | What is open: symbol, timeframe, strategy, `signal_uxid`, opened |
 | `/closed` | Positions that are over, newest first, paged |
 | `/flat all \| SYMBOL \| STRATEGY` | Closes positions, after a confirmation |
@@ -1145,6 +1147,7 @@ because only one process may poll `getUpdates` for a token at a time.
 | `/allow all \| SYMBOL \| STRATEGY` | Resumes deciding |
 | `/warmup all \| SYMBOL` | Asks the vendor for the warm-up window again |
 | `/flush all \| SYMBOL` | Drops the warm-up bars Redis holds |
+| `/demo all \| STRATEGY` | Fires one demo open cycle per strategy — Telegram sees the card, no worker does |
 
 `/strategies` is the one command that asks neither the runner nor a database. It
 scans the `__strategies__/` mount and, for every strategy folder, prints one
@@ -1157,7 +1160,33 @@ under a runner that keeps executing the code it already imported until it
 restarts, so after a deploy restart the runner, then check `/runner` for what it
 actually loaded.
 
-Three things are worth knowing before you use the last five:
+`/mapping` and `/provider` read the two configuration files back —
+[`config/strategies_mapping.toml`](#pairing-symbols-with-strategies) and
+each `config/data_providers/<provider>.toml` — so they answer "what is this
+book configured to do" from the files an operator edits rather than from a
+running process. Both tell an **absent** file from an **empty** one, because
+those are different instructions: no mapping table means every strategy keeps
+the symbols it declares on itself, while a table that maps no pairs means trade
+nothing, and the two differ by a deploy. Compare either with `/runner` to see a
+deploy that has not been restarted yet. No credential reaches `/provider`: the
+plan parser drops every credential-shaped key as it reads the file, and the
+vendor key lives in `.env`.
+
+`/demo` is `make demo-signal` run from
+the chat, and it is the one command that *does* something rather than asking:
+it drives each mounted strategy over four synthetic regimes, publishes the
+first entry one of them produces on `SIGNALS_DEMO.<strategy>`, and the broker
+answers with a Telegram card and forwards nothing to a worker. It runs inside
+the bot rather than in the runner — seconds of CPU per pair, which the live
+loop must not spend — and writes nothing to Redis, Postgres or the outbox, so a
+running runner is untouched. Its report keeps three outcomes apart: an envelope
+that did not leave (transport), a strategy that **raised** while being driven
+(the drill's finding — it would raise on a live bar too), and a strategy that
+simply declined every regime, which is ordinary and still gets a synthetic
+payload so the path is proven. Two notes before `/demo all`: it puts one card
+per strategy into the channel, and one bot runs one drill at a time.
+
+Three things are worth knowing before you use the acting commands:
 
 * **`/prevent` does not drop bars.** They keep arriving and keep filling the
   window; only the decision is skipped, so `/allow` resumes on the next bar
@@ -1176,8 +1205,9 @@ Three things are worth knowing before you use the last five:
 There is no HTTP control plane and this adds none: the bot asks the running
 services over NATS request/reply — the same actions `qte-control` uses — and
 reads Redis and Postgres directly for `/redis`, `/positions` and `/closed`, so
-those three still answer when the runner is down — as does `/strategies`, which
-reads the mounted directory.
+those three still answer when the runner is down — as do `/strategies`,
+`/mapping` and `/provider`, which read the mounted directory and the
+configuration files, and `/demo`, which drives the mounted strategies itself.
 
 ---
 

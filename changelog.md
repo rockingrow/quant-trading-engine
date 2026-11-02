@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Three more commands on the operator's Telegram bot: `/demo`, `/mapping`
+  and `/provider`.**
+
+  - **`/demo all | STRATEGY`** runs the drill below from the chat: it drives
+    each mounted strategy over the same ideal candles `make demo-signal` uses
+    and publishes what comes out on the broker's drill subject, so the broker
+    answers with a Telegram card and commands no worker. The report tells
+    apart the three outcomes an operator acts on differently — an envelope
+    that did not leave, a strategy that *raised* while being driven, and a
+    strategy that merely declined every regime and got the synthetic
+    fallback. The strategy names it offers come from the `__strategies__/`
+    mount, not from the runner, because the drill loads the strategies off
+    disk itself; and one bot process runs one drill at a time, since two would
+    drive the same strategies and double every card in the channel. It runs in
+    the bot and not in the runner on purpose: driving a strategy over four
+    regimes is seconds of CPU per pair and the live loop must not spend them.
+    Nothing is written to Redis, Postgres or the outbox, so a running runner is
+    untouched.
+  - **`/mapping`** reads `config/strategies_mapping.toml` back: every pair,
+    the parameters it runs with, and the per-strategy defaults underneath
+    them. A table that is absent and a table that maps nothing read
+    differently, because they are different instructions — no table means
+    every strategy keeps the symbols it declares on itself, an empty one means
+    trade nothing.
+  - **`/provider`** reads each `config/data_providers/<provider>.toml` back:
+    the symbols that provider feeds with their market and timeframes, and its
+    own `[provider]` knobs. One message per provider, since each reads its own
+    file and a merged view loses the knobs. No credential can appear — the
+    parser drops every credential-shaped key as it reads the file.
+
 - **`make demo-signal` — one open cycle from a real strategy to the broker, for
   the drill.** It answers a deployment question rather than a trading one:
   given data a strategy would act on, does a signal still make it all the way

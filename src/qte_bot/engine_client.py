@@ -17,6 +17,15 @@ Four sources, picked by what the question actually is:
   repository is deployed — its ``BUNDLE_VERSION.json`` — and what it
   publishes. Read from disk, so it answers without a runner and without
   importing a line of private code.
+* **The configuration files** for the symbol → strategy table and the
+  data-provider plans, which are what an operator edits and so what they
+  expect a command to read back.
+
+The drill behind ``/demo`` is the one thing here that *runs* rather than asks:
+it drives the mounted strategies itself, in a worker thread, exactly as
+``make demo-signal`` does. It belongs in the bot and not in the runner because
+it is seconds of CPU per pair and the live loop must not spend them — and it is
+safe beside a running runner because it writes no engine state.
 
 Every method is best-effort and returns ``None`` (or an empty page) when the
 engine cannot be reached, so a handler renders "could not reach the runner"
@@ -32,13 +41,22 @@ from qte_bot.mounts import MountedRepository, scan_mounted_repositories
 from qte_shared.bar_gate import BAR_GATE_FLAG, BarGate
 from qte_shared.bus import NatsBus, Subjects
 from qte_shared.cache import RedisState
-from qte_shared.config import market_data_plan, settings
+from qte_shared.config import market_data_plan, provider_market_data_plan, settings
 from qte_shared.logging_setup import get_logger
-from qte_shared.market_data_plan import SymbolFeed
+from qte_shared.market_data_plan import MarketDataPlan, SymbolFeed
+from qte_shared.strategies.mapping import SymbolMapping
 from qte_strategy_engine.db import (
     ClosedCycle,
     OpenPositionRepository,
     SignalRepository,
+)
+from qte_strategy_engine.demo_signal import (
+    DemoDelivery,
+    DemoPair,
+    DemoSignal,
+    build_demo_pairs,
+    build_demo_signal,
+    publish_demo_signals,
 )
 
 log = get_logger(__name__)
@@ -64,6 +82,10 @@ class EngineClient:
         self._subjects = Subjects()
         self._request_timeout = request_timeout
         self._flat_timeout = flat_timeout
+        # One drill at a time per bot process. Two concurrent runs would drive
+        # the same strategies over the same synthetic bars for no extra
+        # coverage and put every card into the channel twice.
+        self._demo_lock = asyncio.Lock()
 
     @property
     def namespace(self) -> str:
@@ -95,6 +117,27 @@ class EngineClient:
 
     def planned_symbols(self) -> list[str]:
         return sorted({feed.symbol for feed in self.planned_feeds()})
+
+    def provider_plans(self) -> dict[str, MarketDataPlan]:
+        """Each configured provider's own plan, keyed by provider name.
+
+        The per-provider plans rather than the merged one, because ``[provider]``
+        — the vendor's own knobs — survives the merge only when a single
+        provider is configured, and the knobs are half of what ``/provider``
+        exists to show. Credentials cannot appear: the parser drops every
+        credential-shaped key out of ``[provider]`` as it reads the file.
+        """
+        return {name: provider_market_data_plan(name) for name in settings.market_data.providers}
+
+    async def strategy_mapping(self) -> SymbolMapping:
+        """The symbol → strategy table as the runner reads it, parsed off-thread.
+
+        Read from the file rather than asked of the runner on purpose: this is
+        the configuration an operator edits, and comparing it with what
+        ``/runner`` says is loaded is how a deploy that has not been restarted
+        yet shows itself.
+        """
+        return await asyncio.to_thread(SymbolMapping.load, settings.engine.mapping_file)
 
     # ── Redis ─────────────────────────────────────────────────────────
 
@@ -141,6 +184,45 @@ class EngineClient:
         imported before the deploy — would answer a different one.
         """
         return await asyncio.to_thread(scan_mounted_repositories, settings.engine.strategies_dir)
+
+    async def mounted_strategy_names(self) -> list[str]:
+        """Every strategy the mount record publishes — what a drill can fire.
+
+        The mount, not the runner: :func:`build_demo_pairs` loads the
+        strategies off disk itself, so offering the runner's list would offer
+        names this bot cannot drill and hide ones it can.
+        """
+        repositories = await self.mounted_repositories()
+        return sorted({name for repository in repositories for name in repository.strategies})
+
+    # ── The drill ─────────────────────────────────────────────────────
+
+    @property
+    def demo_running(self) -> bool:
+        return self._demo_lock.locked()
+
+    async def fire_demo_signals(
+        self, strategy: str | None = None
+    ) -> tuple[list[DemoDelivery], list[str]]:
+        """Run the demo drill here and publish it; returns deliveries and failures.
+
+        The same code path as ``make demo-signal``, and for the same reason it
+        does not go through the runner: driving a strategy over four synthetic
+        regimes is seconds of CPU per pair, and the live loop must not spend
+        them. It is safe to run beside a live runner because the drill writes
+        no engine state — a throwaway ``SignalFactory``, nothing into Redis,
+        Postgres or the outbox — and publishes on a subject the broker answers
+        with a Telegram card and nothing else.
+
+        Building is synchronous and runs in a worker thread, so the bot keeps
+        answering while a drill over a whole mount is in flight. *failures* are
+        the pairs whose payload could not be built at all, as readable lines.
+        """
+        async with self._demo_lock:
+            pairs, demos, failures = await asyncio.to_thread(_build_demos, strategy)
+            if not pairs:
+                return [], failures
+            return await publish_demo_signals(demos), failures
 
     # ── Postgres ──────────────────────────────────────────────────────
 
@@ -265,3 +347,28 @@ class EngineClient:
             log.warning("No answer on %s for %s: %s", subject, payload.get("action"), failure)
             return None
         return reply if isinstance(reply, dict) else None
+
+
+def _build_demos(
+    strategy: str | None,
+) -> tuple[list[DemoPair], list[DemoSignal], list[str]]:
+    """Build every pair's payload in one thread, keeping the ones that worked.
+
+    A pair whose payload cannot be built is the drill's finding, not a reason
+    to drop the pairs that can: an operator firing the whole mount wants the
+    working ones fired and the broken ones named.
+    """
+    pairs = build_demo_pairs(strategy)
+    demos: list[DemoSignal] = []
+    failures: list[str] = []
+    for pair in pairs:
+        try:
+            demos.append(build_demo_signal(pair))
+        except Exception as failure:
+            log.exception(
+                "Demo drill could not build a payload for %s on %s",
+                pair.strategy_name,
+                pair.symbol,
+            )
+            failures.append(f"{pair.strategy_name} on {pair.symbol}: {failure}")
+    return pairs, demos, failures
