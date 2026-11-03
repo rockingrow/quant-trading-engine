@@ -17,10 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **LONG and SHORT read as a green and a red dot** in the lifecycle message
-  (`🟢` / `🔴`) in place of the two chart glyphs, which were hard to tell
-  apart at a glance. `algo-trading-broker` carries the same change, so one
-  trade reads the same in both messages.
+- **LONG and SHORT read as a green and a red square** in the lifecycle message
+  (`🟩` / `🟥`) in place of the two chart glyphs, which were hard to tell apart
+  at a glance. Dots were tried first and dropped: the flags, the service
+  UP/DOWN notices and the dashboard's severity badges are circles too, so a
+  green dot said nothing about being an entry. The squares are only ever an
+  entry. `broker/helpers/emoji_constants.py` in `algo-trading-broker` mirrors
+  this table and has to make the same change for one trade to read the same in
+  both messages. The Markdown report and the HTML dashboard keep their `L` /
+  `S` column, which takes its colour from the theme.
 - **Every glyph is named in one place**, `qte_shared.emoji_constants`, and
   resolved through the `emoji` package — the table `algo-trading-broker`
   already kept as `broker/helpers/emoji_constants.py`. They were literals in
