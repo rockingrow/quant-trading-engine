@@ -20,8 +20,11 @@ from qte_bot.mounts import MountedRepository
 from qte_bot.pagination import page_footer
 from qte_bot.tables import marked, render_table
 from qte_shared.config import settings
+from qte_shared.market_data_plan import MarketDataPlan
 from qte_shared.notifications.telegram_sink import boxed, clipped
+from qte_shared.strategies.mapping import SymbolMapping
 from qte_strategy_engine.db import ClosedCycle
+from qte_strategy_engine.demo_signal import DemoDelivery
 
 NO_RUNNER = (
     "⚠️ No runner answered. It may be down, or wired to another book — "
@@ -452,6 +455,242 @@ def _unknown_line(unknown: list[str]) -> str:
     if not unknown:
         return ""
     return "\n⚠️ Not fed here: <code>" + escaped(", ".join(unknown)) + "</code>"
+
+
+# ── Configuration, read back from the files an operator edits ─────────────
+
+#: Lines of a configuration listing in one message. A listing is a page of a
+#: file rather than a window on a database, so there are no paging buttons and
+#: a long file is simply sent as several messages.
+CONFIG_ROWS_PER_MESSAGE = 30
+
+#: Parameters spelled out beside a pair before the rest is counted instead.
+MAX_PARAMS_PER_ROW = 6
+
+
+def _as_messages(lines: list[str]) -> list[str]:
+    """Pack *lines* into as few messages as the Bot API's length limit allows.
+
+    A body past 4096 characters is refused whole, and the refusal lands after
+    whatever the message was reporting has already happened — a fired drill
+    whose report never arrives reads to the operator like a drill that never
+    ran. Splitting on a line boundary keeps each message complete instead.
+    """
+    messages: list[str] = []
+    current: list[str] = []
+    used = 0
+    for line in lines:
+        if current and used + len(line) > MAX_MESSAGE_CHARS:
+            messages.append("\n".join(current))
+            current, used = [], 0
+        current.append(line)
+        used += len(line) + 1
+    messages.append("\n".join(current))
+    return messages
+
+
+def _params_text(params: dict[str, Any]) -> str:
+    """One pair's overrides as ``key=value``, in the file's own order."""
+    if not params:
+        return "—"
+    items = list(params.items())
+    rendered = " ".join(f"{key}={value}" for key, value in items[:MAX_PARAMS_PER_ROW])
+    if len(items) > MAX_PARAMS_PER_ROW:
+        rendered += f" +{len(items) - MAX_PARAMS_PER_ROW}"
+    return rendered
+
+
+def strategy_mapping(mapping: SymbolMapping, namespace: str) -> list[str]:
+    """``/mapping``: the symbol → strategy table, as the file states it.
+
+    The absent file and the empty one are told apart, because they are two
+    different instructions: no table at all means every strategy keeps the
+    symbols it declares on itself, while a table that maps nothing means trade
+    nothing. They differ by a deploy, so a message that collapsed them would be
+    the one an operator reads on the quiet weekend that was not meant to be
+    quiet.
+    """
+    title = header("Strategies mapping", namespace)
+    if not mapping:
+        return [
+            f"{title}\n\nNo mapping table is deployed "
+            f"(<code>{escaped(settings.engine.mapping_file.name)}</code>), so every strategy "
+            "keeps the symbols it declares on itself."
+        ]
+    source = f"File: <code>{escaped(mapping.source.name if mapping.source else '—')}</code>"
+    if not mapping.pairings:
+        return [
+            f"{title}\n{source}\n\n⚠️ The table maps no pairs, so nothing is traded. "
+            "A symbol switched off keeps its entry with <code>enabled = false</code>."
+        ]
+
+    # Grouped under each symbol rather than tabulated, for the reason the
+    # drill's report is not a table either: these names run past thirty
+    # characters and a pair's long and short variant differ by a suffix, so a
+    # column wide enough to tell them apart is wider than a phone.
+    rows: list[str] = []
+    for symbol in mapping.symbols:
+        rows.append(f"<b>{escaped(symbol)}</b>")
+        rows.extend(
+            f"· <code>{escaped(pairing.strategy)}</code> — {escaped(_params_text(pairing.params))}"
+            for pairing in mapping.pairings
+            if pairing.symbol == symbol
+        )
+
+    messages = []
+    for start in range(0, len(rows), CONFIG_ROWS_PER_MESSAGE):
+        body = "\n".join(rows[start : start + CONFIG_ROWS_PER_MESSAGE])
+        messages.append(f"{title}\n{source}\n{body}" if start == 0 else body)
+
+    tail = [f"{len(mapping.pairings)} pair(s) · {len(mapping.symbols)} symbol(s)"]
+    if mapping.strategy_defaults:
+        tail.append("<b>Per-strategy defaults</b> (a pair's own params win over these)")
+        tail.extend(
+            f"· <code>{escaped(name)}</code>: {escaped(_params_text(values))}"
+            for name, values in sorted(mapping.strategy_defaults.items())
+        )
+    tail.append("Read from the file — <code>/runner</code> shows what is loaded.")
+    messages[-1] += "\n" + "\n".join(tail)
+    return messages
+
+
+def data_providers(plans: dict[str, MarketDataPlan], namespace: str) -> list[str]:
+    """``/provider``: each provider's plan — its symbols, and its own knobs.
+
+    One message per provider, because each reads its own
+    ``config/data_providers/<provider>.toml`` and a merged view would lose the
+    ``[provider]`` table that half the question is about. No credential can
+    appear here: the parser drops every credential-shaped key as it reads the
+    file, and the vendor key lives in ``.env`` instead.
+    """
+    title = header("Data providers", namespace)
+    if not plans:
+        return [f"{title}\n\nNo provider is configured (<code>QTE_MARKET_DATA__PROVIDER</code>)."]
+
+    messages: list[str] = []
+    for index, (provider, plan) in enumerate(plans.items()):
+        lines = [title] if index == 0 else []
+        lines.append(f"<b>{escaped(provider)}</b>")
+        if not plan:
+            lines.append(
+                "No plan file is deployed, so the <code>QTE_ENGINE__*</code> defaults decide "
+                "what is subscribed."
+            )
+            messages.append("\n".join(lines))
+            continue
+        lines.append(f"File: <code>{escaped(plan.source.name if plan.source else '—')}</code>")
+        if not plan.feeds:
+            lines.append("⚠️ The plan enables no symbol, so nothing is subscribed.")
+        for start in range(0, len(plan.feeds), CONFIG_ROWS_PER_MESSAGE):
+            # One table per thirty symbols: a plan feeding a hundred of them
+            # would otherwise render a body past the 4096 characters the Bot
+            # API accepts, and the whole message would be refused.
+            page = plan.feeds[start : start + CONFIG_ROWS_PER_MESSAGE]
+            if start:
+                messages.append("\n".join(lines))
+                lines = [f"<b>{escaped(provider)}</b> (continued)"]
+            lines.append(
+                render_table(
+                    ("Symbol", "Market", "Timeframes"),
+                    [(feed.symbol, feed.market, ", ".join(feed.timeframes)) for feed in page],
+                    max_widths=(12, 8, 24),
+                )
+            )
+        if plan.options:
+            lines.append("<b>Vendor options</b>")
+            lines.extend(
+                f"· <code>{escaped(key)}</code> = <code>{escaped(value)}</code>"
+                for key, value in sorted(plan.options.items())
+            )
+        messages.append("\n".join(lines))
+
+    messages[-1] += (
+        f"\nDeciding on: <code>{escaped(settings.engine.signal_timeframe)}</code> · "
+        "read from the files — <code>/redis</code> shows what is held."
+    )
+    return messages
+
+
+# ── The drill ─────────────────────────────────────────────────────────────
+
+DEMO_RUNNING = (
+    "⏳ A demo drill is already running on <code>{namespace}</code>. It fires one open cycle "
+    "per strategy and takes a few seconds each; wait for its report rather than starting a "
+    "second one."
+)
+
+
+def demo_started(target: str, namespace: str) -> str:
+    """The holding message the drill's own report replaces when it is done."""
+    return (
+        f"⏳ Firing a demo signal for {target} on <code>{escaped(namespace)}</code>…\n"
+        "Driving each strategy over ideal candles, which takes a few seconds per pair."
+    )
+
+
+def demo_result(
+    deliveries: list[DemoDelivery], failures: list[str], namespace: str, target: str
+) -> list[str]:
+    """``/demo``: what each strategy decided, and whether its envelope left.
+
+    Three outcomes are kept apart because they mean different things. An
+    envelope that did not leave is a transport fault. A strategy that *raised*
+    while being driven is the drill's own finding — it would raise on a live
+    bar too. A strategy that merely declined every regime is neither: the
+    payload went out as a synthetic fallback, and what is proven is the path
+    rather than the edge.
+    """
+    title = header("Demo signal", namespace)
+    if not deliveries and not failures:
+        return [
+            f"{title}\n\nNothing to fire for {target}: no mounted strategy is mapped to a "
+            "symbol. <code>/mapping</code> shows the table, <code>/strategies</code> the mount."
+        ]
+
+    # One entry per delivery rather than a table: a strategy name runs well past
+    # thirty characters here, and the two that differ only by a suffix — a
+    # pair's long variant and its short one — would truncate into the same row
+    # and the report would say nothing about which of them fired.
+    lines = [title]
+    for delivery in deliveries:
+        signal = delivery.demo.signal
+        mark = "✅" if delivery.delivered else "❌"
+        lines.append(
+            f"{mark} <code>{escaped(signal.strategy)}</code>\n"
+            f"   {escaped(signal.symbol)} {escaped(signal.position.action.value)} · "
+            f"{escaped(delivery.demo.source)} data"
+        )
+    for delivery in deliveries:
+        if not delivery.delivered:
+            lines.append(
+                f"⚠️ {escaped(delivery.demo.signal.strategy)} not delivered: "
+                f"{escaped(delivery.error)}"
+            )
+    for delivery in deliveries:
+        if delivery.demo.strategy_error:
+            lines.append(
+                f"🔴 {escaped(delivery.demo.signal.strategy)} raised while being driven: "
+                f"<code>{escaped(delivery.demo.strategy_error)}</code> — it would raise on a "
+                "live bar too."
+            )
+    for failure in failures:
+        lines.append(f"🔴 No payload could be built for {escaped(failure)}")
+
+    delivered = sum(1 for delivery in deliveries if delivery.delivered)
+    lines.append(
+        f"{delivered} of {len(deliveries) + len(failures)} fired on "
+        f"<code>{escaped(settings.broker.demo_subject_prefix)}.*</code>. The broker answers "
+        "each with a Telegram card and forwards nothing to a worker."
+    )
+    synthetic = [delivery for delivery in deliveries if not delivery.demo.from_strategy]
+    if synthetic:
+        lines.append(
+            f"<i>{len(synthetic)} payload(s) are a synthetic fallback: the strategy entered on "
+            "none of the four regimes, which is ordinary — the transport is what was tested.</i>"
+        )
+    # A mount of forty strategies reports past the length the Bot API accepts,
+    # and the refusal would land after every envelope had already left.
+    return _as_messages(lines)
 
 
 def usage(

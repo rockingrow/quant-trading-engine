@@ -64,6 +64,10 @@ def test_the_parser_accepts_the_documented_commands():
     assert parser.parse_args(["shadow", "on"]).state == "on"
     assert parser.parse_args(["shadow", "off", "--yes"]).yes is True
     assert parser.parse_args(["ping"]).command == "ping"
+    demo = parser.parse_args(["demo-signal", "--strategy", "S1", "--symbol", "XAUUSD"])
+    assert (demo.command, demo.strategy, demo.symbol) == ("demo-signal", "S1", "XAUUSD")
+    bare = parser.parse_args(["demo-signal"])
+    assert (bare.strategy, bare.symbol) == (None, None)
 
 
 def test_an_unknown_state_is_refused():
@@ -391,6 +395,33 @@ async def test_an_unreachable_redis_changes_nothing_rather_than_half_applying(mo
     assert exit_info.value.code == 2
     assert bus.published == [], "nothing may be broadcast if the flag was not stored"
     assert "Could not reach Redis" in capsys.readouterr().err
+
+
+async def test_demo_signal_reports_an_unreachable_broker_as_one_line(monkeypatch, capsys):
+    """The drill is run *because* the broker link is suspect, so that is its likeliest
+    outcome and it must read like every other command's refusal.
+    """
+
+    async def unreachable(strategy, symbol):
+        raise ConnectionRefusedError("nats://broker:4222")
+
+    monkeypatch.setattr(control, "run_demo", unreachable)
+    with pytest.raises(SystemExit):
+        await control._run_demo_signal(None, None)
+
+    error = capsys.readouterr().err
+    assert "Could not fire the demo signal" in error
+    assert "Traceback" not in error
+    assert "ConnectionRefusedError" in error  # the cause is still named
+
+
+async def test_demo_signal_reports_a_bad_argument_without_a_traceback(monkeypatch, capsys):
+    async def refuse(strategy, symbol):
+        raise ValueError("No mounted strategy named 'TYPO'. Mounted: REAL_ONE")
+
+    monkeypatch.setattr(control, "run_demo", refuse)
+    with pytest.raises(SystemExit, match="No mounted strategy named"):
+        await control._run_demo_signal("TYPO", None)
 
 
 async def test_a_dependency_failure_prints_one_line_not_a_traceback(monkeypatch, capsys):

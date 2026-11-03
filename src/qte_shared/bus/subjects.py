@@ -8,6 +8,10 @@ Two namespaces meet here and they belong to different owners:
   ``algo-trading-broker`` consumes with its own ``SignalWorker``; publishing
   there is the NATS equivalent of POSTing its ``/secret/webhook``. The shape of
   what we put on it is fixed by that repo, not by us.
+* ``SIGNALS_DEMO.<strategy>`` — the broker's too, and the one subject on it
+  that reaches no worker. Same envelope, different namespace: the broker
+  notifies Telegram and stops there. See
+  :mod:`qte_strategy_engine.demo_signal`.
 """
 
 from __future__ import annotations
@@ -66,6 +70,19 @@ class Subjects:
     def broker_signal(strategy: str, prefix: str | None = None) -> str:
         """``SIGNALS.<strategy>`` — the broker's durable webhook buffer."""
         return f"{prefix or settings.broker.subject_prefix}.{strategy}"
+
+    @staticmethod
+    def broker_signal_demo(strategy: str, prefix: str | None = None) -> str:
+        """``SIGNALS_DEMO.<strategy>`` — the broker's end-to-end drill subject.
+
+        A separate namespace rather than a flag inside the payload, because the
+        guarantee an operator needs is "nothing a worker can reach": the
+        broker's ``SIGNALS`` JetStream stream captures ``SIGNALS.>``, and
+        ``SIGNALS_DEMO`` is a different first token, so a demo envelope cannot
+        land in the buffer the fan-out consumes even if this subject is
+        misspelled at either end.
+        """
+        return f"{prefix or settings.broker.demo_subject_prefix}.{strategy}"
 
 
 subjects = Subjects()

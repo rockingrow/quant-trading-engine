@@ -269,10 +269,15 @@ services:
   # rather than polling, and restart: unless-stopped would turn that into a
   # crash loop in a stack nobody asked to have a bot in.
   #
-  # It opens no vendor socket and loads no strategy. What it needs is the
-  # control plane (NATS), the candle windows (Redis) and the book (Postgres) —
-  # which is also why it can answer /positions and /closed while the runner is
-  # down.
+  # It opens no vendor socket. What it needs is the control plane (NATS), the
+  # candle windows (Redis) and the book (Postgres) — which is also why it can
+  # answer /positions and /closed while the runner is down.
+  #
+  # One command does import the private code: /demo drives each mounted
+  # strategy over synthetic bars, in a worker thread, exactly as
+  # `make demo-signal` does. So this container needs the read-only
+  # __strategies__ mount above and the strategy requirements the image already
+  # installs — and it writes no engine state while doing it.
   telegram-bot:
     <<: *app
     profiles: ["bot"]

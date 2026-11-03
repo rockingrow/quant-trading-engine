@@ -11,6 +11,12 @@ kept alive to answer it.
 ``status`` changes nothing: it asks every link the engine depends on and
 prints one line each — see :mod:`qte_strategy_engine.connectivity`.
 
+``demo-signal`` changes nothing a trade depends on either: it drives a mounted
+strategy over synthetic data until it enters, builds the payload through the
+live factory and publishes it on the broker's demo subject, which reaches the
+broker's Telegram notification and no worker — see
+:mod:`qte_strategy_engine.demo_signal`.
+
 The execution namespace selects paper or live at startup. Shadow mode pauses
 live delivery without converting broker positions into simulated ones. Its
 control message travels on the namespace-qualified NATS control subject.
@@ -37,6 +43,7 @@ from qte_shared.config import settings
 from qte_shared.db import EventRepository
 from qte_shared.logging_setup import configure_logging, get_logger
 from qte_strategy_engine import connectivity
+from qte_strategy_engine.demo_signal import run_demo
 
 log = get_logger(__name__)
 
@@ -79,6 +86,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--yes",
         action="store_true",
         help="Skip the confirmation prompt when clearing",
+    )
+
+    demo = subparsers.add_parser(
+        "demo-signal",
+        help="Fire one open cycle per mounted strategy at the broker's demo subject "
+        "(Telegram only — no worker ever sees it)",
+    )
+    demo.add_argument(
+        "--strategy",
+        help="Only this strategy; without it every mounted strategy is fired in turn",
+    )
+    demo.add_argument(
+        "--symbol",
+        help="Only this symbol; without it each strategy uses the first symbol it is mapped to",
     )
     return parser
 
@@ -348,6 +369,23 @@ async def _clear_runner_owner(*, assume_yes: bool) -> None:
     print("Cleared. The next runner to start will claim the namespace.")
 
 
+async def _run_demo_signal(strategy: str | None, symbol: str | None) -> int:
+    """``demo-signal``, with its failures reported the way the rest of the CLI does.
+
+    The drill is what an operator reaches for when they suspect the broker link
+    is down, so an unreachable broker NATS is its *likeliest* outcome — and it
+    must read as one line naming the address, not as a nats-py traceback.
+    ``ValueError`` is the other expected one: a mistyped ``--strategy``, a pair
+    whose ``warmup`` cannot be honoured, a payload the factory refused.
+    """
+    try:
+        return await run_demo(strategy, symbol)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from None
+    except Exception as exc:
+        _die(f"Could not fire the demo signal at {settings.broker_nats_url}.", exc)
+
+
 async def _show_status() -> int:
     """Print one line per link; the return value is the process exit code."""
     reports = await connectivity.collect_reports()
@@ -376,6 +414,9 @@ def main() -> None:
 
     if args.command == "status":
         raise SystemExit(asyncio.run(_show_status()))
+
+    if args.command == "demo-signal":
+        raise SystemExit(asyncio.run(_run_demo_signal(args.strategy, args.symbol)))
 
     if args.command == "owner":
         if args.operation == "status":

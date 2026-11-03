@@ -252,6 +252,22 @@ the token, including when serializing a legacy signal that still contains one.
 Trading fields remain unchanged. Existing historical files and database rows
 are not automatically rewritten by this change.
 
+### `SIGNALS_DEMO.<strategy>` — the drill, not a transport
+
+Not a transport a signal is ever delivered over. `make demo-signal` publishes
+the *same* envelope on core NATS subject `SIGNALS_DEMO.<strategy>`
+(`ALGO_BROKER__DEMO_SUBJECT_PREFIX`), where the broker's `DemoSignalConsumer`
+renders the Telegram card a real signal would get and forwards nothing to a
+worker. It is what proves the path for one strategy without a position being
+opened — see `src/qte_strategy_engine/demo_signal.py`.
+
+The first token is `SIGNALS_DEMO` rather than `SIGNALS.DEMO` because the
+broker's stream captures `SIGNALS.>`: a demo published one token deeper would be
+stored in the buffer `SignalWorker` drains and fanned out like any other signal.
+Nothing on this subject is durable (no stream backs it), nothing is persisted
+into the broker's `signals` table, and `token` is unverified here for the same
+reason it is unverified on `SIGNALS.<strategy>`.
+
 ## What QTE does not do
 
 - It does not subscribe to `{strategy}`, `ADMIN`, `SYSTEM` or `TRADE`. Those are

@@ -137,6 +137,11 @@ class BrokerSettings(BaseSettings):
     token: str = ""
     stream: str = "SIGNALS"
     subject_prefix: str = "SIGNALS"
+    #: Namespace for the end-to-end drill — see
+    #: :mod:`qte_strategy_engine.demo_signal`. The broker subscribes to it on
+    #: core NATS and answers with a Telegram notification only; nothing
+    #: published here can reach a trading worker.
+    demo_subject_prefix: str = "SIGNALS_DEMO"
     publish_timeout: float = 5.0
     # Shadow mode is the safety catch from phase 6: the runner does everything
     # it would do live — build the signal, log it, audit it — but stops short of

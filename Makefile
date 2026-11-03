@@ -747,6 +747,15 @@ shadow-off: ## Resume delivery to the broker (GOES LIVE — prompts to confirm)
 ping: ## Ask the running runners to identify themselves
 	uv run qte-control ping
 
+# The end-to-end drill. Fires one open cycle per mounted strategy at the
+# broker's SIGNALS_DEMO.<strategy> subject: the broker renders its Telegram
+# notification and forwards nothing to a worker, so this is safe to run against
+# a live stack. STRATEGY= narrows it to one strategy, SYMBOL= to one symbol;
+# with neither, every mounted strategy is fired on the first symbol it is
+# mapped to. See src/qte_strategy_engine/demo_signal.py.
+demo-signal: ## Fire a demo open cycle at the broker, Telegram only [STRATEGY=] [SYMBOL=]
+	uv run qte-control demo-signal $(if $(STRATEGY),--strategy $(STRATEGY),) $(if $(SYMBOL),--symbol $(SYMBOL),)
+
 owner-status: ## Show which runner holds the ownership claim for this namespace
 	uv run qte-control owner status
 
@@ -779,5 +788,5 @@ owner-preflight:
 	db-upgrade db-downgrade db-revision db-current db-history db-check \
 	download backtest chart reports csv-import costs \
 	sim sim-status sim-replay warmup warmup-cache sim-bar bar signal sim-walk sim-stop sim-reset sim-watch \
-	status shadow-status shadow-on shadow-off ping owner-status owner-check owner-clear \
+	status shadow-status shadow-on shadow-off ping demo-signal owner-status owner-check owner-clear \
 	owner-preflight
