@@ -32,11 +32,14 @@ def _glyph(name: str) -> str:
 
 
 # ── Signal actions ────────────────────────────────────────────────────────
-# One per SignalAction. A green and a red dot for the two entries: the chart
-# glyphs they replaced (📈 / 📉) were a pixel apart at the size Telegram draws
-# an emoji in a message header.
-LONG: str = _glyph("green_circle")
-SHORT: str = _glyph("red_circle")
+# One per SignalAction. A green and a red square for the two entries: the
+# chart glyphs they replaced (📈 / 📉) were a pixel apart at the size Telegram
+# draws an emoji in a message header, and the dots that replaced those read as
+# the same mark as the flag and service-status circles further down this file.
+# A square is the larger block of colour of the three, and it is only ever an
+# entry.
+LONG: str = _glyph("green_square")
+SHORT: str = _glyph("red_square")
 TP1: str = _glyph("bullseye")
 TP2: str = _glyph("rocket")
 R_SL: str = _glyph("shield")
