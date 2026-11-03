@@ -133,6 +133,7 @@ package; never scan from the repository root.
 | Pausing decisions per symbol/strategy (`/prevent`, `/allow`) | `src/qte_shared/bar_gate.py` |
 | Telegram position-lifecycle message: one per cycle, edited in place | `src/qte_strategy_engine/telegram_notify.py` |
 | Telegram Bot API calls, chat/topic ids, ERROR forwarding, service UP/DOWN | `src/qte_shared/notifications/`, `TelegramSettings` in `src/qte_shared/config.py`, `QTE_TELEGRAM__*` in `.env.example` |
+| Every glyph shown to a reader, named once (the same table `algo-trading-broker` keeps) | `src/qte_shared/emoji_constants.py` |
 | Backtest replay, fills, metrics, reports | `src/qte_backtest/{replay,execution,metrics,report,diagnostics}.py` |
 | What a replay charges a fill, per symbol and per account type (`--cost-profile`) | `src/qte_backtest/costs.py`, `config/costs.example.toml` |
 | Parquet history: download to `data/parquet/<source>/`, read one file | `src/qte_backtest/{downloader,data_store}.py` |

@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A Telegram position message spells its timeframe again.** The cycle stores
+  the timeframe as the broker contract spells it — bare minutes — so the header
+  read `SHORT XAGUSD (15)` instead of `(M15)`. It is now rendered through the
+  canonical label, and a spelling nothing recognises is shown unchanged rather
+  than raised.
+
+### Changed
+
+- **LONG and SHORT read as a green and a red dot** in the lifecycle message
+  (`🟢` / `🔴`) in place of the two chart glyphs, which were hard to tell
+  apart at a glance. `algo-trading-broker` carries the same change, so one
+  trade reads the same in both messages.
+- **Every glyph is named in one place**, `qte_shared.emoji_constants`, and
+  resolved through the `emoji` package — the table `algo-trading-broker`
+  already kept as `broker/helpers/emoji_constants.py`. They were literals in
+  seven modules, which is how the entry icon came to be spelled three ways.
+  The lifecycle message, the operator bot, the service UP/DOWN and ERROR
+  notices and the backtest dashboard's severity badges all read from it, and
+  an unknown name now fails at import rather than reaching a chat as
+  `":name:"`. New production dependency: `emoji`, a core one because
+  `qte_shared.notifications` imports it. `qte_bot.tables` keeps its `✓` and
+  `✗`: those are text marks, one cell wide, and an emoji would break the
+  column alignment the table exists for.
+
 ### Added
 
 - **Three more commands on the operator's Telegram bot: `/demo`, `/mapping`

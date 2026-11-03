@@ -40,6 +40,7 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from qte_shared import emoji_constants
 from qte_shared.config import settings
 from qte_shared.logging_setup import get_logger
 from qte_shared.models import TERMINAL_ACTIONS, BrokerSignal, SignalAction
@@ -51,6 +52,7 @@ from qte_shared.notifications.telegram_sink import (
     escaped,
     parse_chat_targets,
 )
+from qte_shared.timeframes import normalize_timeframe
 from qte_strategy_engine.db.repository import TelegramCycleRecord, TelegramCycleRepository
 
 log = get_logger(__name__)
@@ -63,22 +65,25 @@ PRIVATE_AUDIENCE = "private"
 STATUS_RUNNING = "RUNNING"
 STATUS_CLOSED = "CLOSED"
 
-#: Same glyphs as ``broker/helpers/emoji_constants.py``, written out rather
-#: than resolved through the ``emoji`` package: one shared message shape is not
-#: worth a production dependency in the runner's image.
+#: Named in ``qte_shared.emoji_constants``, which holds the same glyphs as
+#: ``broker/helpers/emoji_constants.py`` — one trade is reported by both
+#: services and has to look the same in each.
 ACTION_ICONS: dict[SignalAction, str] = {
-    SignalAction.LONG: "📈",
-    SignalAction.SHORT: "📉",
-    SignalAction.TP1: "🎯",
-    SignalAction.TP2: "🚀",
-    SignalAction.R_SL: "🛡️",
-    SignalAction.SL: "⭕",
-    SignalAction.FLAT: "🏳️",
+    SignalAction.LONG: emoji_constants.LONG,
+    SignalAction.SHORT: emoji_constants.SHORT,
+    SignalAction.TP1: emoji_constants.TP1,
+    SignalAction.TP2: emoji_constants.TP2,
+    SignalAction.R_SL: emoji_constants.R_SL,
+    SignalAction.SL: emoji_constants.SL,
+    SignalAction.FLAT: emoji_constants.FLAT,
 }
-DEFAULT_ICON = "📡"
-STATUS_ICONS = {STATUS_RUNNING: "⏳", STATUS_CLOSED: "🏁"}
-SHADOW_ICON = "🧪"
-UNDELIVERED_ICON = "⚠️"
+DEFAULT_ICON = emoji_constants.DEFAULT_SIGNAL
+STATUS_ICONS = {
+    STATUS_RUNNING: emoji_constants.CYCLE_RUNNING,
+    STATUS_CLOSED: emoji_constants.CYCLE_CLOSED,
+}
+SHADOW_ICON = emoji_constants.SHADOW
+UNDELIVERED_ICON = emoji_constants.UNDELIVERED
 
 DIVIDER = "-----------"
 
@@ -93,6 +98,21 @@ MAX_DETAIL_CHARS = 200
 #: Delivery outcomes that mean the broker has the signal (or was never meant to
 #: get it). Anything else is reported in the message as not delivered.
 ACCEPTED_DELIVERY = frozenset({"sent", "shadow"})
+
+
+def display_timeframe(stored: str) -> str:
+    """Render a stored timeframe the way a reader expects it: ``M15``, ``H1``.
+
+    The cycle stores whatever the broker payload carried, and the broker
+    contract spells a timeframe as bare minutes (``"15"``, ``"60"``), which
+    reads as a naked number in the chat. Canonical labels are stored by newer
+    cycles, so both spellings have to render; an unknown spelling is shown
+    unchanged rather than hiding the cycle behind an exception.
+    """
+    try:
+        return normalize_timeframe(stored)
+    except ValueError:
+        return stored
 
 
 # ── Events ────────────────────────────────────────────────────────────────
@@ -268,7 +288,7 @@ def _flags_line(event: dict) -> str:
     """
 
     def _flag(value: Any) -> str:
-        return "🟢" if value else "🔴"
+        return emoji_constants.FLAG_ON if value else emoji_constants.FLAG_OFF
 
     parts: list[str] = []
     if event.get("tp1_percent") is not None:
@@ -323,7 +343,7 @@ def format_cycle(record: TelegramCycleRecord, *, audience: str, include_raw: boo
     entry_event = events[0] if events else {}
     entry_action = _event_action(entry_event)
     entry_icon = ACTION_ICONS.get(entry_action, DEFAULT_ICON) if entry_action else DEFAULT_ICON
-    timeframe = f" ({escaped(record.timeframe)})" if record.timeframe else ""
+    timeframe = f" ({escaped(display_timeframe(record.timeframe))})" if record.timeframe else ""
 
     header = f"[{STATUS_ICONS.get(record.status, STATUS_ICONS[STATUS_RUNNING])}{record.status}]"
     if entry_event.get("delivery_status") == "shadow":
@@ -365,7 +385,7 @@ def format_cycle(record: TelegramCycleRecord, *, audience: str, include_raw: boo
         meta_lines.append(DIVIDER)
         flags = _flags_line(entry_event)
         if flags:
-            meta_lines.extend(["📊Settings:", DIVIDER, flags, DIVIDER])
+            meta_lines.extend([f"{emoji_constants.BAR_CHART}Settings:", DIVIDER, flags, DIVIDER])
         if include_raw:
             raw_block = _raw_block(entry_event)
             if raw_block:

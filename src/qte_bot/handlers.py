@@ -34,6 +34,7 @@ from qte_bot.access import IsOperator
 from qte_bot.commands import HELP
 from qte_bot.engine_client import EngineClient
 from qte_bot.pagination import page_of, pagination_keyboard
+from qte_shared import emoji_constants as em
 from qte_shared.logging_setup import get_logger
 
 log = get_logger(__name__)
@@ -277,8 +278,8 @@ def _flat_keyboard(scope: dict[str, Any]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="✅ Close them", callback_data=encoded),
-                InlineKeyboardButton(text="✖ Cancel", callback_data="flat:no"),
+                InlineKeyboardButton(text=f"{em.CONFIRM} Close them", callback_data=encoded),
+                InlineKeyboardButton(text=f"{em.CANCEL} Cancel", callback_data="flat:no"),
             ]
         ]
     )
@@ -386,7 +387,8 @@ async def _change_gate(
     )
     if gate is None:
         await message.answer(
-            "⚠️ Could not store the change in Redis, so nothing was changed — a pause that "
+            f"{em.WARNING} Could not store the change in Redis, so nothing was changed — "
+            "a pause that "
             "is not stored would be lost by the next restart."
         )
         return

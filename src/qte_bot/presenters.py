@@ -19,6 +19,7 @@ from typing import Any
 from qte_bot.mounts import MountedRepository
 from qte_bot.pagination import page_footer
 from qte_bot.tables import marked, render_table
+from qte_shared import emoji_constants as em
 from qte_shared.config import settings
 from qte_shared.market_data_plan import MarketDataPlan
 from qte_shared.notifications.telegram_sink import boxed, clipped
@@ -27,11 +28,11 @@ from qte_strategy_engine.db import ClosedCycle
 from qte_strategy_engine.demo_signal import DemoDelivery
 
 NO_RUNNER = (
-    "⚠️ No runner answered. It may be down, or wired to another book — "
+    f"{em.WARNING} No runner answered. It may be down, or wired to another book — "
     "this bot is on <code>{namespace}</code>."
 )
 NO_INGESTION = (
-    "⚠️ Ingestion did not answer. It may be down, or wired to another book — "
+    f"{em.WARNING} Ingestion did not answer. It may be down, or wired to another book — "
     "this bot is on <code>{namespace}</code>."
 )
 
@@ -191,7 +192,7 @@ def _bundle_lines(repository: MountedRepository) -> list[str]:
     if stamp is None:
         if repository.bundle_problem:
             reason = clipped(escaped(repository.bundle_problem), MAX_PROBLEM_CHARS)
-            return [f"⚠️ BUNDLE_VERSION.json unreadable: {reason}"]
+            return [f"{em.WARNING} BUNDLE_VERSION.json unreadable: {reason}"]
         return ["Version: — (no BUNDLE_VERSION.json)"]
 
     def text(key: str) -> str:
@@ -203,7 +204,7 @@ def _bundle_lines(repository: MountedRepository) -> list[str]:
     if dirty is None:
         dirty_text = "—"
     else:
-        dirty_text = "⚠️ yes" if dirty else "no"
+        dirty_text = f"{em.WARNING} yes" if dirty else "no"
     return [
         f"Version: {text('version')}",
         f"Built: {moment(stamp.get('built_at') or None, full=True)}",
@@ -225,9 +226,9 @@ def _strategy_lines(repository: MountedRepository) -> list[str]:
     lines = [f"Strategies ({len(names)}):"]
     for name in names[:MAX_STRATEGIES_PER_BOX]:
         if repository.strategies[name]:
-            lines.append(f"🟢 {escaped(name)}")
+            lines.append(f"{em.FLAG_ON} {escaped(name)}")
         else:
-            lines.append(f"🔴 {escaped(name)} (failed audit)")
+            lines.append(f"{em.FLAG_OFF} {escaped(name)} (failed audit)")
     if len(names) > MAX_STRATEGIES_PER_BOX:
         lines.append(f"… {len(names) - MAX_STRATEGIES_PER_BOX} more")
     return lines
@@ -236,7 +237,7 @@ def _strategy_lines(repository: MountedRepository) -> list[str]:
 def strategy_box(repository: MountedRepository) -> str:
     """One mounted repository as one box: its build, then what it publishes."""
     lines = [
-        f"[📦 {escaped(repository.name)}]",
+        f"[{em.PACKAGE} {escaped(repository.name)}]",
         BOX_DIVIDER,
         *_bundle_lines(repository),
         BOX_DIVIDER,
@@ -349,7 +350,7 @@ def scope_text(scope: dict[str, Any]) -> str:
 
 def flat_confirmation(scope: dict[str, Any], namespace: str, open_count: int) -> str:
     return (
-        f"⚠️ Close {open_count} position(s) on {scope_text(scope)}?\n"
+        f"{em.WARNING} Close {open_count} position(s) on {scope_text(scope)}?\n"
         f"Book: <code>{escaped(namespace)}</code>\n\n"
         "This sends a FLAT through the broker, the same as any other exit."
     )
@@ -358,21 +359,21 @@ def flat_confirmation(scope: dict[str, Any], namespace: str, open_count: int) ->
 def flat_result(reply: dict[str, Any], scope: dict[str, Any]) -> str:
     """What the runner managed, and what it refused and why."""
     if reply.get("error"):
-        return f"⚠️ {escaped(reply['error'])}"
+        return f"{em.WARNING} {escaped(reply['error'])}"
     closed = reply.get("closed") or []
     refused = reply.get("refused") or []
     if not closed and not refused:
         return f"Nothing was open on {scope_text(scope)}."
     lines = []
     if closed:
-        lines.append(f"✅ Closed {len(closed)}:")
+        lines.append(f"{em.CONFIRM} Closed {len(closed)}:")
         lines.extend(
             f"· {escaped(row.get('symbol'))} {escaped(row.get('strategy'))} "
             f"<code>{escaped(row.get('signal_uxid'))}</code>"
             for row in closed
         )
     if refused:
-        lines.append(f"⚠️ Not closed ({len(refused)}):")
+        lines.append(f"{em.WARNING} Not closed ({len(refused)}):")
         lines.extend(
             f"· {escaped(row.get('symbol'))} {escaped(row.get('strategy'))}: "
             f"{escaped(row.get('reason'))}"
@@ -391,7 +392,7 @@ def gate_result(
         else ", ".join([*gate_payload.get("symbols", []), *gate_payload.get("strategies", [])])
         or "nothing"
     )
-    headline = "⏸ Not deciding on" if blocking else "▶️ Deciding again"
+    headline = f"{em.PAUSED} Not deciding on" if blocking else f"{em.RESUMED} Deciding again"
     reach = (
         "Applied now."
         if announced
@@ -428,7 +429,7 @@ def warmup_result(reply: dict[str, Any], namespace: str) -> str:
     body = f"{header('Warm-up requested', namespace)}\n{table}"
     for row in failures:
         body += (
-            f"\n⚠️ {escaped(row.get('symbol'))} {escaped(row.get('timeframe'))}: "
+            f"\n{em.WARNING} {escaped(row.get('symbol'))} {escaped(row.get('timeframe'))}: "
             f"{escaped(row.get('error'))}"
         )
     return body + _unknown_line(unknown)
@@ -454,7 +455,7 @@ def flush_result(reply: dict[str, Any], namespace: str) -> str:
 def _unknown_line(unknown: list[str]) -> str:
     if not unknown:
         return ""
-    return "\n⚠️ Not fed here: <code>" + escaped(", ".join(unknown)) + "</code>"
+    return f"\n{em.WARNING} Not fed here: <code>" + escaped(", ".join(unknown)) + "</code>"
 
 
 # ── Configuration, read back from the files an operator edits ─────────────
@@ -711,6 +712,7 @@ def usage(
     caveat = (
         ""
         if runner_answered
-        else "\n\n⚠️ The runner is not answering, so strategy names are missing from this list."
+        else f"\n\n{em.WARNING} The runner is not answering, so strategy names"
+        " are missing from this list."
     )
     return f"Name what to act on:\n{listed}{caveat}"

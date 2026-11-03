@@ -26,6 +26,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
 
+from qte_shared import emoji_constants
 from qte_shared.config import settings
 from qte_shared.logging_setup import get_logger
 from qte_shared.notifications.telegram_sink import (
@@ -38,8 +39,8 @@ from qte_shared.notifications.telegram_sink import (
 
 log = get_logger(__name__)
 
-UP_ICON = "🟢"
-DOWN_ICON = "🛑"
+UP_ICON = emoji_constants.SERVICE_UP
+DOWN_ICON = emoji_constants.SERVICE_DOWN
 DIVIDER = "-----------"
 
 #: Enough for a service's details without risking the Bot API's 4096 cap.

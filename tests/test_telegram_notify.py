@@ -31,6 +31,7 @@ from qte_strategy_engine.telegram_notify import (
     STATUS_CLOSED,
     STATUS_RUNNING,
     TelegramLifecycleNotifier,
+    display_timeframe,
     format_cycle,
     format_number,
     lifecycle_event,
@@ -200,7 +201,7 @@ def test_the_entry_message_carries_the_position_and_its_levels(monkeypatch):
 
     broadcast = format_cycle(record, audience=BROADCAST_AUDIENCE)
     assert f"[⏳{STATUS_RUNNING}]" in broadcast
-    assert "📈 LONG XAUUSD (M15)" in broadcast
+    assert "🟢 LONG XAUUSD (M15)" in broadcast
     assert "Price: 2340" in broadcast
     assert "Quantity: 0.05 | Risk: 1%" in broadcast
     assert "SL: 2330 | TP1: 2350 | TP2: 2360" in broadcast
@@ -213,6 +214,31 @@ def test_the_entry_message_carries_the_position_and_its_levels(monkeypatch):
     assert f"Strategy: {signal.strategy}" in private
     assert f"Signal: {CYCLE_UXID}" in private
     assert "Delivery: sent via nats" in private
+
+
+def test_a_broker_spelled_timeframe_renders_as_a_label():
+    """``BrokerSignal.timeframe`` is bare minutes, which reads as "(15)".
+
+    The cycle stores whatever the payload carried, so the header has to turn
+    the broker's spelling back into the label a reader recognises.
+    """
+    signal = build_signal(SignalAction.LONG)
+    record = TelegramCycleRecord(
+        strategy=signal.strategy,
+        symbol=signal.symbol,
+        signal_uxid=signal.signal_uxid,
+        timeframe="15",
+        events=[queued_event(signal)],
+    )
+
+    assert "XAUUSD (M15)" in format_cycle(record, audience=BROADCAST_AUDIENCE)
+
+
+def test_an_unknown_timeframe_is_shown_unchanged():
+    """A spelling nothing recognises must not hide the whole cycle."""
+    assert display_timeframe("weekly") == "weekly"
+    assert display_timeframe("60") == "H1"
+    assert display_timeframe("M15") == "M15"
 
 
 def test_every_later_action_is_appended_to_the_same_body():
@@ -237,7 +263,7 @@ def test_every_later_action_is_appended_to_the_same_body():
     body = format_cycle(record, audience=BROADCAST_AUDIENCE)
     # The entry block is still there: the message is the whole cycle, not its
     # latest event.
-    assert "📈 LONG XAUUSD (M15)" in body
+    assert "🟢 LONG XAUUSD (M15)" in body
     assert "Actions:" in body
     assert "🎯 TP1" in body
     assert "Price: 2350 | Quantity: 0.025" in body
@@ -513,7 +539,7 @@ def test_a_long_cycle_stays_inside_the_bot_api_message_limit(monkeypatch):
     assert "… truncated" in body, "the raw dump was clipped"
     assert "earlier action(s) not shown" in body, "the oldest actions were dropped"
     # What a reader needs most is still there: the entry and the newest action.
-    assert "📈 LONG XAUUSD (M15)" in body
+    assert "🟢 LONG XAUUSD (M15)" in body
     assert "🎯 TP1" in body
 
 
