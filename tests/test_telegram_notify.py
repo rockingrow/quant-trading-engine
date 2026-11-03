@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from qte_shared import emoji_constants
 from qte_shared.config import settings
 from qte_shared.models import BrokerSignal, PositionBlock, SignalAction
 from qte_shared.notifications.telegram_sink import (
@@ -201,7 +202,7 @@ def test_the_entry_message_carries_the_position_and_its_levels(monkeypatch):
 
     broadcast = format_cycle(record, audience=BROADCAST_AUDIENCE)
     assert f"[⏳{STATUS_RUNNING}]" in broadcast
-    assert "🟢 LONG XAUUSD (M15)" in broadcast
+    assert f"{emoji_constants.LONG} LONG XAUUSD (M15)" in broadcast
     assert "Price: 2340" in broadcast
     assert "Quantity: 0.05 | Risk: 1%" in broadcast
     assert "SL: 2330 | TP1: 2350 | TP2: 2360" in broadcast
@@ -263,7 +264,7 @@ def test_every_later_action_is_appended_to_the_same_body():
     body = format_cycle(record, audience=BROADCAST_AUDIENCE)
     # The entry block is still there: the message is the whole cycle, not its
     # latest event.
-    assert "🟢 LONG XAUUSD (M15)" in body
+    assert f"{emoji_constants.LONG} LONG XAUUSD (M15)" in body
     assert "Actions:" in body
     assert "🎯 TP1" in body
     assert "Price: 2350 | Quantity: 0.025" in body
@@ -539,7 +540,7 @@ def test_a_long_cycle_stays_inside_the_bot_api_message_limit(monkeypatch):
     assert "… truncated" in body, "the raw dump was clipped"
     assert "earlier action(s) not shown" in body, "the oldest actions were dropped"
     # What a reader needs most is still there: the entry and the newest action.
-    assert "🟢 LONG XAUUSD (M15)" in body
+    assert f"{emoji_constants.LONG} LONG XAUUSD (M15)" in body
     assert "🎯 TP1" in body
 
 
