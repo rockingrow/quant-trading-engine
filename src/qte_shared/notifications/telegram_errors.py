@@ -36,6 +36,7 @@ import contextlib
 import logging
 import time
 
+from qte_shared import emoji_constants
 from qte_shared.config import settings
 from qte_shared.logging_setup import get_logger
 from qte_shared.notifications.telegram_sink import (
@@ -69,7 +70,7 @@ QUEUE_CAPACITY = 100
 #: header and the exception type — the part that says what broke.
 MAX_ERROR_CHARS = 3000
 
-ERROR_ICON = "🚨"
+ERROR_ICON = emoji_constants.ERROR_ALERT
 
 
 class _RecursionFilter(logging.Filter):

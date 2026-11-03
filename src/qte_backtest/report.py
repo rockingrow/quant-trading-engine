@@ -45,6 +45,7 @@ from qte_backtest.diagnostics import CRITICAL, INFO, WARNING, DiagnosticContext,
 from qte_backtest.execution import SimulatedPosition
 from qte_backtest.replay import BacktestResult
 from qte_backtest.visualize import render_html
+from qte_shared import emoji_constants
 from qte_shared.config import REPORT_SCHEMA_VERSION
 from qte_shared.logging_setup import get_logger
 from qte_shared.strategies.signal_serialization import signal_record
@@ -406,7 +407,11 @@ def build_report(
 
 # ── Helpers ───────────────────────────────────────────────────────────
 
-_BADGE = {CRITICAL: "🔴", WARNING: "🟠", INFO: "🔵"}
+_BADGE = {
+    CRITICAL: emoji_constants.BADGE_CRITICAL,
+    WARNING: emoji_constants.BADGE_WARNING,
+    INFO: emoji_constants.BADGE_INFO,
+}
 
 
 def _closed(positions: Sequence[SimulatedPosition]) -> list[SimulatedPosition]:

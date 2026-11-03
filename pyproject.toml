@@ -23,6 +23,11 @@ dependencies = [
     "asyncpg>=0.29",
     "alembic>=1.13",
     "orjson>=3.10",
+    # Every glyph a reader sees is named rather than pasted in, in
+    # qte_shared.emoji_constants — the same table algo-trading-broker keeps, so
+    # one trade looks the same in both services' messages. Core rather than an
+    # extra: qte_shared.notifications imports it, which every service does.
+    "emoji>=2.12",
 ]
 
 # The image boundary. One distribution ships every service's code — 612 KB, next
