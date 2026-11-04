@@ -138,6 +138,7 @@ package; never scan from the repository root.
 | What a replay charges a fill, per symbol and per account type (`--cost-profile`) | `src/qte_backtest/costs.py`, `config/costs.example.toml` |
 | Parquet history: download to `data/parquet/<source>/`, read one file | `src/qte_backtest/{downloader,data_store}.py` |
 | Backtest HTML dashboard | `src/qte_backtest/visualize/` |
+| The auto-generated `Latest artefacts` block at the bottom of each `docs/concepts/<strategy>.md` — rewritten by every reporting run | `src/qte_backtest/doc_reference.py`, `make doc-reference` |
 | Strategy deploy audit | `src/qte_strategy_audit/{auditor,contract,mount}.py` |
 | Dev-only WebSocket simulator | `src/qte_simulator/` (refuses to run unless `QTE_ENV=dev`) |
 | **Why** something is built this way | `docs/architecture.md` — 20 "Why X" sections; run `rg -n '^## ' docs/architecture.md`, then read only the one you need |
