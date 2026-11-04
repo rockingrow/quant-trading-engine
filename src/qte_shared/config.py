@@ -434,6 +434,10 @@ class EngineSettings(BaseSettings):
     #: ``mt5/`` for a CSV import) so a file's path names its origin.
     parquet_dir: Path = REPO_ROOT / "data" / "parquet"
     reports_dir: Path = REPO_ROOT / "data" / "reports"
+    #: Where the dated audit write-ups live. Nothing writes here by itself —
+    #: an audit is written by hand — but a strategy's concept document links
+    #: the newest one that names it; see :mod:`qte_backtest.doc_reference`.
+    audits_dir: Path = REPO_ROOT / "data" / "audits"
     #: The zone a strategy's declared weekend-flat window is read in — see
     #: :mod:`qte_shared.strategies.strategy_settings`. An IANA name; ``UTC``
     #: takes the declared times literally, which is what the mounted strategies

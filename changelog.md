@@ -40,6 +40,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Each strategy's concept document now names its newest artefacts.** A
+  reporting backtest rewrites one machine-owned block at the bottom of the
+  replayed strategy's `docs/concepts/<strategy>.md` in the mounted strategy
+  repository: what was replayed and over which period, a headline of trades,
+  win rate, longest losing run, net result and maximum drawdown, and links to
+  the JSON, the Markdown and the HTML dashboard it just wrote, plus the newest
+  write-up under `data/audits/` that names the alias. Everything between the
+  `QTE-LATEST-ARTEFACTS` markers is generated, carries a "do not edit" notice
+  and is replaced wholesale; everything outside them is never touched. The
+  document is matched by the alias it opens with rather than by a filename
+  convention, and a missing mount, a missing document or an unwritable file is
+  logged and stepped over, never raised into a finished replay.
+  `--no-doc-reference` skips it for a run; `make doc-reference [STRATEGY=]
+  [REPORT=x.json]` seeds the block or fills it from a report written earlier.
+  New: `qte_backtest.doc_reference`, the `doc-reference` subcommand and
+  `QTE_ENGINE__AUDITS_DIR`.
+
 - **Three more commands on the operator's Telegram bot: `/demo`, `/mapping`
   and `/provider`.**
 

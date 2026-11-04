@@ -10,6 +10,7 @@ from typing import Any
 from qte_backtest.costs import CostProfiles, resolve_costs
 from qte_backtest.data_store import load_history
 from qte_backtest.db import BacktestRepository
+from qte_backtest.doc_reference import record_report
 from qte_backtest.execution import CostModel
 from qte_backtest.replay import BacktestEngine
 from qte_backtest.report import BacktestReport, build_report
@@ -64,6 +65,12 @@ class BacktestRequest:
     report_dir: Path | None = None
     report_formats: tuple[str, ...] = ("json", "md", "html")
     report_include_signals: bool = True
+    #: Point the strategy's concept document in the mounted strategy
+    #: repository at the report this run writes — the auto-generated block at
+    #: the bottom of ``docs/concepts/<strategy>.md``. Off when no report is
+    #: written, since there would be nothing to point at. See
+    #: :mod:`qte_backtest.doc_reference`.
+    update_strategy_document: bool = True
 
 
 async def run_backtest(
@@ -155,11 +162,13 @@ async def run_backtest(
         )
 
     if request.report_dir is not None:
-        report.write(
+        written = report.write(
             request.report_dir,
             formats=request.report_formats,
             include_signals=request.report_include_signals,
         )
+        if request.update_strategy_document:
+            record_report(report, written)
 
     if request.persist and settings.postgres.enabled:
         run_id = await BacktestRepository().record_backtest(

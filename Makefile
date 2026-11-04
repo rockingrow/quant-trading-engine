@@ -637,6 +637,9 @@ backtest: ## Replay one strategy: make backtest STRATEGY=... SYMBOL=XAUUSD TF=M1
 chart: ## Draw a report as an interactive HTML dashboard: make chart REPORT=data/reports/x.json
 	uv run qte-backtest chart $(REPORT)
 
+doc-reference: ## Refresh the auto-generated artefact block in each strategy document [STRATEGY=] [REPORT=x.json]
+	uv run qte-backtest doc-reference $(if $(STRATEGY),--strategy $(STRATEGY)) $(if $(REPORT),--report $(REPORT))
+
 reports: ## List the backtest reports written so far
 	@ls -lht data/reports 2>/dev/null | head -20 || echo "No reports yet — run make backtest"
 
@@ -786,7 +789,7 @@ owner-preflight:
 	build build-prod log-directory up start stop down restart restart-preflight dev dev-restart logs logging logging-broker nuke tailscale-status \
 	strategy-mount strategy-audit strategy-requirements strategy-test strategies audit audit-strict strategy-mapping \
 	db-upgrade db-downgrade db-revision db-current db-history db-check \
-	download backtest chart reports csv-import costs \
+	download backtest chart doc-reference reports csv-import costs \
 	sim sim-status sim-replay warmup warmup-cache sim-bar bar signal sim-walk sim-stop sim-reset sim-watch \
 	status shadow-status shadow-on shadow-off ping demo-signal owner-status owner-check owner-clear \
 	owner-preflight
