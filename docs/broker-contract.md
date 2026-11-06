@@ -258,6 +258,13 @@ inside a verified broker duplicate window, including time for publication.
 This path *does* verify `token` (`ALGO_BROKER__TOKEN`, matched against the
 broker's). Use it across any boundary you do not control.
 
+What comes back decides whether the outbox reconciles. A refused connection
+and a 4xx sent nothing the broker acted on, so they are `failed`. A timeout, a
+connection dropped after the request was written, and any 5xx — a proxy's 502
+or 504 says nothing about whether the broker took the signal — are `unknown`,
+and the pair stays blocked until the outbox settles it. The request carries the
+outbox row id as `Idempotency-Key`.
+
 The sink injects the current `ALGO_BROKER__TOKEN` for both transports at send
 time. Reports, persisted audit/outbox payloads and internal signal mirrors omit
 the token, including when serializing a legacy signal that still contains one.

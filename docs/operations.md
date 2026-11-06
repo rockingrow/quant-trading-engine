@@ -75,6 +75,18 @@ in place, so a `FLAT` the broker rejects over a closed weekend is retried at
 the next start. Why these two are separate mechanisms:
 [architecture notes](architecture.md).
 
+## When NATS is down
+
+Closed candles are staged in Redis before they are published, and a staged
+close is removed only once the NATS server has confirmed it — a publish nats-py
+merely buffered while reconnecting does not count. While ingestion has no
+connection the closes stay staged (one `WARNING` per outage) and go out, oldest
+first, when it returns. A staged entry that can never be published — it does
+not decode, or it belongs to another state namespace — is moved to the
+`outbox:candles:dead` list with an `ERROR` instead of holding back every close
+behind it; the list keeps the newest 1,000. `QTE_INGESTION__PUBLISH_CONFIRM_TIMEOUT`
+(default `5` seconds) is how long a publish may wait for that confirmation.
+
 ## Where to look
 
 Everything else the engine knows is a CLI command or a SQL query:

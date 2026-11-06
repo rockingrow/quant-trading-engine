@@ -144,7 +144,7 @@ because only one process may poll `getUpdates` for a token at a time.
 | `/positions` | What is open: symbol, timeframe, strategy, `signal_uxid`, opened |
 | `/closed` | Positions that are over, newest first, paged |
 | `/flat all \| SYMBOL \| STRATEGY` | Closes positions, after a confirmation |
-| `/prevent all \| SYMBOL \| STRATEGY` | Stops deciding on closed bars |
+| `/prevent all \| SYMBOL \| STRATEGY` | Stops deciding — on closed bars and on ticks |
 | `/allow all \| SYMBOL \| STRATEGY` | Resumes deciding |
 | `/warmup all \| SYMBOL` | Asks the vendor for the warm-up window again |
 | `/flush all \| SYMBOL` | Drops the warm-up bars Redis holds |
@@ -191,12 +191,16 @@ Three things are worth knowing before you use the acting commands:
 
 * **`/prevent` does not drop bars.** They keep arriving and keep filling the
   window; only the decision is skipped, so `/allow` resumes on the next bar
-  with no hole behind it. It is stored in Redis, so it survives a runner
-  restart, and it does not touch a position that is already open — that is what
-  `/flat` is for.
+  with no hole behind it. A strategy that also decides on ticks (`on_tick`) is
+  not asked about them either while its pair is paused. It is stored in Redis,
+  so it survives a runner restart, and it does not touch a position that is
+  already open — that is what `/flat` is for, and `/flat` works even before the
+  first bar after a restart has arrived.
 * **`/flat` is an ordinary exit.** It goes out as a `FLAT` through the outbox,
   sized and audited like a strategy's own close, labelled `MANUAL_FLAT`. The
-  reply says what it closed and what it refused, per cycle.
+  reply says what it closed and what it refused, per cycle. A command the
+  runner cannot serve — an unknown action, or one that failed — is answered
+  with an error rather than left to time out.
 * **`/warmup` and `/flush` are served by ingestion**, not by the bot reaching
   into Redis. The stored bars, the staging watermark and the resampler's
   in-flight bucket are one piece of state; dropping the bars from outside would
