@@ -53,10 +53,10 @@ nobody declared is refused rather than guessed.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import Any
+from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
 from qte_shared.logging_setup import get_logger
@@ -384,6 +384,50 @@ PORT_ONLY_PARAMS = (
 )
 
 
+class _Action(Protocol):
+    @property
+    def is_entry(self) -> bool: ...
+
+
+class _Intent(Protocol):
+    @property
+    def action(self) -> _Action: ...
+
+
+@dataclass(frozen=True, slots=True)
+class EntryGate[IntentT: _Intent]:
+    """One decision's intents, split by the weekend calendar."""
+
+    #: What may be emitted, in the order the strategy returned it.
+    allowed: list[IntentT]
+    #: Entries the calendar refused; exits are never in here.
+    blocked: list[IntentT]
+    #: Whether the window was open — the caller then flattens what is left.
+    market_is_shut: bool
+
+
+def gate_entries[IntentT: _Intent](
+    intents: Sequence[IntentT],
+    policy: WeekendFlatPolicy,
+    moment: datetime,
+    market_zone: ZoneInfo,
+) -> EntryGate[IntentT]:
+    """Drop the entries a shut market cannot take; let every exit through.
+
+    The one implementation the live runner (bar and tick paths) and the backtest
+    replay all call, so the rule that makes a backtest predict live behaviour is
+    enforced by construction rather than by three copies staying in step.
+    Callers keep their own logging and counting of what was blocked.
+    """
+    if not policy.covers(moment, market_zone):
+        return EntryGate(allowed=list(intents), blocked=[], market_is_shut=False)
+    allowed: list[IntentT] = []
+    blocked: list[IntentT] = []
+    for intent in intents:
+        (blocked if intent.action.is_entry else allowed).append(intent)
+    return EntryGate(allowed=allowed, blocked=blocked, market_is_shut=True)
+
+
 def resolve_warmup(
     declared: int,
     history_window: int | None,
@@ -545,6 +589,8 @@ __all__ = [
     "describe_warmup",
     "resolve_warmup",
     "DatedFlatWindow",
+    "EntryGate",
+    "gate_entries",
     "NO_WEEKEND_FLAT",
     "STRATEGY_SETTINGS_HOOK",
     "StrategySettings",

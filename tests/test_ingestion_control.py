@@ -220,6 +220,10 @@ async def test_flush_leaves_a_symbol_it_does_not_feed_alone():
     assert answer == {"flushed": [], "unknown": ["BTCUSDT"]}
 
 
-async def test_an_unknown_action_is_ignored():
+async def test_an_unknown_action_is_answered_with_an_error():
+    # Answered rather than ignored: a silent request reads as "ingestion is
+    # down" to a caller that waits out its timeout.
     service = _service()
-    assert await _ask(service, {"action": "drop_everything"}) is None
+    answer = await _ask(service, {"action": "drop_everything"})
+    assert "unknown action" in answer["error"]
+    assert "flush" in answer["actions"]

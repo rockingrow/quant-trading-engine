@@ -103,6 +103,7 @@ from qte_shared.strategies.strategy_settings import (
     NO_WEEKEND_FLAT,
     WeekendFlatPolicy,
     describe_warmup,
+    gate_entries,
     resolve_warmup,
     resolve_weekend_flat,
 )
@@ -1246,27 +1247,26 @@ class StrategyRunner:
             )
             return
 
-        market_is_shut = slot.weekend_flat.covers(context.now, self._market_zone)
-        for intent in as_intents(result):
-            if market_is_shut and intent.action.is_entry:
-                # The market this pair trades shuts before the next bar the
-                # strategy could manage this position on. Dropped here rather
-                # than in the strategy: the gate belongs to the calendar, and
-                # without it the FLAT below and the next entry would take turns
-                # every bar until the close.
-                log.info(
-                    "Blocked %s for %s %s at %s: inside the weekend-flat window %s (%s)",
-                    intent.action.value,
-                    slot.strategy.name,
-                    slot.symbol,
-                    context.now,
-                    slot.weekend_flat.describe(),
-                    self._market_zone.key,
-                )
-                continue
+        # The market this pair trades shuts before the next bar the strategy
+        # could manage a position on, so its entries are dropped here rather
+        # than in the strategy: the gate belongs to the calendar, and without
+        # it the FLAT below and the next entry would take turns every bar until
+        # the close. The replay calls the same function.
+        gate = gate_entries(as_intents(result), slot.weekend_flat, context.now, self._market_zone)
+        for blocked in gate.blocked:
+            log.info(
+                "Blocked %s for %s %s at %s: inside the weekend-flat window %s (%s)",
+                blocked.action.value,
+                slot.strategy.name,
+                slot.symbol,
+                context.now,
+                slot.weekend_flat.describe(),
+                self._market_zone.key,
+            )
+        for intent in gate.allowed:
             await self._emit(slot, intent, candle.close, context.now)
 
-        if market_is_shut:
+        if gate.market_is_shut:
             # After the strategy's own exits, not before them: a bar that hit
             # the stop stopped out, and the flat is what is left over.
             await self._flatten_for_the_weekend(slot, candle.close, context.now)
@@ -1444,17 +1444,18 @@ class StrategyRunner:
                 # The same calendar gate the candle path applies. A tick-driven
                 # entry into a market that is shutting is the same mistake, and
                 # exits still pass so a position can always be got out of.
-                market_is_shut = slot.weekend_flat.covers(event.tick.ts, self._market_zone)
-                for intent in as_intents(result):
-                    if market_is_shut and intent.action.is_entry:
-                        log.info(
-                            "Blocked tick %s for %s %s: inside the weekend-flat window %s",
-                            intent.action.value,
-                            slot.strategy.name,
-                            slot.symbol,
-                            slot.weekend_flat.describe(),
-                        )
-                        continue
+                gate = gate_entries(
+                    as_intents(result), slot.weekend_flat, event.tick.ts, self._market_zone
+                )
+                for blocked in gate.blocked:
+                    log.info(
+                        "Blocked tick %s for %s %s: inside the weekend-flat window %s",
+                        blocked.action.value,
+                        slot.strategy.name,
+                        slot.symbol,
+                        slot.weekend_flat.describe(),
+                    )
+                for intent in gate.allowed:
                     await self._emit(slot, intent, price, event.tick.ts)
 
     async def _on_control_message(self, msg: Msg) -> None:

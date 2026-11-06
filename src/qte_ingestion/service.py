@@ -67,7 +67,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -77,7 +76,7 @@ from qte_ingestion.repair import PartialBarRepairer, RoutedBarRepairer
 from qte_ingestion.resampler import Resampler
 from qte_ingestion.settings import ingestion_settings
 from qte_ingestion.state_guard import discard_foreign_candle_state
-from qte_shared.bus import NatsBus, Subjects
+from qte_shared.bus import ControlRouter, NatsBus, Subjects
 from qte_shared.cache import RedisState
 from qte_shared.config import market_data_plan, settings
 from qte_shared.db import EventRepository
@@ -215,6 +214,7 @@ class IngestionService:
         #: True while the outbox is held back for want of a NATS connection, so
         #: the outage is logged once rather than on every flush interval.
         self._outbox_waiting_for_nats = False
+        self._control = self._build_control_router()
         self._cleaned = False
 
     # ── Lifecycle ─────────────────────────────────────────────────────
@@ -417,25 +417,25 @@ class IngestionService:
         touch: the vendor request protocol, and the staging watermark that
         decides whether a replayed bar counts as a duplicate.
         """
-        try:
-            command = json.loads(msg.data)
-        except json.JSONDecodeError:
-            log.warning("Unparseable control message: %.120r", msg.data)
-            return
+        await self._control.dispatch(msg, bus=self.bus)
 
-        action = command.get("action")
-        if action in {"ping", "status"}:
-            await self._reply(msg, await self._status_payload())
-        elif action == "warmup":
-            await self._reply(msg, await self._warmup_on_request(command.get("symbols")))
-        elif action == "flush":
-            await self._reply(msg, await self._flush_on_request(command.get("symbols")))
-        else:
-            log.warning("Unknown ingestion control action: %r", action)
+    def _build_control_router(self) -> ControlRouter:
+        router = ControlRouter(SERVICE_NAME)
 
-    async def _reply(self, msg, payload: dict) -> None:
-        if msg.reply:
-            await self.bus.nc.publish(msg.reply, json.dumps(payload, default=str).encode())
+        async def status(command: dict) -> dict:
+            return await self._status_payload()
+
+        async def warmup(command: dict) -> dict:
+            return await self._warmup_on_request(command.get("symbols"))
+
+        async def flush(command: dict) -> dict:
+            return await self._flush_on_request(command.get("symbols"))
+
+        router.register("ping", status)
+        router.register("status", status)
+        router.register("warmup", warmup)
+        router.register("flush", flush)
+        return router
 
     async def _status_payload(self) -> dict:
         """What is subscribed, and how full each series' window is in Redis."""

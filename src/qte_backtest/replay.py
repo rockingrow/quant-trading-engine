@@ -52,6 +52,7 @@ from qte_shared.strategies.strategy_base import (
 from qte_shared.strategies.strategy_settings import (
     NO_WEEKEND_FLAT,
     WeekendFlatPolicy,
+    gate_entries,
     resolve_warmup,
 )
 from qte_shared.timeframes import TIMEFRAME_SECONDS, timeframe_seconds
@@ -298,13 +299,16 @@ class BacktestEngine:
             start = 0 if window_size is None else max(0, position + 1 - window_size)
             window = frame.iloc[start : position + 1]
             close = float(bar["close"])
-            market_is_shut = self.weekend_flat.covers(bar_time, self.market_zone)
-            for intent in as_intents(self.strategy.on_candle_closed(window, context)):
-                if market_is_shut and intent.action.is_entry:
-                    self._blocked += 1
-                    continue
+            gate = gate_entries(
+                as_intents(self.strategy.on_candle_closed(window, context)),
+                self.weekend_flat,
+                bar_time,
+                self.market_zone,
+            )
+            self._blocked += len(gate.blocked)
+            for intent in gate.allowed:
                 self._apply(intent, bar_time, close)
-            if market_is_shut:
+            if gate.market_is_shut:
                 # After the strategy's own exits, as in the runner: a bar that
                 # hit the stop stopped out, and the flat is what is left.
                 self._flatten_for_the_weekend(bar_time, close)
