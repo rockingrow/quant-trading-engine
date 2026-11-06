@@ -7,11 +7,11 @@ from unittest.mock import AsyncMock
 import pytest
 from fakeredis import FakeServer
 from fakeredis.aioredis import FakeRedis
+from ingestion_support import bare_ingestion_service
 from test_broker_sink import FakeBus, _signal
 from test_runner_catch_up import CandleStore, bar_at, build_runner
 from test_runner_delivery import _enter, _held, _runner, _slot
 
-from qte_ingestion.service import IngestionService
 from qte_ingestion.settings import ingestion_settings
 from qte_shared.bus.subjects import Subjects
 from qte_shared.cache.redis_state import RedisState
@@ -193,7 +193,7 @@ async def test_unattributed_and_foreign_history_cannot_warm_the_runner(monkeypat
 async def test_ingestion_attributes_ticks_before_persistence_and_publication(monkeypatch):
     select_scope(monkeypatch)
     monkeypatch.setattr(ingestion_settings, "publish_ticks", True)
-    service = object.__new__(IngestionService)
+    service = bare_ingestion_service()
     service._scope = settings.state_scope
     service._origins = {service._scope.provider: service._scope.origin()}
     service._symbol_providers = {}

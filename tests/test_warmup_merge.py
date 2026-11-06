@@ -15,6 +15,7 @@ import json
 from datetime import UTC, datetime, timedelta
 
 from fakeredis.aioredis import FakeRedis
+from ingestion_support import bare_ingestion_service
 
 from qte_ingestion.service import IngestionService
 from qte_shared.cache.redis_state import RedisState
@@ -29,7 +30,7 @@ FIRST_BAR = datetime(2026, 9, 28, 10, 0, tzinfo=UTC)
 
 def warmup_service() -> IngestionService:
     """An ingestion service with just enough wired to route a bar."""
-    service = object.__new__(IngestionService)
+    service = bare_ingestion_service()
     service.subscriptions = [
         SymbolFeed(symbol="XAUUSD", market="fx", timeframes=("M15",)),
         SymbolFeed(symbol="BTCUSDT", market="crypto", timeframes=("M15",)),

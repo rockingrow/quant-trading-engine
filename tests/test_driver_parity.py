@@ -8,6 +8,7 @@ from test_runner_catch_up import CandleStore, DecisionRecorder, bar_at, build_ru
 from qte_backtest.replay import BacktestEngine
 from qte_shared.config import settings
 from qte_shared.strategies.strategy_base import candles_to_frame
+from qte_strategy_engine import history_sync as history_module
 from qte_strategy_engine import runner as runner_module
 
 
@@ -28,7 +29,10 @@ async def test_first_decision_and_benchmark_match_live_warmup(
         def now(cls, timezone=None):
             return cls.current_time.astimezone(timezone)
 
-    monkeypatch.setattr(runner_module, "datetime", MarketClock)
+    # The runner reads the clock, and so does the history sync it delegates
+    # catch-up to; both have to see the market's time.
+    for clocked_module in (runner_module, history_module):
+        monkeypatch.setattr(clocked_module, "datetime", MarketClock)
     runner, strategy_slot, live_strategy = build_runner(
         monkeypatch, CandleStore([]), provider="simulator"
     )

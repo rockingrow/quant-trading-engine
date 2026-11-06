@@ -80,7 +80,7 @@ class PartialBarRepairer:
             vendor_bar = await asyncio.wait_for(
                 self._vendor_bar(candle), timeout=self.timeout_seconds
             )
-        except Exception as failure:
+        except Exception as failure:  # noqa: BLE001 - an unrepaired bar is published as it is
             log.warning(
                 "Published partial bar %s %s open_time=%s unrepaired: fetching the vendor's "
                 "bar failed (%r). Its open, high and low cover only the ticks this process "

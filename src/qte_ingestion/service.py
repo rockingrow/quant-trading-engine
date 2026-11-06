@@ -67,17 +67,18 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+
+from nats.errors import Error as NatsError
 
 from qte_ingestion.backfill import HistoryBackfiller, open_history_source
 from qte_ingestion.repair import PartialBarRepairer, RoutedBarRepairer
 from qte_ingestion.resampler import Resampler
 from qte_ingestion.settings import ingestion_settings
 from qte_ingestion.state_guard import discard_foreign_candle_state
-from qte_shared.bus import NatsBus, Subjects
+from qte_shared.bus import ControlRouter, NatsBus, Subjects
 from qte_shared.cache import RedisState
 from qte_shared.config import market_data_plan, settings
 from qte_shared.db import EventRepository
@@ -96,13 +97,16 @@ from qte_shared.market_data_plan import SymbolFeed
 from qte_shared.models import Candle, CandleClosedEvent, Tick, TickEvent
 from qte_shared.notifications import ServiceStatusNotifier, TelegramErrorNotifier
 from qte_shared.providers import create_provider
-from qte_shared.state_scope import MarketDataOrigin, stamp_market_data
+from qte_shared.state_scope import MarketDataOrigin, StateScope, stamp_market_data
 from qte_shared.symbols import SymbolSpec
 from qte_shared.timeframes import CLOCK_TOLERANCE, bucket_close, timeframe_seconds
 
 log = get_logger(__name__)
 
 SERVICE_NAME = "data-ingestion"
+
+#: Closes published per confirmation round trip when the outbox drains.
+OUTBOX_BATCH_SIZE = 100
 
 
 @dataclass
@@ -124,8 +128,26 @@ def resolve_subscriptions() -> list[SymbolFeed]:
 class IngestionService:
     """Owns the live feeds, the resamplers and the publish loop."""
 
-    def __init__(self) -> None:
-        self.subscriptions = resolve_subscriptions()
+    def __init__(
+        self,
+        *,
+        subscriptions: list[SymbolFeed] | None = None,
+        providers: dict[str, MarketDataProvider] | None = None,
+        bus: NatsBus | None = None,
+        state: RedisState | None = None,
+        events: EventRepository | None = None,
+        scope: StateScope | None = None,
+    ) -> None:
+        """Wire the service from settings, or from what the caller hands in.
+
+        Every keyword defaults to what production builds from the environment.
+        Passing one in is how a test, or another driver, swaps a collaborator
+        without bypassing the constructor — so every attribute the service's
+        methods read exists from the start, whoever built it.
+        """
+        self.subscriptions = (
+            resolve_subscriptions() if subscriptions is None else list(subscriptions)
+        )
         if not self.subscriptions:
             raise ValueError(
                 "Market-data configuration enables no subscriptions. Enable a planned symbol "
@@ -138,23 +160,27 @@ class IngestionService:
         self.timeframes = list(
             dict.fromkeys(tf for feed in self.subscriptions for tf in feed.timeframes)
         )
-        self.bus = NatsBus(name="qte-ingestion")
-        self.state = RedisState()
+        self.bus = bus if bus is not None else NatsBus(name="qte-ingestion")
+        self.state = state if state is not None else RedisState()
         self.subjects = Subjects()
-        self.events = EventRepository()
+        self.events = events if events is not None else EventRepository()
         #: Telegram, if it is configured: the service's own UP/DOWN message and
         #: its ERROR logs. Both are no-ops without a token and a chat, and
         #: neither is ever on the bar path.
         self.status = ServiceStatusNotifier(SERVICE_NAME)
         self.telegram_errors = TelegramErrorNotifier()
-        self._scope = settings.state_scope
+        self._scope = scope if scope is not None else settings.state_scope
         #: Every configured provider, by name, in the order configured.
-        self.providers: dict[str, MarketDataProvider] = {
-            provider_name: create_provider(
-                provider_name, capability=(Capability.LIVE, Capability.LIVE_BARS)
-            )
-            for provider_name in self._scope.providers
-        }
+        self.providers: dict[str, MarketDataProvider] = (
+            dict(providers)
+            if providers is not None
+            else {
+                provider_name: create_provider(
+                    provider_name, capability=(Capability.LIVE, Capability.LIVE_BARS)
+                )
+                for provider_name in self._scope.providers
+            }
+        )
         #: The provenance each provider stamps on what it feeds.
         self._origins: dict[str, MarketDataOrigin] = {
             provider_name: self._scope.origin(provider=provider_name, synthetic=provider.synthetic)
@@ -190,6 +216,10 @@ class IngestionService:
         self._vendor_offline = False
         #: When each series last had a gap topped up inline.
         self._gap_asked_at: dict[tuple[str, str], datetime] = {}
+        #: True while the outbox is held back for want of a NATS connection, so
+        #: the outage is logged once rather than on every flush interval.
+        self._outbox_waiting_for_nats = False
+        self._control = self._build_control_router()
         self._cleaned = False
 
     # ── Lifecycle ─────────────────────────────────────────────────────
@@ -392,25 +422,25 @@ class IngestionService:
         touch: the vendor request protocol, and the staging watermark that
         decides whether a replayed bar counts as a duplicate.
         """
-        try:
-            command = json.loads(msg.data)
-        except json.JSONDecodeError:
-            log.warning("Unparseable control message: %.120r", msg.data)
-            return
+        await self._control.dispatch(msg, reply_bus=self.bus)
 
-        action = command.get("action")
-        if action in {"ping", "status"}:
-            await self._reply(msg, await self._status_payload())
-        elif action == "warmup":
-            await self._reply(msg, await self._warmup_on_request(command.get("symbols")))
-        elif action == "flush":
-            await self._reply(msg, await self._flush_on_request(command.get("symbols")))
-        else:
-            log.warning("Unknown ingestion control action: %r", action)
+    def _build_control_router(self) -> ControlRouter:
+        router = ControlRouter(SERVICE_NAME)
 
-    async def _reply(self, msg, payload: dict) -> None:
-        if msg.reply:
-            await self.bus.nc.publish(msg.reply, json.dumps(payload, default=str).encode())
+        async def report_status(command: dict) -> dict:
+            return await self._status_payload()
+
+        async def warm_windows(command: dict) -> dict:
+            return await self._warmup_on_request(command.get("symbols"))
+
+        async def flush_windows(command: dict) -> dict:
+            return await self._flush_on_request(command.get("symbols"))
+
+        router.register("ping", report_status)
+        router.register("status", report_status)
+        router.register("warmup", warm_windows)
+        router.register("flush", flush_windows)
+        return router
 
     async def _status_payload(self) -> dict:
         """What is subscribed, and how full each series' window is in Redis."""
@@ -489,7 +519,7 @@ class IngestionService:
                 await backfiller.backfill_series(spec, timeframe, force=True)
             except asyncio.CancelledError:
                 raise
-            except Exception as failure:
+            except Exception as failure:  # noqa: BLE001 - logged; one series must not stop the others
                 log.warning(
                     "Requested warm-up of %s %s failed: %s", spec.symbol, timeframe, failure
                 )
@@ -637,7 +667,7 @@ class IngestionService:
         async with self._processing_guard():
             # Do not retire another batch while Redis cannot retain the first.
             # This bounds memory by the configured series, rather than ticks.
-            if getattr(self, "_retired_candles", None):
+            if self._retired_candles:
                 await self._emit_candles([])
             await self._handle_tick_serialized(tick)
 
@@ -690,7 +720,7 @@ class IngestionService:
 
         try:
             watching = await backfiller.watch_online(vendor_online)
-        except Exception as failure:
+        except Exception as failure:  # noqa: BLE001 - logged; windows are checked again later
             log.warning(
                 "Cannot listen for %r announcing itself (%s) — its windows are checked "
                 "again only when a live bar arrives, or by the probe if one is configured",
@@ -757,7 +787,7 @@ class IngestionService:
                 timeframe,
                 refusal,
             )
-        except Exception as failure:
+        except Exception as failure:  # noqa: BLE001 - logged; one series must not stop the others
             log.warning(
                 "History for %s %s is still not available: %s", spec.symbol, timeframe, failure
             )
@@ -961,8 +991,6 @@ class IngestionService:
             )
 
     def _processing_guard(self) -> asyncio.Lock:
-        if not hasattr(self, "_processing_lock"):
-            self._processing_lock = asyncio.Lock()
         return self._processing_lock
 
     async def _handle_tick_serialized(self, tick: Tick) -> None:
@@ -1000,7 +1028,7 @@ class IngestionService:
             await asyncio.sleep(ingestion_settings.flush_interval)
             try:
                 async with self._processing_guard():
-                    if getattr(self, "_retired_candles", None):
+                    if self._retired_candles:
                         await self._emit_candles([])
                     await self._emit_candles(self._close_ended_bars(datetime.now(UTC)))
             except asyncio.CancelledError:
@@ -1032,8 +1060,6 @@ class IngestionService:
         outage that outlasted their bucket: this process's last tick for them
         predates the outage, so their close comes from the vendor as well.
         """
-        if not hasattr(self, "_retired_candles"):
-            self._retired_candles = {}
         # Retain the entire batch and its partial flags before the first await.
         # A failure on any item must leave that item and all later ones intact.
         for candle in candles:
@@ -1067,38 +1093,98 @@ class IngestionService:
             await self._drain_candle_outbox()
 
     async def _drain_candle_outbox(self) -> None:
-        """Publish staged closes oldest-first, acknowledging only on success.
+        """Publish staged closes oldest-first, removing them only once NATS has them.
 
-        Core NATS has no server acknowledgement.  A crash immediately after
-        publish can therefore replay one duplicate, which the runner already
-        rejects by candle open time.  The opposite outcome — deleting before
-        publish and losing a strategy decision — is never allowed.
+        "Has them" is the server's word, not the client's: nats-py buffers a
+        publish while it reconnects and returns as if it had gone, so removing
+        the rows on that return would lose them to a restart mid-outage — the
+        exact case this outbox exists for. So the drain stops while there is no
+        connection, publishes a batch, confirms the whole batch with one flush
+        (a PING/PONG round trip), and only then removes it. A publish or a flush
+        that fails or times out leaves the batch staged for the next interval;
+        the outage is logged once, not on every flush.
+
+        A crash between the confirmation and the removal replays the batch,
+        which the runner rejects by candle open time. Deleting before publish
+        and losing a strategy decision is never allowed.
+
+        A head that can never be published — it does not decode, or it belongs
+        to another state scope — is moved to the dead-letter list with an
+        ERROR rather than left to block every candle behind it.
         """
         # Several live feeds call this method concurrently. Without a single
         # consumer lock, two callbacks can peek A, both publish A, then pop A
         # and B — silently acknowledging B without ever publishing it.
-        lock = getattr(self, "_outbox_lock", None)
-        if lock is None:
-            lock = self._outbox_lock = asyncio.Lock()
-        async with lock:
-            while candle := await self.state.peek_pending_candle():
-                if not self._scope.accepts(candle.origin):
-                    raise ValueError("Refusing to publish a candle from another state scope")
+        async with self._outbox_lock:
+            while True:
+                staged_batch = await self.state.pending_candle_batch(OUTBOX_BATCH_SIZE)
+                if not staged_batch:
+                    self._outbox_waiting_for_nats = False
+                    return
+                publishable = self._publishable_prefix(staged_batch)
+                if not publishable:
+                    oldest_entry = staged_batch[0]
+                    await self._quarantine_outbox_head(
+                        "it does not decode"
+                        if oldest_entry is None
+                        else f"{oldest_entry.symbol} {oldest_entry.timeframe} "
+                        f"{oldest_entry.open_time.isoformat()} "
+                        "belongs to another state scope"
+                    )
+                    continue
+                if not await self._publish_confirmed(publishable):
+                    return
+                await self.state.ack_pending_candles(len(publishable))
+                self._outbox_waiting_for_nats = False
+                for candle in publishable:
+                    log.info(
+                        "Candle closed %s %s open_time=%s o=%s h=%s l=%s c=%s ticks=%d",
+                        candle.symbol,
+                        candle.timeframe,
+                        candle.open_time.isoformat(),
+                        candle.open,
+                        candle.high,
+                        candle.low,
+                        candle.close,
+                        candle.tick_count,
+                    )
+
+    def _publishable_prefix(self, staged_batch: list[Candle | None]) -> list[Candle]:
+        """The leading run of *staged_batch* that can go out, up to the first that cannot."""
+        publishable: list[Candle] = []
+        for candle in staged_batch:
+            if candle is None or not self._scope.accepts(candle.origin):
+                break
+            publishable.append(candle)
+        return publishable
+
+    async def _publish_confirmed(self, candles: list[Candle]) -> bool:
+        """Publish *candles* and wait for the server; ``False`` leaves them staged."""
+        if not self.bus.is_connected:
+            self._note_outbox_held("NATS is not connected")
+            return False
+        try:
+            for candle in candles:
                 await self.bus.publish(
                     self.subjects.candle_closed(candle.symbol, candle.timeframe),
                     CandleClosedEvent(
                         symbol=candle.symbol, timeframe=candle.timeframe, candle=candle
                     ).model_dump(mode="json"),
                 )
-                await self.state.ack_pending_candle()
-                log.info(
-                    "Candle closed %s %s open_time=%s o=%s h=%s l=%s c=%s ticks=%d",
-                    candle.symbol,
-                    candle.timeframe,
-                    candle.open_time.isoformat(),
-                    candle.open,
-                    candle.high,
-                    candle.low,
-                    candle.close,
-                    candle.tick_count,
-                )
+            await self.bus.confirm_published(timeout=ingestion_settings.publish_confirm_timeout)
+        except (ConnectionError, TimeoutError, NatsError) as failure:
+            self._note_outbox_held(f"{type(failure).__name__}: {failure}")
+            return False
+        return True
+
+    def _note_outbox_held(self, reason: str) -> None:
+        if not self._outbox_waiting_for_nats:
+            log.warning(
+                "Staged candle closes stay in the outbox until NATS confirms them (%s)", reason
+            )
+            self._outbox_waiting_for_nats = True
+
+    async def _quarantine_outbox_head(self, reason: str) -> None:
+        """Move the outbox head aside so the candles behind it can go out."""
+        log.error("Moved an unpublishable candle to the outbox dead-letter list: %s", reason)
+        await self.state.quarantine_pending_candle()

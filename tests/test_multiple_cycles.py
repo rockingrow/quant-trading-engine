@@ -483,14 +483,14 @@ async def test_the_runner_delivers_and_persists_each_cycle_on_its_own():
     runner = _runner(state=CycleState(), positions=CyclePositions())
     strategy_slot = multi_slot()
     for uxid in ("A000000000000001", "B000000000000002"):
-        await runner._emit(strategy_slot, entry(uxid), 2000.0, MOMENT)
+        await runner.emit(strategy_slot, entry(uxid), 2000.0, MOMENT)
     assert set(runner.state.cycles) == {
         (STRATEGY_NAME, SYMBOL, "A000000000000001"),
         (STRATEGY_NAME, SYMBOL, "B000000000000002"),
     }
     assert set(runner.positions.cycles) == set(runner.state.cycles)
 
-    await runner._emit(strategy_slot, close(SignalAction.SL, "A000000000000001"), 2000.0, MOMENT)
+    await runner.emit(strategy_slot, close(SignalAction.SL, "A000000000000001"), 2000.0, MOMENT)
     assert set(runner.state.cycles) == {(STRATEGY_NAME, SYMBOL, "B000000000000002")}
     assert set(runner.positions.cycles) == {(STRATEGY_NAME, SYMBOL, "B000000000000002")}
     assert strategy_slot.factory.open_cycles(SYMBOL) == ("B000000000000002",)
@@ -503,7 +503,7 @@ async def test_the_runner_restores_every_cycle_a_pair_holds():
     }
     runner = _runner(state=CycleState(), positions=CyclePositions(held))
     strategy_slot = multi_slot()
-    await runner._restore_position(strategy_slot)
+    await runner.recovery.restore_position(strategy_slot)
     assert strategy_slot.factory.open_cycles(SYMBOL) == ("A000000000000001", "B000000000000002")
     assert set(runner.state.cycles) == set(held), "Postgres re-seeded Redis"
 
@@ -521,7 +521,7 @@ async def test_the_runner_weekend_flat_names_every_cycle():
     runner = _runner(state=CycleState(), positions=CyclePositions())
     strategy_slot = multi_slot()
     for uxid in ("A000000000000001", "B000000000000002"):
-        await runner._emit(strategy_slot, entry(uxid), 2000.0, MOMENT)
+        await runner.emit(strategy_slot, entry(uxid), 2000.0, MOMENT)
     await runner._flatten_for_the_weekend(strategy_slot, 2001.0, MOMENT)
     flats = [
         signal for signal, _ in runner.signals.rows if signal.position.action is SignalAction.FLAT

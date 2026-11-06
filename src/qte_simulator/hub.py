@@ -102,7 +102,7 @@ class SimulatorHub:
                 continue
             try:
                 await subscriber.send(frame)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - one client must not stop the dev simulator
                 log.warning("Dropping feed client id=%d: %s", subscriber.id, exc)
                 self.detach(subscriber)
                 continue
@@ -173,7 +173,7 @@ class SimulatorHub:
             task.cancel()
             try:
                 await task
-            except (asyncio.CancelledError, Exception):
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001 - one client must not stop the dev simulator
                 pass
             stopped.append(key)
         return stopped

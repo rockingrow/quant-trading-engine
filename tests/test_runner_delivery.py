@@ -40,6 +40,8 @@ class ProbeStrategy(StrategyBase):
 
 class FailedSink:
     shadow_mode = False
+    # Like the real sink: the process switch, read when asked.
+    force_shadow_mode = property(lambda self: settings.broker.force_shadow_mode)
     transport = "nats"
 
     def set_shadow_mode(self, enabled):
@@ -137,7 +139,7 @@ async def test_failed_entry_delivery_does_not_create_a_ghost_live_cycle():
     factory = SignalFactory("DELIVERY_PROBE", timeframe="M15", token="test")
     slot = StrategySlot(ProbeStrategy(), "XAUUSD", factory)
 
-    await runner._emit(
+    await runner.emit(
         slot,
         SignalIntent(action=SignalAction.LONG, price=2000.0, quantity=1.0, sl=1990.0),
         fallback_price=2000.0,
@@ -159,6 +161,8 @@ async def test_failed_entry_delivery_does_not_create_a_ghost_live_cycle():
 
 class AcceptingSink:
     shadow_mode = False
+    # Like the real sink: the process switch, read when asked.
+    force_shadow_mode = property(lambda self: settings.broker.force_shadow_mode)
     transport = "nats"
 
     def __init__(self):
@@ -287,7 +291,7 @@ def _slot() -> StrategySlot:
 
 
 async def _enter(runner, slot, **kwargs):
-    await runner._emit(
+    await runner.emit(
         slot,
         SignalIntent(
             action=SignalAction.LONG, price=2334.50, sl=2329.50, tp1_percent=30.0, **kwargs
@@ -298,7 +302,7 @@ async def _enter(runner, slot, **kwargs):
 
 
 async def _close(runner, slot, action, price, **kwargs):
-    await runner._emit(
+    await runner.emit(
         slot,
         SignalIntent(action=action, price=price, **kwargs),
         fallback_price=price,
@@ -377,7 +381,7 @@ async def test_an_unknown_delivery_does_not_commit_and_blocks_the_pair():
     assert slot.factory.open_cycle("XAUUSD") is None
     assert runner.state.held == {}
     assert runner.signals.rows[0][1]["delivery_status"] == "unknown"
-    assert slot.key in runner._uncertain_pairs
+    assert slot.key in runner.delivery.uncertain_pairs
 
 
 async def test_a_signal_is_not_sent_when_the_durable_outbox_cannot_be_written():
@@ -450,7 +454,7 @@ async def test_boot_reads_the_cycle_out_of_redis():
     runner = _runner(state=FakeState({key: _held()}))
     slot = _slot()
 
-    await runner._restore_position(slot)
+    await runner.recovery.restore_position(slot)
 
     restored = slot.factory.open_position("XAUUSD")
     assert restored.signal_uxid == "9F2C4B7E18A3D605"
@@ -463,7 +467,7 @@ async def test_an_empty_cache_falls_back_to_the_table_and_re_seeds_it():
     runner = _runner(state=FakeState(), positions=FakePositions({key: _held()}))
     slot = _slot()
 
-    await runner._restore_position(slot)
+    await runner.recovery.restore_position(slot)
 
     assert slot.factory.open_cycle("XAUUSD") == "9F2C4B7E18A3D605"
     assert runner.state.held[key].signal_uxid == "9F2C4B7E18A3D605"
@@ -471,7 +475,7 @@ async def test_an_empty_cache_falls_back_to_the_table_and_re_seeds_it():
 
 async def test_nothing_stored_anywhere_means_the_slot_really_is_flat():
     runner, slot = _runner(), _slot()
-    await runner._restore_position(slot)
+    await runner.recovery.restore_position(slot)
     assert slot.factory.open_position("XAUUSD") is None
 
 
@@ -479,7 +483,7 @@ async def test_a_restored_runner_closes_the_position_at_the_size_that_is_left():
     key = ("DELIVERY_PROBE", "XAUUSD")
     runner = _runner(state=FakeState({key: _held()}))
     slot = _slot()
-    await runner._restore_position(slot)
+    await runner.recovery.restore_position(slot)
 
     await _close(runner, slot, SignalAction.SL, 2329.50)
 
@@ -512,7 +516,7 @@ async def test_startup_replays_a_pending_signal_with_its_original_delivery_id():
     runner.signals = RecordingSignals([row])
     runner.slots = [slot]
 
-    await runner._recover_pending_deliveries()
+    await runner.delivery.recover_pending_deliveries()
 
     assert sink.delivery_ids == [str(delivery_id)]
     assert slot.factory.open_cycle("XAUUSD") == signal.signal_uxid
@@ -549,12 +553,12 @@ async def test_a_pending_shadow_signal_cannot_turn_live_during_recovery():
     runner.signals = RecordingSignals([row])
     runner.slots = [slot]
 
-    await runner._recover_pending_deliveries()
+    await runner.delivery.recover_pending_deliveries()
 
     assert sink.delivery_ids == []
     assert row.delivery_status == "pending"
     assert slot.factory.open_cycle("XAUUSD") is None
-    assert slot.key in runner._uncertain_pairs
+    assert slot.key in runner.delivery.uncertain_pairs
 
 
 def test_replaying_the_same_partial_close_does_not_reduce_position_twice():

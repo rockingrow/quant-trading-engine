@@ -152,8 +152,11 @@ async def test_an_invalid_signal_is_rejected_before_any_transport_runs():
         position=PositionBlock(action=SignalAction.LONG, price=2000.0),
         token="t",
     )
-    with pytest.raises(ValueError):
-        await sink.send(naked)
+    # Refused, not raised: nothing was sent, so the outcome is a definite
+    # `failed` rather than an exception the runner would record as `unknown`.
+    result = await sink.send(naked)
+    assert result.status == "failed"
+    assert "price and quantity" in result.detail
     assert bus.published == []
 
 
@@ -176,3 +179,73 @@ def live_state_scope(monkeypatch):
 
     monkeypatch.setattr(settings, "env", "prod")
     monkeypatch.setattr(settings.state_config, "execution_mode", "live")
+
+
+# ── HTTP: what counts as "nothing reached the broker" ────────────────
+
+
+def _http_sink(handler) -> BrokerSink:
+    import httpx
+
+    sink = BrokerSink(transport="http", shadow_mode=False)
+    sink._http = httpx.AsyncClient(
+        base_url="http://broker.test", transport=httpx.MockTransport(handler)
+    )
+    return sink
+
+
+def _raising(error_type):
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise error_type("boom", request=request)
+
+    return handler
+
+
+def _answering(status_code: int):
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, request=request)
+
+    return handler
+
+
+@pytest.mark.parametrize(
+    ("handler_name", "expected"),
+    [
+        ("ConnectError", "failed"),
+        ("ConnectTimeout", "failed"),
+        ("ReadTimeout", "unknown"),
+        ("ReadError", "unknown"),
+        ("RemoteProtocolError", "unknown"),
+        ("WriteError", "unknown"),
+    ],
+)
+async def test_an_http_transport_error_is_unknown_unless_nothing_left(
+    monkeypatch, handler_name, expected
+):
+    import httpx
+
+    from qte_shared.config import settings
+
+    monkeypatch.setattr(settings.state_config, "execution_mode", "live")
+    sink = _http_sink(_raising(getattr(httpx, handler_name)))
+    result = await sink.send(_signal())
+    assert result.status == expected
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected"),
+    [(200, "sent"), (400, "failed"), (422, "failed"), (502, "unknown"), (504, "unknown")],
+)
+async def test_an_http_answer_is_classified_by_who_could_have_acted(
+    monkeypatch, status_code, expected
+):
+    from qte_shared.config import settings
+
+    monkeypatch.setattr(settings.state_config, "execution_mode", "live")
+    sink = _http_sink(_answering(status_code))
+    result = await sink.send(_signal())
+    assert result.status == expected

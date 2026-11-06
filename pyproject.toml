@@ -129,7 +129,8 @@ target-version = "py313"
 exclude = ["__strategies__"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B"]
+# BLE: a blind `except Exception` must say why with `# noqa: BLE001 - <reason>`.
+select = ["E", "F", "I", "UP", "B", "BLE"]
 ignore = [
     # FastAPI's Depends()/Query() defaults are the framework's own idiom.
     "B008",

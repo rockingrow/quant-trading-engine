@@ -19,9 +19,10 @@ import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from ingestion_support import bare_ingestion_service
 
 from qte_ingestion.resampler import Resampler
-from qte_ingestion.service import SERVICE_NAME, IngestionService
+from qte_ingestion.service import SERVICE_NAME
 from qte_shared.config import settings
 from qte_shared.models import Tick
 from qte_shared.notifications import ServiceStatusNotifier, TelegramErrorNotifier
@@ -59,7 +60,7 @@ def _frame(price: float) -> str:
 
 async def test_partial_ingestion_startup_closes_resources_already_acquired():
     events: list[str] = []
-    service = object.__new__(IngestionService)
+    service = bare_ingestion_service()
     service._scope = settings.state_scope
     service._origins = {service._scope.provider: service._scope.origin()}
     service._symbol_providers = {}
@@ -135,7 +136,7 @@ async def test_a_raising_handler_does_not_stop_the_tiingo_feed():
 
 
 async def test_a_failed_publish_costs_one_cycle_not_the_flush_loop(monkeypatch):
-    service = object.__new__(IngestionService)
+    service = bare_ingestion_service()
     service._scope = settings.state_scope
     # No Redis, NATS or provider.
     service._origins = {service._scope.provider: service._scope.origin()}
@@ -197,8 +198,16 @@ class CandleOutbox:
     async def ack_pending_candle(self) -> None:
         self.pending.pop(0)
 
+    async def pending_candle_batch(self, limit):
+        return list(self.pending[:limit])
+
+    async def ack_pending_candles(self, count) -> None:
+        del self.pending[:count]
+
 
 class FlakyCandleBus:
+    is_connected = True
+
     def __init__(self) -> None:
         self.fail = True
         self.published = []
@@ -207,6 +216,9 @@ class FlakyCandleBus:
         if self.fail:
             raise ConnectionError("core NATS is unavailable")
         self.published.append((subject, payload))
+
+    async def confirm_published(self, *, timeout: float = 5.0) -> None:
+        return None
 
 
 class YieldingCandleBus(FlakyCandleBus):
@@ -220,7 +232,7 @@ class YieldingCandleBus(FlakyCandleBus):
 
 
 async def test_a_failed_candle_publish_remains_in_the_durable_outbox():
-    service = object.__new__(IngestionService)
+    service = bare_ingestion_service()
     service._scope = settings.state_scope
     service._origins = {service._scope.provider: service._scope.origin()}
     service._symbol_providers = {}
@@ -236,8 +248,9 @@ async def test_a_failed_candle_publish_remains_in_the_durable_outbox():
         candle.flush(MOMENT + timedelta(minutes=1))[0], service._scope.origin()
     )
 
-    with pytest.raises(ConnectionError, match="unavailable"):
-        await service._emit_candle(closed)
+    # A publish that fails is not raised into the bar path: the close stays
+    # staged and the next drain sends it.
+    await service._emit_candle(closed)
 
     assert service.state.pending == [closed]
     assert service.state.staged == [closed]
@@ -254,7 +267,7 @@ async def test_a_failed_candle_publish_remains_in_the_durable_outbox():
 
 
 async def test_concurrent_feeds_cannot_ack_a_candle_another_feed_has_not_published():
-    service = object.__new__(IngestionService)
+    service = bare_ingestion_service()
     service._scope = settings.state_scope
     service._origins = {service._scope.provider: service._scope.origin()}
     service._symbol_providers = {}
@@ -301,7 +314,7 @@ class RecordingRepairer:
 
 
 async def test_a_partial_bar_is_repaired_after_whole_bars_have_gone_out():
-    service = object.__new__(IngestionService)
+    service = bare_ingestion_service()
     service._scope = settings.state_scope
     service._origins = {service._scope.provider: service._scope.origin()}
     service._symbol_providers = {}
@@ -343,7 +356,7 @@ class FlakyStaging(CandleOutbox):
 
 
 def staging_service(failure_index):
-    service = object.__new__(IngestionService)
+    service = bare_ingestion_service()
     service._scope = settings.state_scope
     service._origins = {service._scope.provider: service._scope.origin()}
     service._symbol_providers = {}

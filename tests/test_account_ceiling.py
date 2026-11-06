@@ -84,7 +84,7 @@ def _book(*slots: StrategySlot):
 
 
 async def _enter(runner, slot, price: float = 2000.0):
-    await runner._emit(
+    await runner.emit(
         slot,
         SignalIntent(action=SignalAction.LONG, price=price, sl=price - 10.0, tp2=price + 20.0),
         fallback_price=price,
@@ -93,7 +93,7 @@ async def _enter(runner, slot, price: float = 2000.0):
 
 
 async def _close(runner, slot, action, uxid, price: float = 2010.0):
-    await runner._emit(
+    await runner.emit(
         slot,
         SignalIntent(action=action, price=price, signal_uxid=uxid),
         fallback_price=price,
@@ -275,7 +275,7 @@ async def test_a_refused_entry_gives_its_reservation_back(monkeypatch):
     runner = _book(slot)
 
     # No stop and no size: `build()` refuses it inside the reservation.
-    await runner._emit(
+    await runner.emit(
         slot,
         SignalIntent(action=SignalAction.LONG, price=2000.0, quantity=0.0),
         fallback_price=2000.0,

@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A candle close staged during a NATS outage is no longer lost to a
+  restart.** nats-py buffers a core publish while it reconnects and returns as
+  if it had gone, and the outbox removed the close on that return — so a
+  container restarted before NATS came back lost every close staged since. The
+  outbox now holds its closes while ingestion has no connection, and removes
+  one only after the server confirms the publish
+  (`QTE_INGESTION__PUBLISH_CONFIRM_TIMEOUT`, default `5` seconds) — one round
+  trip per batch of up to 100 closes. A publish or confirmation that fails
+  leaves the batch staged for the next flush interval, at start-up too, rather
+  than stopping ingestion. A staged entry that can never be published moves to
+  `outbox:candles:dead` with an `ERROR` instead of blocking every close behind
+  it.
+- **An ambiguous HTTP delivery is `unknown`, not `failed`.** On
+  `ALGO_BROKER__TRANSPORT=http`, a connection dropped after the request was
+  written, and any 5xx (a proxy's 502 or 504 included), may have reached the
+  broker; they now go through outbox reconciliation, so a close the broker took
+  is no longer kept open locally and an entry is not offered again. A refused
+  connection and a 4xx stay `failed`. A payload that fails validation is
+  reported `failed` instead of raising and blocking its pair.
+- **`/prevent` pauses tick decisions too.** A strategy overriding `on_tick` was
+  still asked about ticks — entries included — on a paused pair.
+- **A failed `QTE.signal.emitted` mirror no longer cuts a bar short.** The
+  signal had already gone to the broker; the exception skipped the rest of that
+  bar's intents and the weekend `FLAT`. It is now a `WARNING`.
+- **`/flat` works before the first bar after a restart.** It refused a pair
+  whose window was still empty; the audit price now falls back to the entry's,
+  as the stale and orphan closes already did.
+- **A control request is always answered.** An unknown action, a payload that
+  is not a JSON object, or a handler that raised left the caller to wait out
+  its timeout; the runner and ingestion now reply with a `control_error`. The
+  bot, `make status` and `qte-control ping` read such a reply as a service that
+  is down, never as an answer — a `flat` refusal that is the handler's own
+  `error` is still shown as one.
+- **`ensure_stream` no longer mistakes a timeout for a missing stream**, and
+  the MT5 core-NATS consumer reconnects the moment its connection closes rather
+  than on a one-second poll. `qte-control owner clear` reads its confirmation
+  off the event loop.
+
 - **A Telegram position message spells its timeframe again.** The cycle stores
   the timeframe as the broker contract spells it — bare minutes — so the header
   read `SHORT XAGUSD (15)` instead of `(M15)`. It is now rendered through the
@@ -17,6 +55,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The strategy runner is split into a coordinator and four collaborators.**
+  `StrategyRunner` keeps the lifecycle, the ownership claim, the slots and the
+  decision path; the signal outbox (`delivery.py`), restore, stale flush and
+  orphan settlement (`recovery.py`), warm-up and catch-up (`history_sync.py`)
+  and the control plane (`control_plane.py`) are objects of their own that
+  share one `RunnerContext`. `StrategySlot` lives in `slot.py` and is still
+  importable from the runner. No behaviour changes apart from the fixes above;
+  ownership is now checked once per intent rather than twice.
+- **Outbox statuses are a `DeliveryStatus` enum with a transition table.**
+  `mark_delivery` writes only the moves the table allows and reports any other
+  as a failed write, which keeps the pair blocked for reconciliation. The
+  stored strings are unchanged, so there is no migration.
+- **One weekend entry gate for both drivers.** The runner's bar and tick paths
+  and the backtest replay now call the same `gate_entries`, instead of three
+  copies of the rule. `IngestionService` takes its collaborators through its
+  constructor, and Ruff's `BLE` rule now requires a reason on every
+  `except Exception`.
+- **The README is a landing page; the operator guides moved to `docs/`.** It
+  went from about 71 KB to 10 KB and now holds the quick start, the
+  architecture diagram, the core concepts, the everyday commands and an index
+  of `docs/`. Its long sections became eight guides —
+  `docs/strategies.md`, `docs/mapping-and-sizing.md`, `docs/backtesting.md`,
+  `docs/mt5-ingester.md`, `docs/telegram.md`, `docs/tailscale.md`,
+  `docs/operations.md` and `docs/deployment.md` — while the transport
+  comparison joined `docs/broker-contract.md` and the case for the simulator
+  joined `docs/simulator.md`. No behaviour changes; links into the old README
+  anchors need the new file. Two statements were corrected on the way: a
+  backtest **stacks** a second entry beside open cycles rather than rejecting
+  it, as the runner does, and the operator bot has thirteen commands, not ten.
+  The strategy audit's fix hint now points at `docs/strategies.md`.
 - **LONG and SHORT read as a green and a red square** in the lifecycle message
   (`🟩` / `🟥`) in place of the two chart glyphs, which were hard to tell apart
   at a glance. Dots were tried first and dropped: the flags, the service

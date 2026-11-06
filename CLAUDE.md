@@ -44,8 +44,9 @@ it disappears with the worktree. Backtest output must not end up there.
 
 Use plan mode, and confirm the approach, before editing:
 
-- `src/qte_strategy_engine/{broker_sink,runner}.py` —
-  the live delivery path; a mistake here sends or loses real orders.
+- `src/qte_strategy_engine/{broker_sink,runner,delivery,delivery_status,recovery}.py` —
+  the live delivery path (the decision, the outbox and its transitions, the
+  stale and orphan closes); a mistake here sends or loses real orders.
 - `migrations/versions/` — one Alembic chain for every engine.
 - `src/qte_shared/models.py` and
   `src/qte_shared/strategies/strategy_base.py` — a contract change

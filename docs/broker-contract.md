@@ -220,6 +220,18 @@ so such a cycle stays open until a terminal action ends it.
 
 ## Transports
 
+`ALGO_BROKER__TRANSPORT` selects which of two carries the payload:
+
+| | `nats` (default) | `http` |
+| --- | --- | --- |
+| Destination | JetStream `SIGNALS.<strategy>` | `POST /secret/webhook` |
+| Why | The broker's own webhook endpoint writes to that same stream, so we inherit its persistence, retry and de-duplication with no HTTP hop in the trade path. | Slower, but it is the path that verifies the `token` field. |
+| Auth | Access to the NATS cluster **is** the authentication. | `ALGO_BROKER__TOKEN`, matched against the broker's. |
+| Use when | QTE and the broker share a trusted/private NATS cluster. | Anything crosses a boundary you do not control. |
+
+The engine also mirrors every emitted signal on `QTE.signal.emitted` and rows
+it into Postgres, whether it was delivered, shadowed or failed.
+
 ### `nats` (default)
 
 Publish `{"payload": {...}}` to JetStream subject `SIGNALS.<strategy>`, stream
@@ -245,6 +257,13 @@ inside a verified broker duplicate window, including time for publication.
 `POST {ALGO_BROKER__HTTP_URL}/secret/webhook` with the payload as the JSON body.
 This path *does* verify `token` (`ALGO_BROKER__TOKEN`, matched against the
 broker's). Use it across any boundary you do not control.
+
+What comes back decides whether the outbox reconciles. A refused connection
+and a 4xx sent nothing the broker acted on, so they are `failed`. A timeout, a
+connection dropped after the request was written, and any 5xx — a proxy's 502
+or 504 says nothing about whether the broker took the signal — are `unknown`,
+and the pair stays blocked until the outbox settles it. The request carries the
+outbox row id as `Idempotency-Key`.
 
 The sink injects the current `ALGO_BROKER__TOKEN` for both transports at send
 time. Reports, persisted audit/outbox payloads and internal signal mirrors omit

@@ -312,7 +312,7 @@ class TelegramSink:
             )
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - notifications never reach the trade path
             log.error("Telegram %s raised for chat_id=%s: %s", method, payload["chat_id"], exc)
             return None
         finally:
@@ -324,7 +324,7 @@ def _result_field(response: httpx.Response, field_name: str) -> Any:
     """Best-effort read of one field out of a Bot API ``result`` object."""
     try:
         body = response.json()
-    except Exception:
+    except Exception:  # noqa: BLE001 - notifications never reach the trade path
         return None
     result = body.get("result") if isinstance(body, dict) else None
     return result.get(field_name) if isinstance(result, dict) else None

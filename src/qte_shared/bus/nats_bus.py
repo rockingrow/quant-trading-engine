@@ -25,6 +25,7 @@ from nats.aio.client import Client as NATSClient
 from nats.aio.msg import Msg
 from nats.js import JetStreamContext
 from nats.js import api as js_api
+from nats.js import errors as js_errors
 
 from qte_shared.config import settings
 from qte_shared.logging_setup import get_logger
@@ -54,6 +55,10 @@ class NatsBus:
         self._closing = False
         #: Called after every re-established connection, in registration order.
         self._reconnect_hooks: list[Callable[[], Awaitable[None]]] = []
+        #: Set once nats-py gives the connection up for good (reconnects
+        #: exhausted, or a deliberate close), so a consumer can wait on it
+        #: instead of polling :attr:`NATSClient.is_closed`.
+        self._closed = asyncio.Event()
 
     # ── Lifecycle ─────────────────────────────────────────────────────
 
@@ -96,6 +101,7 @@ class NatsBus:
             "disconnected_cb": self._on_disconnected,
             "reconnected_cb": self._on_reconnected,
             "error_cb": self._on_error,
+            "closed_cb": self._on_closed,
         }
         options["token"] = self._token
 
@@ -106,6 +112,7 @@ class NatsBus:
         # startup that cannot reach NATS fails fast and the caller decides
         # whether that is fatal, while a connection that was once established
         # still reconnects without limit.
+        self._closed.clear()
         try:
             self._nc = await asyncio.wait_for(
                 nats.connect(**options), timeout=settings.nats.connect_timeout
@@ -124,7 +131,7 @@ class NatsBus:
             # Drain rather than close: in-flight publishes and queued messages
             # for our subscriptions get flushed instead of dropped on shutdown.
             await self._nc.drain()
-        except Exception as exc:  # pragma: no cover - shutdown best effort
+        except Exception as exc:  # pragma: no cover - shutdown best effort  # noqa: BLE001 - best effort, and logged
             log.warning("NATS drain failed, closing hard: %s", exc)
             await self._nc.close()
         finally:
@@ -133,6 +140,13 @@ class NatsBus:
             self._subscriptions.clear()
             self._closing = False
             log.info("NATS closed name=%s", self._name)
+
+    async def wait_closed(self) -> None:
+        """Return once the connection is closed for good, not merely dropped."""
+        await self._closed.wait()
+
+    async def _on_closed(self) -> None:
+        self._closed.set()
 
     async def _on_disconnected(self) -> None:
         if self._closing:
@@ -178,6 +192,23 @@ class NatsBus:
         """Fire-and-forget core publish — used for ticks and candle closes."""
         data = payload if isinstance(payload, bytes) else _encode(payload)
         await self.nc.publish(subject, data)
+
+    async def confirm_published(self, *, timeout: float = 5.0) -> None:
+        """Return only once the server has every core publish made so far.
+
+        :meth:`publish` returns as soon as nats-py has *buffered* the frame —
+        and while the client is reconnecting it buffers without complaint, so a
+        caller that deletes its own copy on return can lose what it published
+        if the process stops before the connection comes back. A flush is a
+        PING/PONG round trip behind those frames, so a normal return here means
+        the server received them. Call it once after a batch of publishes.
+
+        Raises ``ConnectionError`` when not connected; a flush that times out
+        raises the client's timeout error.
+        """
+        if not self.is_connected:
+            raise ConnectionError(f"NATS ({self._url}) is not connected")
+        await self.nc.flush(timeout=timeout)
 
     async def publish_jetstream(
         self,
@@ -242,7 +273,9 @@ class NatsBus:
             await self.js.stream_info(name)
             log.debug("JetStream stream %s already exists", name)
             return
-        except Exception:
+        except js_errors.NotFoundError:
+            # The one answer that means "create it". A timeout or a permission
+            # error is not evidence the stream is missing, so it propagates.
             pass
         try:
             await self.js.add_stream(
@@ -255,7 +288,7 @@ class NatsBus:
                 )
             )
             log.info("JetStream stream created name=%s subjects=%s", name, subjects)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - best effort, and logged
             # Losing a create race with the broker (or another QTE replica) is
             # the expected outcome, not a failure.
             log.info("Could not create stream %s (may already exist): %s", name, exc)
