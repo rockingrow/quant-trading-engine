@@ -220,6 +220,18 @@ so such a cycle stays open until a terminal action ends it.
 
 ## Transports
 
+`ALGO_BROKER__TRANSPORT` selects which of two carries the payload:
+
+| | `nats` (default) | `http` |
+| --- | --- | --- |
+| Destination | JetStream `SIGNALS.<strategy>` | `POST /secret/webhook` |
+| Why | The broker's own webhook endpoint writes to that same stream, so we inherit its persistence, retry and de-duplication with no HTTP hop in the trade path. | Slower, but it is the path that verifies the `token` field. |
+| Auth | Access to the NATS cluster **is** the authentication. | `ALGO_BROKER__TOKEN`, matched against the broker's. |
+| Use when | QTE and the broker share a trusted/private NATS cluster. | Anything crosses a boundary you do not control. |
+
+The engine also mirrors every emitted signal on `QTE.signal.emitted` and rows
+it into Postgres, whether it was delivered, shadowed or failed.
+
 ### `nats` (default)
 
 Publish `{"payload": {...}}` to JetStream subject `SIGNALS.<strategy>`, stream

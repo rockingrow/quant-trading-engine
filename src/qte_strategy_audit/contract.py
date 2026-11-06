@@ -144,7 +144,7 @@ def _check_drivable(name: str, candidate: Any, source: Path) -> list[Finding]:
             fix=(
                 "subclass qte_shared.strategies.strategy_base.SignalStrategy, or restate that "
                 "interface on the plugin's side - see 'How strategies are found' in "
-                "the README"
+                "docs/strategies.md"
             ),
             source=source,
         )

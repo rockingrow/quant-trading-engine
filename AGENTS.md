@@ -105,7 +105,7 @@ package; never scan from the repository root.
 | Strategy contract and its seven methods | `src/qte_shared/strategies/strategy_base.py` |
 | Strategy discovery and manifests: the `load_all` / `load_settings` / `load_disabled` hooks, `SKIPPED_REPOSITORIES` | `src/qte_shared/strategies/plugin_loader.py` |
 | What `make strategy-mount` recorded, per strategy | `src/qte_shared/strategies/mount_manifest.py`, `__strategies__/strategies.toml` |
-| The build stamp each strategy folder carries at its root (written by that repo's build, read by `/strategies`; examples in the two templates) | `__strategies__/<folder>/BUNDLE_VERSION.json`, README "Which build is deployed" |
+| The build stamp each strategy folder carries at its root (written by that repo's build, read by `/strategies`; examples in the two templates) | `__strategies__/<folder>/BUNDLE_VERSION.json`, `docs/strategies.md` "Which build is deployed" |
 | Per-strategy settings a repo declares; the weekend flat; the mapping's `warmup` override | `src/qte_shared/strategies/strategy_settings.py`, each repo's `settings.py` |
 | Intent to broker payload | `src/qte_shared/strategies/signal_factory.py` |
 | Position sizing and account risk | `src/qte_shared/strategies/sizing.py` |
@@ -145,13 +145,15 @@ package; never scan from the repository root.
 | Broker payload contract | `docs/broker-contract.md` |
 | Backtest report schema | `docs/backtest-report.md` |
 | Simulator walkthrough, and running the whole stack locally with no vendor | `docs/simulator.md` |
+| Operator guides: strategies, mapping and sizing, backtesting, MT5 ingester, Telegram, Tailscale, operations, deployment | `docs/{strategies,mapping-and-sizing,backtesting,mt5-ingester,telegram,tailscale,operations,deployment}.md` |
 
 CLI entry points: `qte-backtest`, `qte-ingestion`, `qte-strategy-runner`,
 `qte-control`, `qte-strategy-audit`, `qte-strategy-mount`, `qte-simulator`,
 `qte-bot`.
 
-`README.md` is ~46KB — never read it whole. Run `rg -n '^#{1,3} ' README.md` for
-the section index, then read only that range.
+`README.md` is the landing page only — quick start, architecture, an index of
+`docs/`. The operator guides live in `docs/`; run `rg -n '^#{1,3} ' docs/<file>.md`
+for a guide's section index, then read only that range.
 
 Do not scan `.venv/`, `uv.lock`, caches, or generated data under `data/csv/`,
 `data/parquet/`, `data/reports/`. Treat `__strategies__/` as private and out of

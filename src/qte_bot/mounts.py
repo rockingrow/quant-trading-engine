@@ -41,7 +41,7 @@ from qte_shared.strategies.plugin_loader import (
 log = get_logger(__name__)
 
 #: Written by the strategy repository's own build, at its root, beside the
-#: manifest. The engine only reads it; the keys are listed in the README.
+#: manifest. The engine only reads it; the keys are listed in docs/strategies.md.
 BUNDLE_VERSION_FILENAME = "BUNDLE_VERSION.json"
 
 

@@ -792,7 +792,7 @@ live feed wants) would make a first connect against a dead server hang forever.
 
 ## Why the fill simulator is pessimistic
 
-Listed in the README. The one worth repeating: when a bar's range covers both
+Listed in [Backtesting](backtesting.md#cost-profiles). The one worth repeating: when a bar's range covers both
 the stop and the target, the simulator takes the **stop**. Without tick data
 there is no ordering, and assuming the favourable one is precisely how a losing
 strategy backtests profitably.

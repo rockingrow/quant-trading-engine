@@ -17,6 +17,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The README is a landing page; the operator guides moved to `docs/`.** It
+  went from about 71 KB to 10 KB and now holds the quick start, the
+  architecture diagram, the core concepts, the everyday commands and an index
+  of `docs/`. Its long sections became eight guides —
+  `docs/strategies.md`, `docs/mapping-and-sizing.md`, `docs/backtesting.md`,
+  `docs/mt5-ingester.md`, `docs/telegram.md`, `docs/tailscale.md`,
+  `docs/operations.md` and `docs/deployment.md` — while the transport
+  comparison joined `docs/broker-contract.md` and the case for the simulator
+  joined `docs/simulator.md`. No behaviour changes; links into the old README
+  anchors need the new file. Two statements were corrected on the way: a
+  backtest **stacks** a second entry beside open cycles rather than rejecting
+  it, as the runner does, and the operator bot has thirteen commands, not ten.
+  The strategy audit's fix hint now points at `docs/strategies.md`.
 - **LONG and SHORT read as a green and a red square** in the lifecycle message
   (`🟩` / `🟥`) in place of the two chart glyphs, which were hard to tell apart
   at a glance. Dots were tried first and dropped: the flags, the service
