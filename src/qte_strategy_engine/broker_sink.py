@@ -17,7 +17,16 @@ Keep the broker's NATS on a private network (or set a NATS token) if you run
 that way, and use the HTTP transport across any boundary you do not control.
 
 Shadow mode short-circuits both: the signal is built, validated and audited,
-and then simply not sent. It is the phase-6 paper-trading switch.
+and then simply not sent. It is the paper-trading switch.
+
+**An ambiguous failure is ``unknown``, never ``failed``.** ``failed`` tells the
+runner nothing reached the broker, so it may enter again or keep managing a
+cycle as still open; ``unknown`` sends the row through outbox reconciliation.
+So only errors raised before a request could have left this host — a refused
+connection, a payload that fails validation, a 4xx the broker answered with —
+are ``failed``. A timeout, a connection dropped after the request was written,
+and any 5xx (a proxy's 502 or 504 says nothing about whether the broker acted)
+are ``unknown``.
 """
 
 from __future__ import annotations
@@ -29,10 +38,11 @@ from dataclasses import dataclass
 import httpx
 
 from qte_shared.bus import NatsBus, Subjects
-from qte_shared.config import settings
+from qte_shared.config import BrokerSettings, settings
 from qte_shared.logging_setup import get_logger
 from qte_shared.models import BrokerSignal
 from qte_shared.strategies.signal_serialization import authenticated_signal, signal_record
+from qte_strategy_engine.delivery_status import DeliveryStatus
 
 log = get_logger(__name__)
 
@@ -41,13 +51,27 @@ log = get_logger(__name__)
 class DeliveryResult:
     """What happened to one signal on its way out."""
 
-    status: str  # "sent" | "shadow" | "failed" | "unknown"
+    #: One of ``sent``, ``shadow``, ``failed`` or ``unknown``.
+    status: DeliveryStatus
     transport: str
     detail: str = ""
 
+    def __post_init__(self) -> None:
+        self.status = DeliveryStatus(self.status)
+
     @property
     def delivered(self) -> bool:
-        return self.status == "sent"
+        return self.status is DeliveryStatus.SENT
+
+
+#: Raised before a request can have left this host, so nothing reached the broker.
+_NOT_SENT_ERRORS: tuple[type[Exception], ...] = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+    httpx.UnsupportedProtocol,
+    httpx.InvalidURL,
+)
 
 
 class BrokerSink:
@@ -59,13 +83,17 @@ class BrokerSink:
         *,
         bus: NatsBus | None = None,
         shadow_mode: bool | None = None,
+        broker_settings: BrokerSettings | None = None,
     ) -> None:
-        self.transport = transport or settings.broker.transport
+        #: Read at send time, not copied here, so a rotated token or a test's
+        #: monkeypatch reaches the next signal.
+        self._broker = broker_settings or settings.broker
+        self.transport = transport or self._broker.transport
         self._scope = settings.state_scope
         self.shadow_mode = (
             self._scope.is_paper
-            or settings.broker.force_shadow_mode
-            or (settings.broker.shadow_mode if shadow_mode is None else shadow_mode)
+            or self._broker.force_shadow_mode
+            or (self._broker.shadow_mode if shadow_mode is None else shadow_mode)
         )
         self._bus = bus
         self._owns_bus = bus is None
@@ -84,14 +112,14 @@ class BrokerSink:
             await self._bus.connect()
         else:
             self._http = httpx.AsyncClient(
-                base_url=settings.broker.http_url.rstrip("/"),
-                timeout=settings.broker.publish_timeout,
+                base_url=self._broker.http_url.rstrip("/"),
+                timeout=self._broker.publish_timeout,
             )
         log.info(
             "Broker sink ready transport=%s shadow_mode=%s target=%s",
             self.transport,
             self.shadow_mode,
-            settings.broker_nats_url if self.transport == "nats" else settings.broker.http_url,
+            settings.broker_nats_url if self.transport == "nats" else self._broker.http_url,
         )
 
     async def stop(self) -> None:
@@ -103,7 +131,7 @@ class BrokerSink:
             self._bus = None
 
     def set_shadow_mode(self, enabled: bool) -> None:
-        enabled = enabled or self._scope.is_paper or settings.broker.force_shadow_mode
+        enabled = enabled or self._scope.is_paper or self._broker.force_shadow_mode
         log.warning(
             "Shadow mode %s",
             "ENABLED — signals will NOT reach the broker"
@@ -119,13 +147,30 @@ class BrokerSink:
 
         Never raises. A delivery failure is returned so the caller can audit it
         and carry on: an exception here would take down the runner and stop
-        every other strategy from trading over one bad publish.
+        every other strategy from trading over one bad publish. A payload that
+        fails validation is ``failed``: nothing was sent, and calling it
+        ``unknown`` would block the pair for a reconciliation that has nothing to
+        find.
         """
-        signal.validate_shape()
-
-        if not self._scope.is_paper and (self.shadow_mode or settings.broker.force_shadow_mode):
+        try:
+            signal.validate_shape()
+        except ValueError as invalid:
+            log.error(
+                "Signal NOT SENT transport=%s strategy=%s uxid=%s: invalid payload: %s",
+                self.transport,
+                signal.strategy,
+                signal.signal_uxid,
+                invalid,
+            )
             return DeliveryResult(
-                status="failed", transport=self.transport, detail="Live delivery is paused"
+                status=DeliveryStatus.FAILED, transport=self.transport, detail=str(invalid)
+            )
+
+        if not self._scope.is_paper and (self.shadow_mode or self._broker.force_shadow_mode):
+            return DeliveryResult(
+                status=DeliveryStatus.FAILED,
+                transport=self.transport,
+                detail="Live delivery is paused",
             )
         if self._scope.is_paper:
             log.info(
@@ -140,35 +185,30 @@ class BrokerSink:
                 signal.position.tp2,
                 signal.signal_uxid,
             )
-            return DeliveryResult(status="shadow", transport=self.transport)
+            return DeliveryResult(status=DeliveryStatus.SHADOW, transport=self.transport)
 
         try:
             if self.transport == "nats":
                 detail = await self._send_nats(signal, delivery_id=delivery_id)
             else:
                 detail = await self._send_http(signal, delivery_id=delivery_id)
-        except (TimeoutError, httpx.TimeoutException) as exc:
-            # A timeout is not a negative acknowledgement.  The remote side
-            # may have stored/accepted the request and only lost the response,
-            # so calling it "failed" would invite a fresh entry against an
-            # already-open position.
-            log.error(
-                "Signal delivery UNKNOWN transport=%s strategy=%s uxid=%s: %s",
-                self.transport,
-                signal.strategy,
-                signal.signal_uxid,
-                exc,
-            )
-            return DeliveryResult(status="unknown", transport=self.transport, detail=str(exc))
-        except Exception as exc:
-            log.error(
-                "Signal delivery FAILED transport=%s strategy=%s uxid=%s: %s",
-                self.transport,
-                signal.strategy,
-                signal.signal_uxid,
-                exc,
-            )
-            return DeliveryResult(status="failed", transport=self.transport, detail=str(exc))
+        except _NOT_SENT_ERRORS as exc:
+            return self._failed(signal, exc)
+        except httpx.HTTPStatusError as exc:
+            # The broker (or something in front of it) answered. A 4xx is the
+            # broker refusing this request; a 5xx is a server that may or may
+            # not have acted before it failed.
+            if exc.response.status_code < 500:
+                return self._failed(signal, exc)
+            return self._unknown(signal, exc)
+        except (TimeoutError, httpx.TimeoutException, httpx.TransportError) as exc:
+            # Not a negative acknowledgement. The remote side may have stored
+            # the request and only lost the response, so calling it "failed"
+            # would invite a fresh entry against an already-open position.
+            # (Connect-phase errors were caught above: those sent nothing.)
+            return self._unknown(signal, exc)
+        except Exception as exc:  # noqa: BLE001 - the contract is "never raises"
+            return self._failed(signal, exc)
 
         log.info(
             "Signal sent transport=%s %s %s %s uxid=%s (%s)",
@@ -179,7 +219,31 @@ class BrokerSink:
             signal.signal_uxid,
             detail,
         )
-        return DeliveryResult(status="sent", transport=self.transport, detail=detail)
+        return DeliveryResult(status=DeliveryStatus.SENT, transport=self.transport, detail=detail)
+
+    def _unknown(self, signal: BrokerSignal, exc: BaseException) -> DeliveryResult:
+        log.error(
+            "Signal delivery UNKNOWN transport=%s strategy=%s uxid=%s: %s",
+            self.transport,
+            signal.strategy,
+            signal.signal_uxid,
+            exc,
+        )
+        return DeliveryResult(
+            status=DeliveryStatus.UNKNOWN, transport=self.transport, detail=str(exc)
+        )
+
+    def _failed(self, signal: BrokerSignal, exc: BaseException) -> DeliveryResult:
+        log.error(
+            "Signal delivery FAILED transport=%s strategy=%s uxid=%s: %s",
+            self.transport,
+            signal.strategy,
+            signal.signal_uxid,
+            exc,
+        )
+        return DeliveryResult(
+            status=DeliveryStatus.FAILED, transport=self.transport, detail=str(exc)
+        )
 
     async def _send_nats(self, signal: BrokerSignal, *, delivery_id: str | None = None) -> str:
         if self._bus is None:
@@ -191,9 +255,9 @@ class BrokerSink:
         # second trade command.
         ack = await self._bus.publish_jetstream(
             subject,
-            {"payload": authenticated_signal(signal, settings.broker.token)},
+            {"payload": authenticated_signal(signal, self._broker.token)},
             msg_id=delivery_id or signal_delivery_id(signal),
-            timeout=settings.broker.publish_timeout,
+            timeout=self._broker.publish_timeout,
         )
         return (
             f"subject={subject} seq={getattr(ack, 'seq', None)} "
@@ -205,7 +269,7 @@ class BrokerSink:
             raise RuntimeError("Broker sink was not started")
         response = await self._http.post(
             "/secret/webhook",
-            json=authenticated_signal(signal, settings.broker.token),
+            json=authenticated_signal(signal, self._broker.token),
             headers={"Idempotency-Key": delivery_id or signal_delivery_id(signal)},
         )
         response.raise_for_status()

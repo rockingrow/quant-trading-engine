@@ -21,6 +21,7 @@ from qte_strategy_engine.db.models import (
     SignalAudit,
     TelegramCycleMessage,
 )
+from qte_strategy_engine.delivery_status import PREDECESSORS, UNFINISHED, DeliveryStatus
 
 log = get_logger(__name__)
 
@@ -55,7 +56,7 @@ class SignalRepository:
             namespace=self._namespace,
             row_id=delivery_id,
             transport=transport,
-            delivery_status="prepared",
+            delivery_status=DeliveryStatus.PREPARED,
             shadow=shadow,
             recovery_context=recovery_context,
         )
@@ -81,17 +82,43 @@ class SignalRepository:
         status: str,
         error: str | None = None,
     ) -> bool:
-        """Record the latest outcome without deleting ambiguous outbox rows."""
+        """Record the latest outcome without deleting ambiguous outbox rows.
+
+        Only a move :data:`~qte_strategy_engine.delivery_status.PREDECESSORS`
+        allows is written: the update is conditional on the row's current
+        status, so a move the table does not list — or a row that is not there
+        — updates nothing and returns ``False``, which keeps the pair blocked
+        for reconciliation rather than recording a signal in the wrong state.
+
+        A *status* that is not a :class:`DeliveryStatus` at all is a bug in the
+        caller and raises ``ValueError`` instead of being stored.
+        """
+        target = DeliveryStatus(status)
+        allowed_before = sorted(previous.value for previous in PREDECESSORS[target])
         try:
             row_id = uuid.UUID(delivery_id)
             async with self._db.session() as session:
                 execution = await session.execute(
                     update(SignalAudit)
-                    .where(SignalAudit.id == row_id, SignalAudit.namespace == self._namespace)
-                    .values(delivery_status=status, delivery_error=error)
+                    .where(
+                        SignalAudit.id == row_id,
+                        SignalAudit.namespace == self._namespace,
+                        SignalAudit.delivery_status.in_(allowed_before),
+                    )
+                    .values(delivery_status=target.value, delivery_error=error)
                 )
-            return execution.rowcount == 1
-        except Exception as exc:
+            if execution.rowcount == 1:
+                return True
+            log.error(
+                "Outbox row %s was not marked %s: it is missing, in another namespace, "
+                "or in a status that may not move to %s (allowed from: %s)",
+                delivery_id,
+                target.value,
+                target.value,
+                ", ".join(allowed_before) or "nothing",
+            )
+            return False
+        except Exception as exc:  # noqa: BLE001 - reported as an unrecorded write
             log.error("Could not mark signal delivery %s as %s: %s", delivery_id, status, exc)
             return False
 
@@ -99,13 +126,7 @@ class SignalRepository:
         self,
         limit: int = 100,
         *,
-        statuses: tuple[str, ...] = (
-            "prepared",
-            "pending",
-            "unknown",
-            "sent_pending",
-            "shadow_pending",
-        ),
+        statuses: tuple[str, ...] = tuple(sorted(UNFINISHED)),
         after_cursor: tuple[datetime, uuid.UUID] | None = None,
         include_ids: Sequence[str] = (),
     ) -> Sequence[SignalAudit]:
