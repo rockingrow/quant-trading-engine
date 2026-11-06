@@ -341,7 +341,11 @@ async def _clear_runner_owner(*, assume_yes: bool) -> None:
                 "either: confirm yourself that no runner process for this namespace is "
                 "left on any host before continuing."
             )
-            answer = input(f"Type the namespace ({namespace}) to clear its claim: ")
+            # Off the event loop: the Redis connection opened above stays
+            # serviced while the operator reads the warning.
+            answer = await asyncio.to_thread(
+                input, f"Type the namespace ({namespace}) to clear its claim: "
+            )
             if answer.strip() != namespace:
                 print("Aborted; the claim is unchanged.")
                 raise SystemExit(1)

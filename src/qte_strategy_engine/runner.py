@@ -45,13 +45,11 @@ Redis and falls back to the table. A re-provisioned cache would otherwise be
 indistinguishable from "flat", and the runner would mint a second cycle against
 a position the broker still has open.
 
-Restoring a cycle is the right answer for a restart and the wrong one for an
-outage. One pair holds one cycle at a time, so a row that outlived a long
-downtime locks it: every entry the strategy proposes is refused, and the
-position it is locked on was sized against a bracket the market left behind
-hours ago. So :meth:`StrategyRunner._flush_stale_positions` closes what has gone
-stale — ``R_SL``, on the ordinary delivery path — while anything younger than
-``QTE_RUNNER__STALE_POSITION_MAX_AGE`` is restored exactly as before.
+Restoring a cycle is the right answer for a restart. Age alone closes nothing:
+a strategy can be right to hold a cycle for days, so the stale flush
+(``QTE_RUNNER__FLUSH_STALE_POSITIONS``) is ``off`` unless an operator asks for
+it. What *is* closed on start is a cycle the mapping table no longer claims —
+nothing would decide on it — see :mod:`qte_strategy_engine.recovery`.
 """
 
 from __future__ import annotations
@@ -269,7 +267,7 @@ class StrategyRunner:
             if not self.slots:
                 raise RuntimeError(
                     f"No strategies loaded from {settings.engine.strategies_dir}. Clone your "
-                    "private strategy repo into __strategies__/ (see README, phase 6)."
+                    "private strategy repo into __strategies__/ (see docs/strategies.md)."
                 )
 
             self._validate_tick_publication()
@@ -1424,6 +1422,13 @@ class StrategyRunner:
         for slot in self.slots:
             if slot.symbol != event.symbol or not slot.started or slot.key in self._uncertain_pairs:
                 continue
+            if self._bar_gate.blocks(symbol=slot.symbol, strategy=slot.strategy.name):
+                # `/prevent` pauses the pair, not only its closed bars: a
+                # tick-driven strategy must not go on trading behind it. The
+                # gate held in memory is read, refreshed on every bar and on
+                # the control broadcast — a Redis GET per tick would cost more
+                # than everything else this handler does.
+                continue
             async with slot.lock:
                 await self._check_ownership()
                 if await self._live_delivery_paused():
@@ -1591,9 +1596,14 @@ class StrategyRunner:
                     {"strategy": slot.strategy.name, "symbol": slot.symbol, "reason": refusal}
                 )
                 continue
-            price = slot.buffer[-1].close
             async with slot.lock:
                 for uxid in list(slot.factory.open_cycles(slot.symbol)):
+                    position = slot.factory.open_position(slot.symbol, uxid)
+                    price = (
+                        self._last_known_price(slot, position)
+                        if position is not None
+                        else (slot.buffer[-1].close if slot.buffer else None)
+                    )
                     log.warning(
                         "Operator FLAT: closing %s on %s uxid=%s",
                         slot.strategy.name,
@@ -1946,19 +1956,30 @@ class StrategyRunner:
         if await self._finish_delivery(slot, signal, delivery_id, result):
             self._uncertain_pairs.discard(slot.key)
 
-        await self.bus.publish(
-            self.subjects.signal_emitted(),
-            {
-                "signal": signal_record(signal),
-                "delivery": {
-                    "id": delivery_id,
-                    "status": result.status,
-                    "transport": result.transport,
+        try:
+            await self.bus.publish(
+                self.subjects.signal_emitted(),
+                {
+                    "signal": signal_record(signal),
+                    "delivery": {
+                        "id": delivery_id,
+                        "status": result.status,
+                        "transport": result.transport,
+                    },
+                    "reason": intent.reason,
+                    "emitted_at": datetime.now(UTC).isoformat(),
                 },
-                "reason": intent.reason,
-                "emitted_at": datetime.now(UTC).isoformat(),
-            },
-        )
+            )
+        except Exception as mirror_error:  # noqa: BLE001 - a mirror must not stop a decision
+            # The signal itself went out over the broker's connection and is in
+            # Postgres. Raising here would skip the rest of this bar's intents
+            # — a stop after a target, the weekend FLAT — over a copy.
+            log.warning(
+                "Could not mirror signal %s on %s: %s",
+                signal.signal_uxid,
+                self.subjects.signal_emitted(),
+                mirror_error,
+            )
 
     async def _send_staged_signal(
         self, signal: BrokerSignal, delivery_id: str, *, shadow: bool
@@ -2325,11 +2346,12 @@ def _flat_refusal(
     shadow_mode: bool,
     state_scope: Any,
 ) -> str | None:
-    """Why this pair cannot be flattened right now, or ``None`` when it can."""
-    if not slot.buffer:
-        # A FLAT carries no level to the broker, but the intent still has to be
-        # built and audited, and the last close is the only price there is.
-        return "no bar has been seen yet, so there is no price to report"
+    """Why this pair cannot be flattened right now, or ``None`` when it can.
+
+    A pair that has not seen a bar yet is not refused: a ``FLAT`` carries no
+    level to the broker, and the audit price falls back to the entry's — the
+    same rule the stale and orphan closes follow.
+    """
     if slot.key in uncertain_pairs:
         return "an unreconciled delivery is blocking the pair"
     if not state_scope.is_paper and shadow_mode:

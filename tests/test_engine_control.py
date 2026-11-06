@@ -415,3 +415,69 @@ async def test_a_cycle_that_is_still_open_afterwards_is_reported_not_claimed():
     [refusal] = answer["refused"]
     assert refusal["reason"] == "the close was not delivered"
     assert slot.factory.open_cycles(slot.symbol), "the cycle is still open"
+
+
+# ── Audit fixes: an empty window, the tick path, the mirror ─────────────
+
+
+async def test_flat_closes_a_restored_cycle_before_any_bar_has_arrived():
+    """After a restart over a weekend the window can be empty; /flat still works.
+
+    The audit price falls back to the entry's, as it does for stale and orphan
+    closes; a FLAT carries no level to the broker.
+    """
+    runner, slot = _ready_runner()
+    uxid = await _open_a_cycle(runner, slot)
+    slot.buffer.clear()
+
+    answer = await _ask(runner, {"action": "flat", "scope": {"everything": True}})
+
+    assert [row["signal_uxid"] for row in answer["closed"]] == [uxid]
+    flat_signal = runner.signals.rows[-1][0]
+    assert flat_signal.position.action is SignalAction.FLAT
+    assert flat_signal.position.price == 2334.50
+
+
+async def test_a_prevented_pair_is_not_asked_about_ticks():
+    from types import SimpleNamespace
+
+    from qte_shared.models import Tick, TickEvent
+
+    runner, slot = _ready_runner()
+    slot.started = True
+    ticks_seen: list[float] = []
+    slot.strategy.on_tick = lambda price, context: ticks_seen.append(price)
+
+    def tick_message(price: float):
+        tick = Tick(
+            symbol="XAUUSD",
+            ts=datetime.now(UTC),
+            last=price,
+            origin=settings.state_scope.origin(),
+        )
+        event = TickEvent(symbol="XAUUSD", tick=tick)
+        return SimpleNamespace(data=event.model_dump_json().encode())
+
+    runner._bar_gate = BarGate().prevent(symbol="XAUUSD")
+    await runner._on_tick_message(tick_message(2341.0))
+    assert ticks_seen == []
+
+    runner._bar_gate = BarGate()
+    await runner._on_tick_message(tick_message(2342.0))
+    assert ticks_seen == [2342.0]
+
+
+async def test_a_failed_mirror_publish_does_not_stop_the_next_intent():
+    runner, slot = _ready_runner()
+
+    class MirrorDown(ReplyBus):
+        async def publish(self, subject, payload=None):
+            raise ConnectionError("QTE NATS is down")
+
+    runner.bus = MirrorDown()
+    uxid = await _open_a_cycle(runner, slot)
+    await runner._flatten_cycle(slot, uxid, 2340.0, MOMENT, reason="MANUAL_FLAT")
+
+    actions = [row[0].position.action for row in runner.signals.rows]
+    assert actions == [SignalAction.LONG, SignalAction.FLAT]
+    assert slot.factory.open_cycles(slot.symbol) == ()
