@@ -236,8 +236,11 @@ class IngesterBarFeed(LiveFeed):
             self._config.subject_filter,
             ",".join(self.symbols),
         )
-        while self._running and not bus.nc.is_closed:
-            await asyncio.sleep(1.0)
+        # Woken by the client's closed callback rather than a poll: nats-py
+        # reconnects on its own, so only a connection it has given up on is
+        # this consumer's business. `stop()` cancels the task while it waits.
+        if not bus.nc.is_closed:
+            await bus.wait_closed()
         if self._running:
             raise ConnectionError("the NATS connection closed")
 

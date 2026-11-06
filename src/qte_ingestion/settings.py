@@ -11,6 +11,9 @@ class IngestionSettings(MarketStreamSettings):
     #: How often the wall-clock flush runs. Must stay well under the shortest
     #: timeframe, or bars close late in a quiet market.
     flush_interval: float = 1.0
+    #: Seconds a staged candle close waits for the server to confirm its publish
+    #: before the outbox row is popped; a slower answer leaves the row staged.
+    publish_confirm_timeout: float = 5.0
     #: Persist the in-progress bar to Redis on each closed candle so a restart
     #: mid-bar resumes rather than losing it.
     persist_open_candles: bool = True

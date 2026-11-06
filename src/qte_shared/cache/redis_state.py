@@ -25,6 +25,9 @@ from qte_shared.timeframes import CLOCK_TOLERANCE
 
 log = get_logger(__name__)
 
+#: Undeliverable outbox candles kept for an operator to read; older ones are trimmed.
+DEAD_LETTER_LIMIT = 1000
+
 STAGE_CLOSED_CANDLE = """
 local previous = redis.call('GET', KEYS[4])
 if previous and tonumber(previous) >= tonumber(ARGV[2]) then return 0 end
@@ -248,6 +251,19 @@ class RedisState:
     async def ack_pending_candle(self) -> None:
         """Remove the oldest candle after its Core NATS publish succeeds."""
         await self.client.lpop(self.key("outbox", "candles"))
+
+    async def quarantine_pending_candle(self) -> None:
+        """Move the oldest staged candle to the dead-letter list.
+
+        For a head the drain can never publish — it does not decode, or it
+        belongs to another state scope. Left in place it would stop every later
+        candle, for every symbol, behind it. Moved rather than deleted, so an
+        operator can still read what it was; the list keeps the newest
+        :data:`DEAD_LETTER_LIMIT` entries.
+        """
+        dead_letters = self.key("outbox", "candles", "dead")
+        await self.client.lmove(self.key("outbox", "candles"), dead_letters, "LEFT", "RIGHT")
+        await self.client.ltrim(dead_letters, -DEAD_LETTER_LIMIT, -1)
 
     async def get_candles(self, symbol: str, timeframe: str, count: int = 0) -> list[Candle]:
         """Oldest-first history; ``count=0`` returns everything stored."""

@@ -19,9 +19,10 @@ import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from ingestion_support import bare_ingestion_service
 
 from qte_ingestion.resampler import Resampler
-from qte_ingestion.service import SERVICE_NAME, IngestionService
+from qte_ingestion.service import SERVICE_NAME
 from qte_shared.config import settings
 from qte_shared.models import Tick
 from qte_shared.notifications import ServiceStatusNotifier, TelegramErrorNotifier
@@ -59,7 +60,7 @@ def _frame(price: float) -> str:
 
 async def test_partial_ingestion_startup_closes_resources_already_acquired():
     events: list[str] = []
-    service = object.__new__(IngestionService)
+    service = bare_ingestion_service()
     service._scope = settings.state_scope
     service._origins = {service._scope.provider: service._scope.origin()}
     service._symbol_providers = {}
@@ -135,7 +136,7 @@ async def test_a_raising_handler_does_not_stop_the_tiingo_feed():
 
 
 async def test_a_failed_publish_costs_one_cycle_not_the_flush_loop(monkeypatch):
-    service = object.__new__(IngestionService)
+    service = bare_ingestion_service()
     service._scope = settings.state_scope
     # No Redis, NATS or provider.
     service._origins = {service._scope.provider: service._scope.origin()}
@@ -199,6 +200,8 @@ class CandleOutbox:
 
 
 class FlakyCandleBus:
+    is_connected = True
+
     def __init__(self) -> None:
         self.fail = True
         self.published = []
@@ -207,6 +210,9 @@ class FlakyCandleBus:
         if self.fail:
             raise ConnectionError("core NATS is unavailable")
         self.published.append((subject, payload))
+
+    async def publish_confirmed(self, subject, payload, *, timeout: float = 5.0) -> None:
+        await self.publish(subject, payload)
 
 
 class YieldingCandleBus(FlakyCandleBus):
@@ -220,7 +226,7 @@ class YieldingCandleBus(FlakyCandleBus):
 
 
 async def test_a_failed_candle_publish_remains_in_the_durable_outbox():
-    service = object.__new__(IngestionService)
+    service = bare_ingestion_service()
     service._scope = settings.state_scope
     service._origins = {service._scope.provider: service._scope.origin()}
     service._symbol_providers = {}
@@ -254,7 +260,7 @@ async def test_a_failed_candle_publish_remains_in_the_durable_outbox():
 
 
 async def test_concurrent_feeds_cannot_ack_a_candle_another_feed_has_not_published():
-    service = object.__new__(IngestionService)
+    service = bare_ingestion_service()
     service._scope = settings.state_scope
     service._origins = {service._scope.provider: service._scope.origin()}
     service._symbol_providers = {}
@@ -301,7 +307,7 @@ class RecordingRepairer:
 
 
 async def test_a_partial_bar_is_repaired_after_whole_bars_have_gone_out():
-    service = object.__new__(IngestionService)
+    service = bare_ingestion_service()
     service._scope = settings.state_scope
     service._origins = {service._scope.provider: service._scope.origin()}
     service._symbol_providers = {}
@@ -343,7 +349,7 @@ class FlakyStaging(CandleOutbox):
 
 
 def staging_service(failure_index):
-    service = object.__new__(IngestionService)
+    service = bare_ingestion_service()
     service._scope = settings.state_scope
     service._origins = {service._scope.provider: service._scope.origin()}
     service._symbol_providers = {}
