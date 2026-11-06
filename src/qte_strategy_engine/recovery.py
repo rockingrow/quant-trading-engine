@@ -98,7 +98,7 @@ class PositionRecovery:
         carry one for days, and an outage nobody can attend to outlasts any
         window worth setting — so the operator who wants the old behaviour asks
         for it with ``QTE_RUNNER__FLUSH_STALE_POSITIONS``. What genuinely has
-        nobody deciding on it is closed by :meth:`_settle_orphan_positions`
+        nobody deciding on it is closed by :meth:`settle_orphan_positions`
         instead, on the mapping table rather than on a clock.
 
         When it is on, a position past ``QTE_RUNNER__STALE_POSITION_MAX_AGE``
@@ -116,10 +116,10 @@ class PositionRecovery:
         a staleness one, and nothing else on the boot path would catch it.
         """
         mode = self._settings.flush_stale_positions
-        # What locks a pair is the cycle `_restore_position` put on its slot,
+        # What locks a pair is the cycle `restore_position` put on its slot,
         # and that came from Redis in preference to Postgres. Deciding from the
         # table instead would miss a cycle Redis holds and Postgres does not —
-        # `_persist_position` writes Redis first and `upsert` swallows its own
+        # `DeliveryPipeline.persist_position` writes Redis first and `upsert` swallows its own
         # failure, so the two can disagree, and the pair would come back locked
         # on a position this never looked at.
         locked_pairs = [
@@ -129,7 +129,7 @@ class PositionRecovery:
         ]
         # The table is still read, for the one thing the slots cannot show:
         # duplicate cycle ids across the whole namespace. Rows belonging to no
-        # running strategy are `_settle_orphan_positions`' business. Best-effort
+        # running strategy are `settle_orphan_positions`' business. Best-effort
         # — `list_open` reports its own failures and answers with an empty list.
         listed = await self._context.positions.list_open()
         # Whatever the mode: a duplicated cycle id is a correctness problem
@@ -198,7 +198,7 @@ class PositionRecovery:
         come off each strategy's own class — so every orphan is reported and
         none is closed.
 
-        Unlike :meth:`_flush_stale_positions` this does not consult age. The
+        Unlike :meth:`PositionRecovery.flush_stale_positions` this does not consult age. The
         table saying a pair is gone is evidence; a position being old is not.
         """
         mode = self._settings.close_orphan_positions
@@ -243,7 +243,7 @@ class PositionRecovery:
                 continue
             if pair in self._delivery.uncertain_pairs:
                 # The same guard the age flush keeps, and it matters more here:
-                # `_recover_pending_deliveries` cannot reconcile a pair it has
+                # `DeliveryPipeline.recover_pending_deliveries` cannot reconcile a pair it has
                 # no slot for, so it leaves it blocked. Sending over that would
                 # put a second command against one cycle whose first one may
                 # already have reached the broker — and, since an unconfirmed
@@ -290,7 +290,7 @@ class PositionRecovery:
         is left of the position, and ``_carry_entry_context`` restates the rest,
         so the payload says the same things a strategy's own exit would.
 
-        Emitted through :meth:`_emit`, so it is staged in the durable outbox,
+        Emitted through :meth:`StrategyRunner.emit`, so it is staged in the durable outbox,
         delivered and audited like any other exit and inherits every guard there
         — ownership, shadow mode, the uncertain-pair block.
         """
@@ -412,7 +412,7 @@ class PositionRecovery:
         refused with that said rather than closed with a guess.
 
         Both callers land here: the operator's ``/flat`` and, on start,
-        :meth:`_settle_orphan_positions`.
+        :meth:`settle_orphan_positions`.
 
         Local state is dropped only on a confirmed ``sent`` whose outbox
         checkpoint also landed. A failed or ambiguous delivery, or a checkpoint
@@ -489,7 +489,7 @@ class PositionRecovery:
             detail=outcome.detail or None,
         )
         # Checkpointed before the local writes and only then finalised, the
-        # same order `_finish_delivery` keeps. A checkpoint that cannot be
+        # same order `DeliveryPipeline.finish_delivery` keeps. A checkpoint that cannot be
         # written is a refusal: clearing the book against an outbox row still
         # reading `prepared` would leave the position forgotten here and the
         # row unresolvable, since no slot drives the pair the retry loop would

@@ -15,9 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   container restarted before NATS came back lost every close staged since. The
   outbox now holds its closes while ingestion has no connection, and removes
   one only after the server confirms the publish
-  (`QTE_INGESTION__PUBLISH_CONFIRM_TIMEOUT`, default `5` seconds). A staged
-  entry that can never be published moves to `outbox:candles:dead` with an
-  `ERROR` instead of blocking every close behind it.
+  (`QTE_INGESTION__PUBLISH_CONFIRM_TIMEOUT`, default `5` seconds) — one round
+  trip per batch of up to 100 closes. A publish or confirmation that fails
+  leaves the batch staged for the next flush interval, at start-up too, rather
+  than stopping ingestion. A staged entry that can never be published moves to
+  `outbox:candles:dead` with an `ERROR` instead of blocking every close behind
+  it.
 - **An ambiguous HTTP delivery is `unknown`, not `failed`.** On
   `ALGO_BROKER__TRANSPORT=http`, a connection dropped after the request was
   written, and any 5xx (a proxy's 502 or 504 included), may have reached the
@@ -34,9 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whose window was still empty; the audit price now falls back to the entry's,
   as the stale and orphan closes already did.
 - **A control request is always answered.** An unknown action, a payload that
-  is not a JSON object, or a handler that raised left `qte-control` and the bot
-  to time out and report the service as down; both the runner and ingestion now
-  reply with an `error`.
+  is not a JSON object, or a handler that raised left the caller to wait out
+  its timeout; the runner and ingestion now reply with a `control_error`. The
+  bot, `make status` and `qte-control ping` read such a reply as a service that
+  is down, never as an answer — a `flat` refusal that is the handler's own
+  `error` is still shown as one.
 - **`ensure_stream` no longer mistakes a timeout for a missing stream**, and
   the MT5 core-NATS consumer reconnects the moment its connection closes rather
   than on a one-second poll. `qte-control owner clear` reads its confirmation

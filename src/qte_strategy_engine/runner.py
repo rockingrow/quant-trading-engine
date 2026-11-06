@@ -132,7 +132,7 @@ from qte_strategy_engine.telegram_notify import TelegramLifecycleNotifier
 log = get_logger(__name__)
 
 
-def _context_attribute(name: str) -> property:
+def _context_attribute(field_name: str) -> property:
     """A runner attribute that reads and writes the shared :class:`RunnerContext`.
 
     So ``runner.signals = repository`` — a test, or a driver swapping a
@@ -140,13 +140,13 @@ def _context_attribute(name: str) -> property:
     leaving them on the old one.
     """
 
-    def read(runner: StrategyRunner) -> Any:
-        return getattr(runner.context, name)
+    def read_attribute(runner: StrategyRunner) -> Any:
+        return getattr(runner.context, field_name)
 
-    def write(runner: StrategyRunner, value: Any) -> None:
-        setattr(runner.context, name, value)
+    def write_attribute(runner: StrategyRunner, replacement: Any) -> None:
+        setattr(runner.context, field_name, replacement)
 
-    return property(read, write, doc=f"The shared context's ``{name}``.")
+    return property(read_attribute, write_attribute, doc=f"The shared context's ``{field_name}``.")
 
 
 class StrategyRunner:
@@ -176,9 +176,9 @@ class StrategyRunner:
             telegram=TelegramLifecycleNotifier(),
             scope=scope,
         )
-        #: Read at call time rather than copied, so a changed ceiling or a
-        #: test's monkeypatch reaches the next decision.
-        self._account = account_settings or settings.account
+        #: An override for this runner alone; without one, :attr:`_account`
+        #: reads the process settings at each decision.
+        self._account_override = account_settings
         self._settings = settings_for_runner or runner_settings
         #: ERROR logs forwarded to the same bot, de-duplicated. Also a no-op
         #: unless QTE_TELEGRAM__LOG_ERRORS_ENABLED is on.
@@ -223,6 +223,11 @@ class StrategyRunner:
             self.recovery,
             RunnerIdentity(owner_id=self._owner_id, started_at=self._started_at),
         )
+
+    @property
+    def _account(self) -> AccountSettings:
+        """The account settings, read at each decision rather than held."""
+        return self._account_override or settings.account
 
     # ── The shared context, as attributes ─────────────────────────────
 
@@ -399,7 +404,7 @@ class StrategyRunner:
             raise
         effective_mode = (
             self._scope.is_paper
-            or settings.broker.force_shadow_mode
+            or self.sink.force_shadow_mode
             or (self._configured_shadow_mode if stored_mode is None else stored_mode)
         )
         if self.sink.shadow_mode != effective_mode:
@@ -590,7 +595,7 @@ class StrategyRunner:
 
         A slot that has been fed before takes only the bars up to the newest one
         it was fed. Anything Redis holds beyond that closed while this runner was
-        not listening, and :meth:`_catch_up` feeds it as a close rather than
+        not listening, and :meth:`HistorySync.catch_up` feeds it as a close rather than
         leaving it in the window as history nobody decided on.
         """
         allow_future = provider_is_synthetic()
@@ -724,8 +729,10 @@ class StrategyRunner:
         # than in the strategy: the gate belongs to the calendar, and without
         # it the FLAT below and the next entry would take turns every bar until
         # the close. The replay calls the same function.
-        gate = gate_entries(as_intents(result), slot.weekend_flat, context.now, self._market_zone)
-        for blocked in gate.blocked:
+        entry_gate = gate_entries(
+            as_intents(result), slot.weekend_flat, context.now, self._market_zone
+        )
+        for blocked in entry_gate.blocked:
             log.info(
                 "Blocked %s for %s %s at %s: inside the weekend-flat window %s (%s)",
                 blocked.action.value,
@@ -735,10 +742,10 @@ class StrategyRunner:
                 slot.weekend_flat.describe(),
                 self._market_zone.key,
             )
-        for intent in gate.allowed:
+        for intent in entry_gate.allowed:
             await self.emit(slot, intent, candle.close, context.now)
 
-        if gate.market_is_shut:
+        if entry_gate.market_is_shut:
             # After the strategy's own exits, not before them: a bar that hit
             # the stop stopped out, and the flat is what is left over.
             await self._flatten_for_the_weekend(slot, candle.close, context.now)
@@ -924,10 +931,10 @@ class StrategyRunner:
                 # The same calendar gate the candle path applies. A tick-driven
                 # entry into a market that is shutting is the same mistake, and
                 # exits still pass so a position can always be got out of.
-                gate = gate_entries(
+                entry_gate = gate_entries(
                     as_intents(result), slot.weekend_flat, event.tick.ts, self._market_zone
                 )
-                for blocked in gate.blocked:
+                for blocked in entry_gate.blocked:
                     log.info(
                         "Blocked tick %s for %s %s: inside the weekend-flat window %s",
                         blocked.action.value,
@@ -935,7 +942,7 @@ class StrategyRunner:
                         slot.symbol,
                         slot.weekend_flat.describe(),
                     )
-                for intent in gate.allowed:
+                for intent in entry_gate.allowed:
                     await self.emit(slot, intent, price, event.tick.ts)
 
     # ── Emission ──────────────────────────────────────────────────────
@@ -996,7 +1003,7 @@ class StrategyRunner:
         overrun the account between them.
 
         The count is this process's own book, summed over every slot in memory
-        — the same source :meth:`_flush_stale_positions` treats as
+        — the same source :meth:`PositionRecovery.flush_stale_positions` treats as
         authoritative, and no database round trip on the trade path. So it
         counts what *this engine* opened, not what the account holds: a
         position placed by hand, or an entry the worker refused for some other

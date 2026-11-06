@@ -117,6 +117,8 @@ class SubscribingBus:
 
 class QuietSink:
     shadow_mode = True
+    # Like the real sink: the process switch, read when asked.
+    force_shadow_mode = property(lambda self: settings.broker.force_shadow_mode)
     transport = "nats"
 
     def set_shadow_mode(self, enabled):

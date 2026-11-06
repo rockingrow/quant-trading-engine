@@ -513,3 +513,32 @@ async def test_history_sync_still_reports_a_non_redis_failure(monkeypatch, caplo
     assert records, "An unexpected failure must still be reported"
     assert records[0].levelname == "ERROR"
     assert records[0].exc_info is not None
+
+
+async def test_a_sink_with_its_own_force_switch_is_not_flipped_on_every_refresh(
+    monkeypatch, caplog
+):
+    """The runner reads the force switch from the sink, so the two agree.
+
+    Read from the process settings instead, a sink given its own settings with
+    the switch on was "corrected" on every refresh — a WARNING per bar.
+    """
+    from qte_shared.config import BrokerSettings
+    from qte_strategy_engine.broker_sink import BrokerSink
+
+    # A live book: on paper the scope alone holds the sink in shadow.
+    monkeypatch.setattr(settings.state_config, "execution_mode", "live")
+    sink = BrokerSink(
+        transport="nats",
+        shadow_mode=True,
+        broker_settings=BrokerSettings(_env_file=None, force_shadow_mode=True),
+    )
+    runner = _runner(sink=sink)
+    runner.state.flags["shadow_mode"] = False
+
+    with caplog.at_level("WARNING", logger="qte_strategy_engine.broker_sink"):
+        await runner.refresh_shadow_mode()
+        await runner.refresh_shadow_mode()
+
+    assert sink.shadow_mode is True
+    assert [record for record in caplog.records if "Shadow mode" in record.message] == []

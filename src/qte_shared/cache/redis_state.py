@@ -252,6 +252,33 @@ class RedisState:
         """Remove the oldest candle after its Core NATS publish succeeds."""
         await self.client.lpop(self.key("outbox", "candles"))
 
+    async def pending_candle_batch(self, batch_limit: int) -> list[Candle | None]:
+        """The oldest *batch_limit* staged closes, oldest first.
+
+        ``None`` stands for an entry that does not decode.
+
+        A batch rather than one at a time so the drain can publish them all and
+        confirm the lot with one server round trip. Nothing is removed here.
+        """
+        raw_entries = await self.client.lrange(self.key("outbox", "candles"), 0, batch_limit - 1)
+        decoded: list[Candle | None] = []
+        for raw_entry in raw_entries:
+            try:
+                decoded.append(Candle.model_validate_json(raw_entry))
+            except ValueError:
+                decoded.append(None)
+        return decoded
+
+    async def ack_pending_candles(self, entry_count: int) -> None:
+        """Remove the oldest *entry_count* staged closes, once their publish is confirmed.
+
+        Only the drain removes from the head, under its own lock, and staging
+        appends at the tail, so the first *entry_count* entries are exactly the ones
+        it published.
+        """
+        if entry_count > 0:
+            await self.client.ltrim(self.key("outbox", "candles"), entry_count, -1)
+
     async def quarantine_pending_candle(self) -> None:
         """Move the oldest staged candle to the dead-letter list.
 
@@ -441,7 +468,7 @@ class RedisState:
     #
     # The open time of the newest bar each (strategy, symbol, timeframe) was fed.
     # Closes published while a runner was down or still starting are the bars
-    # newer than this; see ``StrategyRunner._catch_up``.
+    # newer than this; see ``HistorySync.catch_up``.
 
     async def get_decided_open_time(
         self, strategy: str, symbol: str, timeframe: str

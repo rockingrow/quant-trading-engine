@@ -37,7 +37,7 @@ from typing import NoReturn
 from nats.errors import NoRespondersError
 from nats.errors import TimeoutError as NatsTimeoutError
 
-from qte_shared.bus import NatsBus, Subjects
+from qte_shared.bus import NatsBus, Subjects, is_control_failure
 from qte_shared.cache import RedisState
 from qte_shared.config import settings
 from qte_shared.db import EventRepository
@@ -199,6 +199,8 @@ async def _ping() -> None:
     try:
         reply = await bus.request(Subjects().engine_control(), {"action": "ping"}, timeout=2.0)
         print(json.dumps(reply, indent=2))
+        if is_control_failure(reply):
+            raise SystemExit(1)
     except Exception as exc:
         print(f"No runner answered within 2s: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc

@@ -76,9 +76,9 @@ class ControlPlane:
     def _started_at(self) -> datetime:
         return self._identity.started_at
 
-    async def dispatch(self, msg: Msg) -> None:
+    async def dispatch(self, message: Msg) -> None:
         """Answer one control message over the runner's current bus."""
-        await self._router.dispatch(msg, bus=self._context.bus)
+        await self._router.dispatch(message, reply_bus=self._context.bus)
 
     # ── Handlers ──────────────────────────────────────────────────────
 
@@ -184,7 +184,7 @@ class ControlPlane:
         still held a position has no slot, and skipping it silently is what made
         ``/flat`` report "nothing was open" while ``/positions`` kept listing it
         and the broker never heard anything. Those rows are closed by
-        :meth:`_flatten_orphan_cycle` instead.
+        :meth:`PositionRecovery.flatten_orphan_cycle` instead.
         """
         everything = bool(scope.get("everything"))
         symbol = (scope.get("symbol") or "").upper() or None

@@ -193,25 +193,21 @@ class NatsBus:
         data = payload if isinstance(payload, bytes) else _encode(payload)
         await self.nc.publish(subject, data)
 
-    async def publish_confirmed(
-        self, subject: str, payload: dict[str, Any] | bytes, *, timeout: float = 5.0
-    ) -> None:
-        """Core publish that returns only once the server has the message.
+    async def confirm_published(self, *, timeout: float = 5.0) -> None:
+        """Return only once the server has every core publish made so far.
 
         :meth:`publish` returns as soon as nats-py has *buffered* the frame —
         and while the client is reconnecting it buffers without complaint, so a
         caller that deletes its own copy on return can lose what it published
-        if the process stops before the connection comes back. This refuses up
-        front when there is no live connection and then flushes (a PING/PONG
-        round trip), so a normal return means the server received the frame.
+        if the process stops before the connection comes back. A flush is a
+        PING/PONG round trip behind those frames, so a normal return here means
+        the server received them. Call it once after a batch of publishes.
 
         Raises ``ConnectionError`` when not connected; a flush that times out
         raises the client's timeout error.
         """
         if not self.is_connected:
             raise ConnectionError(f"NATS ({self._url}) is not connected")
-        data = payload if isinstance(payload, bytes) else _encode(payload)
-        await self.nc.publish(subject, data)
         await self.nc.flush(timeout=timeout)
 
     async def publish_jetstream(

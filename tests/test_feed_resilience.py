@@ -198,6 +198,12 @@ class CandleOutbox:
     async def ack_pending_candle(self) -> None:
         self.pending.pop(0)
 
+    async def pending_candle_batch(self, limit):
+        return list(self.pending[:limit])
+
+    async def ack_pending_candles(self, count) -> None:
+        del self.pending[:count]
+
 
 class FlakyCandleBus:
     is_connected = True
@@ -211,8 +217,8 @@ class FlakyCandleBus:
             raise ConnectionError("core NATS is unavailable")
         self.published.append((subject, payload))
 
-    async def publish_confirmed(self, subject, payload, *, timeout: float = 5.0) -> None:
-        await self.publish(subject, payload)
+    async def confirm_published(self, *, timeout: float = 5.0) -> None:
+        return None
 
 
 class YieldingCandleBus(FlakyCandleBus):
@@ -242,8 +248,9 @@ async def test_a_failed_candle_publish_remains_in_the_durable_outbox():
         candle.flush(MOMENT + timedelta(minutes=1))[0], service._scope.origin()
     )
 
-    with pytest.raises(ConnectionError, match="unavailable"):
-        await service._emit_candle(closed)
+    # A publish that fails is not raised into the bar path: the close stays
+    # staged and the next drain sends it.
+    await service._emit_candle(closed)
 
     assert service.state.pending == [closed]
     assert service.state.staged == [closed]

@@ -45,5 +45,5 @@ class EventRepository:
                         payload=payload or {},
                     )
                 )
-        except Exception as exc:  # noqa: BLE001 - a failed write is reported to the caller
+        except Exception as exc:  # noqa: BLE001 - engine events are best effort, logged at DEBUG
             log.debug("Engine event write failed (%s/%s): %s", service, event, exc)

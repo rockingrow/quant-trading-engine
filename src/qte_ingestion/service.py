@@ -71,6 +71,8 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
+from nats.errors import Error as NatsError
+
 from qte_ingestion.backfill import HistoryBackfiller, open_history_source
 from qte_ingestion.repair import PartialBarRepairer, RoutedBarRepairer
 from qte_ingestion.resampler import Resampler
@@ -102,6 +104,9 @@ from qte_shared.timeframes import CLOCK_TOLERANCE, bucket_close, timeframe_secon
 log = get_logger(__name__)
 
 SERVICE_NAME = "data-ingestion"
+
+#: Closes published per confirmation round trip when the outbox drains.
+OUTBOX_BATCH_SIZE = 100
 
 
 @dataclass
@@ -417,24 +422,24 @@ class IngestionService:
         touch: the vendor request protocol, and the staging watermark that
         decides whether a replayed bar counts as a duplicate.
         """
-        await self._control.dispatch(msg, bus=self.bus)
+        await self._control.dispatch(msg, reply_bus=self.bus)
 
     def _build_control_router(self) -> ControlRouter:
         router = ControlRouter(SERVICE_NAME)
 
-        async def status(command: dict) -> dict:
+        async def report_status(command: dict) -> dict:
             return await self._status_payload()
 
-        async def warmup(command: dict) -> dict:
+        async def warm_windows(command: dict) -> dict:
             return await self._warmup_on_request(command.get("symbols"))
 
-        async def flush(command: dict) -> dict:
+        async def flush_windows(command: dict) -> dict:
             return await self._flush_on_request(command.get("symbols"))
 
-        router.register("ping", status)
-        router.register("status", status)
-        router.register("warmup", warmup)
-        router.register("flush", flush)
+        router.register("ping", report_status)
+        router.register("status", report_status)
+        router.register("warmup", warm_windows)
+        router.register("flush", flush_windows)
         return router
 
     async def _status_payload(self) -> dict:
@@ -715,7 +720,7 @@ class IngestionService:
 
         try:
             watching = await backfiller.watch_online(vendor_online)
-        except Exception as failure:  # noqa: BLE001 - logged; one series must not stop the others
+        except Exception as failure:  # noqa: BLE001 - logged; windows are checked again later
             log.warning(
                 "Cannot listen for %r announcing itself (%s) — its windows are checked "
                 "again only when a live bar arrives, or by the probe if one is configured",
@@ -1088,18 +1093,20 @@ class IngestionService:
             await self._drain_candle_outbox()
 
     async def _drain_candle_outbox(self) -> None:
-        """Publish staged closes oldest-first, acknowledging only on success.
+        """Publish staged closes oldest-first, removing them only once NATS has them.
 
-        "Success" is the server's, not the client's: nats-py buffers a publish
-        while it reconnects and returns as if it had gone, so popping the row on
-        that return would lose the candle to a restart mid-outage — the exact
-        case this outbox exists for. So the drain stops while there is no
-        connection, leaving the rows for the next flush interval, and each
-        publish is confirmed by a server round trip before its row is popped.
+        "Has them" is the server's word, not the client's: nats-py buffers a
+        publish while it reconnects and returns as if it had gone, so removing
+        the rows on that return would lose them to a restart mid-outage — the
+        exact case this outbox exists for. So the drain stops while there is no
+        connection, publishes a batch, confirms the whole batch with one flush
+        (a PING/PONG round trip), and only then removes it. A publish or a flush
+        that fails or times out leaves the batch staged for the next interval;
+        the outage is logged once, not on every flush.
 
-        A crash between the confirmed publish and the pop replays one duplicate,
-        which the runner already rejects by candle open time. Deleting before
-        publish and losing a strategy decision is never allowed.
+        A crash between the confirmation and the removal replays the batch,
+        which the runner rejects by candle open time. Deleting before publish
+        and losing a strategy decision is never allowed.
 
         A head that can never be published — it does not decode, or it belongs
         to another state scope — is moved to the dead-letter list with an
@@ -1110,47 +1117,72 @@ class IngestionService:
         # and B — silently acknowledging B without ever publishing it.
         async with self._outbox_lock:
             while True:
-                if not self.bus.is_connected:
-                    if not self._outbox_waiting_for_nats:
-                        log.warning(
-                            "NATS is not connected; staged candle closes stay in the "
-                            "outbox until it is"
-                        )
-                        self._outbox_waiting_for_nats = True
+                staged_batch = await self.state.pending_candle_batch(OUTBOX_BATCH_SIZE)
+                if not staged_batch:
+                    self._outbox_waiting_for_nats = False
                     return
-                try:
-                    candle = await self.state.peek_pending_candle()
-                except ValueError as undecodable:
-                    await self._quarantine_outbox_head(f"it does not decode: {undecodable}")
-                    continue
-                if candle is None:
-                    break
-                if not self._scope.accepts(candle.origin):
+                publishable = self._publishable_prefix(staged_batch)
+                if not publishable:
+                    oldest_entry = staged_batch[0]
                     await self._quarantine_outbox_head(
-                        f"{candle.symbol} {candle.timeframe} {candle.open_time.isoformat()} "
+                        "it does not decode"
+                        if oldest_entry is None
+                        else f"{oldest_entry.symbol} {oldest_entry.timeframe} "
+                        f"{oldest_entry.open_time.isoformat()} "
                         "belongs to another state scope"
                     )
                     continue
-                await self.bus.publish_confirmed(
+                if not await self._publish_confirmed(publishable):
+                    return
+                await self.state.ack_pending_candles(len(publishable))
+                self._outbox_waiting_for_nats = False
+                for candle in publishable:
+                    log.info(
+                        "Candle closed %s %s open_time=%s o=%s h=%s l=%s c=%s ticks=%d",
+                        candle.symbol,
+                        candle.timeframe,
+                        candle.open_time.isoformat(),
+                        candle.open,
+                        candle.high,
+                        candle.low,
+                        candle.close,
+                        candle.tick_count,
+                    )
+
+    def _publishable_prefix(self, staged_batch: list[Candle | None]) -> list[Candle]:
+        """The leading run of *staged_batch* that can go out, up to the first that cannot."""
+        publishable: list[Candle] = []
+        for candle in staged_batch:
+            if candle is None or not self._scope.accepts(candle.origin):
+                break
+            publishable.append(candle)
+        return publishable
+
+    async def _publish_confirmed(self, candles: list[Candle]) -> bool:
+        """Publish *candles* and wait for the server; ``False`` leaves them staged."""
+        if not self.bus.is_connected:
+            self._note_outbox_held("NATS is not connected")
+            return False
+        try:
+            for candle in candles:
+                await self.bus.publish(
                     self.subjects.candle_closed(candle.symbol, candle.timeframe),
                     CandleClosedEvent(
                         symbol=candle.symbol, timeframe=candle.timeframe, candle=candle
                     ).model_dump(mode="json"),
-                    timeout=ingestion_settings.publish_confirm_timeout,
                 )
-                await self.state.ack_pending_candle()
-                self._outbox_waiting_for_nats = False
-                log.info(
-                    "Candle closed %s %s open_time=%s o=%s h=%s l=%s c=%s ticks=%d",
-                    candle.symbol,
-                    candle.timeframe,
-                    candle.open_time.isoformat(),
-                    candle.open,
-                    candle.high,
-                    candle.low,
-                    candle.close,
-                    candle.tick_count,
-                )
+            await self.bus.confirm_published(timeout=ingestion_settings.publish_confirm_timeout)
+        except (ConnectionError, TimeoutError, NatsError) as failure:
+            self._note_outbox_held(f"{type(failure).__name__}: {failure}")
+            return False
+        return True
+
+    def _note_outbox_held(self, reason: str) -> None:
+        if not self._outbox_waiting_for_nats:
+            log.warning(
+                "Staged candle closes stay in the outbox until NATS confirms them (%s)", reason
+            )
+            self._outbox_waiting_for_nats = True
 
     async def _quarantine_outbox_head(self, reason: str) -> None:
         """Move the outbox head aside so the candles behind it can go out."""

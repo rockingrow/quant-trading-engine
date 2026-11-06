@@ -39,7 +39,7 @@ from typing import Any
 
 from qte_bot.mounts import MountedRepository, scan_mounted_repositories
 from qte_shared.bar_gate import BAR_GATE_FLAG, BarGate
-from qte_shared.bus import NatsBus, Subjects
+from qte_shared.bus import CONTROL_ERROR_KEY, NatsBus, Subjects, is_control_failure
 from qte_shared.cache import RedisState
 from qte_shared.config import market_data_plan, provider_market_data_plan, settings
 from qte_shared.logging_setup import get_logger
@@ -338,13 +338,27 @@ class EngineClient:
     async def _request(
         self, subject: str, payload: dict[str, Any], *, timeout: float | None = None
     ) -> dict[str, Any] | None:
-        """One control request. ``None`` means nobody answered in time."""
+        """One control request. ``None`` means nobody answered in time.
+
+        A service that answered only to say it could not serve the request at
+        all (:func:`~qte_shared.bus.is_control_failure`) counts as no answer: it
+        is a service that is down for this purpose, and showing its error reply
+        as a real answer would read as an empty book or a live runner.
+        """
         try:
             reply = await self._bus.request(
                 subject, payload, timeout=timeout or self._request_timeout
             )
         except Exception as failure:  # noqa: BLE001 - the bot reports an unreachable service
             log.warning("No answer on %s for %s: %s", subject, payload.get("action"), failure)
+            return None
+        if is_control_failure(reply):
+            log.warning(
+                "%s could not serve %s: %s",
+                subject,
+                payload.get("action"),
+                reply[CONTROL_ERROR_KEY],
+            )
             return None
         return reply if isinstance(reply, dict) else None
 

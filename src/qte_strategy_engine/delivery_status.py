@@ -114,11 +114,6 @@ PREDECESSORS: dict[DeliveryStatus, frozenset[DeliveryStatus]] = {
 }
 
 
-def may_follow(previous: str, status: str) -> bool:
-    """Whether a row holding *previous* may be marked *status*."""
-    return DeliveryStatus(previous) in PREDECESSORS[DeliveryStatus(status)]
-
-
 __all__ = [
     "AMBIGUOUS",
     "DELIVERED",
@@ -128,5 +123,4 @@ __all__ = [
     "SETTLED",
     "UNFINISHED",
     "DeliveryStatus",
-    "may_follow",
 ]

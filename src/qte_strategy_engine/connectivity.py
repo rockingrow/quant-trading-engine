@@ -47,7 +47,7 @@ from nats.errors import NoRespondersError
 from nats.errors import TimeoutError as NatsTimeoutError
 from nats.js.errors import NotFoundError
 
-from qte_shared.bus import NatsBus, Subjects
+from qte_shared.bus import CONTROL_ERROR_KEY, NatsBus, Subjects, is_control_failure
 from qte_shared.cache import RedisState
 from qte_shared.config import settings
 from qte_shared.db import Database
@@ -184,6 +184,9 @@ async def _control_ping(control_bus: NatsBus, subject: str) -> tuple[dict[str, A
         )
     except Exception as failure:  # noqa: BLE001 - a probe reports any failure as a down link
         return None, _describe(failure)
+    if is_control_failure(reply):
+        # It answered, but only to say it cannot serve a ping: as down as silence.
+        return None, f"answered {subject} with an error — {reply[CONTROL_ERROR_KEY]}"
     return reply, ""
 
 

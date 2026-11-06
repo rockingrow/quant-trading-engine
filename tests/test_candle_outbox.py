@@ -29,17 +29,24 @@ MOMENT = datetime(2026, 5, 1, 10, 0, tzinfo=UTC)
 
 
 class ConfirmingBus:
-    """A bus whose connection the test switches off and on."""
+    """A bus whose connection, and whose flush, the test controls."""
 
-    def __init__(self, *, connected: bool) -> None:
+    def __init__(self, *, connected: bool, flush_fails: bool = False) -> None:
         self.is_connected = connected
+        self.flush_fails = flush_fails
+        self.buffered: list[str] = []
         self.confirmed: list[str] = []
+        self.flushes = 0
 
     async def publish(self, subject, payload) -> None:
-        raise AssertionError("the outbox must not use the unconfirmed publish")
+        self.buffered.append(subject)
 
-    async def publish_confirmed(self, subject, payload, *, timeout: float = 5.0) -> None:
-        self.confirmed.append(subject)
+    async def confirm_published(self, *, timeout: float = 5.0) -> None:
+        self.flushes += 1
+        if self.flush_fails:
+            raise TimeoutError("no PONG")
+        self.confirmed.extend(self.buffered)
+        self.buffered.clear()
 
 
 def closed_candle(symbol: str = "XAUUSD", *, scope: StateScope | None = None):
@@ -68,7 +75,7 @@ async def test_nothing_is_popped_while_nats_is_disconnected(caplog):
 
     assert await service.state.peek_pending_candle() is not None
     assert bus.confirmed == []
-    outage_lines = [record for record in caplog.records if "not connected" in record.message]
+    outage_lines = [record for record in caplog.records if "stay in the outbox" in record.message]
     assert len(outage_lines) == 1, "an outage is logged once, not on every flush interval"
 
     bus.is_connected = True
@@ -133,17 +140,63 @@ def bus_with(client: RecordingClient) -> NatsBus:
     return bus
 
 
-async def test_a_confirmed_publish_flushes_after_publishing():
+async def test_confirming_a_batch_is_one_flush_behind_its_publishes():
     client = RecordingClient()
-    await bus_with(client).publish_confirmed("QTE.candle", {"close": 1.0})
-    assert client.calls == ["publish:QTE.candle", "flush"]
+    bus = bus_with(client)
+    await bus.publish("QTE.candle.a", {"close": 1.0})
+    await bus.publish("QTE.candle.b", {"close": 2.0})
+    await bus.confirm_published()
+    assert client.calls == ["publish:QTE.candle.a", "publish:QTE.candle.b", "flush"]
 
 
-async def test_a_confirmed_publish_refuses_without_a_connection():
+async def test_confirming_refuses_without_a_connection():
     client = RecordingClient(connected=False)
     with pytest.raises(ConnectionError, match="not connected"):
-        await bus_with(client).publish_confirmed("QTE.candle", {"close": 1.0})
+        await bus_with(client).confirm_published()
     assert client.calls == []
+
+
+async def test_a_batch_of_closes_is_confirmed_with_one_round_trip():
+    bus = ConfirmingBus(connected=True)
+    service = outbox_service(bus)
+    for symbol in ("XAUUSD", "BTCUSDT", "EURUSD"):
+        await service.state.stage_closed_candle(closed_candle(symbol))
+
+    await service._drain_candle_outbox()
+
+    assert len(bus.confirmed) == 3
+    assert bus.flushes == 1
+    assert await service.state.peek_pending_candle() is None
+
+
+async def test_a_flush_that_times_out_leaves_the_batch_staged_without_raising():
+    # At boot or on any drain: a slow PONG must neither crash ingestion nor
+    # remove closes the server may not have.
+    bus = ConfirmingBus(connected=True, flush_fails=True)
+    service = outbox_service(bus)
+    await service.state.stage_closed_candle(closed_candle())
+
+    await service._drain_candle_outbox()
+
+    assert await service.state.peek_pending_candle() is not None
+    bus.flush_fails = False
+    await service._drain_candle_outbox()
+    assert await service.state.peek_pending_candle() is None
+
+
+async def test_an_outage_with_nothing_staged_does_not_mute_the_next_one(caplog):
+    bus = ConfirmingBus(connected=False)
+    service = outbox_service(bus)
+    await service._drain_candle_outbox()  # nothing staged: nothing to say
+    bus.is_connected = True
+    await service._drain_candle_outbox()
+    bus.is_connected = False
+    await service.state.stage_closed_candle(closed_candle())
+
+    with caplog.at_level(logging.WARNING, logger="qte_ingestion.service"):
+        await service._drain_candle_outbox()
+
+    assert any("stay in the outbox" in record.message for record in caplog.records)
 
 
 class StreamContext:

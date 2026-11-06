@@ -85,9 +85,9 @@ class BrokerSink:
         shadow_mode: bool | None = None,
         broker_settings: BrokerSettings | None = None,
     ) -> None:
-        #: Read at send time, not copied here, so a rotated token or a test's
-        #: monkeypatch reaches the next signal.
-        self._broker = broker_settings or settings.broker
+        #: An override for this sink alone; without one every read goes to the
+        #: process settings at that moment (see :attr:`_broker`).
+        self._broker_override = broker_settings
         self.transport = transport or self._broker.transport
         self._scope = settings.state_scope
         self.shadow_mode = (
@@ -98,6 +98,24 @@ class BrokerSink:
         self._bus = bus
         self._owns_bus = bus is None
         self._http: httpx.AsyncClient | None = None
+
+    @property
+    def _broker(self) -> BrokerSettings:
+        """The broker settings, read on every use rather than held.
+
+        So a replaced ``settings.broker`` — a rotated token, a test — reaches
+        the next signal, as it did before the sink took an override.
+        """
+        return self._broker_override or settings.broker
+
+    @property
+    def force_shadow_mode(self) -> bool:
+        """Whether ``ALGO_BROKER__FORCE_SHADOW_MODE`` holds this sink in shadow.
+
+        The runner reads it from here rather than from the settings, so the two
+        agree on the switch even when this sink was given its own settings.
+        """
+        return self._broker.force_shadow_mode
 
     # ── Lifecycle ─────────────────────────────────────────────────────
 
@@ -192,23 +210,23 @@ class BrokerSink:
                 detail = await self._send_nats(signal, delivery_id=delivery_id)
             else:
                 detail = await self._send_http(signal, delivery_id=delivery_id)
-        except _NOT_SENT_ERRORS as exc:
-            return self._failed(signal, exc)
-        except httpx.HTTPStatusError as exc:
+        except _NOT_SENT_ERRORS as failure:
+            return self._report_failed(signal, failure)
+        except httpx.HTTPStatusError as failure:
             # The broker (or something in front of it) answered. A 4xx is the
             # broker refusing this request; a 5xx is a server that may or may
             # not have acted before it failed.
-            if exc.response.status_code < 500:
-                return self._failed(signal, exc)
-            return self._unknown(signal, exc)
-        except (TimeoutError, httpx.TimeoutException, httpx.TransportError) as exc:
+            if failure.response.status_code < 500:
+                return self._report_failed(signal, failure)
+            return self._report_unknown(signal, failure)
+        except (TimeoutError, httpx.TimeoutException, httpx.TransportError) as failure:
             # Not a negative acknowledgement. The remote side may have stored
             # the request and only lost the response, so calling it "failed"
             # would invite a fresh entry against an already-open position.
             # (Connect-phase errors were caught above: those sent nothing.)
-            return self._unknown(signal, exc)
-        except Exception as exc:  # noqa: BLE001 - the contract is "never raises"
-            return self._failed(signal, exc)
+            return self._report_unknown(signal, failure)
+        except Exception as failure:  # noqa: BLE001 - the contract is "never raises"
+            return self._report_failed(signal, failure)
 
         log.info(
             "Signal sent transport=%s %s %s %s uxid=%s (%s)",
@@ -221,28 +239,28 @@ class BrokerSink:
         )
         return DeliveryResult(status=DeliveryStatus.SENT, transport=self.transport, detail=detail)
 
-    def _unknown(self, signal: BrokerSignal, exc: BaseException) -> DeliveryResult:
+    def _report_unknown(self, signal: BrokerSignal, failure: BaseException) -> DeliveryResult:
         log.error(
             "Signal delivery UNKNOWN transport=%s strategy=%s uxid=%s: %s",
             self.transport,
             signal.strategy,
             signal.signal_uxid,
-            exc,
+            failure,
         )
         return DeliveryResult(
-            status=DeliveryStatus.UNKNOWN, transport=self.transport, detail=str(exc)
+            status=DeliveryStatus.UNKNOWN, transport=self.transport, detail=str(failure)
         )
 
-    def _failed(self, signal: BrokerSignal, exc: BaseException) -> DeliveryResult:
+    def _report_failed(self, signal: BrokerSignal, failure: BaseException) -> DeliveryResult:
         log.error(
             "Signal delivery FAILED transport=%s strategy=%s uxid=%s: %s",
             self.transport,
             signal.strategy,
             signal.signal_uxid,
-            exc,
+            failure,
         )
         return DeliveryResult(
-            status=DeliveryStatus.FAILED, transport=self.transport, detail=str(exc)
+            status=DeliveryStatus.FAILED, transport=self.transport, detail=str(failure)
         )
 
     async def _send_nats(self, signal: BrokerSignal, *, delivery_id: str | None = None) -> str:

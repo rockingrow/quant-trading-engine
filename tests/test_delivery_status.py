@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from qte_strategy_engine.delivery_status import (
-    PREDECESSORS,
-    UNFINISHED,
-    DeliveryStatus,
-    may_follow,
-)
+from qte_strategy_engine.delivery_status import PREDECESSORS, UNFINISHED, DeliveryStatus
+
+
+def may_follow(previous: str, status: str) -> bool:
+    """Read the table the way ``mark_delivery``'s conditional update does."""
+    return DeliveryStatus(previous) in PREDECESSORS[DeliveryStatus(status)]
+
 
 #: Every (from, to) the runner, its recovery path and the orphan FLAT write.
 RUNNER_MOVES = [

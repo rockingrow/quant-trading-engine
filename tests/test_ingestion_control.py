@@ -225,5 +225,5 @@ async def test_an_unknown_action_is_answered_with_an_error():
     # down" to a caller that waits out its timeout.
     service = _service()
     answer = await _ask(service, {"action": "drop_everything"})
-    assert "unknown action" in answer["error"]
+    assert "unknown action" in answer["control_error"]
     assert "flush" in answer["actions"]

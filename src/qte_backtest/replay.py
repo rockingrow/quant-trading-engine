@@ -299,16 +299,16 @@ class BacktestEngine:
             start = 0 if window_size is None else max(0, position + 1 - window_size)
             window = frame.iloc[start : position + 1]
             close = float(bar["close"])
-            gate = gate_entries(
+            entry_gate = gate_entries(
                 as_intents(self.strategy.on_candle_closed(window, context)),
                 self.weekend_flat,
                 bar_time,
                 self.market_zone,
             )
-            self._blocked += len(gate.blocked)
-            for intent in gate.allowed:
+            self._blocked += len(entry_gate.blocked)
+            for intent in entry_gate.allowed:
                 self._apply(intent, bar_time, close)
-            if gate.market_is_shut:
+            if entry_gate.market_is_shut:
                 # After the strategy's own exits, as in the runner: a bar that
                 # hit the stop stopped out, and the flat is what is left.
                 self._flatten_for_the_weekend(bar_time, close)

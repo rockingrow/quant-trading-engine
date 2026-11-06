@@ -170,7 +170,7 @@ async def test_an_unknown_action_changes_nothing_and_says_so():
     # answered" to a caller that waits out its timeout.
     runner, _ = _ready_runner()
     answer = await _ask(runner, {"action": "reboot"})
-    assert "unknown action" in answer["error"]
+    assert "unknown action" in answer["control_error"]
     assert "flat" in answer["actions"]
 
 
@@ -180,7 +180,7 @@ async def test_an_unparseable_message_is_answered_with_an_error():
     message.data = b"{not json"
     await runner._on_control_message(message)
     [(_, answer)] = runner.bus.messages
-    assert "not valid JSON" in answer["error"]
+    assert "not valid JSON" in answer["control_error"]
 
 
 # ── The runner: the bar gate ──────────────────────────────────────────────

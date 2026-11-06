@@ -209,7 +209,7 @@ class AccountSettings(BaseSettings):
     #: every strategy and symbol together. ``0`` means uncapped, and is the
     #: default: an engine that has not been told its account's limit must not
     #: invent one. Above zero, the runner refuses an entry that would exceed it
-    #: — see :meth:`qte_strategy_engine.runner.StrategyRunner._emit`.
+    #: — see :meth:`qte_strategy_engine.runner.StrategyRunner.emit`.
     #:
     #: **This is the engine's copy of a number it cannot read.** The limit is
     #: enforced downstream, by the worker that places the orders, and the
