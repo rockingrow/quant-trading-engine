@@ -85,7 +85,7 @@ class Database:
             async with self.engine.connect() as connection:
                 await connection.exec_driver_sql("SELECT 1")
             return True
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - a failed ping is the answer
             log.warning("Postgres ping failed: %s", exc)
             return False
 

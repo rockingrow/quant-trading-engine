@@ -514,7 +514,7 @@ class IngestionService:
                 await backfiller.backfill_series(spec, timeframe, force=True)
             except asyncio.CancelledError:
                 raise
-            except Exception as failure:
+            except Exception as failure:  # noqa: BLE001 - logged; one series must not stop the others
                 log.warning(
                     "Requested warm-up of %s %s failed: %s", spec.symbol, timeframe, failure
                 )
@@ -715,7 +715,7 @@ class IngestionService:
 
         try:
             watching = await backfiller.watch_online(vendor_online)
-        except Exception as failure:
+        except Exception as failure:  # noqa: BLE001 - logged; one series must not stop the others
             log.warning(
                 "Cannot listen for %r announcing itself (%s) — its windows are checked "
                 "again only when a live bar arrives, or by the probe if one is configured",
@@ -782,7 +782,7 @@ class IngestionService:
                 timeframe,
                 refusal,
             )
-        except Exception as failure:
+        except Exception as failure:  # noqa: BLE001 - logged; one series must not stop the others
             log.warning(
                 "History for %s %s is still not available: %s", spec.symbol, timeframe, failure
             )

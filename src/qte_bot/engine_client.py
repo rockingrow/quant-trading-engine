@@ -149,7 +149,7 @@ class EngineClient:
                 try:
                     held = await self._state.count_candles(feed.symbol, timeframe)
                     newest = await self._state.get_candles(feed.symbol, timeframe, count=1)
-                except Exception as failure:
+                except Exception as failure:  # noqa: BLE001 - the bot reports an unreachable service
                     log.warning(
                         "Could not read the %s %s window: %s", feed.symbol, timeframe, failure
                     )
@@ -170,7 +170,7 @@ class EngineClient:
     async def history_provider(self) -> str | None:
         try:
             return await self._state.get_history_provider()
-        except Exception:
+        except Exception:  # noqa: BLE001 - the bot reports an unreachable service
             return None
 
     # ── The mount ─────────────────────────────────────────────────────
@@ -277,7 +277,7 @@ class EngineClient:
     async def read_gate(self) -> BarGate:
         try:
             return BarGate.from_payload(await self._state.get_flag(BAR_GATE_FLAG, None))
-        except Exception as failure:
+        except Exception as failure:  # noqa: BLE001 - the bot reports an unreachable service
             log.warning("Could not read the bar gate: %s", failure)
             return BarGate()
 
@@ -303,7 +303,7 @@ class EngineClient:
             gate.allow(everything=everything, symbol=symbol, strategy=strategy)
         try:
             await self._state.set_flag(BAR_GATE_FLAG, gate.to_payload())
-        except Exception as failure:
+        except Exception as failure:  # noqa: BLE001 - the bot reports an unreachable service
             # Nothing was changed: a gate that cannot be stored would be lost
             # by the next restart, and reporting it as applied would be a lie
             # about whether a pair is trading.
@@ -343,7 +343,7 @@ class EngineClient:
             reply = await self._bus.request(
                 subject, payload, timeout=timeout or self._request_timeout
             )
-        except Exception as failure:
+        except Exception as failure:  # noqa: BLE001 - the bot reports an unreachable service
             log.warning("No answer on %s for %s: %s", subject, payload.get("action"), failure)
             return None
         return reply if isinstance(reply, dict) else None

@@ -65,7 +65,7 @@ class SignalRepository:
                 session.add(row)
                 await session.flush()
             return str(delivery_id)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - a failed read or write is reported to the caller
             log.error("Could not stage signal %s %s: %s", signal.strategy, signal.symbol, exc)
             return None
 
@@ -187,7 +187,7 @@ class SignalRepository:
                 session.add(row)
                 await session.flush()
                 return str(row.id)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - a failed read or write is reported to the caller
             log.error("Audit write failed for %s %s: %s", signal.strategy, signal.symbol, exc)
             return None
 
@@ -243,7 +243,7 @@ class SignalRepository:
         try:
             async with self._db.session() as session:
                 rows = (await session.execute(statement)).all()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - a failed read or write is reported to the caller
             log.error("Could not read the timeframes of %d cycle(s): %s", len(cycle_ids), exc)
             return {}
         return {row.signal_uxid: row.timeframe for row in rows if row.timeframe}
@@ -314,7 +314,7 @@ class SignalRepository:
                     .scalars()
                     .all()
                 )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - a failed read or write is reported to the caller
             log.error("Could not list closed cycles: %s", exc)
             return [], 0
 
@@ -413,7 +413,7 @@ class OpenPositionRepository:
             async with self._db.session() as session:
                 await session.execute(statement)
             return True
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - a failed read or write is reported to the caller
             log.error(
                 "Could not persist open position %s %s: %s", position.strategy, position.symbol, exc
             )
@@ -432,7 +432,7 @@ class OpenPositionRepository:
             async with self._db.session() as session:
                 await session.execute(statement)
             return True
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - a failed read or write is reported to the caller
             log.error("Could not clear open position %s %s: %s", strategy, symbol, exc)
             return False
 
@@ -455,7 +455,7 @@ class OpenPositionRepository:
         try:
             async with self._db.session() as session:
                 rows = (await session.execute(statement)).scalars().all()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - a failed read or write is reported to the caller
             log.error("Could not read open positions %s %s: %s", strategy, symbol, exc)
             return []
         return [position for position in map(_as_position, rows) if position is not None]
@@ -471,7 +471,7 @@ class OpenPositionRepository:
         try:
             async with self._db.session() as session:
                 rows = (await session.execute(statement)).scalars().all()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - a failed read or write is reported to the caller
             log.error("Could not list open positions: %s", exc)
             return []
         return [position for position in map(_as_position, rows) if position is not None]
@@ -581,7 +581,7 @@ class TelegramCycleRepository:
         try:
             async with self._db.session() as session:
                 row = (await session.execute(statement)).scalar_one_or_none()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - a failed read or write is reported to the caller
             log.error("Could not read the Telegram cycle %s %s: %s", strategy, signal_uxid, exc)
             return None
         if row is None:
@@ -621,7 +621,7 @@ class TelegramCycleRepository:
             async with self._db.session() as session:
                 await session.execute(statement)
             return True
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - a failed read or write is reported to the caller
             log.error(
                 "Could not persist the Telegram cycle %s %s: %s",
                 record.strategy,

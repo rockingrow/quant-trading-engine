@@ -116,7 +116,7 @@ async def _set_shadow_mode(enabled: bool) -> None:
     try:
         await state.connect()
         await state.set_flag("shadow_mode", enabled)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - the CLI reports the failure to the operator
         # Refusing here is deliberate. If the flag cannot be stored, a runner
         # restarting later would silently come back in the *old* mode — and for
         # "off" that means going live again on its own. Better to fail loudly
@@ -134,7 +134,7 @@ async def _set_shadow_mode(enabled: bool) -> None:
             {"action": "set_shadow_mode", "enabled": enabled},
         )
         broadcast = True
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - the CLI reports the failure to the operator
         # The Redis write already happened, so the next runner to start will
         # honour it. Saying so is the difference between "not applied" and
         # "applied, but not to the process running right now".
@@ -168,7 +168,7 @@ async def _show_shadow_mode() -> None:
     try:
         await state.connect()
         stored = await state.get_flag("shadow_mode", None)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - the CLI reports the failure to the operator
         _die(f"Could not reach Redis at {settings.redis.url}.", exc)
     finally:
         await state.close()
@@ -194,7 +194,7 @@ async def _ping() -> None:
     bus = NatsBus(name="qte-control")
     try:
         await bus.connect()
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - the CLI reports the failure to the operator
         _die(f"Could not reach NATS at {settings.nats.url}.", exc)
     try:
         reply = await bus.request(Subjects().engine_control(), {"action": "ping"}, timeout=2.0)
@@ -352,7 +352,7 @@ async def _clear_runner_owner(*, assume_yes: bool) -> None:
 
         try:
             cleared = await redis_state.release_runner(holder)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - the CLI reports the failure to the operator
             _die(f"Could not reach Redis at {settings.redis.url}.", exc)
         if not cleared:
             raise SystemExit(
@@ -386,7 +386,7 @@ async def _run_demo_signal(strategy: str | None, symbol: str | None) -> int:
         return await run_demo(strategy, symbol)
     except ValueError as exc:
         raise SystemExit(str(exc)) from None
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - the CLI reports the failure to the operator
         _die(f"Could not fire the demo signal at {settings.broker_nats_url}.", exc)
 
 

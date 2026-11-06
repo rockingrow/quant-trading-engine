@@ -124,12 +124,14 @@ package; never scan from the repository root.
 | Optional Tailscale node: tailnet forwards, signals to the broker over the tailnet | `docker-compose.yml` (`tailscale`, `broker-nats-relay`), `config/tailscale/{serve.json,policy.hujson}`, `TAILSCALE_ENABLED` in the `Makefile` |
 | Live feed, resampling, Redis and NATS | `src/qte_ingestion/{service,resampler}.py` |
 | Live loop, broker delivery, control CLI | `src/qte_strategy_engine/{runner,broker_sink,preflight,control}.py` |
+| The runner's collaborators: the signal outbox, restore/stale/orphan, warm-up and catch-up, the control plane; what they share | `src/qte_strategy_engine/{delivery,recovery,history_sync,control_plane,runner_context,slot}.py`, `tests/test_runner_collaborators.py` |
+| Outbox statuses and the transitions `mark_delivery` allows | `src/qte_strategy_engine/delivery_status.py`, `tests/test_delivery_status.py` |
 | `make status` / `qte-control status`: read-only probes of Redis, Postgres, NATS, runner, ingestion, MT5 ingester, broker | `src/qte_strategy_engine/connectivity.py`, `tests/test_connectivity.py` |
 | `make demo-signal` / `qte-control demo-signal`: one open cycle per mounted strategy on the broker's demo subject (Telegram only, never a worker) | `src/qte_strategy_engine/demo_signal.py`, `tests/test_demo_signal.py` |
 | Operator's Telegram bot: the thirteen commands, tables, paging | `src/qte_bot/`, `QTE_BOT__*` |
 | `/demo`, `/mapping`, `/provider`: the drill run from the chat, and the two configuration files read back | `fire_demo`/`show_mapping`/`show_providers` in `src/qte_bot/handlers.py`, `tests/test_bot_demo.py`, `tests/test_bot_config.py` |
 | `/strategies`: the mount scanned on disk, each folder's `BUNDLE_VERSION.json` and published strategies, one box per folder | `src/qte_bot/mounts.py`, `presenters.strategy_bundles`, `tests/test_bot_strategies.py` |
-| Control plane the bot and `qte-control` both call (NATS request/reply) | `_on_control_message` in `src/qte_strategy_engine/runner.py` and `src/qte_ingestion/service.py`, `Subjects.{engine,ingestion}_control` |
+| Control plane the bot and `qte-control` both call (NATS request/reply) | `src/qte_shared/bus/control_router.py`, `src/qte_strategy_engine/control_plane.py`, `_build_control_router` in `src/qte_ingestion/service.py`, `Subjects.{engine,ingestion}_control` |
 | Pausing decisions per symbol/strategy (`/prevent`, `/allow`) | `src/qte_shared/bar_gate.py` |
 | Telegram position-lifecycle message: one per cycle, edited in place | `src/qte_strategy_engine/telegram_notify.py` |
 | Telegram Bot API calls, chat/topic ids, ERROR forwarding, service UP/DOWN | `src/qte_shared/notifications/`, `TelegramSettings` in `src/qte_shared/config.py`, `QTE_TELEGRAM__*` in `.env.example` |
@@ -185,7 +187,8 @@ the plugin shape.
 ## Code style
 
 - Python 3.13, one `uv` package. Run Python tooling through `uv run`.
-- Ruff rules `E,F,I,UP,B`, line length 100. Run `make format` before committing.
+- Ruff rules `E,F,I,UP,B,BLE`, line length 100. Run `make format` before committing.
+  A deliberate `except Exception` carries `# noqa: BLE001 - <reason>`.
 - Async throughout the services; pytest runs with `asyncio_mode = "auto"`.
 - Prefer explicit types and domain terminology over clever, compressed code.
 - Cover behaviour changes with focused tests, including failure paths and

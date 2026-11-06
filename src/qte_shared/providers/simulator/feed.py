@@ -105,7 +105,7 @@ class SimulatorLiveFeed(LiveFeed):
                         await self._handle_raw(raw)
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - the reconnect loop retries any failure
                 if not self._running:
                     return
                 attempt += 1

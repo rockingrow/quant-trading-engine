@@ -53,7 +53,7 @@ class BacktestRepository:
                 session.add(run)
                 await session.flush()
                 return str(run.id)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - a failed write is reported to the caller
             log.error("Backtest audit write failed: %s", exc)
             return None
 

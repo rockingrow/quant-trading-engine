@@ -99,7 +99,7 @@ class TelegramErrorHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         try:
             self._notifier.offer(record, self.format(record))
-        except Exception:  # pragma: no cover — a handler must never raise
+        except Exception:  # pragma: no cover — a handler must never raise  # noqa: BLE001 - notifications never reach the trade path
             self.handleError(record)
 
 
@@ -211,7 +211,7 @@ class TelegramErrorNotifier:
             return False
         try:
             key = f"{record.name}|{record.levelno}|{record.getMessage()}"
-        except Exception:
+        except Exception:  # noqa: BLE001 - notifications never reach the trade path
             key = f"{record.name}|{record.levelno}|{record.msg!r}"
         now = time.monotonic()
         # Pruned on every call, so the map cannot grow without bound.
@@ -239,7 +239,7 @@ class TelegramErrorNotifier:
                 await self.deliver(message_text)
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception:  # noqa: BLE001 - notifications never reach the trade path
                 # Never log from here: the sink reports its own failures, and
                 # anything this task logged would be filtered out anyway.
                 pass

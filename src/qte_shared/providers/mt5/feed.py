@@ -163,7 +163,7 @@ class IngesterBarFeed(LiveFeed):
                     await self._consume_core(self._bus)
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - the reconnect loop retries any failure
                 if not self._running:
                     return
                 self._attempt += 1

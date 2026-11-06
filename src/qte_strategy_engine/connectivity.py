@@ -104,7 +104,7 @@ async def probe_redis() -> LinkReport:
     try:
         await redis_state.connect()
         holder = await redis_state.runner_owner()
-    except Exception as failure:
+    except Exception as failure:  # noqa: BLE001 - a probe reports any failure as a down link
         return LinkReport("Redis", "fail", f"{endpoint} unreachable ({_describe(failure)})")
     finally:
         await redis_state.close()
@@ -118,7 +118,7 @@ async def probe_postgres() -> LinkReport:
         location = database.engine.url
         endpoint = f"{location.host}:{location.port}/{location.database}"
         answered = await database.ping()
-    except Exception as failure:
+    except Exception as failure:  # noqa: BLE001 - a probe reports any failure as a down link
         return LinkReport("Postgres", "fail", _describe(failure))
     finally:
         await database.close()
@@ -140,7 +140,7 @@ async def probe_engine_bus() -> list[LinkReport]:
     control_bus = NatsBus(name="qte-status")
     try:
         await control_bus.connect()
-    except Exception as failure:
+    except Exception as failure:  # noqa: BLE001 - a probe reports any failure as a down link
         unreachable = "not asked: QTE's NATS is unreachable"
         return [
             LinkReport("NATS (QTE)", "fail", f"{endpoint} unreachable ({_describe(failure)})"),
@@ -182,7 +182,7 @@ async def _control_ping(control_bus: NatsBus, subject: str) -> tuple[dict[str, A
             f"subscribed to {subject} but silent for {CONTROL_TIMEOUT_SECONDS:.0f}s "
             "— hung, or still starting"
         )
-    except Exception as failure:
+    except Exception as failure:  # noqa: BLE001 - a probe reports any failure as a down link
         return None, _describe(failure)
     return reply, ""
 
@@ -244,7 +244,7 @@ async def probe_ingester(ingestion_reply: dict[str, Any] | None) -> LinkReport:
     target = "Ingester (mt5)"
     try:
         gateway_setup = Mt5Settings()
-    except Exception as failure:
+    except Exception as failure:  # noqa: BLE001 - a probe reports any failure as a down link
         return LinkReport(target, "fail", f"MT5 provider settings unusable ({_describe(failure)})")
 
     request_tokens = [*gateway_setup.request_prefix.split("."), "history", gateway_setup.gateway]
@@ -254,7 +254,7 @@ async def probe_ingester(ingestion_reply: dict[str, Any] | None) -> LinkReport:
     )
     try:
         connections = await asyncio.to_thread(_read_connections, monitor_address)
-    except Exception as failure:
+    except Exception as failure:  # noqa: BLE001 - a probe reports any failure as a down link
         return _ingester_unverified(target, monitor_address, failure, ingestion_reply)
 
     answering = [
@@ -342,7 +342,7 @@ async def _probe_broker_stream() -> LinkReport:
     )
     try:
         await broker_bus.connect()
-    except Exception as failure:
+    except Exception as failure:  # noqa: BLE001 - a probe reports any failure as a down link
         return LinkReport(
             "Broker", "fail", f"its NATS at {endpoint} is unreachable ({_describe(failure)})"
         )
@@ -357,7 +357,7 @@ async def _probe_broker_stream() -> LinkReport:
             f"NATS at {endpoint} answers but holds no {stream_name} stream — the broker has "
             "never started against this server",
         )
-    except Exception as failure:
+    except Exception as failure:  # noqa: BLE001 - a probe reports any failure as a down link
         return LinkReport("Broker", "fail", f"NATS at {endpoint}: {_describe(failure)}")
     finally:
         await broker_bus.close()
@@ -396,7 +396,7 @@ def _probe_broker_http() -> LinkReport:
     try:
         with urllib.request.urlopen(health_address, timeout=HTTP_TIMEOUT_SECONDS) as response:
             status_code = response.status
-    except Exception as failure:
+    except Exception as failure:  # noqa: BLE001 - a probe reports any failure as a down link
         return LinkReport(
             "Broker", "fail", f"GET {endpoint}/v1/health failed ({_describe(failure)})"
         )

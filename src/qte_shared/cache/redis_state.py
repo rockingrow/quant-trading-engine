@@ -569,7 +569,7 @@ class RedisState:
     async def ping(self) -> bool:
         try:
             return bool(await self.client.ping())
-        except Exception:
+        except Exception:  # noqa: BLE001 - a failed ping is the answer
             return False
 
 

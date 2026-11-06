@@ -766,7 +766,7 @@ class StrategyRunner:
         """Re-read the stored gate. A Redis failure keeps the last known one."""
         try:
             stored = await self.state.get_flag(BAR_GATE_FLAG, None)
-        except Exception:
+        except Exception:  # noqa: BLE001 - an unreadable gate keeps the last one
             log.warning("Could not read the bar gate; keeping %s", self._bar_gate.describe())
             return
         self._bar_gate = BarGate.from_payload(stored)

@@ -131,7 +131,7 @@ class NatsBus:
             # Drain rather than close: in-flight publishes and queued messages
             # for our subscriptions get flushed instead of dropped on shutdown.
             await self._nc.drain()
-        except Exception as exc:  # pragma: no cover - shutdown best effort
+        except Exception as exc:  # pragma: no cover - shutdown best effort  # noqa: BLE001 - best effort, and logged
             log.warning("NATS drain failed, closing hard: %s", exc)
             await self._nc.close()
         finally:
@@ -292,7 +292,7 @@ class NatsBus:
                 )
             )
             log.info("JetStream stream created name=%s subjects=%s", name, subjects)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - best effort, and logged
             # Losing a create race with the broker (or another QTE replica) is
             # the expected outcome, not a failure.
             log.info("Could not create stream %s (may already exist): %s", name, exc)
