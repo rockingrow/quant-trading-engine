@@ -34,6 +34,7 @@ from qte_shared.strategies.strategy_settings import (
     describe_warmup,
     resolve_warmup,
 )
+from qte_strategy_engine import history_sync as history_module
 from qte_strategy_engine import runner as runner_module
 from qte_strategy_engine.runner import StrategySlot
 
@@ -246,7 +247,10 @@ async def test_the_override_moves_the_first_decision_in_both_drivers(monkeypatch
         def now(cls, timezone=None):
             return cls.current_time.astimezone(timezone)
 
-    monkeypatch.setattr(runner_module, "datetime", MarketClock)
+    # The runner reads the clock, and so does the history sync it delegates
+    # catch-up to; both have to see the market's time.
+    for clocked_module in (runner_module, history_module):
+        monkeypatch.setattr(clocked_module, "datetime", MarketClock)
     runner, strategy_slot, live_strategy = build_runner(
         monkeypatch, CandleStore([]), provider="simulator"
     )

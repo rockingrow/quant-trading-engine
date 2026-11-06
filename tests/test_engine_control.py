@@ -150,7 +150,7 @@ async def test_status_marks_a_paused_pair():
 
 async def test_status_marks_a_pair_an_unreconciled_delivery_is_blocking():
     runner, slot = _ready_runner()
-    runner._uncertain_pairs.add(slot.key)
+    runner.delivery.uncertain_pairs.add(slot.key)
 
     answer = await _ask(runner, {"action": "status"})
 
@@ -165,17 +165,22 @@ async def test_a_broadcast_with_no_reply_subject_is_answered_with_nothing():
     assert runner.bus.messages == []
 
 
-async def test_an_unknown_action_changes_nothing():
+async def test_an_unknown_action_changes_nothing_and_says_so():
+    # Answered rather than ignored: a silent request reads as "no runner
+    # answered" to a caller that waits out its timeout.
     runner, _ = _ready_runner()
-    assert await _ask(runner, {"action": "reboot"}) is None
+    answer = await _ask(runner, {"action": "reboot"})
+    assert "unknown action" in answer["error"]
+    assert "flat" in answer["actions"]
 
 
-async def test_an_unparseable_message_is_ignored():
+async def test_an_unparseable_message_is_answered_with_an_error():
     runner, _ = _ready_runner()
     message = ControlMessage({"action": "status"})
     message.data = b"{not json"
     await runner._on_control_message(message)
-    assert runner.bus.messages == []
+    [(_, answer)] = runner.bus.messages
+    assert "not valid JSON" in answer["error"]
 
 
 # ── The runner: the bar gate ──────────────────────────────────────────────
@@ -196,7 +201,7 @@ async def test_set_bar_gate_rereads_the_stored_flag_rather_than_trusting_the_mes
 
 
 async def _open_a_cycle(runner, slot) -> str:
-    await runner._emit(
+    await runner.emit(
         slot,
         SignalIntent(action=SignalAction.LONG, price=2334.50, sl=2329.50),
         fallback_price=2334.50,
@@ -388,7 +393,7 @@ async def test_flat_without_a_scope_is_refused_rather_than_read_as_everything():
 async def test_flat_refuses_a_pair_whose_delivery_is_unreconciled():
     runner, slot = _ready_runner()
     await _open_a_cycle(runner, slot)
-    runner._uncertain_pairs.add(slot.key)
+    runner.delivery.uncertain_pairs.add(slot.key)
 
     answer = await _ask(runner, {"action": "flat", "scope": {"everything": True}})
 
@@ -476,7 +481,7 @@ async def test_a_failed_mirror_publish_does_not_stop_the_next_intent():
 
     runner.bus = MirrorDown()
     uxid = await _open_a_cycle(runner, slot)
-    await runner._flatten_cycle(slot, uxid, 2340.0, MOMENT, reason="MANUAL_FLAT")
+    await runner.flatten_cycle(slot, uxid, 2340.0, MOMENT, reason="MANUAL_FLAT")
 
     actions = [row[0].position.action for row in runner.signals.rows]
     assert actions == [SignalAction.LONG, SignalAction.FLAT]

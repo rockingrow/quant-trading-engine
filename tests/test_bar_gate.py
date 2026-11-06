@@ -140,7 +140,7 @@ async def _feed(gate: BarGate | None, bar_count: int = 2):
 
     first_open = floor_to_bucket(datetime.now(UTC), "M15") - BAR_LENGTH * bar_count
     for index in range(bar_count):
-        await runner._feed_candle_serialized(slot, _bar(first_open + BAR_LENGTH * index))
+        await runner.feed_candle_serialized(slot, _bar(first_open + BAR_LENGTH * index))
     return runner, slot, counting
 
 
@@ -176,7 +176,7 @@ async def test_releasing_the_gate_resumes_on_the_next_bar_with_a_whole_window():
 
     runner.state.flags[BAR_GATE_FLAG] = BarGate().to_payload()
     next_open = slot.buffer[-1].open_time + BAR_LENGTH
-    await runner._feed_candle_serialized(slot, _bar(next_open))
+    await runner.feed_candle_serialized(slot, _bar(next_open))
 
     assert strategy.decisions == [next_open]
     assert len(slot.buffer) == 3, "the paused bars are still behind it"
@@ -190,6 +190,6 @@ async def test_an_unreadable_redis_keeps_the_last_known_gate():
         raise RuntimeError("Redis is unreachable")
 
     runner.state.get_flag = refuse
-    await runner._feed_candle_serialized(slot, _bar(slot.buffer[-1].open_time + BAR_LENGTH))
+    await runner.feed_candle_serialized(slot, _bar(slot.buffer[-1].open_time + BAR_LENGTH))
 
     assert strategy.decisions == []

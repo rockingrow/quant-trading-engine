@@ -601,7 +601,7 @@ def emitted_signals(runner) -> list:
 
 
 async def open_a_position(runner, strategy_slot) -> None:
-    await runner._emit(
+    await runner.emit(
         strategy_slot,
         SignalIntent(action=SignalAction.LONG, price=2000.0, sl=1990.0),
         fallback_price=2000.0,
@@ -715,7 +715,7 @@ async def feed_one_bar(runner, strategy_slot, moment: datetime) -> None:
         tick_count=5,
     )
     async with strategy_slot.lock:
-        await runner._feed_candle_serialized(strategy_slot, candle)
+        await runner.feed_candle_serialized(strategy_slot, candle)
 
 
 # ── The sweep between bars ───────────────────────────────────────────────
