@@ -39,7 +39,7 @@ from typing import Any
 
 from qte_bot.mounts import MountedRepository, scan_mounted_repositories
 from qte_shared.bar_gate import BAR_GATE_FLAG, BarGate
-from qte_shared.bus import NatsBus, Subjects
+from qte_shared.bus import CONTROL_ERROR_KEY, NatsBus, Subjects, is_control_failure
 from qte_shared.cache import RedisState
 from qte_shared.config import market_data_plan, provider_market_data_plan, settings
 from qte_shared.logging_setup import get_logger
@@ -149,7 +149,7 @@ class EngineClient:
                 try:
                     held = await self._state.count_candles(feed.symbol, timeframe)
                     newest = await self._state.get_candles(feed.symbol, timeframe, count=1)
-                except Exception as failure:
+                except Exception as failure:  # noqa: BLE001 - the bot reports an unreachable service
                     log.warning(
                         "Could not read the %s %s window: %s", feed.symbol, timeframe, failure
                     )
@@ -170,7 +170,7 @@ class EngineClient:
     async def history_provider(self) -> str | None:
         try:
             return await self._state.get_history_provider()
-        except Exception:
+        except Exception:  # noqa: BLE001 - the bot reports an unreachable service
             return None
 
     # ── The mount ─────────────────────────────────────────────────────
@@ -277,7 +277,7 @@ class EngineClient:
     async def read_gate(self) -> BarGate:
         try:
             return BarGate.from_payload(await self._state.get_flag(BAR_GATE_FLAG, None))
-        except Exception as failure:
+        except Exception as failure:  # noqa: BLE001 - the bot reports an unreachable service
             log.warning("Could not read the bar gate: %s", failure)
             return BarGate()
 
@@ -303,7 +303,7 @@ class EngineClient:
             gate.allow(everything=everything, symbol=symbol, strategy=strategy)
         try:
             await self._state.set_flag(BAR_GATE_FLAG, gate.to_payload())
-        except Exception as failure:
+        except Exception as failure:  # noqa: BLE001 - the bot reports an unreachable service
             # Nothing was changed: a gate that cannot be stored would be lost
             # by the next restart, and reporting it as applied would be a lie
             # about whether a pair is trading.
@@ -338,13 +338,27 @@ class EngineClient:
     async def _request(
         self, subject: str, payload: dict[str, Any], *, timeout: float | None = None
     ) -> dict[str, Any] | None:
-        """One control request. ``None`` means nobody answered in time."""
+        """One control request. ``None`` means nobody answered in time.
+
+        A service that answered only to say it could not serve the request at
+        all (:func:`~qte_shared.bus.is_control_failure`) counts as no answer: it
+        is a service that is down for this purpose, and showing its error reply
+        as a real answer would read as an empty book or a live runner.
+        """
         try:
             reply = await self._bus.request(
                 subject, payload, timeout=timeout or self._request_timeout
             )
-        except Exception as failure:
+        except Exception as failure:  # noqa: BLE001 - the bot reports an unreachable service
             log.warning("No answer on %s for %s: %s", subject, payload.get("action"), failure)
+            return None
+        if is_control_failure(reply):
+            log.warning(
+                "%s could not serve %s: %s",
+                subject,
+                payload.get("action"),
+                reply[CONTROL_ERROR_KEY],
+            )
             return None
         return reply if isinstance(reply, dict) else None
 

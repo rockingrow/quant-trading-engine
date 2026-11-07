@@ -352,3 +352,16 @@ def test_the_status_command_exits_with_the_reports_verdict(monkeypatch, capsys):
 
     assert stopped.value.code == 1
     assert "[FAIL] Broker" in capsys.readouterr().out
+
+
+async def test_a_service_that_answers_only_with_a_control_error_is_down(monkeypatch, no_ingester):
+    # A ping whose handler raised (Redis down, say) is answered with an error
+    # rather than left to time out; that answer must not read as "up".
+    failure = {"control_error": "ping failed: ConnectionError: Redis is down"}
+    control_bus = FakeControlBus(runner=failure, ingestion=failure)
+    monkeypatch.setattr(connectivity, "NatsBus", lambda *a, **k: control_bus)
+
+    _, runner, ingestion = await connectivity.probe_engine_bus()
+
+    assert runner.verdict == "fail" and "Redis is down" in runner.detail
+    assert ingestion.verdict == "fail" and "Redis is down" in ingestion.detail

@@ -455,7 +455,6 @@ class SignalFactory:
         if position.risk_percent is not None:
             intent.risk_percent = position.risk_percent
         for name in (
-            "risk_percent",
             "tp1_percent",
             "move_sl_to_be",
             "use_equity_sizing",

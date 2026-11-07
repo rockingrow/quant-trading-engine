@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import asyncio
 
-from qte_ingestion.service import SERVICE_NAME, IngestionService
+from ingestion_support import bare_ingestion_service
+
+from qte_ingestion.service import SERVICE_NAME
 from qte_shared.bus import Subjects
 from qte_shared.config import settings
 from qte_shared.interfaces.market_data import Capability
@@ -78,7 +80,7 @@ class SilentEvents:
 
 async def test_start_up_guards_restores_closes_backfills_then_listens(monkeypatch):
     journal: list[str] = []
-    service = object.__new__(IngestionService)
+    service = bare_ingestion_service()
     service._scope = settings.state_scope
     service.subjects = Subjects()
     service.status = ServiceStatusNotifier(SERVICE_NAME)

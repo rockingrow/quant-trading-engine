@@ -150,7 +150,7 @@ async def test_status_marks_a_paused_pair():
 
 async def test_status_marks_a_pair_an_unreconciled_delivery_is_blocking():
     runner, slot = _ready_runner()
-    runner._uncertain_pairs.add(slot.key)
+    runner.delivery.uncertain_pairs.add(slot.key)
 
     answer = await _ask(runner, {"action": "status"})
 
@@ -165,17 +165,22 @@ async def test_a_broadcast_with_no_reply_subject_is_answered_with_nothing():
     assert runner.bus.messages == []
 
 
-async def test_an_unknown_action_changes_nothing():
+async def test_an_unknown_action_changes_nothing_and_says_so():
+    # Answered rather than ignored: a silent request reads as "no runner
+    # answered" to a caller that waits out its timeout.
     runner, _ = _ready_runner()
-    assert await _ask(runner, {"action": "reboot"}) is None
+    answer = await _ask(runner, {"action": "reboot"})
+    assert "unknown action" in answer["control_error"]
+    assert "flat" in answer["actions"]
 
 
-async def test_an_unparseable_message_is_ignored():
+async def test_an_unparseable_message_is_answered_with_an_error():
     runner, _ = _ready_runner()
     message = ControlMessage({"action": "status"})
     message.data = b"{not json"
     await runner._on_control_message(message)
-    assert runner.bus.messages == []
+    [(_, answer)] = runner.bus.messages
+    assert "not valid JSON" in answer["control_error"]
 
 
 # ── The runner: the bar gate ──────────────────────────────────────────────
@@ -196,7 +201,7 @@ async def test_set_bar_gate_rereads_the_stored_flag_rather_than_trusting_the_mes
 
 
 async def _open_a_cycle(runner, slot) -> str:
-    await runner._emit(
+    await runner.emit(
         slot,
         SignalIntent(action=SignalAction.LONG, price=2334.50, sl=2329.50),
         fallback_price=2334.50,
@@ -388,7 +393,7 @@ async def test_flat_without_a_scope_is_refused_rather_than_read_as_everything():
 async def test_flat_refuses_a_pair_whose_delivery_is_unreconciled():
     runner, slot = _ready_runner()
     await _open_a_cycle(runner, slot)
-    runner._uncertain_pairs.add(slot.key)
+    runner.delivery.uncertain_pairs.add(slot.key)
 
     answer = await _ask(runner, {"action": "flat", "scope": {"everything": True}})
 
@@ -415,3 +420,69 @@ async def test_a_cycle_that_is_still_open_afterwards_is_reported_not_claimed():
     [refusal] = answer["refused"]
     assert refusal["reason"] == "the close was not delivered"
     assert slot.factory.open_cycles(slot.symbol), "the cycle is still open"
+
+
+# ── Audit fixes: an empty window, the tick path, the mirror ─────────────
+
+
+async def test_flat_closes_a_restored_cycle_before_any_bar_has_arrived():
+    """After a restart over a weekend the window can be empty; /flat still works.
+
+    The audit price falls back to the entry's, as it does for stale and orphan
+    closes; a FLAT carries no level to the broker.
+    """
+    runner, slot = _ready_runner()
+    uxid = await _open_a_cycle(runner, slot)
+    slot.buffer.clear()
+
+    answer = await _ask(runner, {"action": "flat", "scope": {"everything": True}})
+
+    assert [row["signal_uxid"] for row in answer["closed"]] == [uxid]
+    flat_signal = runner.signals.rows[-1][0]
+    assert flat_signal.position.action is SignalAction.FLAT
+    assert flat_signal.position.price == 2334.50
+
+
+async def test_a_prevented_pair_is_not_asked_about_ticks():
+    from types import SimpleNamespace
+
+    from qte_shared.models import Tick, TickEvent
+
+    runner, slot = _ready_runner()
+    slot.started = True
+    ticks_seen: list[float] = []
+    slot.strategy.on_tick = lambda price, context: ticks_seen.append(price)
+
+    def tick_message(price: float):
+        tick = Tick(
+            symbol="XAUUSD",
+            ts=datetime.now(UTC),
+            last=price,
+            origin=settings.state_scope.origin(),
+        )
+        event = TickEvent(symbol="XAUUSD", tick=tick)
+        return SimpleNamespace(data=event.model_dump_json().encode())
+
+    runner._bar_gate = BarGate().prevent(symbol="XAUUSD")
+    await runner._on_tick_message(tick_message(2341.0))
+    assert ticks_seen == []
+
+    runner._bar_gate = BarGate()
+    await runner._on_tick_message(tick_message(2342.0))
+    assert ticks_seen == [2342.0]
+
+
+async def test_a_failed_mirror_publish_does_not_stop_the_next_intent():
+    runner, slot = _ready_runner()
+
+    class MirrorDown(ReplyBus):
+        async def publish(self, subject, payload=None):
+            raise ConnectionError("QTE NATS is down")
+
+    runner.bus = MirrorDown()
+    uxid = await _open_a_cycle(runner, slot)
+    await runner.flatten_cycle(slot, uxid, 2340.0, MOMENT, reason="MANUAL_FLAT")
+
+    actions = [row[0].position.action for row in runner.signals.rows]
+    assert actions == [SignalAction.LONG, SignalAction.FLAT]
+    assert slot.factory.open_cycles(slot.symbol) == ()

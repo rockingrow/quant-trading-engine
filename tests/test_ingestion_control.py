@@ -16,7 +16,9 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 
-from qte_ingestion.service import SERVICE_NAME, IngestionService
+from ingestion_support import bare_ingestion_service
+
+from qte_ingestion.service import SERVICE_NAME
 from qte_shared.config import settings
 from qte_shared.market_data_plan import SymbolFeed
 from qte_shared.models import Candle
@@ -92,7 +94,7 @@ class RecordingResampler:
 
 def _service(*, bars=None, backfiller=None, symbols=("XAUUSD", "EURUSD")):
     """A service built field by field: start() needs a vendor socket, this does not."""
-    service = object.__new__(IngestionService)
+    service = bare_ingestion_service()
     service._scope = settings.state_scope
     service.subscriptions = [
         SymbolFeed(symbol=symbol, market="fx", timeframes=("M15",)) for symbol in symbols
@@ -218,6 +220,10 @@ async def test_flush_leaves_a_symbol_it_does_not_feed_alone():
     assert answer == {"flushed": [], "unknown": ["BTCUSDT"]}
 
 
-async def test_an_unknown_action_is_ignored():
+async def test_an_unknown_action_is_answered_with_an_error():
+    # Answered rather than ignored: a silent request reads as "ingestion is
+    # down" to a caller that waits out its timeout.
     service = _service()
-    assert await _ask(service, {"action": "drop_everything"}) is None
+    answer = await _ask(service, {"action": "drop_everything"})
+    assert "unknown action" in answer["control_error"]
+    assert "flush" in answer["actions"]

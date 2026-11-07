@@ -26,6 +26,45 @@ market-simulator --WebSocket ticks--> data-ingestion
                                              broker delivery: shadow
 ```
 
+## Why rehearse, and why only in dev
+
+A backtest replays history through a strategy. It does not exercise the socket,
+the resampler, Redis, NATS, the runner's warm-up or the broker sink — which is
+most of what runs in production and all of what breaks at 3am.
+
+`qte-simulator` is a WebSocket server that speaks a market feed. `data-ingestion`
+connects to it exactly as it connects to a vendor, so the pipeline under test is
+the real one and only the prices are invented:
+
+```bash
+QTE_MARKET_DATA__PROVIDER=simulator   # the whole switch
+
+make sim                              # the feed
+uv run qte-simulator tick   --symbol XAUUSD --bid 2400.0 --ask 2400.4
+uv run qte-simulator replay --symbol XAUUSD --generate 300 --seed 7 --verify --expect-signal
+uv run qte-simulator walk   --symbol XAUUSD --rate 5
+```
+
+A bar is not published as a candle — it is expanded into the ticks a bar is made
+of, and ingestion's own resampler rebuilds it. `--verify` then subscribes to the
+closed-candle subject and compares what came back, field by field, exiting
+non-zero on a mismatch:
+
+```
+Played 300 XAUUSD M15 bars as 1201 ticks → 1 feed client(s)
+
+Verify  300/300 candles republished by ingestion
+Signals 1 emitted on XAUUSD
+  QTE_EXAMPLE_EMA_ATR LONG price=2525.638811 qty=0.01 sl=2504.94991 [shadow]
+```
+
+**It refuses to run outside `QTE_ENV=dev`, and so does the provider that reads
+it** — checked before the server binds a port, with no override flag. A
+simulator looks exactly like a feed, so an engine wired to one in production
+would trade fabricated prices and log nothing unusual doing it. Compose keeps it
+behind the `dev` profile for the same reason: alongside a real feed, one symbol
+would have two sources.
+
 ## 0. Prerequisites and an isolated workspace
 
 - Docker with Compose v2, Python 3.13, uv, and GNU Make.

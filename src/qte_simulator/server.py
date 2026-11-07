@@ -103,7 +103,7 @@ class SimulatorServer:
             await connection.send(dumps(welcome_frame(STREAM_PATH)))
             async for raw in connection:
                 await self._on_stream_frame(connection, subscriber, raw)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - one client must not stop the dev simulator
             log.debug("Feed client id=%d closed: %s", subscriber.id, exc)
         finally:
             self.hub.detach(subscriber)

@@ -1,6 +1,6 @@
 [project]
 name = "quant-trading-engine"
-version = "0.1.1"
+version = "0.1.2"
 description = "Data-driven quant trading engine for backtesting and executing proprietary strategies via integrated data providers (Tiingo first), featuring full trade lifecycle management and external signal routing."
 readme = "README.md"
 # Pinned to 3.13, and the reason is not this repo's own dependencies — they are
@@ -129,7 +129,8 @@ target-version = "py313"
 exclude = ["__strategies__"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B"]
+# BLE: a blind `except Exception` must say why with `# noqa: BLE001 - <reason>`.
+select = ["E", "F", "I", "UP", "B", "BLE"]
 ignore = [
     # FastAPI's Depends()/Query() defaults are the framework's own idiom.
     "B008",

@@ -25,6 +25,9 @@ from qte_shared.timeframes import CLOCK_TOLERANCE
 
 log = get_logger(__name__)
 
+#: Undeliverable outbox candles kept for an operator to read; older ones are trimmed.
+DEAD_LETTER_LIMIT = 1000
+
 STAGE_CLOSED_CANDLE = """
 local previous = redis.call('GET', KEYS[4])
 if previous and tonumber(previous) >= tonumber(ARGV[2]) then return 0 end
@@ -249,6 +252,51 @@ class RedisState:
         """Remove the oldest candle after its Core NATS publish succeeds."""
         await self.client.lpop(self.key("outbox", "candles"))
 
+    async def pending_candle_batch(self, batch_limit: int) -> list[Candle | None]:
+        """The oldest *batch_limit* staged closes, oldest first.
+
+        ``None`` stands for an entry that does not decode.
+
+        A batch rather than one at a time so the drain can publish them all and
+        confirm the lot with one server round trip. Nothing is removed here.
+
+        A *batch_limit* of zero or less reads nothing. Passing it straight to
+        ``LRANGE`` would ask for ``0..-1``, which is Redis for *every* element.
+        """
+        if batch_limit <= 0:
+            return []
+        raw_entries = await self.client.lrange(self.key("outbox", "candles"), 0, batch_limit - 1)
+        decoded: list[Candle | None] = []
+        for raw_entry in raw_entries:
+            try:
+                decoded.append(Candle.model_validate_json(raw_entry))
+            except ValueError:
+                decoded.append(None)
+        return decoded
+
+    async def ack_pending_candles(self, entry_count: int) -> None:
+        """Remove the oldest *entry_count* staged closes, once their publish is confirmed.
+
+        Only the drain removes from the head, under its own lock, and staging
+        appends at the tail, so the first *entry_count* entries are exactly the ones
+        it published.
+        """
+        if entry_count > 0:
+            await self.client.ltrim(self.key("outbox", "candles"), entry_count, -1)
+
+    async def quarantine_pending_candle(self) -> None:
+        """Move the oldest staged candle to the dead-letter list.
+
+        For a head the drain can never publish — it does not decode, or it
+        belongs to another state scope. Left in place it would stop every later
+        candle, for every symbol, behind it. Moved rather than deleted, so an
+        operator can still read what it was; the list keeps the newest
+        :data:`DEAD_LETTER_LIMIT` entries.
+        """
+        dead_letters = self.key("outbox", "candles", "dead")
+        await self.client.lmove(self.key("outbox", "candles"), dead_letters, "LEFT", "RIGHT")
+        await self.client.ltrim(dead_letters, -DEAD_LETTER_LIMIT, -1)
+
     async def get_candles(self, symbol: str, timeframe: str, count: int = 0) -> list[Candle]:
         """Oldest-first history; ``count=0`` returns everything stored."""
         key = self.key("candles", symbol, timeframe)
@@ -425,7 +473,7 @@ class RedisState:
     #
     # The open time of the newest bar each (strategy, symbol, timeframe) was fed.
     # Closes published while a runner was down or still starting are the bars
-    # newer than this; see ``StrategyRunner._catch_up``.
+    # newer than this; see ``HistorySync.catch_up``.
 
     async def get_decided_open_time(
         self, strategy: str, symbol: str, timeframe: str
@@ -553,7 +601,7 @@ class RedisState:
     async def ping(self) -> bool:
         try:
             return bool(await self.client.ping())
-        except Exception:
+        except Exception:  # noqa: BLE001 - a failed ping is the answer
             return False
 
 

@@ -17,6 +17,7 @@ from datetime import UTC, datetime, timedelta
 
 import nats.errors
 import pytest
+from ingestion_support import bare_ingestion_service
 from nats.js.errors import NotFoundError
 from pydantic import ValidationError
 
@@ -408,12 +409,17 @@ class FakeBus:
         self.js = jetstream
         self.handlers: dict[str, Callable] = {}
         self.closed = False
+        self._closed_event = asyncio.Event()
 
     async def connect(self) -> None:
         return None
 
     async def close(self) -> None:
         self.closed = True
+        self._closed_event.set()
+
+    async def wait_closed(self) -> None:
+        await self._closed_event.wait()
 
     async def subscribe(self, subject: str, handler) -> None:
         self.handlers[subject] = handler
@@ -615,7 +621,7 @@ class BarProvider:
 
 
 def bare_service() -> IngestionService:
-    service = object.__new__(IngestionService)
+    service = bare_ingestion_service()
     service.subscriptions = [SymbolFeed(symbol="XAUUSD", market="fx", timeframes=("M15",))]
     service.specs = [feed.spec for feed in service.subscriptions]
     service.providers = {"mt5": BarProvider()}
@@ -661,3 +667,28 @@ async def test_a_bar_whose_bucket_has_not_ended_is_dropped(monkeypatch, caplog):
     await service._handle_closed_bar(candle)
     assert emitted == []
     assert "MT5_SERVER_TIMEZONE" in caplog.text
+
+
+async def test_a_core_consumer_reconnects_once_its_connection_is_closed():
+    # Woken by the client's closed callback, not by a one-second poll: the
+    # reconnect starts as soon as nats-py gives the connection up.
+    connections: list[FakeBus] = []
+
+    def factory() -> FakeBus:
+        connections.append(FakeBus())
+        return connections[-1]
+
+    async def ignore(candle: Candle) -> None:
+        return None
+
+    feed = IngesterBarFeed(
+        {"XAUUSD": ("M15",)}, ignore, Mt5Settings(jetstream=False), bus_factory=factory
+    )
+    feed._backoff = lambda attempt: 0.0
+    feed.start()
+    try:
+        await wait_until(lambda: bool(connections and connections[0].handlers))
+        await connections[0].close()
+        await wait_until(lambda: len(connections) >= 2 and bool(connections[1].handlers))
+    finally:
+        await feed.stop()

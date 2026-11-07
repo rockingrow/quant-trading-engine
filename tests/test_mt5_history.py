@@ -18,6 +18,7 @@ from pathlib import Path
 import nats.errors
 import pytest
 from fakeredis.aioredis import FakeRedis
+from ingestion_support import bare_ingestion_service
 
 from qte_ingestion.backfill import HistoryBackfiller
 from qte_ingestion.service import IngestionService
@@ -585,7 +586,7 @@ async def test_before_keeps_the_live_bar_itself_out_of_the_merge():
 
 
 def history_service(state, source) -> IngestionService:
-    service = object.__new__(IngestionService)
+    service = bare_ingestion_service()
     service.subscriptions = [SymbolFeed(symbol="XAUUSD", market="fx", timeframes=("M15",))]
     service._symbol_providers = {"XAUUSD": "mt5"}
     service._origins = {"mt5": settings.state_scope.origin()}
