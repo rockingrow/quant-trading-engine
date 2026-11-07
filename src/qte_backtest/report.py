@@ -45,6 +45,7 @@ from qte_backtest.diagnostics import CRITICAL, INFO, WARNING, DiagnosticContext,
 from qte_backtest.execution import SimulatedPosition
 from qte_backtest.replay import BacktestResult
 from qte_backtest.visualize import render_html
+from qte_shared import emoji_constants
 from qte_shared.config import REPORT_SCHEMA_VERSION
 from qte_shared.logging_setup import get_logger
 from qte_shared.strategies.signal_serialization import signal_record
@@ -95,7 +96,9 @@ READING_GUIDE = {
         "trade loses about that share of the account if its stop is hit. The capital is "
         "fixed for the whole run — it does not compound — which is what makes two runs "
         "comparable. use_equity_sizing on the payload reports the pair's configured mode "
-        "to the broker and does not change this number."
+        "to the broker and does not change this number. Each trade states the "
+        "risk_percent it was sized at: run.risk_percent on most pairs, and on a pair with "
+        "run.dynamic_risk the one its strategy asked for, never above run.max_risk_percent."
     ),
     "single_position": (
         "The engine stacks as many cycles per symbol as the strategy opens, mirroring the "
@@ -155,6 +158,8 @@ class BacktestReport:
                 "default_quantity": result.quantity,
                 "starting_equity": result.starting_equity,
                 "risk_percent": result.risk_percent,
+                "dynamic_risk": result.dynamic_risk,
+                "max_risk_percent": result.max_risk_percent,
                 "strategy_meta": result.strategy_meta,
             },
             "data": {
@@ -266,8 +271,7 @@ class BacktestReport:
             f"| Trades | {metrics.trades} — {metrics.wins}W / {metrics.losses}L "
             f"({metrics.win_rate:.1f}%) |",
             f"| Capital | {metrics.starting_equity:,.2f} → {metrics.ending_equity:,.2f} "
-            f"({_fmt(metrics.return_pct, '{:+.2f}%')}) at "
-            f"{_fmt(result.risk_percent, '{:.2f}%')} risk per entry |",
+            f"({_fmt(metrics.return_pct, '{:+.2f}%')}) at {_risk_summary(result)} |",
             f"| Net P&L | {metrics.net_pnl:,.2f} (fees {metrics.total_fees:,.2f}) |",
             f"| Expectancy | {_fmt(metrics.expectancy_r, '{:+.3f}R')} per trade "
             f"({metrics.expectancy:,.4f} currency) |",
@@ -403,11 +407,24 @@ def build_report(
 
 # ── Helpers ───────────────────────────────────────────────────────────
 
-_BADGE = {CRITICAL: "🔴", WARNING: "🟠", INFO: "🔵"}
+_BADGE = {
+    CRITICAL: emoji_constants.BADGE_CRITICAL,
+    WARNING: emoji_constants.BADGE_WARNING,
+    INFO: emoji_constants.BADGE_INFO,
+}
 
 
 def _closed(positions: Sequence[SimulatedPosition]) -> list[SimulatedPosition]:
     return [position for position in positions if position.legs]
+
+
+def _risk_summary(result: BacktestResult) -> str:
+    """How entries were risked, for the Markdown header line."""
+    base_risk = _fmt(result.risk_percent, "{:.2f}%")
+    if not result.dynamic_risk:
+        return f"{base_risk} risk per entry"
+    ceiling = _fmt(result.max_risk_percent, "{:.2f}%", "uncapped")
+    return f"dynamic risk per entry (base {base_risk}, ceiling {ceiling})"
 
 
 def _trade_to_dict(index: int, position: SimulatedPosition) -> dict[str, Any]:
@@ -428,6 +445,7 @@ def _trade_to_dict(index: int, position: SimulatedPosition) -> dict[str, Any]:
         "tp1": position.tp1,
         "tp2": position.tp2,
         "initial_risk": position.initial_risk,
+        "risk_percent": position.risk_percent,
         "exit_reason": position.exit_reason,
         "exit_note": position.exit_note,
         "gross_pnl": round(position.gross_pnl, 8),

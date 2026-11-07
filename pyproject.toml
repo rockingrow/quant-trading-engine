@@ -1,6 +1,6 @@
 [project]
 name = "quant-trading-engine"
-version = "0.1.1"
+version = "0.1.2"
 description = "Data-driven quant trading engine for backtesting and executing proprietary strategies via integrated data providers (Tiingo first), featuring full trade lifecycle management and external signal routing."
 readme = "README.md"
 # Pinned to 3.13, and the reason is not this repo's own dependencies — they are
@@ -18,11 +18,16 @@ dependencies = [
     "pandas>=2.2",
     "numpy>=1.26",
     "nats-py>=2.7",
-    "redis>=5.0",
+    "redis>=5.0,<9",
     "sqlalchemy[asyncio]>=2.0",
     "asyncpg>=0.29",
     "alembic>=1.13",
     "orjson>=3.10",
+    # Every glyph a reader sees is named rather than pasted in, in
+    # qte_shared.emoji_constants — the same table algo-trading-broker keeps, so
+    # one trade looks the same in both services' messages. Core rather than an
+    # extra: qte_shared.notifications imports it, which every service does.
+    "emoji>=2.12",
 ]
 
 # The image boundary. One distribution ships every service's code — 612 KB, next
@@ -124,7 +129,8 @@ target-version = "py313"
 exclude = ["__strategies__"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B"]
+# BLE: a blind `except Exception` must say why with `# noqa: BLE001 - <reason>`.
+select = ["E", "F", "I", "UP", "B", "BLE"]
 ignore = [
     # FastAPI's Depends()/Query() defaults are the framework's own idiom.
     "B008",

@@ -117,6 +117,8 @@ class SubscribingBus:
 
 class QuietSink:
     shadow_mode = True
+    # Like the real sink: the process switch, read when asked.
+    force_shadow_mode = property(lambda self: settings.broker.force_shadow_mode)
     transport = "nats"
 
     def set_shadow_mode(self, enabled):
@@ -414,12 +416,12 @@ async def test_cold_periodic_sync_does_not_swallow_the_first_post_start_close(mo
     runner, strategy_slot, strategy = build_runner(monkeypatch, candle_store)
     await runner.start()
     try:
-        runner._history_started_at = bucket_close(history[1].open_time, "M15") - timedelta(
+        runner.context.history_started_at = bucket_close(history[1].open_time, "M15") - timedelta(
             seconds=1
         )
         candle_store.candles = history
         async with strategy_slot.lock:
-            await runner._sync_history(strategy_slot)
+            await runner.history.sync_history(strategy_slot)
         assert list(strategy_slot.buffer) == history
         assert strategy.decided_on == [history[1].open_time]
         await deliver_live(runner, history[1])

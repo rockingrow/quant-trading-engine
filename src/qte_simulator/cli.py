@@ -354,7 +354,7 @@ async def _play(args: argparse.Namespace, rows: list[dict[str, Any]]) -> int:
             # Before the send, not after: a fast replay produces its candles
             # while the command is still in flight.
             await watcher.start()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - the dev simulator reports and carries on
             print(
                 f"error: cannot reach NATS at {settings.nats.url} to verify: {exc}", file=sys.stderr
             )

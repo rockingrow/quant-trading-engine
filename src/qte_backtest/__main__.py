@@ -9,6 +9,12 @@ import sys
 from datetime import UTC, date, datetime
 from pathlib import Path
 
+from qte_backtest.doc_reference import (
+    BEGIN_MARKER,
+    concept_documents,
+    reference_from_report_file,
+    update_concept_document,
+)
 from qte_backtest.downloader import DownloadRequest, HistoryDownloader
 from qte_backtest.runner import BacktestRequest, run_backtest
 from qte_backtest.visualize import render_html
@@ -151,12 +157,41 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     run.add_argument(
+        "--no-doc-reference",
+        action="store_true",
+        help=(
+            "Leave the auto-generated 'Latest artefacts' block at the bottom of "
+            "docs/concepts/<strategy>.md alone; by default a reporting run "
+            "rewrites it to point at the report it just wrote"
+        ),
+    )
+    run.add_argument(
         "--param",
         action="append",
         default=[],
         metavar="KEY=VALUE",
         help="Repeatable strategy parameter override",
     )
+    reference = subparsers.add_parser(
+        "doc-reference",
+        help="Refresh the auto-generated artefact block in the strategy concept documents",
+    )
+    reference.add_argument(
+        "--strategy",
+        default=None,
+        help="Only this alias (default: every mounted strategy that has a document)",
+    )
+    reference.add_argument(
+        "--report",
+        type=Path,
+        default=None,
+        metavar="JSON",
+        help=(
+            "Fill the block from a report written earlier; without it the block "
+            "is only created, saying no replay has been recorded yet"
+        ),
+    )
+
     chart = subparsers.add_parser(
         "chart", help="Render a report JSON into an interactive HTML dashboard"
     )
@@ -278,6 +313,7 @@ async def _run(args: argparse.Namespace) -> None:
             report_dir=report_dir,
             report_formats=_report_formats(args),
             report_include_signals=not args.no_report_signals,
+            update_strategy_document=not args.no_doc_reference,
         )
     )
     print()
@@ -291,6 +327,45 @@ def _report_formats(args: argparse.Namespace) -> tuple[str, ...]:
     if args.chart and "html" not in formats:
         formats.append("html")
     return tuple(formats)
+
+
+def _doc_reference(args: argparse.Namespace) -> None:
+    """Create or refresh the machine-owned block in the concept documents.
+
+    A reporting replay does this by itself. This command exists for the two
+    cases a replay does not cover: seeding the block into a document that has
+    never had one, and pointing a document at a report that was written before
+    the block existed.
+    """
+    documents = concept_documents()
+    if not documents:
+        raise SystemExit(
+            f"No concept document found under {settings.engine.strategies_dir}"
+            "/*/docs/concepts/. Is the strategy repository mounted?"
+        )
+
+    if args.report is not None:
+        reference = reference_from_report_file(args.report)
+        if args.strategy and args.strategy != reference.strategy:
+            raise SystemExit(f"{args.report} reports {reference.strategy}, not {args.strategy}")
+        written = update_concept_document(reference.strategy, reference, documents=documents)
+        if written is None:
+            raise SystemExit(f"No concept document found for {reference.strategy}")
+        print(f"Updated {written} → {reference.strategy}")
+        return
+
+    targets = [args.strategy] if args.strategy else sorted(documents)
+    for alias in targets:
+        if alias not in documents:
+            raise SystemExit(f"No concept document found for {alias}")
+        # Seeding only: a block that already names a replay is left as it is,
+        # or this command would throw away what the last run recorded.
+        if BEGIN_MARKER in documents[alias].read_text(encoding="utf-8"):
+            print(f"Kept    {documents[alias]} → {alias}")
+            continue
+        written = update_concept_document(alias, None, documents=documents)
+        if written is not None:
+            print(f"Seeded  {written} → {alias}")
 
 
 def _chart(args: argparse.Namespace) -> None:
@@ -392,6 +467,8 @@ def main() -> None:
         asyncio.run(_download(args))
     elif args.command == "run":
         asyncio.run(_run(args))
+    elif args.command == "doc-reference":
+        _doc_reference(args)
     else:
         _chart(args)
 

@@ -7,6 +7,8 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 from test_runner_catch_up import CandleStore, build_runner, completed_bars
 from test_runner_delivery import (
     FailedSink,
@@ -55,7 +57,7 @@ async def test_start_restores_shadow_before_outbox_recovery(monkeypatch, stored_
     async def inspect_recovery():
         observed.append(runner.sink.shadow_mode)
 
-    monkeypatch.setattr(runner, "_recover_pending_deliveries", inspect_recovery)
+    monkeypatch.setattr(runner.delivery, "recover_pending_deliveries", inspect_recovery)
     await runner.start()
     try:
         assert observed == [True if stored_mode is None else stored_mode]
@@ -235,12 +237,12 @@ async def test_position_failure_recovers_without_sending_a_confirmed_order_again
     monkeypatch.setattr(runner.positions, "upsert", fail_upsert)
     await _enter(runner, strategy_slot)
     assert runner.signals.pending[0].delivery_status == "sent_pending"
-    assert strategy_slot.key in runner._uncertain_pairs
+    assert strategy_slot.key in runner.delivery.uncertain_pairs
     monkeypatch.setattr(runner.positions, "upsert", original_upsert)
-    await runner._recover_pending_deliveries()
+    await runner.delivery.recover_pending_deliveries()
     assert len(runner.sink.delivery_ids) == 1
     assert runner.signals.pending[0].delivery_status == "sent"
-    assert strategy_slot.key not in runner._uncertain_pairs
+    assert strategy_slot.key not in runner.delivery.uncertain_pairs
     assert runner.positions.held[strategy_slot.key].remaining == 6.0
 
 
@@ -265,10 +267,10 @@ async def test_failed_checkpoints_remain_blocked_and_retry_local_work_only(
 
     monkeypatch.setattr(runner.signals, "mark_delivery", fail_mark)
     await _enter(runner, strategy_slot)
-    assert strategy_slot.key in runner._uncertain_pairs
+    assert strategy_slot.key in runner.delivery.uncertain_pairs
     monkeypatch.setattr(runner.signals, "mark_delivery", original_mark)
-    await runner._recover_pending_deliveries()
-    assert strategy_slot.key not in runner._uncertain_pairs
+    await runner.delivery.recover_pending_deliveries()
+    assert strategy_slot.key not in runner.delivery.uncertain_pairs
     assert runner.signals.pending[0].delivery_status == (
         "failed" if failed_status == "failed" else "sent"
     )
@@ -285,7 +287,7 @@ async def test_pre_send_checkpoint_failure_prevents_any_broker_call(monkeypatch)
     monkeypatch.setattr(runner.signals, "mark_delivery", fail_mark)
     await _enter(runner, strategy_slot)
     assert runner.sink.delivery_ids == []
-    assert strategy_slot.key in runner._uncertain_pairs
+    assert strategy_slot.key in runner.delivery.uncertain_pairs
 
 
 async def test_restart_reconciles_a_confirmed_partial_exactly_once(monkeypatch):
@@ -304,8 +306,8 @@ async def test_restart_reconciles_a_confirmed_partial_exactly_once(monkeypatch):
     restored_slot = _slot()
     replacement.slots = [restored_slot]
     replacement.signals = RecordingSignals(runner.signals.pending)
-    await replacement._restore_position(restored_slot)
-    await replacement._recover_pending_deliveries()
+    await replacement.recovery.restore_position(restored_slot)
+    await replacement.delivery.recover_pending_deliveries()
     assert restored_slot.factory.open_position("XAUUSD").remaining == pytest.approx(4.2)
     assert replacement.sink.delivery_ids == []
 
@@ -315,9 +317,9 @@ async def test_legacy_or_unknown_live_delivery_is_not_blindly_resent(status):
     runner, strategy_slot = _runner(), _slot()
     runner.slots = [strategy_slot]
     runner.signals = RecordingSignals([pending_signal(strategy_slot, status=status)])
-    await runner._recover_pending_deliveries()
+    await runner.delivery.recover_pending_deliveries()
     assert runner.sink.delivery_ids == []
-    assert strategy_slot.key in runner._uncertain_pairs
+    assert strategy_slot.key in runner.delivery.uncertain_pairs
 
 
 @pytest.mark.parametrize("age_seconds,expected_sends", [(10, 1), (300, 0), (-10, 0)])
@@ -336,7 +338,7 @@ async def test_explicit_retry_horizon_bounds_ambiguous_resends(
             )
         ]
     )
-    await runner._recover_pending_deliveries()
+    await runner.delivery.recover_pending_deliveries()
     assert len(runner.sink.delivery_ids) == expected_sends
 
 
@@ -345,9 +347,9 @@ async def test_a_rejected_retry_does_not_disprove_the_original_ambiguous_send(mo
     runner, strategy_slot = _runner(sink=FailedSink()), _slot()
     runner.slots = [strategy_slot]
     runner.signals = RecordingSignals([pending_signal(strategy_slot, status="unknown")])
-    await runner._recover_pending_deliveries()
+    await runner.delivery.recover_pending_deliveries()
     assert runner.signals.pending[0].delivery_status == "unknown"
-    assert strategy_slot.key in runner._uncertain_pairs
+    assert strategy_slot.key in runner.delivery.uncertain_pairs
 
 
 async def test_blocked_first_page_does_not_starve_later_pairs():
@@ -359,9 +361,9 @@ async def test_blocked_first_page_does_not_starve_later_pairs():
     later_row.created_at = max(record.created_at for record in blocked_rows) + timedelta(seconds=1)
     runner.slots = [blocked_slot, later_slot]
     runner.signals = RecordingSignals([*blocked_rows, later_row])
-    await runner._recover_pending_deliveries()
-    assert blocked_slot.key in runner._uncertain_pairs
-    assert later_slot.key not in runner._uncertain_pairs
+    await runner.delivery.recover_pending_deliveries()
+    assert blocked_slot.key in runner.delivery.uncertain_pairs
+    assert later_slot.key not in runner.delivery.uncertain_pairs
     assert later_row.delivery_status == "sent"
     assert runner.sink.delivery_ids == []
 
@@ -373,7 +375,7 @@ async def test_unfinished_older_row_blocks_later_row_of_the_same_pair():
     later_row.created_at = earlier.created_at + timedelta(seconds=1)
     runner.slots = [strategy_slot]
     runner.signals = RecordingSignals([earlier, later_row])
-    await runner._recover_pending_deliveries()
+    await runner.delivery.recover_pending_deliveries()
     assert later_row.delivery_status == "prepared"
     assert strategy_slot.factory.open_position("XAUUSD") is None
 
@@ -383,15 +385,15 @@ async def test_periodic_retry_revisits_pending_local_persistence(monkeypatch):
     runner, strategy_slot = _runner(), _slot()
     runner.slots = [strategy_slot]
     runner.signals = RecordingSignals([pending_signal(strategy_slot, status="sent_pending")])
-    original_track = runner._track_cycle
+    original_track = runner.delivery.track_cycle
 
     async def stop_after_tracking(selected_slot, signal_uxid):
         persisted = await original_track(selected_slot, signal_uxid)
         runner.request_stop()
         return persisted
 
-    monkeypatch.setattr(runner, "_track_cycle", stop_after_tracking)
-    await asyncio.wait_for(runner._delivery_retry_loop(), timeout=1)
+    monkeypatch.setattr(runner.delivery, "track_cycle", stop_after_tracking)
+    await asyncio.wait_for(runner.delivery.retry_loop(), timeout=1)
     assert runner.signals.pending[0].delivery_status == "sent"
     assert runner.sink.delivery_ids == []
 
@@ -401,7 +403,7 @@ async def test_recovery_refreshes_a_stale_scan_after_acquiring_the_pair_lock():
     await _enter(runner, strategy_slot)
     stale_snapshot = copy(runner.signals.pending[0])
     stale_snapshot.delivery_status = "prepared"
-    assert await runner._recover_delivery(strategy_slot, stale_snapshot)
+    assert await runner.delivery.recover_delivery(strategy_slot, stale_snapshot)
     assert len(runner.sink.delivery_ids) == 1
 
 
@@ -418,11 +420,11 @@ async def test_failed_stage_is_reconciled_before_the_pair_can_emit_again(monkeyp
 
     monkeypatch.setattr(runner.signals, "stage_signal", lose_stage_response)
     await _enter(runner, strategy_slot)
-    assert strategy_slot.key in runner._uncertain_pairs
+    assert strategy_slot.key in runner.delivery.uncertain_pairs
     await _enter(runner, strategy_slot)
     assert len(runner.signals.pending) == int(committed)
-    await runner._recover_pending_deliveries()
-    assert strategy_slot.key not in runner._uncertain_pairs
+    await runner.delivery.recover_pending_deliveries()
+    assert strategy_slot.key not in runner.delivery.uncertain_pairs
     assert len(runner.sink.delivery_ids) == int(committed)
 
 
@@ -431,3 +433,112 @@ def live_state_scope(monkeypatch):
     """Select a live book; all broker transports in this suite are test doubles."""
     monkeypatch.setattr(settings, "env", "prod")
     monkeypatch.setattr(settings.state_config, "execution_mode", "live")
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        RedisConnectionError("Connection closed by server"),
+        RedisTimeoutError("Timeout reading from socket"),
+    ],
+)
+async def test_history_sync_survives_a_transient_redis_failure(monkeypatch, caplog, failure):
+    """A dropped connection costs one pass and is logged without a traceback.
+
+    The pass is lost either way; what matters is that the loop keeps running and
+    that the record stays at WARNING, because ERROR is forwarded to Telegram.
+    """
+    runner, _, _ = build_runner(monkeypatch, CandleStore(completed_bars(2)))
+    monkeypatch.setattr(runner_settings, "history_sync_interval", 0.01)
+    recovered = asyncio.Event()
+    attempts = []
+
+    async def flaky_refresh():
+        attempts.append(failure)
+        if len(attempts) == 1:
+            raise failure
+        recovered.set()
+
+    monkeypatch.setattr(runner, "refresh_shadow_mode", flaky_refresh)
+    monkeypatch.setattr(runner.history, "sync_history", lambda strategy_slot: asyncio.sleep(0))
+
+    with caplog.at_level("WARNING"):
+        loop_task = asyncio.create_task(runner.history.run_loop())
+        try:
+            await asyncio.wait_for(recovered.wait(), timeout=2)
+        finally:
+            runner._stopping.set()
+            loop_task.cancel()
+            await asyncio.gather(loop_task, return_exceptions=True)
+
+    records = [record for record in caplog.records if "History synchronization" in record.message]
+    assert [record.levelname for record in records] == ["WARNING"]
+    assert records[0].exc_info is None
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        ValueError("Stored position has missing or foreign state provenance"),
+        # nats-py raises asyncio.TimeoutError, which is the builtin on 3.13,
+        # when the MT5 ingester never answers a history request. That is an
+        # outage of its own and must not read as Redis being unreachable.
+        TimeoutError(),
+    ],
+    ids=["unexpected_error", "history_request_timeout"],
+)
+async def test_history_sync_still_reports_a_non_redis_failure(monkeypatch, caplog, failure):
+    """Anything that is not a Redis blip keeps its ERROR and its traceback."""
+    runner, _, _ = build_runner(monkeypatch, CandleStore(completed_bars(2)))
+    monkeypatch.setattr(runner_settings, "history_sync_interval", 0.01)
+    reported = asyncio.Event()
+
+    async def broken_refresh():
+        reported.set()
+        raise failure
+
+    monkeypatch.setattr(runner, "refresh_shadow_mode", broken_refresh)
+
+    with caplog.at_level("WARNING"):
+        loop_task = asyncio.create_task(runner.history.run_loop())
+        try:
+            await asyncio.wait_for(reported.wait(), timeout=2)
+            await asyncio.sleep(0.05)
+        finally:
+            runner._stopping.set()
+            loop_task.cancel()
+            await asyncio.gather(loop_task, return_exceptions=True)
+
+    records = [record for record in caplog.records if "History synchronization" in record.message]
+    assert records, "An unexpected failure must still be reported"
+    assert records[0].levelname == "ERROR"
+    assert records[0].exc_info is not None
+
+
+async def test_a_sink_with_its_own_force_switch_is_not_flipped_on_every_refresh(
+    monkeypatch, caplog
+):
+    """The runner reads the force switch from the sink, so the two agree.
+
+    Read from the process settings instead, a sink given its own settings with
+    the switch on was "corrected" on every refresh — a WARNING per bar.
+    """
+    from qte_shared.config import BrokerSettings
+    from qte_strategy_engine.broker_sink import BrokerSink
+
+    # A live book: on paper the scope alone holds the sink in shadow.
+    monkeypatch.setattr(settings.state_config, "execution_mode", "live")
+    sink = BrokerSink(
+        transport="nats",
+        shadow_mode=True,
+        broker_settings=BrokerSettings(_env_file=None, force_shadow_mode=True),
+    )
+    runner = _runner(sink=sink)
+    runner.state.flags["shadow_mode"] = False
+
+    with caplog.at_level("WARNING", logger="qte_strategy_engine.broker_sink"):
+        await runner.refresh_shadow_mode()
+        await runner.refresh_shadow_mode()
+
+    assert sink.shadow_mode is True
+    assert [record for record in caplog.records if "Shadow mode" in record.message] == []

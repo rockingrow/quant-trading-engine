@@ -11,6 +11,12 @@ kept alive to answer it.
 ``status`` changes nothing: it asks every link the engine depends on and
 prints one line each — see :mod:`qte_strategy_engine.connectivity`.
 
+``demo-signal`` changes nothing a trade depends on either: it drives a mounted
+strategy over synthetic data until it enters, builds the payload through the
+live factory and publishes it on the broker's demo subject, which reaches the
+broker's Telegram notification and no worker — see
+:mod:`qte_strategy_engine.demo_signal`.
+
 The execution namespace selects paper or live at startup. Shadow mode pauses
 live delivery without converting broker positions into simulated ones. Its
 control message travels on the namespace-qualified NATS control subject.
@@ -26,16 +32,18 @@ import argparse
 import asyncio
 import json
 import sys
+from typing import NoReturn
 
 from nats.errors import NoRespondersError
 from nats.errors import TimeoutError as NatsTimeoutError
 
-from qte_shared.bus import NatsBus, Subjects
+from qte_shared.bus import NatsBus, Subjects, is_control_failure
 from qte_shared.cache import RedisState
 from qte_shared.config import settings
 from qte_shared.db import EventRepository
 from qte_shared.logging_setup import configure_logging, get_logger
 from qte_strategy_engine import connectivity
+from qte_strategy_engine.demo_signal import run_demo
 
 log = get_logger(__name__)
 
@@ -70,13 +78,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     owner.add_argument(
         "operation",
-        choices=["status", "clear"],
-        help="status = show who holds the claim; clear = remove a stale claim",
+        choices=["status", "check", "clear"],
+        help="status = show who holds the claim; check = exit 1 when a claim is held that "
+        "no runner answers for; clear = remove a stale claim",
     )
     owner.add_argument(
         "--yes",
         action="store_true",
         help="Skip the confirmation prompt when clearing",
+    )
+
+    demo = subparsers.add_parser(
+        "demo-signal",
+        help="Fire one open cycle per mounted strategy at the broker's demo subject "
+        "(Telegram only — no worker ever sees it)",
+    )
+    demo.add_argument(
+        "--strategy",
+        help="Only this strategy; without it every mounted strategy is fired in turn",
+    )
+    demo.add_argument(
+        "--symbol",
+        help="Only this symbol; without it each strategy uses the first symbol it is mapped to",
     )
     return parser
 
@@ -93,7 +116,7 @@ async def _set_shadow_mode(enabled: bool) -> None:
     try:
         await state.connect()
         await state.set_flag("shadow_mode", enabled)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - the CLI reports the failure to the operator
         # Refusing here is deliberate. If the flag cannot be stored, a runner
         # restarting later would silently come back in the *old* mode — and for
         # "off" that means going live again on its own. Better to fail loudly
@@ -111,7 +134,7 @@ async def _set_shadow_mode(enabled: bool) -> None:
             {"action": "set_shadow_mode", "enabled": enabled},
         )
         broadcast = True
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - the CLI reports the failure to the operator
         # The Redis write already happened, so the next runner to start will
         # honour it. Saying so is the difference between "not applied" and
         # "applied, but not to the process running right now".
@@ -145,7 +168,7 @@ async def _show_shadow_mode() -> None:
     try:
         await state.connect()
         stored = await state.get_flag("shadow_mode", None)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - the CLI reports the failure to the operator
         _die(f"Could not reach Redis at {settings.redis.url}.", exc)
     finally:
         await state.close()
@@ -171,11 +194,13 @@ async def _ping() -> None:
     bus = NatsBus(name="qte-control")
     try:
         await bus.connect()
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - the CLI reports the failure to the operator
         _die(f"Could not reach NATS at {settings.nats.url}.", exc)
     try:
         reply = await bus.request(Subjects().engine_control(), {"action": "ping"}, timeout=2.0)
         print(json.dumps(reply, indent=2))
+        if is_control_failure(reply):
+            raise SystemExit(1)
     except Exception as exc:
         print(f"No runner answered within 2s: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
@@ -183,18 +208,35 @@ async def _ping() -> None:
         await bus.close()
 
 
+class _Unverifiable(Exception):
+    """A dependency was unreachable, so nothing about a claim could be ruled out.
+
+    Raised rather than exited on, because what it means belongs to the caller:
+    clearing a claim has to refuse, while the deploy pre-flight has no stale
+    claim to report and must not block the deploy that brings the dependency
+    back up.
+    """
+
+
+def _die_unverifiable(unverifiable: _Unverifiable) -> NoReturn:
+    """Fail the way every other unreachable dependency here does."""
+    _die(f"{unverifiable} — nothing was changed.", unverifiable.__cause__ or unverifiable)
+
+
 async def _read_runner_owner(redis_state: RedisState) -> str | None:
     try:
         await redis_state.connect()
         return await redis_state.runner_owner()
     except Exception as exc:
-        _die(f"Could not reach Redis at {settings.redis.url} — nothing was changed.", exc)
+        raise _Unverifiable(f"Could not reach Redis at {settings.redis.url}") from exc
 
 
 async def _show_runner_owner() -> None:
     redis_state = RedisState()
     try:
         holder = await _read_runner_owner(redis_state)
+    except _Unverifiable as unverifiable:
+        _die_unverifiable(unverifiable)
     finally:
         await redis_state.close()
     print(f"State namespace: {settings.state_scope.namespace}")
@@ -212,11 +254,9 @@ async def _answering_runner() -> dict | None:
     try:
         await control_bus.connect()
     except Exception as exc:
-        _die(
-            f"Could not reach NATS at {settings.nats.url}, so no runner could be ruled out "
-            "— nothing was changed.",
-            exc,
-        )
+        raise _Unverifiable(
+            f"Could not reach NATS at {settings.nats.url}, so no runner could be ruled out"
+        ) from exc
     try:
         return await control_bus.request(
             Subjects().engine_control(), {"action": "ping"}, timeout=2.0
@@ -225,9 +265,50 @@ async def _answering_runner() -> dict | None:
         return None
     except Exception as exc:
         # Anything else is a broken request, not an absent runner.
-        _die("The runner ping failed, so no runner could be ruled out — nothing was changed.", exc)
+        raise _Unverifiable("The runner ping failed, so no runner could be ruled out") from exc
     finally:
         await control_bus.close()
+
+
+async def _check_runner_owner() -> int:
+    """Report a claim that no runner answers for, before a deploy rebuilds one.
+
+    A deploy that rebuilds the runner image recreates its container, and the
+    container instance token an automatic reclaim needs does not survive that.
+    So a claim an unclean exit left behind refuses every new container, and the
+    refusal surfaces as a crash loop minutes after the build began. Checking
+    first turns that into one message naming the remedy.
+
+    A claim whose runner answers is the normal state mid-deploy: the runner
+    about to be replaced still owns the namespace. An unreachable dependency
+    reports nothing and does not block — the deploy is what brings it back up.
+    """
+    namespace = settings.state_scope.namespace
+    redis_state = RedisState()
+    try:
+        holder = await _read_runner_owner(redis_state)
+    except _Unverifiable as unverifiable:
+        print(f"Runner ownership not checked: {unverifiable}")
+        return 0
+    finally:
+        await redis_state.close()
+    if holder is None:
+        return 0
+    try:
+        runner_reply = await _answering_runner()
+    except _Unverifiable as unverifiable:
+        print(f"Runner ownership not checked: {unverifiable}")
+        return 0
+    if runner_reply is not None:
+        return 0
+    print(
+        f"The runner ownership claim for {namespace} is held by {holder}, and no runner "
+        "answers for it.\nThe next strategy-runner container will be refused until it is "
+        "cleared. Confirm no runner process for this namespace is left on any host, then:\n"
+        "    make owner-clear YES=1",
+        file=sys.stderr,
+    )
+    return 1
 
 
 async def _clear_runner_owner(*, assume_yes: bool) -> None:
@@ -262,20 +343,26 @@ async def _clear_runner_owner(*, assume_yes: bool) -> None:
                 "either: confirm yourself that no runner process for this namespace is "
                 "left on any host before continuing."
             )
-            answer = input(f"Type the namespace ({namespace}) to clear its claim: ")
+            # Off the event loop: the Redis connection opened above stays
+            # serviced while the operator reads the warning.
+            answer = await asyncio.to_thread(
+                input, f"Type the namespace ({namespace}) to clear its claim: "
+            )
             if answer.strip() != namespace:
                 print("Aborted; the claim is unchanged.")
                 raise SystemExit(1)
 
         try:
             cleared = await redis_state.release_runner(holder)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - the CLI reports the failure to the operator
             _die(f"Could not reach Redis at {settings.redis.url}.", exc)
         if not cleared:
             raise SystemExit(
                 "The claim changed while this command ran — another runner took it. "
                 "Nothing was removed."
             )
+    except _Unverifiable as unverifiable:
+        _die_unverifiable(unverifiable)
     finally:
         await redis_state.close()
 
@@ -288,6 +375,23 @@ async def _clear_runner_owner(*, assume_yes: bool) -> None:
     print("Cleared. The next runner to start will claim the namespace.")
 
 
+async def _run_demo_signal(strategy: str | None, symbol: str | None) -> int:
+    """``demo-signal``, with its failures reported the way the rest of the CLI does.
+
+    The drill is what an operator reaches for when they suspect the broker link
+    is down, so an unreachable broker NATS is its *likeliest* outcome — and it
+    must read as one line naming the address, not as a nats-py traceback.
+    ``ValueError`` is the other expected one: a mistyped ``--strategy``, a pair
+    whose ``warmup`` cannot be honoured, a payload the factory refused.
+    """
+    try:
+        return await run_demo(strategy, symbol)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from None
+    except Exception as exc:  # noqa: BLE001 - the CLI reports the failure to the operator
+        _die(f"Could not fire the demo signal at {settings.broker_nats_url}.", exc)
+
+
 async def _show_status() -> int:
     """Print one line per link; the return value is the process exit code."""
     reports = await connectivity.collect_reports()
@@ -296,7 +400,7 @@ async def _show_status() -> int:
     return connectivity.exit_code(reports)
 
 
-def _die(message: str, exc: Exception) -> None:
+def _die(message: str, exc: BaseException) -> NoReturn:
     """Fail the way a CLI should: one line of what went wrong, no traceback.
 
     An operator reaching for the kill switch needs to know which dependency is
@@ -317,9 +421,14 @@ def main() -> None:
     if args.command == "status":
         raise SystemExit(asyncio.run(_show_status()))
 
+    if args.command == "demo-signal":
+        raise SystemExit(asyncio.run(_run_demo_signal(args.strategy, args.symbol)))
+
     if args.command == "owner":
         if args.operation == "status":
             asyncio.run(_show_runner_owner())
+        elif args.operation == "check":
+            raise SystemExit(asyncio.run(_check_runner_owner()))
         else:
             asyncio.run(_clear_runner_owner(assume_yes=args.yes))
         return

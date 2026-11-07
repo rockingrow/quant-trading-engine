@@ -34,6 +34,7 @@ from qte_bot.access import IsOperator
 from qte_bot.commands import HELP
 from qte_bot.engine_client import EngineClient
 from qte_bot.pagination import page_of, pagination_keyboard
+from qte_shared import emoji_constants as em
 from qte_shared.logging_setup import get_logger
 
 log = get_logger(__name__)
@@ -81,6 +82,14 @@ async def show_runner(message: Message, engine: EngineClient) -> None:
     await message.answer(presenters.runner_status(status))
 
 
+@router.message(Command("strategies"))
+async def show_strategies(message: Message, engine: EngineClient) -> None:
+    repositories = await engine.mounted_repositories()
+    # Several messages when the mount is large; each is a complete set of boxes.
+    for body in presenters.strategy_bundles(repositories, engine.namespace):
+        await message.answer(body)
+
+
 @router.message(Command("positions"))
 async def show_positions(message: Message, engine: EngineClient) -> None:
     positions = await engine.open_positions()
@@ -112,6 +121,90 @@ async def _closed_page(engine: EngineClient, *, offset: int) -> dict[str, Any]:
         "text": presenters.closed_cycles(cycles, page, engine.namespace),
         "reply_markup": pagination_keyboard(page, lambda target: f"closed:{target}"),
     }
+
+
+@router.message(Command("mapping"))
+async def show_mapping(message: Message, engine: EngineClient) -> None:
+    mapping = await engine.strategy_mapping()
+    for body in presenters.strategy_mapping(mapping, engine.namespace):
+        await message.answer(body)
+
+
+@router.message(Command("provider"))
+async def show_providers(message: Message, engine: EngineClient) -> None:
+    for body in presenters.data_providers(engine.provider_plans(), engine.namespace):
+        await message.answer(body)
+
+
+# ── Act: the drill ────────────────────────────────────────────────────────
+
+
+def _matching_strategy(argument: str, names: list[str]) -> str | None:
+    """One mounted strategy by name, case-insensitively; ``None`` when none matches.
+
+    The drill is addressed by strategy and never by symbol, unlike the three
+    scope words elsewhere in this module: a demo fires one open cycle *per
+    strategy*, and a symbol two strategies share would fire two.
+    """
+    wanted = argument.strip()
+    return next((name for name in names if name.lower() == wanted.lower()), None)
+
+
+@router.message(Command("demo"))
+async def fire_demo(message: Message, command: CommandObject, engine: EngineClient) -> None:
+    """Fire the demo drill, and report it in the message that announced it.
+
+    The strategy names come from the mount and not from the runner, because the
+    drill loads the strategies off disk itself: a runner that is down, or still
+    holding the build it imported before the last deploy, would answer a
+    different list from the one this command can actually fire.
+    """
+    names = await engine.mounted_strategy_names()
+    argument = (command.args or "").strip()
+    if not argument:
+        await message.answer(presenters.usage("demo", names))
+        return
+
+    wanted: str | None = None
+    if argument.lower() != "all":
+        wanted = _matching_strategy(argument, names)
+        if wanted is None:
+            await message.answer(
+                f"<code>{presenters.escaped(argument)}</code> is not a strategy in the mount."
+                "\n\n" + presenters.usage("demo", names)
+            )
+            return
+
+    # Two /demo in the same second both pass this check; the lock behind
+    # fire_demo_signals still runs them one after the other, so the worst case
+    # is a second report rather than two drills driving the same strategies at
+    # once.
+    if engine.demo_running:
+        await message.answer(presenters.DEMO_RUNNING.format(namespace=engine.namespace))
+        return
+
+    target = (
+        "every mounted strategy" if wanted is None else f"<code>{presenters.escaped(wanted)}</code>"
+    )
+    log.warning("Operator %s asked for a demo signal on %s", message.from_user.id, wanted or "all")
+    announced = await message.answer(presenters.demo_started(target, engine.namespace))
+    try:
+        deliveries, failures = await engine.fire_demo_signals(wanted)
+    except Exception as failure:
+        # A drill that cannot even start is the configuration it was run to
+        # check, so the reason goes into the chat rather than only the log.
+        log.exception("The demo drill could not run")
+        await _safe_edit(
+            announced,
+            f"⚠️ The drill could not run: <code>{presenters.escaped(failure)}</code>",
+        )
+        return
+    # The first message replaces the one that announced the drill; a report
+    # too long for one message continues underneath it.
+    report = presenters.demo_result(deliveries, failures, engine.namespace, target)
+    await _safe_edit(announced, report[0])
+    for body in report[1:]:
+        await message.answer(body)
 
 
 # ── Scope parsing ─────────────────────────────────────────────────────────
@@ -185,8 +278,8 @@ def _flat_keyboard(scope: dict[str, Any]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="✅ Close them", callback_data=encoded),
-                InlineKeyboardButton(text="✖ Cancel", callback_data="flat:no"),
+                InlineKeyboardButton(text=f"{em.CONFIRM} Close them", callback_data=encoded),
+                InlineKeyboardButton(text=f"{em.CANCEL} Cancel", callback_data="flat:no"),
             ]
         ]
     )
@@ -294,7 +387,8 @@ async def _change_gate(
     )
     if gate is None:
         await message.answer(
-            "⚠️ Could not store the change in Redis, so nothing was changed — a pause that "
+            f"{em.WARNING} Could not store the change in Redis, so nothing was changed — "
+            "a pause that "
             "is not stored would be lost by the next restart."
         )
         return

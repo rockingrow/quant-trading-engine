@@ -215,6 +215,8 @@ async def test_partial_runner_startup_unwinds_resources_in_reverse_order(monkeyp
             return True
 
         shadow_mode = True
+        # Like the real sink: the process switch, read when asked.
+        force_shadow_mode = property(lambda self: settings.broker.force_shadow_mode)
 
     monkeypatch.setattr("qte_strategy_engine.runner.run_preflight_audit", lambda: None)
     runner = StrategyRunner()

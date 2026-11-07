@@ -140,3 +140,24 @@ async def test_events_and_backtests_retain_their_execution_identity(monkeypatch,
             "prod:shadow:tiingo",
             "prod:live:tiingo",
         }
+
+
+async def test_the_outbox_only_records_moves_the_transition_table_allows(monkeypatch, database):
+    select_scope(monkeypatch, execution_mode="live")
+    broker_book = SignalRepository(database)
+    delivery_id = await broker_book.stage_signal(_signal(), transport="nats", shadow=False)
+
+    # A prepared row was never sent, so it cannot be recorded as delivered.
+    assert not await broker_book.mark_delivery(delivery_id, status="sent")
+    assert await broker_book.mark_delivery(delivery_id, status="unknown")
+    assert await broker_book.mark_delivery(delivery_id, status="sent_pending")
+    assert await broker_book.mark_delivery(delivery_id, status="sent")
+    # A repeated checkpoint after a final mark whose acknowledgement was lost.
+    assert await broker_book.mark_delivery(delivery_id, status="sent_pending")
+    assert await broker_book.mark_delivery(delivery_id, status="sent")
+    # A delivered row cannot be turned into a failure afterwards.
+    assert not await broker_book.mark_delivery(delivery_id, status="failed")
+    assert (await broker_book.get_delivery(delivery_id)).delivery_status == "sent"
+
+    with pytest.raises(ValueError):
+        await broker_book.mark_delivery(delivery_id, status="delivered-ish")

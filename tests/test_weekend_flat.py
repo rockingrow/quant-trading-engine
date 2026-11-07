@@ -601,7 +601,7 @@ def emitted_signals(runner) -> list:
 
 
 async def open_a_position(runner, strategy_slot) -> None:
-    await runner._emit(
+    await runner.emit(
         strategy_slot,
         SignalIntent(action=SignalAction.LONG, price=2000.0, sl=1990.0),
         fallback_price=2000.0,
@@ -715,7 +715,7 @@ async def feed_one_bar(runner, strategy_slot, moment: datetime) -> None:
         tick_count=5,
     )
     async with strategy_slot.lock:
-        await runner._feed_candle_serialized(strategy_slot, candle)
+        await runner.feed_candle_serialized(strategy_slot, candle)
 
 
 # ── The sweep between bars ───────────────────────────────────────────────
@@ -906,3 +906,30 @@ def live_state_scope(monkeypatch):
     monkeypatch.setattr(settings, "env", "prod")
     monkeypatch.setattr(settings.state_config, "execution_mode", "live")
     monkeypatch.setattr(settings.market_data, "provider", "tiingo")
+
+
+# ── The one gate both drivers call ────────────────────────────────────
+
+
+def test_gate_entries_passes_everything_while_the_market_is_open():
+    from qte_shared.strategies.strategy_settings import gate_entries
+
+    entry = SignalIntent(action=SignalAction.LONG, price=1.0)
+    close = SignalIntent(action=SignalAction.TP1, price=1.0)
+    gate = gate_entries([entry, close], NO_WEEKEND_FLAT, datetime(2026, 5, 2, tzinfo=UTC), UTC_ZONE)
+    assert gate.allowed == [entry, close] and gate.blocked == []
+    assert gate.market_is_shut is False
+
+
+def test_gate_entries_blocks_only_entries_inside_the_window():
+    from qte_shared.strategies.strategy_settings import gate_entries
+
+    entry = SignalIntent(action=SignalAction.SHORT, price=1.0)
+    stop = SignalIntent(action=SignalAction.SL, price=1.0)
+    target = SignalIntent(action=SignalAction.TP2, price=1.0)
+    gate = gate_entries(
+        [stop, entry, target], gold_policy(), moment_at("2026-09-19 12:00"), UTC_ZONE
+    )
+    assert gate.allowed == [stop, target], "exits pass, in the order the strategy returned them"
+    assert gate.blocked == [entry]
+    assert gate.market_is_shut is True

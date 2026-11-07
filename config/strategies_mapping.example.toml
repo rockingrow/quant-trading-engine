@@ -38,6 +38,14 @@ strategies = []
 risk_percent = 3.0
 tp1_qty_percent = 50
 use_equity_sizing = false
+# Read by the engine, not the strategy: size each entry at the risk_percent the
+# strategy states on it, instead of at the risk_percent above. Off when omitted,
+# and then a strategy's own value is overruled. max_risk_percent is the ceiling.
+# Leave it unset and it equals risk_percent, so the strategy can lower its risk
+# but never raise it. QTE_ACCOUNT__MAX_RISK_PERCENT caps every pair on top of
+# this. Applies to the backtest too.
+#dynamic_risk = true
+#max_risk_percent = 4.0
 # Read by the engine, not the strategy: whether the weekend window the strategy's
 # repository declares (settings.py) is enforced. Omit it to keep the repository's
 # declared default; true on a strategy that declares no window stops the pair

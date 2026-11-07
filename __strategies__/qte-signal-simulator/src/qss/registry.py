@@ -5,6 +5,12 @@ alias → ``"module.path:ClassName"``, imported lazily. The alias is the NATS
 subject the broker's workers subscribe to (``SIGNALS.<alias>``), so publishing
 a strategy is a visible, reviewable line here and never a side effect of a file
 lying in the tree.
+
+:data:`DISABLED` is the same table for strategies kept but taken out of
+service: :func:`load_all` never includes them, :func:`load_disabled` hands the
+engine their names so it reports them as disabled rather than missing, and
+:func:`load` refuses them by name. Moving a line between the two tables is the
+whole switch.
 """
 
 from __future__ import annotations
@@ -21,10 +27,19 @@ ALIASES: dict[str, str] = {
     ),
 }
 
+#: The same shape, for strategies kept but not published. Empty: nothing here
+#: is out of service. An alias belongs to exactly one of the two tables.
+DISABLED: dict[str, str] = {}
+
 
 def aliases() -> list[str]:
     """Every alias this repo publishes, sorted."""
     return sorted(ALIASES)
+
+
+def load_disabled() -> list[str]:
+    """The aliases kept out of service, sorted. The engine calls this beside load_all."""
+    return sorted(DISABLED)
 
 
 def load(alias: str) -> type[StrategyBase]:
@@ -33,6 +48,11 @@ def load(alias: str) -> type[StrategyBase]:
         target = ALIASES[alias]
     except KeyError:
         known = ", ".join(aliases()) or "none"
+        if alias in DISABLED:
+            raise LookupError(
+                f"Strategy alias {alias!r} is disabled — listed in qss.registry.DISABLED and "
+                f"not published (registered: {known})"
+            ) from None
         raise LookupError(f"Unknown strategy alias {alias!r} (registered: {known})") from None
 
     module_path, _, class_name = target.partition(":")

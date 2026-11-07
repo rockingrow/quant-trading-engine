@@ -21,6 +21,7 @@ from qte_strategy_engine.db.models import (
     SignalAudit,
     TelegramCycleMessage,
 )
+from qte_strategy_engine.delivery_status import PREDECESSORS, UNFINISHED, DeliveryStatus
 
 log = get_logger(__name__)
 
@@ -55,7 +56,7 @@ class SignalRepository:
             namespace=self._namespace,
             row_id=delivery_id,
             transport=transport,
-            delivery_status="prepared",
+            delivery_status=DeliveryStatus.PREPARED,
             shadow=shadow,
             recovery_context=recovery_context,
         )
@@ -64,7 +65,7 @@ class SignalRepository:
                 session.add(row)
                 await session.flush()
             return str(delivery_id)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - logged, and returned as a failed write
             log.error("Could not stage signal %s %s: %s", signal.strategy, signal.symbol, exc)
             return None
 
@@ -81,17 +82,43 @@ class SignalRepository:
         status: str,
         error: str | None = None,
     ) -> bool:
-        """Record the latest outcome without deleting ambiguous outbox rows."""
+        """Record the latest outcome without deleting ambiguous outbox rows.
+
+        Only a move :data:`~qte_strategy_engine.delivery_status.PREDECESSORS`
+        allows is written: the update is conditional on the row's current
+        status, so a move the table does not list — or a row that is not there
+        — updates nothing and returns ``False``, which keeps the pair blocked
+        for reconciliation rather than recording a signal in the wrong state.
+
+        A *status* that is not a :class:`DeliveryStatus` at all is a bug in the
+        caller and raises ``ValueError`` instead of being stored.
+        """
+        target = DeliveryStatus(status)
+        allowed_before = sorted(previous.value for previous in PREDECESSORS[target])
         try:
             row_id = uuid.UUID(delivery_id)
             async with self._db.session() as session:
                 execution = await session.execute(
                     update(SignalAudit)
-                    .where(SignalAudit.id == row_id, SignalAudit.namespace == self._namespace)
-                    .values(delivery_status=status, delivery_error=error)
+                    .where(
+                        SignalAudit.id == row_id,
+                        SignalAudit.namespace == self._namespace,
+                        SignalAudit.delivery_status.in_(allowed_before),
+                    )
+                    .values(delivery_status=target.value, delivery_error=error)
                 )
-            return execution.rowcount == 1
-        except Exception as exc:
+            if execution.rowcount == 1:
+                return True
+            log.error(
+                "Outbox row %s was not marked %s: it is missing, in another namespace, "
+                "or in a status that may not move to %s (allowed from: %s)",
+                delivery_id,
+                target.value,
+                target.value,
+                ", ".join(allowed_before) or "nothing",
+            )
+            return False
+        except Exception as exc:  # noqa: BLE001 - logged, and returned as a failed write
             log.error("Could not mark signal delivery %s as %s: %s", delivery_id, status, exc)
             return False
 
@@ -99,13 +126,7 @@ class SignalRepository:
         self,
         limit: int = 100,
         *,
-        statuses: tuple[str, ...] = (
-            "prepared",
-            "pending",
-            "unknown",
-            "sent_pending",
-            "shadow_pending",
-        ),
+        statuses: tuple[str, ...] = tuple(sorted(status.value for status in UNFINISHED)),
         after_cursor: tuple[datetime, uuid.UUID] | None = None,
         include_ids: Sequence[str] = (),
     ) -> Sequence[SignalAudit]:
@@ -166,7 +187,7 @@ class SignalRepository:
                 session.add(row)
                 await session.flush()
                 return str(row.id)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - logged, and returned as a failed write
             log.error("Audit write failed for %s %s: %s", signal.strategy, signal.symbol, exc)
             return None
 
@@ -222,7 +243,7 @@ class SignalRepository:
         try:
             async with self._db.session() as session:
                 rows = (await session.execute(statement)).all()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - logged at ERROR; the read answers empty
             log.error("Could not read the timeframes of %d cycle(s): %s", len(cycle_ids), exc)
             return {}
         return {row.signal_uxid: row.timeframe for row in rows if row.timeframe}
@@ -293,7 +314,7 @@ class SignalRepository:
                     .scalars()
                     .all()
                 )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - logged at ERROR; the read answers empty
             log.error("Could not list closed cycles: %s", exc)
             return [], 0
 
@@ -392,7 +413,7 @@ class OpenPositionRepository:
             async with self._db.session() as session:
                 await session.execute(statement)
             return True
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - logged, and returned as a failed write
             log.error(
                 "Could not persist open position %s %s: %s", position.strategy, position.symbol, exc
             )
@@ -411,7 +432,7 @@ class OpenPositionRepository:
             async with self._db.session() as session:
                 await session.execute(statement)
             return True
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - logged, and returned as a failed write
             log.error("Could not clear open position %s %s: %s", strategy, symbol, exc)
             return False
 
@@ -434,7 +455,7 @@ class OpenPositionRepository:
         try:
             async with self._db.session() as session:
                 rows = (await session.execute(statement)).scalars().all()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - logged at ERROR; the read answers empty
             log.error("Could not read open positions %s %s: %s", strategy, symbol, exc)
             return []
         return [position for position in map(_as_position, rows) if position is not None]
@@ -450,7 +471,7 @@ class OpenPositionRepository:
         try:
             async with self._db.session() as session:
                 rows = (await session.execute(statement)).scalars().all()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - logged at ERROR; the read answers empty
             log.error("Could not list open positions: %s", exc)
             return []
         return [position for position in map(_as_position, rows) if position is not None]
@@ -560,7 +581,7 @@ class TelegramCycleRepository:
         try:
             async with self._db.session() as session:
                 row = (await session.execute(statement)).scalar_one_or_none()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - logged at ERROR; the read answers empty
             log.error("Could not read the Telegram cycle %s %s: %s", strategy, signal_uxid, exc)
             return None
         if row is None:
@@ -600,7 +621,7 @@ class TelegramCycleRepository:
             async with self._db.session() as session:
                 await session.execute(statement)
             return True
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - logged, and returned as a failed write
             log.error(
                 "Could not persist the Telegram cycle %s %s: %s",
                 record.strategy,

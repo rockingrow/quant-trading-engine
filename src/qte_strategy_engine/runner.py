@@ -8,6 +8,19 @@ The runner is the only component that knows this is *live*. Strategies see the
 same frame and the same context object the backtest hands them, which is what
 makes a backtested edge and a traded edge the same code path.
 
+This class is the coordinator: it owns the lifecycle, the ownership claim, the
+slots and the decision path, and hands the rest to four collaborators that share
+one :class:`~qte_strategy_engine.runner_context.RunnerContext` and reach back
+only through the :class:`~qte_strategy_engine.runner_context.RunnerHooks` it
+implements:
+
+* :class:`~qte_strategy_engine.delivery.DeliveryPipeline` — the signal outbox;
+* :class:`~qte_strategy_engine.recovery.PositionRecovery` — restore, stale flush,
+  orphan settlement;
+* :class:`~qte_strategy_engine.history_sync.HistorySync` — warm-up and catch-up;
+* :class:`~qte_strategy_engine.control_plane.ControlPlane` — ``qte-control`` and
+  the bot.
+
 Three ordering rules matter here:
 
 * **Stage, publish, then commit.** A durable outbox row is written before the
@@ -32,29 +45,34 @@ decide the same things; the periodic sweep that also flattens between bars is
 the one part with no replay counterpart, and it only fires at moments a backtest
 has no bar for.
 
+``QTE_ACCOUNT__MAX_OPEN_POSITIONS`` is the runner's other own decision, and this
+one has no replay counterpart at all: a backtest replays one strategy and the
+ceiling counts every strategy and symbol on the account together. It is off by
+default for that reason — a configured ceiling makes the traded book a subset of
+the replayed one, which is a divergence an operator chooses knowingly because
+the account enforces its own limit whatever the engine believes.
+
 Position state is written twice on purpose. The cycle a pair is holding goes to
 Redis (hot, read on every bar) *and* to Postgres (durable), and boot prefers
 Redis and falls back to the table. A re-provisioned cache would otherwise be
 indistinguishable from "flat", and the runner would mint a second cycle against
 a position the broker still has open.
 
-Restoring a cycle is the right answer for a restart and the wrong one for an
-outage. One pair holds one cycle at a time, so a row that outlived a long
-downtime locks it: every entry the strategy proposes is refused, and the
-position it is locked on was sized against a bracket the market left behind
-hours ago. So :meth:`StrategyRunner._flush_stale_positions` closes what has gone
-stale — ``R_SL``, on the ordinary delivery path — while anything younger than
-``QTE_RUNNER__STALE_POSITION_MAX_AGE`` is restored exactly as before.
+Restoring a cycle is the right answer for a restart. Age alone closes nothing:
+a strategy can be right to hold a cycle for days, so the stale flush
+(``QTE_RUNNER__FLUSH_STALE_POSITIONS``) is ``off`` unless an operator asks for
+it. What *is* closed on start is a cycle the mapping table no longer claims —
+nothing would decide on it — see :mod:`qte_strategy_engine.recovery`.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
-from collections import defaultdict, deque
-from collections.abc import Sequence
-from datetime import UTC, datetime, timedelta
+from collections import defaultdict
+from collections.abc import Mapping
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -63,162 +81,168 @@ from nats.aio.msg import Msg
 from qte_shared.bar_gate import BAR_GATE_FLAG, BarGate
 from qte_shared.bus import NatsBus, Subjects
 from qte_shared.cache import RedisState
-from qte_shared.config import settings
+from qte_shared.config import AccountSettings, settings
 from qte_shared.db import EventRepository
-from qte_shared.interfaces.market_data import ProviderError
 from qte_shared.logging_setup import get_logger
 from qte_shared.models import (
-    BrokerSignal,
     Candle,
     CandleClosedEvent,
-    OpenPosition,
-    PositionBlock,
     SignalAction,
     TickEvent,
 )
 from qte_shared.notifications import ServiceStatusNotifier, TelegramErrorNotifier
-from qte_shared.providers import get_provider_class
 from qte_shared.strategies.mapping import SymbolMapping
-from qte_shared.strategies.plugin_loader import load_strategies
+from qte_shared.strategies.plugin_loader import DISABLED_HOOK, read_strategy_directory
 from qte_shared.strategies.signal_factory import BracketPolicy, SignalFactory
-from qte_shared.strategies.signal_serialization import signal_record
 from qte_shared.strategies.sizing import PositionSizer
 from qte_shared.strategies.strategy_base import (
     SignalIntent,
     StrategyContext,
-    StrategyLike,
     as_intents,
     candles_to_frame,
     overrides_on_tick,
 )
 from qte_shared.strategies.strategy_settings import (
-    NO_WEEKEND_FLAT,
-    WeekendFlatPolicy,
     describe_warmup,
+    gate_entries,
     resolve_warmup,
     resolve_weekend_flat,
 )
 from qte_shared.timeframes import (
     CLOCK_TOLERANCE,
-    bucket_close,
     normalize_timeframe,
-    timeframe_seconds,
 )
-from qte_strategy_engine.broker_sink import BrokerSink, DeliveryResult
+from qte_strategy_engine.broker_sink import BrokerSink
+from qte_strategy_engine.control_plane import ControlPlane, RunnerIdentity
 from qte_strategy_engine.db import OpenPositionRepository, SignalRepository
+from qte_strategy_engine.delivery import DeliveryPipeline
+from qte_strategy_engine.history_sync import HistorySync
 from qte_strategy_engine.instance import container_instance_token
 from qte_strategy_engine.preflight import run_preflight_audit
-from qte_strategy_engine.settings import runner_settings
+from qte_strategy_engine.recovery import PositionRecovery
+from qte_strategy_engine.runner_context import (
+    SERVICE_NAME,
+    RunnerContext,
+    provider_is_synthetic,
+)
+from qte_strategy_engine.settings import RunnerSettings, runner_settings
+from qte_strategy_engine.slot import StrategySlot
 from qte_strategy_engine.telegram_notify import TelegramLifecycleNotifier
 
 log = get_logger(__name__)
 
-SERVICE_NAME = "strategy-runner"
 
+def _context_attribute(field_name: str) -> property:
+    """A runner attribute that reads and writes the shared :class:`RunnerContext`.
 
-class StrategySlot:
-    """One strategy bound to one symbol, with its own candle buffer and cycle."""
+    So ``runner.signals = repository`` — a test, or a driver swapping a
+    collaborator — reaches every collaborator holding the context, instead of
+    leaving them on the old one.
+    """
 
-    def __init__(
-        self,
-        strategy: StrategyLike,
-        symbol: str,
-        factory: SignalFactory,
-        weekend_flat: WeekendFlatPolicy = NO_WEEKEND_FLAT,
-        warmup: int | None = None,
-    ) -> None:
-        self.strategy = strategy
-        self.symbol = symbol
-        self.factory = factory
-        # What this pair's mapping entry asked for, if it asked for anything.
-        # Kept beside the strategy's own count rather than replacing it, so
-        # `warmup` below still reads the declaration when nothing overrode it
-        # and one strategy can run at two counts on two symbols.
-        self._warmup_override = warmup
-        # The market calendar this pair trades on, as its repository declared
-        # it. It sits on the slot rather than on the strategy because going
-        # flat before the market shuts is the engine's decision — a strategy
-        # that could read this is a strategy that could ignore it.
-        self.weekend_flat = weekend_flat
-        self.timeframe = normalize_timeframe(strategy.timeframe)
-        # Exactly the window the backtest hands the same strategy — the bound
-        # lives on the strategy contract so the two drivers cannot drift apart.
-        self.buffer: deque[Candle] = deque(maxlen=strategy.history_window())
-        self.started = False
-        # Candle and tick subscriptions are independent NATS callbacks. Keep a
-        # strategy instance and its position cycle a single-writer aggregate so
-        # both callbacks cannot decide they are flat and publish two entries.
-        self.lock = asyncio.Lock()
+    def read_attribute(runner: StrategyRunner) -> Any:
+        return getattr(runner.context, field_name)
 
-    @property
-    def key(self) -> tuple[str, str]:
-        return (self.strategy.name, self.symbol)
+    def write_attribute(runner: StrategyRunner, replacement: Any) -> None:
+        setattr(runner.context, field_name, replacement)
 
-    @property
-    def warmup(self) -> int:
-        """Bars this pair collects before it may decide — the mapping's, or the strategy's."""
-        if self._warmup_override is not None:
-            return self._warmup_override
-        return self.strategy.warmup
-
-    @property
-    def is_warm(self) -> bool:
-        return len(self.buffer) >= self.warmup
+    return property(read_attribute, write_attribute, doc=f"The shared context's ``{field_name}``.")
 
 
 class StrategyRunner:
     """Loads the plugins, subscribes, and drives them for the process lifetime."""
 
-    def __init__(self, sink: BrokerSink | None = None) -> None:
-        self.bus = NatsBus(name="qte-strategy-runner")
-        self.state = RedisState()
-        self.subjects = Subjects()
-        self.events = EventRepository()
-        self.signals = SignalRepository()
-        self.positions = OpenPositionRepository()
-        self.sink = sink or BrokerSink()
-        #: Position-lifecycle notifications. A no-op unless a bot token and at
-        #: least one chat id are configured, and never on the trade path: the
-        #: emit path only queues an update for its background worker.
-        self.telegram = TelegramLifecycleNotifier()
+    def __init__(
+        self,
+        sink: BrokerSink | None = None,
+        *,
+        account_settings: AccountSettings | None = None,
+        settings_for_runner: RunnerSettings | None = None,
+    ) -> None:
+        scope = settings.state_scope
+        #: Connections, repositories and the shared book, held by every
+        #: collaborator by reference. The properties below write through to it.
+        self.context = RunnerContext(
+            bus=NatsBus(name="qte-strategy-runner"),
+            state=RedisState(),
+            subjects=Subjects(),
+            events=EventRepository(),
+            signals=SignalRepository(),
+            positions=OpenPositionRepository(),
+            sink=sink or BrokerSink(),
+            #: Position-lifecycle notifications. A no-op unless a bot token and
+            #: at least one chat id are configured, and never on the trade path:
+            #: the emit path only queues an update for its background worker.
+            telegram=TelegramLifecycleNotifier(),
+            scope=scope,
+        )
+        #: An override for this runner alone; without one, :attr:`_account`
+        #: reads the process settings at each decision.
+        self._account_override = account_settings
+        self._settings = settings_for_runner or runner_settings
         #: ERROR logs forwarded to the same bot, de-duplicated. Also a no-op
         #: unless QTE_TELEGRAM__LOG_ERRORS_ENABLED is on.
         self.telegram_errors = TelegramErrorNotifier()
         #: The 'UP' / 'DOWN' message `make start` and `make stop` produce.
         self.status = ServiceStatusNotifier(SERVICE_NAME)
-        self._scope = settings.state_scope
         # Refuses a synthetic feed outside dev state before anything connects.
-        for provider_name in self._scope.providers:
-            self._scope.origin(
-                provider=provider_name, synthetic=self._provider_is_synthetic(provider_name)
-            )
+        for provider_name in scope.providers:
+            scope.origin(provider=provider_name, synthetic=provider_is_synthetic(provider_name))
         #: The zone every slot's weekend window is read in. One value for the
         #: process, resolved once — the backtest reads the same setting.
         self._market_zone = settings.engine.market_zone
         self._configured_shadow_mode = self.sink.shadow_mode
-        self._history_started_at = datetime.now(UTC)
         #: Set only for a container's PID 1, whose stale claim is provably dead.
         self._instance_token = (
-            container_instance_token(runner_settings.instance_file)
-            if runner_settings.reclaim_own_claim
+            container_instance_token(self._settings.instance_file)
+            if self._settings.reclaim_own_claim
             else None
         )
         self._owner_id = (
             f"{self._instance_token}:{uuid4()}" if self._instance_token else str(uuid4())
         )
         self._ownership_acquired = False
-        self.slots: list[StrategySlot] = []
         self._by_subject: dict[tuple[str, str], list[StrategySlot]] = defaultdict(list)
-        self._stopping = asyncio.Event()
         self._tasks: list[asyncio.Task[Any]] = []
-        self._uncertain_pairs: set[tuple[str, str]] = set()
-        self._unconfirmed_staging: set[tuple[str, str]] = set()
-        self._pending_results: dict[str, DeliveryResult] = {}
-        #: Which pairs may not be decided on. Read from Redis, so a restart
-        #: during a pause comes back paused.
-        self._bar_gate = BarGate()
+        #: Entries past the account ceiling but not yet in any slot's book.
+        #: See :meth:`emit`; without it two pairs closing a bar on the same
+        #: boundary would each read the book before the other had grown.
+        self._entries_in_flight = 0
         self._started_at = datetime.now(UTC)
         self._cleaned = False
+
+        # The collaborators. Each depends on the context and on the narrow
+        # RunnerHooks protocol this class implements, never on the runner.
+        self.delivery = DeliveryPipeline(self.context, self, settings=self._settings)
+        self.recovery = PositionRecovery(self.context, self, self.delivery, settings=self._settings)
+        self.history = HistorySync(self.context, self, settings=self._settings)
+        self.control = ControlPlane(
+            self.context,
+            self,
+            self.delivery,
+            self.recovery,
+            RunnerIdentity(owner_id=self._owner_id, started_at=self._started_at),
+        )
+
+    @property
+    def _account(self) -> AccountSettings:
+        """The account settings, read at each decision rather than held."""
+        return self._account_override or settings.account
+
+    # ── The shared context, as attributes ─────────────────────────────
+
+    bus = _context_attribute("bus")
+    state = _context_attribute("state")
+    subjects = _context_attribute("subjects")
+    events = _context_attribute("events")
+    signals = _context_attribute("signals")
+    positions = _context_attribute("positions")
+    sink = _context_attribute("sink")
+    telegram = _context_attribute("telegram")
+    slots = _context_attribute("slots")
+    _scope = _context_attribute("scope")
+    _bar_gate = _context_attribute("bar_gate")
+    _stopping = _context_attribute("stopping")
 
     # ── Startup ───────────────────────────────────────────────────────
 
@@ -229,7 +253,7 @@ class StrategyRunner:
         # we are about to reject. Off by configuration is the same call.
         run_preflight_audit()
         self._cleaned = False
-        self._history_started_at = datetime.now(UTC)
+        self.context.history_started_at = datetime.now(UTC)
 
         try:
             # First of all, so everything below is covered: a refused ownership
@@ -239,8 +263,8 @@ class StrategyRunner:
             await self.bus.connect()
             await self.state.connect()
             await self._acquire_ownership()
-            await self._refresh_shadow_mode()
-            await self._refresh_bar_gate()
+            await self.refresh_shadow_mode()
+            await self.refresh_bar_gate()
             await self.sink.start()
             await self.telegram.start()
 
@@ -248,17 +272,20 @@ class StrategyRunner:
             if not self.slots:
                 raise RuntimeError(
                     f"No strategies loaded from {settings.engine.strategies_dir}. Clone your "
-                    "private strategy repo into __strategies__/ (see README, phase 6)."
+                    "private strategy repo into __strategies__/ (see docs/strategies.md)."
                 )
 
             self._validate_tick_publication()
             await self._restore_state()
-            await self._recover_pending_deliveries()
+            await self.delivery.recover_pending_deliveries()
             # After recovery, so the outbox has reconciled every ambiguous
             # delivery and the book is what it says it is. Before the
             # subscriptions below, so no live close races the flush and no
             # strategy is ever asked to decide a bar against a stale position.
-            await self._flush_stale_positions()
+            await self.recovery.flush_stale_positions()
+            # Independent of the flush above and of its mode: one closes what is
+            # merely old, this closes what the mapping table no longer claims.
+            await self.recovery.settle_orphan_positions()
             # Every slot is held while the subscriptions go live and the missed
             # closes are replayed. A close that arrives meanwhile waits for the
             # replay, then finds its bar already fed and is ignored, so no bar is
@@ -267,14 +294,14 @@ class StrategyRunner:
                 for strategy_slot in self.slots:
                     await held_slots.enter_async_context(strategy_slot.lock)
                 await self._subscribe()
-                await self._catch_up()
+                await self.history.catch_up()
             self._tasks.append(
-                asyncio.create_task(self._delivery_retry_loop(), name="signal-outbox-retry")
+                asyncio.create_task(self.delivery.retry_loop(), name="signal-outbox-retry")
             )
             self._tasks.append(
-                asyncio.create_task(self._history_sync_loop(), name="runner-history-sync")
+                asyncio.create_task(self.history.run_loop(), name="runner-history-sync")
             )
-            if runner_settings.weekend_flat_sweep_interval > 0 and any(
+            if self._settings.weekend_flat_sweep_interval > 0 and any(
                 strategy_slot.weekend_flat.enabled for strategy_slot in self.slots
             ):
                 self._tasks.append(
@@ -362,7 +389,7 @@ class StrategyRunner:
             "is disabled."
         )
 
-    async def _refresh_shadow_mode(self) -> None:
+    async def refresh_shadow_mode(self) -> None:
         """Read the durable control before recovery and every new delivery.
 
         Missing state uses the configured default. Invalid/unreadable state
@@ -377,17 +404,17 @@ class StrategyRunner:
             raise
         effective_mode = (
             self._scope.is_paper
-            or settings.broker.force_shadow_mode
+            or self.sink.force_shadow_mode
             or (self._configured_shadow_mode if stored_mode is None else stored_mode)
         )
         if self.sink.shadow_mode != effective_mode:
             self.sink.set_shadow_mode(effective_mode)
 
-    async def _live_delivery_paused(self) -> bool:
-        await self._refresh_shadow_mode()
+    async def live_delivery_paused(self) -> bool:
+        await self.refresh_shadow_mode()
         return not self._scope.is_paper and self.sink.shadow_mode
 
-    async def _check_ownership(self) -> None:
+    async def check_ownership(self) -> None:
         """Refuse all decisions and effects after shutdown or ownership loss."""
         try:
             owns_state = self._ownership_acquired and await self.state.owns_runner(self._owner_id)
@@ -406,11 +433,20 @@ class StrategyRunner:
         happened before the table existed — see :mod:`qte_shared.strategies.mapping`.
         """
         mapping = SymbolMapping.load(settings.engine.mapping_file)
-        discovered = load_strategies(settings.engine.strategies_dir)
+        directory = read_strategy_directory(settings.engine.strategies_dir)
+        discovered = directory.loaded
+        # Read from the pairings rather than from the file, so a symbol carrying
+        # `enabled = false` is already absent: the parser drops those, and a
+        # disabled symbol is exactly a pair the operator retired.
+        self.context.declared_pairs = (
+            {(pairing.strategy, pairing.symbol.upper()) for pairing in mapping.pairings}
+            if mapping
+            else None
+        )
         if mapping:
             loaded_names = [entry.name for entry in discovered]
-            self._warn_on_unmapped(mapping, loaded_names)
-            self._warn_on_unused_strategy_defaults(mapping, loaded_names)
+            self._warn_on_unmapped(mapping, loaded_names, directory.disabled)
+            self._warn_on_unused_strategy_defaults(mapping, loaded_names, directory.disabled)
 
         for entry in discovered:
             defaults = mapping.defaults_for(entry.name)
@@ -464,12 +500,12 @@ class StrategyRunner:
                     bracket=BracketPolicy(),
                     inputs=strategy.params,
                     sizer=sizer,
-                    default_quantity=runner_settings.default_quantity,
+                    default_quantity=self._settings.default_quantity,
                 )
                 slot = StrategySlot(
                     strategy, symbol, factory, weekend_flat=weekend_flat, warmup=warmup
                 )
-                self._warn_if_history_exceeds_redis(slot)
+                self.history.warn_if_history_exceeds_redis(slot)
                 self.slots.append(slot)
                 self._by_subject[(symbol, slot.timeframe)].append(slot)
                 log.info(
@@ -486,70 +522,72 @@ class StrategyRunner:
                 )
 
     @staticmethod
-    def _warn_on_unmapped(mapping: SymbolMapping, loaded: list[str]) -> None:
+    def _warn_on_unmapped(
+        mapping: SymbolMapping, loaded: list[str], disabled: Mapping[str, Path]
+    ) -> None:
         """Say so when the table names a strategy the loader never found.
 
         Almost always a typo or a stale name after a rename, and the symptom
         without this line is a symbol that quietly trades nothing — which reads
         exactly like a strategy that found no setups.
+
+        A strategy its repository disabled is still an error here — the table
+        and the repository disagree about whether it trades — but it is named
+        as such, because the fix is a deliberate edit to one of the two rather
+        than a hunt for the misspelling.
         """
         unknown = [name for name in mapping.strategies if name not in set(loaded)]
-        if unknown:
+        switched_off = sorted(name for name in unknown if name in disabled)
+        missing = sorted(name for name in unknown if name not in disabled)
+        if switched_off:
+            log.error(
+                "Mapping table %s names %s, which %s keeps disabled (%s). Those symbols will "
+                "not run it: remove it from the table, or move it back into that "
+                "repository's ALIASES.",
+                mapping.source,
+                ", ".join(switched_off),
+                ", ".join(sorted({str(disabled[name]) for name in switched_off})),
+                DISABLED_HOOK,
+            )
+        if missing:
             log.error(
                 "Mapping table %s names %s, which %s did not publish. Those symbols will "
                 "trade nothing. Available: %s",
                 mapping.source,
-                ", ".join(sorted(unknown)),
+                ", ".join(missing),
                 settings.engine.strategies_dir,
                 ", ".join(sorted(loaded)) or "none",
             )
 
     @staticmethod
-    def _warn_on_unused_strategy_defaults(mapping: SymbolMapping, loaded: list[str]) -> None:
+    def _warn_on_unused_strategy_defaults(
+        mapping: SymbolMapping, loaded: list[str], disabled: Mapping[str, Path]
+    ) -> None:
         """Say so when ``[strategies.<name>]`` names a strategy nobody publishes.
 
         Unlike an unmapped pairing this trades nothing wrong — the defaults are
         simply never read — but a typo here means an intended ``risk_percent``
-        override silently does not apply, so it is worth a line.
+        override silently does not apply, so it is worth a line. One for a
+        strategy its repository disabled waits, unread, for it to come back.
         """
         unknown = [name for name in mapping.strategy_defaults if name not in set(loaded)]
-        if unknown:
+        switched_off = sorted(name for name in unknown if name in disabled)
+        missing = sorted(name for name in unknown if name not in disabled)
+        if switched_off:
+            log.warning(
+                "Mapping table %s has [strategies.*] defaults for %s, which its repository "
+                "keeps disabled (%s) — they apply to nothing until it is back in ALIASES.",
+                mapping.source,
+                ", ".join(switched_off),
+                DISABLED_HOOK,
+            )
+        if missing:
             log.warning(
                 "Mapping table %s has [strategies.*] defaults for %s, which %s did not "
                 "publish — those defaults will not apply anywhere.",
                 mapping.source,
-                ", ".join(sorted(unknown)),
+                ", ".join(missing),
                 settings.engine.strategies_dir,
-            )
-
-    @staticmethod
-    def _warn_if_history_exceeds_redis(slot: StrategySlot) -> None:
-        """Say so when live can never give the strategy its backtest window.
-
-        The backtest reads the whole parquet file, so it can always satisfy the
-        window. A restarted runner refills from Redis, which keeps only
-        ``QTE_REDIS__CANDLE_HISTORY`` bars — ask for more than that and the two
-        drivers feed the same strategy different amounts of history, silently.
-        """
-        wanted = slot.strategy.history_window()
-        retained = settings.redis.candle_history
-        if wanted is None:
-            log.warning(
-                "Strategy %s sets max_history=0 (unbounded). Live it will see at most "
-                "%d candles — whatever Redis retained — while a backtest sees the whole "
-                "file. Set an explicit max_history to make the two agree.",
-                slot.strategy.name,
-                retained,
-            )
-        elif wanted > retained:
-            log.warning(
-                "Strategy %s wants %d candles but Redis retains %d. After a restart it "
-                "will run on a shorter window than it was backtested on; raise "
-                "QTE_REDIS__CANDLE_HISTORY to at least %d.",
-                slot.strategy.name,
-                wanted,
-                retained,
-                wanted,
             )
 
     async def _restore_state(self) -> None:
@@ -557,17 +595,17 @@ class StrategyRunner:
 
         A slot that has been fed before takes only the bars up to the newest one
         it was fed. Anything Redis holds beyond that closed while this runner was
-        not listening, and :meth:`_catch_up` feeds it as a close rather than
+        not listening, and :meth:`HistorySync.catch_up` feeds it as a close rather than
         leaving it in the window as history nobody decided on.
         """
-        allow_future = self._provider_is_synthetic()
+        allow_future = provider_is_synthetic()
         for strategy_slot in self.slots:
-            candles = await self._stored_history(strategy_slot, allow_future=allow_future)
-            decided = await self._decided_open_time(strategy_slot, allow_future=allow_future)
+            candles = await self.history.stored_history(strategy_slot, allow_future=allow_future)
+            decided = await self.history.decided_open_time(strategy_slot, allow_future=allow_future)
             if decided is not None:
                 candles = [candle for candle in candles if candle.open_time <= decided]
             strategy_slot.buffer.extend(candles)
-            await self._restore_position(strategy_slot)
+            await self.recovery.restore_position(strategy_slot)
             log.info(
                 "Warm-up %s/%s %s: %d/%d candles from Redis",
                 strategy_slot.strategy.name,
@@ -577,402 +615,10 @@ class StrategyRunner:
                 strategy_slot.warmup,
             )
 
-    async def _stored_history(
-        self, strategy_slot: StrategySlot, *, allow_future: bool
-    ) -> list[Candle]:
-        """The slot's window as Redis holds it, cleaned of what cannot be history."""
-        stored = await self.state.get_candles(
-            strategy_slot.symbol, strategy_slot.timeframe, strategy_slot.buffer.maxlen or 0
-        )
-        trusted = [candle for candle in stored if self._scope.accepts(candle.origin)]
-        return _clean_history(trusted, strategy_slot, allow_future=allow_future)
-
-    async def _decided_open_time(
-        self, strategy_slot: StrategySlot, *, allow_future: bool
-    ) -> datetime | None:
-        """The newest bar this slot was fed, or where to draw that line instead.
-
-        A mark dated after now was written while a synthetic feed ran ahead of
-        the clock, and because every live feed rewrites it, it also means no bar
-        of the current feed has been fed since. Taken at face value it would file
-        every close this runner missed as already decided. So the line is drawn
-        at ``QTE_RUNNER__CATCH_UP_MAX_AGE`` instead: older bars warm the window,
-        newer ones are caught up.
-        """
-        decided = await self.state.get_decided_open_time(
-            strategy_slot.strategy.name, strategy_slot.symbol, strategy_slot.timeframe
-        )
-        moment = datetime.now(UTC)
-        if decided is None or allow_future or decided <= moment + CLOCK_TOLERANCE:
-            return decided
-        oldest_catch_up_close = moment - timedelta(seconds=runner_settings.catch_up_max_age)
-        log.warning(
-            "Ignoring the decided-bar mark %s of %s/%s %s: it is dated after now, so a feed "
-            "running ahead of the clock wrote it. Bars that closed before %s warm the window "
-            "and later ones are caught up.",
-            decided.isoformat(),
-            strategy_slot.strategy.name,
-            strategy_slot.symbol,
-            strategy_slot.timeframe,
-            oldest_catch_up_close.isoformat(),
-        )
-        return oldest_catch_up_close - timedelta(seconds=timeframe_seconds(strategy_slot.timeframe))
-
-    async def _catch_up(self) -> None:
-        """Feed every close Redis holds that this runner was not listening for.
-
-        Called with every slot lock held and the subscriptions already live. A
-        bar that closed within ``QTE_RUNNER__CATCH_UP_MAX_AGE`` is fed like a
-        live close, strategy decision included. An older one joins the window as
-        history only: deciding on it now would send an entry at a price the
-        strategy never saw, which is not the trade a backtest would record.
-        """
-        for strategy_slot in self.slots:
-            await self._sync_history(strategy_slot)
-
-    async def _sync_history(
-        self, strategy_slot: StrategySlot, *, before_open: datetime | None = None
-    ) -> None:
-        """Merge cached history and replay unseen closes with the slot lock held.
-
-        Redis is authoritative about which buckets traded. We never invent
-        candles across a session break. A live event bounds the read so no
-        later cached bar can overtake it or leak into its indicator window.
-        """
-        await self._check_ownership()
-        allow_future = self._provider_is_synthetic()
-        stored = await self._stored_history(strategy_slot, allow_future=allow_future)
-        if before_open is not None:
-            stored = [candle for candle in stored if candle.open_time < before_open]
-        newest_fed = strategy_slot.buffer[-1].open_time if strategy_slot.buffer else None
-        if newest_fed is None:
-            newest_fed = await self._decided_open_time(strategy_slot, allow_future=allow_future)
-            if newest_fed is None:
-                # Initial history may arrive after start() returned. Warm it
-                # without manufacturing past decisions. A close produced after
-                # this process started is still a live event even when its
-                # first NATS notification was lost.
-                for candle in stored:
-                    if (
-                        bucket_close(candle.open_time, strategy_slot.timeframe)
-                        <= self._history_started_at
-                    ):
-                        strategy_slot.buffer.append(candle)
-                    else:
-                        await self._feed_if_current(strategy_slot, candle)
-                return
-        historical = {candle.open_time: candle for candle in strategy_slot.buffer}
-        historical.update(
-            (candle.open_time, candle) for candle in stored if candle.open_time <= newest_fed
-        )
-        strategy_slot.buffer.clear()
-        strategy_slot.buffer.extend(historical[moment] for moment in sorted(historical))
-        for candle in stored:
-            if candle.open_time > newest_fed:
-                await self._feed_if_current(strategy_slot, candle)
-
-    async def _feed_if_current(self, strategy_slot: StrategySlot, candle: Candle) -> None:
-        closed_ago = datetime.now(UTC) - bucket_close(candle.open_time, strategy_slot.timeframe)
-        if closed_ago <= timedelta(seconds=runner_settings.catch_up_max_age):
-            await self._feed_candle_serialized(strategy_slot, candle)
-        else:
-            await self._check_ownership()
-            strategy_slot.buffer.append(candle)
-            await self._record_decided(strategy_slot, candle)
-            log.warning(
-                "Skipped the decision on missed close of %s/%s at %s: older than "
-                "QTE_RUNNER__CATCH_UP_MAX_AGE; retained as history",
-                strategy_slot.strategy.name,
-                strategy_slot.symbol,
-                candle.open_time,
-            )
-
-    async def _history_sync_loop(self) -> None:
-        """Repair lost messages and late backfills without waiting for another tick."""
-        while not self._stopping.is_set():
-            await asyncio.sleep(runner_settings.history_sync_interval)
-            try:
-                await self._refresh_shadow_mode()
-                for strategy_slot in self.slots:
-                    async with strategy_slot.lock:
-                        await self._sync_history(strategy_slot)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.exception("History synchronization failed; retrying at the next interval")
-
-    async def _record_decided(self, strategy_slot: StrategySlot, candle: Candle) -> None:
-        """Remember *candle* as the newest bar this slot was fed. Never raises.
-
-        A lost write can let a restart within ``QTE_RUNNER__CATCH_UP_MAX_AGE``
-        feed the same bar again. That is the lesser failure next to letting a
-        Redis error cost the strategy the decision it is about to make.
-        """
-        try:
-            await self.state.set_decided_open_time(
-                strategy_slot.strategy.name,
-                strategy_slot.symbol,
-                strategy_slot.timeframe,
-                candle.open_time,
-            )
-        except Exception:
-            log.exception(
-                "Could not record the decided bar %s for %s/%s %s",
-                candle.open_time.isoformat(),
-                strategy_slot.strategy.name,
-                strategy_slot.symbol,
-                strategy_slot.timeframe,
-            )
-
-    @staticmethod
-    def _provider_is_synthetic(provider_name: str | None = None) -> bool:
-        """Whether *provider_name* invents its prices, as the dev simulator does.
-
-        Without a name: whether any configured provider does. A synthetic one
-        never shares a state scope with another (:class:`StateScope`), so that is
-        the answer for the whole feed.
-        """
-        names = (provider_name,) if provider_name else settings.market_data.providers
-        try:
-            return any(get_provider_class(name).synthetic for name in names)
-        except (ProviderError, ImportError):
-            return False
-
-    async def _restore_position(self, slot: StrategySlot) -> None:
-        """Reload every cycle this slot holds — Redis first, Postgres behind it.
-
-        The fallback is the point. Redis coming up empty is ambiguous: it means
-        "flat" and it means "someone re-provisioned the cache", and acting on
-        the wrong reading opens a second cycle against a position the broker is
-        still carrying. The table settles it, and re-seeds the cache so the
-        next boot is a cache hit again.
-        """
-        strategy, symbol = slot.strategy.name, slot.symbol
-        positions = await self.state.get_open_positions_for(strategy, symbol)
-        source = "redis"
-        if not positions:
-            positions = await self.positions.list_for(strategy, symbol)
-            source = "postgres"
-            for position in positions:
-                if position.state_namespace != self._scope.namespace:
-                    raise ValueError("Stored position has missing or foreign state provenance")
-                await self.state.set_open_position(position)
-
-        for position in positions:
-            if position.state_namespace != self._scope.namespace:
-                raise ValueError(
-                    "Cannot restore a position with missing or foreign state provenance"
-                )
-            slot.factory.restore_position(position, symbol=symbol)
-            log.info(
-                "Restored open cycle from %s strategy=%s symbol=%s uxid=%s qty=%s remaining=%s",
-                source,
-                strategy,
-                symbol,
-                position.signal_uxid,
-                position.quantity,
-                position.remaining,
-            )
-
     # ── Stale positions ───────────────────────────────────────────────
 
-    async def _flush_stale_positions(self) -> None:
-        """Close what an outage left open, so nothing is left unmanaged.
-
-        A pair stacks as many cycles as its strategy opens, so rows that
-        survived a long downtime are not a lock on new entries any more. They
-        are still positions whose brackets the market left behind hours ago,
-        with nothing deciding on them and their size counted against the
-        account on every later sizing. Each stale cycle is closed on its own.
-
-        Age is what separates that from an ordinary restart. A deploy comes back
-        inside ``QTE_RUNNER__STALE_POSITION_MAX_AGE`` and keeps its positions,
-        which is what the Redis/Postgres recovery path is for; anything older is
-        closed with ``R_SL``, a terminal action, so the cycle ends and the pair
-        is free. Zero makes every open position stale.
-
-        ``warn`` reports and sends nothing, which is how to see what a first
-        ``close`` run would do before letting it do it.
-        """
-        mode = runner_settings.flush_stale_positions
-        # What locks a pair is the cycle `_restore_position` put on its slot,
-        # and that came from Redis in preference to Postgres. Deciding from the
-        # table instead would miss a cycle Redis holds and Postgres does not —
-        # `_persist_position` writes Redis first and `upsert` swallows its own
-        # failure, so the two can disagree, and the pair would come back locked
-        # on a position this never looked at.
-        locked_pairs = [
-            (strategy_slot, position)
-            for strategy_slot in self.slots
-            for position in strategy_slot.factory.positions_for(strategy_slot.symbol)
-        ]
-        # The table is still read, for the two things the slots cannot show:
-        # rows belonging to no running strategy, and duplicate cycle ids across
-        # the whole namespace. Best-effort — `list_open` reports its own
-        # failures and answers with an empty list.
-        listed = await self.positions.list_open()
-        # Whatever the mode: a duplicated cycle id is a correctness problem
-        # rather than a staleness one, and "off" must not hide it. Checked over
-        # both sources so an unreadable table cannot make this pass on no data.
-        self._verify_position_uxids(self.slots, listed)
-        if mode == "off":
-            return
-        self._report_orphan_positions(listed)
-
-        max_age = runner_settings.stale_position_max_age
-        moment = datetime.now(UTC)
-        for strategy_slot, position in locked_pairs:
-            if strategy_slot.key in self._uncertain_pairs:
-                log.warning(
-                    "Not flushing %s %s: its delivery is still unreconciled. The outbox "
-                    "settles first; the next start will flush it if it is still stale.",
-                    position.strategy,
-                    position.symbol,
-                )
-                continue
-
-            age = (moment - _as_aware(position.updated_at)).total_seconds()
-            if age < max_age:
-                log.info(
-                    "Keeping open cycle %s on %s %s: %.0fs old, inside the %.0fs window",
-                    position.signal_uxid,
-                    strategy_slot.strategy.name,
-                    strategy_slot.symbol,
-                    age,
-                    max_age,
-                )
-                continue
-
-            log.warning(
-                "Stale open cycle %s on %s %s: %.0fs since its last transition, over the "
-                "%.0fs window — %s",
-                position.signal_uxid,
-                strategy_slot.strategy.name,
-                strategy_slot.symbol,
-                age,
-                max_age,
-                "closing it with R_SL" if mode == "close" else "would close it with R_SL",
-            )
-            if mode == "close":
-                await self._close_stale_position(strategy_slot, position)
-
-    def _report_orphan_positions(self, listed: list[OpenPosition]) -> None:
-        """Name every table row belonging to a strategy this runner is not driving.
-
-        Reported and not closed: :class:`OpenPosition` records no timeframe and
-        the broker payload requires one, so the engine cannot build a truthful
-        signal for a strategy it is not running. An error rather than a note,
-        because nobody else will ever close these either — the strategy was
-        unmapped or removed while it still held a position.
-        """
-        driven = {strategy_slot.key for strategy_slot in self.slots}
-        for position in listed:
-            if (position.strategy, position.symbol) in driven:
-                continue
-            log.error(
-                "Open position %s %s uxid=%s belongs to no running strategy — this "
-                "runner cannot close it. Map the strategy again and restart, or "
-                "reconcile the position with the broker and delete the row.",
-                position.strategy,
-                position.symbol,
-                position.signal_uxid,
-            )
-
-    async def _close_stale_position(
-        self, strategy_slot: StrategySlot, position: OpenPosition
-    ) -> None:
-        """Send the ``R_SL`` that ends one stale cycle.
-
-        ``R_SL`` rather than ``FLAT``: both are terminal, but ``FLAT`` is the
-        broker's "close everything on this strategy" and this closes exactly one
-        cycle, named by the uxid the factory carries. Only the action and a price
-        are set — :meth:`SignalFactory._size_close` fills the quantity from what
-        is left of the position, and ``_carry_entry_context`` restates the rest,
-        so the payload says the same things a strategy's own exit would.
-
-        Emitted through :meth:`_emit`, so it is staged in the durable outbox,
-        delivered and audited like any other exit and inherits every guard there
-        — ownership, shadow mode, the uncertain-pair block.
-        """
-        price = self._last_known_price(strategy_slot, position)
-        async with strategy_slot.lock:
-            await self._emit(
-                strategy_slot,
-                SignalIntent(
-                    action=SignalAction.R_SL,
-                    symbol=strategy_slot.symbol,
-                    price=price,
-                    reason="STALE_POSITION_FLUSH",
-                    signal_uxid=position.signal_uxid,
-                ),
-                price,
-                datetime.now(UTC),
-            )
-
-    @staticmethod
-    def _last_known_price(strategy_slot: StrategySlot, position: OpenPosition) -> float | None:
-        """The freshest price this pair has, for the audit trail.
-
-        The broker closes at market, so this number is what an operator reads
-        back later rather than what the trade fills at. Redis history is
-        preferred because it is the most recent thing the engine saw; after a
-        long outage the cache may hold nothing current, and the entry price is
-        then the only honest answer available.
-
-        ``None`` when there is neither — a cycle restored from a bare uxid, in a
-        cache that came back empty. The broker's schema leaves a close's price
-        optional for exactly this, and an absent price says "unknown" where a
-        zero would have said the trade closed at nothing.
-        """
-        if strategy_slot.buffer:
-            return strategy_slot.buffer[-1].close
-        return position.price
-
-    @staticmethod
-    def _verify_position_uxids(
-        *sources: Sequence[OpenPosition] | Sequence[StrategySlot],
-    ) -> None:
-        """Refuse to trade a book where two pairs claim one cycle id.
-
-        The broker groups a whole trade by ``signal_uxid``, so a close on either
-        pair would close the other's position and the audit trail would show
-        nothing wrong. ``uq_open_positions_uxid`` makes this impossible to
-        write; this catches rows that predate the constraint, or were put there
-        by hand, and it raises rather than warning because every entry and exit
-        on either pair is unsafe until an operator says which is real.
-
-        Every source is read because each one alone can be blind. The restored
-        slots are the live book and always available; the table adds the pairs
-        this runner is not driving, and it answers with an empty list when it
-        could not be read at all — so checking only the table would let a
-        transient database error pass this on no data.
-        """
-        holders: dict[str, set[str]] = defaultdict(set)
-        for source in sources:
-            for entry in source:
-                held = (
-                    entry.factory.positions_for(entry.symbol)
-                    if isinstance(entry, StrategySlot)
-                    else [entry]
-                )
-                for position in held:
-                    holders[position.signal_uxid].add(f"{position.strategy}/{position.symbol}")
-
-        duplicated = {uxid: pairs for uxid, pairs in holders.items() if len(pairs) > 1}
-        if not duplicated:
-            return
-        described = "; ".join(
-            f"{uxid} held by {', '.join(sorted(pairs))}"
-            for uxid, pairs in sorted(duplicated.items())
-        )
-        raise RuntimeError(
-            "Open positions share a trade-cycle id, so a close on one would close the "
-            f"other at the broker: {described}. Reconcile with the broker, delete the row "
-            "that is not real, and start again."
-        )
-
     def _wants_ticks(self) -> bool:
-        return runner_settings.subscribe_ticks or any(
+        return self._settings.subscribe_ticks or any(
             overrides_on_tick(strategy_slot.strategy) for strategy_slot in self.slots
         )
 
@@ -989,7 +635,7 @@ class StrategyRunner:
             await self.bus.subscribe(
                 self.subjects.candle_closed(symbol, timeframe),
                 self._on_candle_message,
-                queue=runner_settings.queue_group,
+                queue=self._settings.queue_group,
             )
         await self.bus.subscribe(self.subjects.engine_control(), self._on_control_message)
 
@@ -1014,13 +660,13 @@ class StrategyRunner:
         async with slot.lock:
             if slot.buffer and candle.open_time <= slot.buffer[-1].open_time:
                 return
-            await self._sync_history(slot, before_open=candle.open_time)
-            await self._feed_if_current(slot, candle)
+            await self.history.sync_history(slot, before_open=candle.open_time)
+            await self.history.feed_if_current(slot, candle)
 
-    async def _feed_candle_serialized(self, slot: StrategySlot, candle: Candle) -> None:
+    async def feed_candle_serialized(self, slot: StrategySlot, candle: Candle) -> None:
         if not self._scope.accepts(candle.origin):
             return
-        await self._check_ownership()
+        await self.check_ownership()
         if slot.buffer and candle.open_time <= slot.buffer[-1].open_time:
             # A redelivery or a duplicate close. Acting on it twice would open a
             # second position on a signal the strategy already made once.
@@ -1035,7 +681,7 @@ class StrategyRunner:
         # Recorded before the strategy runs, not after it: a crash in between
         # costs this one decision, where recording afterwards would let the next
         # start's catch-up decide the same bar a second time.
-        await self._record_decided(slot, candle)
+        await self.history.record_decided(slot, candle)
 
         if not slot.is_warm:
             log.debug(
@@ -1053,7 +699,7 @@ class StrategyRunner:
         if await self._bar_is_gated(slot):
             return
 
-        if slot.key in self._uncertain_pairs or await self._live_delivery_paused():
+        if slot.key in self.delivery.uncertain_pairs or await self.live_delivery_paused():
             return
 
         context = self._strategy_context(slot, candle.open_time)
@@ -1078,27 +724,28 @@ class StrategyRunner:
             )
             return
 
-        market_is_shut = slot.weekend_flat.covers(context.now, self._market_zone)
-        for intent in as_intents(result):
-            if market_is_shut and intent.action.is_entry:
-                # The market this pair trades shuts before the next bar the
-                # strategy could manage this position on. Dropped here rather
-                # than in the strategy: the gate belongs to the calendar, and
-                # without it the FLAT below and the next entry would take turns
-                # every bar until the close.
-                log.info(
-                    "Blocked %s for %s %s at %s: inside the weekend-flat window %s (%s)",
-                    intent.action.value,
-                    slot.strategy.name,
-                    slot.symbol,
-                    context.now,
-                    slot.weekend_flat.describe(),
-                    self._market_zone.key,
-                )
-                continue
-            await self._emit(slot, intent, candle.close, context.now)
+        # The market this pair trades shuts before the next bar the strategy
+        # could manage a position on, so its entries are dropped here rather
+        # than in the strategy: the gate belongs to the calendar, and without
+        # it the FLAT below and the next entry would take turns every bar until
+        # the close. The replay calls the same function.
+        entry_gate = gate_entries(
+            as_intents(result), slot.weekend_flat, context.now, self._market_zone
+        )
+        for blocked in entry_gate.blocked:
+            log.info(
+                "Blocked %s for %s %s at %s: inside the weekend-flat window %s (%s)",
+                blocked.action.value,
+                slot.strategy.name,
+                slot.symbol,
+                context.now,
+                slot.weekend_flat.describe(),
+                self._market_zone.key,
+            )
+        for intent in entry_gate.allowed:
+            await self.emit(slot, intent, candle.close, context.now)
 
-        if market_is_shut:
+        if entry_gate.market_is_shut:
             # After the strategy's own exits, not before them: a bar that hit
             # the stop stopped out, and the flat is what is left over.
             await self._flatten_for_the_weekend(slot, candle.close, context.now)
@@ -1110,7 +757,7 @@ class StrategyRunner:
         hour — cheap enough to buy the property that matters: a ``/prevent``
         takes effect on the next bar even if the NATS broadcast was missed.
         """
-        await self._refresh_bar_gate()
+        await self.refresh_bar_gate()
         if not self._bar_gate.blocks(symbol=slot.symbol, strategy=slot.strategy.name):
             return False
         log.info(
@@ -1122,11 +769,11 @@ class StrategyRunner:
         )
         return True
 
-    async def _refresh_bar_gate(self) -> None:
+    async def refresh_bar_gate(self) -> None:
         """Re-read the stored gate. A Redis failure keeps the last known one."""
         try:
             stored = await self.state.get_flag(BAR_GATE_FLAG, None)
-        except Exception:
+        except Exception:  # noqa: BLE001 - an unreadable gate keeps the last one
             log.warning("Could not read the bar gate; keeping %s", self._bar_gate.describe())
             return
         self._bar_gate = BarGate.from_payload(stored)
@@ -1159,9 +806,9 @@ class StrategyRunner:
                 slot.weekend_flat.describe(),
                 self._market_zone.key,
             )
-            await self._flatten_cycle(slot, uxid, price, moment, reason="WEEKEND_FLAT")
+            await self.flatten_cycle(slot, uxid, price, moment, reason="WEEKEND_FLAT")
 
-    async def _flatten_cycle(
+    async def flatten_cycle(
         self, slot: StrategySlot, uxid: str, price: float, moment: datetime, *, reason: str
     ) -> None:
         """Close one open cycle with a ``FLAT``, whatever asked for it.
@@ -1176,7 +823,7 @@ class StrategyRunner:
         callers safe to run on every bar, from the sweep and from an operator's
         ``/flat``.
         """
-        await self._emit(
+        await self.emit(
             slot,
             SignalIntent(
                 action=SignalAction.FLAT,
@@ -1192,7 +839,7 @@ class StrategyRunner:
     async def _weekend_flat_loop(self) -> None:
         """Flatten a shut market even when no candle closes to prompt it.
 
-        The bar-driven path in :meth:`_feed_candle_serialized` is the one the
+        The bar-driven path in :meth:`feed_candle_serialized` is the one the
         backtest also takes, so the two drivers decide alike on every bar. It is
         not enough on its own: a feed that stalls at 16:50 on a Friday delivers
         no further close, and the position rides through the weekend. This loop
@@ -1203,7 +850,7 @@ class StrategyRunner:
         only the bar-driven path.
         """
         while not self._stopping.is_set():
-            await asyncio.sleep(runner_settings.weekend_flat_sweep_interval)
+            await asyncio.sleep(self._settings.weekend_flat_sweep_interval)
             for strategy_slot in self.slots:
                 if not strategy_slot.weekend_flat.enabled or not strategy_slot.buffer:
                     continue
@@ -1234,12 +881,16 @@ class StrategyRunner:
         moment = datetime.now(UTC)
         if not strategy_slot.weekend_flat.covers(moment, self._market_zone):
             return
-        if strategy_slot.key in self._uncertain_pairs:
+        if strategy_slot.key in self.delivery.uncertain_pairs:
             return
-        await self._check_ownership()
-        if await self._live_delivery_paused():
+        await self.check_ownership()
+        if await self.live_delivery_paused():
             return
         await self._flatten_for_the_weekend(strategy_slot, strategy_slot.buffer[-1].close, moment)
+
+    async def _on_control_message(self, msg: Msg) -> None:
+        """The control subject's handler; :class:`ControlPlane` answers it."""
+        await self.control.dispatch(msg)
 
     async def _on_tick_message(self, msg: Msg) -> None:
         event = TickEvent.model_validate_json(msg.data)
@@ -1252,11 +903,22 @@ class StrategyRunner:
             return
         price = event.tick.price
         for slot in self.slots:
-            if slot.symbol != event.symbol or not slot.started or slot.key in self._uncertain_pairs:
+            if (
+                slot.symbol != event.symbol
+                or not slot.started
+                or slot.key in self.delivery.uncertain_pairs
+            ):
+                continue
+            if self._bar_gate.blocks(symbol=slot.symbol, strategy=slot.strategy.name):
+                # `/prevent` pauses the pair, not only its closed bars: a
+                # tick-driven strategy must not go on trading behind it. The
+                # gate held in memory is read, refreshed on every bar and on
+                # the control broadcast — a Redis GET per tick would cost more
+                # than everything else this handler does.
                 continue
             async with slot.lock:
-                await self._check_ownership()
-                if await self._live_delivery_paused():
+                await self.check_ownership()
+                if await self.live_delivery_paused():
                     continue
                 context = self._strategy_context(slot, event.tick.ts)
                 try:
@@ -1269,629 +931,123 @@ class StrategyRunner:
                 # The same calendar gate the candle path applies. A tick-driven
                 # entry into a market that is shutting is the same mistake, and
                 # exits still pass so a position can always be got out of.
-                market_is_shut = slot.weekend_flat.covers(event.tick.ts, self._market_zone)
-                for intent in as_intents(result):
-                    if market_is_shut and intent.action.is_entry:
-                        log.info(
-                            "Blocked tick %s for %s %s: inside the weekend-flat window %s",
-                            intent.action.value,
-                            slot.strategy.name,
-                            slot.symbol,
-                            slot.weekend_flat.describe(),
-                        )
-                        continue
-                    await self._emit(slot, intent, price, event.tick.ts)
-
-    async def _on_control_message(self, msg: Msg) -> None:
-        """Control plane: the shadow-mode switch, the bar gate, status, FLAT.
-
-        Request/reply over NATS rather than an HTTP endpoint, because this
-        repository has no control-plane service to hang one on and does not
-        want one -- see :mod:`qte_strategy_engine.control`. The Telegram bot
-        and ``qte-control`` are both clients of exactly these actions.
-        """
-        try:
-            command = json.loads(msg.data)
-        except json.JSONDecodeError:
-            log.warning("Unparseable control message: %.120r", msg.data)
-            return
-
-        action = command.get("action")
-        if action == "set_shadow_mode":
-            # The CLI already persisted the command. Re-read it instead of
-            # allowing an older, delayed broadcast to overwrite a newer mode.
-            await self._refresh_shadow_mode()
-            await self.events.record_event(
-                service=SERVICE_NAME,
-                event="shadow_mode_changed",
-                level="WARNING",
-                payload={"enabled": self.sink.shadow_mode},
-            )
-        elif action == "set_bar_gate":
-            # Same contract as shadow mode: the caller stored it, and this only
-            # makes the running process pick it up without waiting for a bar.
-            await self._refresh_bar_gate()
-            log.warning("Bar gate changed - now blocking %s", self._bar_gate.describe())
-            await self.events.record_event(
-                service=SERVICE_NAME,
-                event="bar_gate_changed",
-                level="WARNING",
-                payload=self._bar_gate.to_payload(),
-            )
-            await self._reply(msg, {"gate": self._bar_gate.to_payload()})
-        elif action == "ping":
-            await self._reply(msg, self._ping_payload())
-        elif action == "status":
-            await self._reply(msg, await self._status_payload())
-        elif action == "flat":
-            await self._reply(msg, await self._flat_on_request(command.get("scope") or {}))
-        else:
-            log.warning("Unknown control action: %r", action)
-
-    async def _reply(self, msg: Msg, payload: dict[str, Any]) -> None:
-        """Answer a request, if it was one. A broadcast has no reply subject."""
-        if msg.reply:
-            await self.bus.nc.publish(msg.reply, _encode(payload))
-
-    def _ping_payload(self) -> dict[str, Any]:
-        return {
-            "service": SERVICE_NAME,
-            "owner_id": self._owner_id,
-            "slots": len(self.slots),
-            "namespace": self._scope.namespace,
-            "execution_mode": self._scope.execution_mode,
-            "delivery_paused": not self._scope.is_paper and self.sink.shadow_mode,
-            "shadow_mode": self.sink.shadow_mode,
-            "ready": all(slot.is_warm for slot in self.slots) and not self._uncertain_pairs,
-        }
-
-    async def _status_payload(self) -> dict[str, Any]:
-        """Every slot, and whether it could decide on the next bar.
-
-        Answered from memory, which is the point of asking the *running*
-        process: how full a window is, and whether a pair is blocked by an
-        unreconciled delivery, are not things Redis or Postgres can be queried
-        for.
-        """
-        await self._refresh_shadow_mode()
-        await self._refresh_bar_gate()
-        delivery_paused = not self._scope.is_paper and self.sink.shadow_mode
-        strategies = []
-        for slot in self.slots:
-            gated = self._bar_gate.blocks(symbol=slot.symbol, strategy=slot.strategy.name)
-            uncertain = slot.key in self._uncertain_pairs
-            strategies.append(
-                {
-                    "strategy": slot.strategy.name,
-                    "symbol": slot.symbol,
-                    "timeframe": slot.timeframe,
-                    "bars": len(slot.buffer),
-                    "warmup": slot.warmup,
-                    "warm": slot.is_warm,
-                    "newest_bar": slot.buffer[-1].open_time.isoformat() if slot.buffer else None,
-                    "open_cycles": list(slot.factory.open_cycles(slot.symbol)),
-                    "gated": gated,
-                    "uncertain": uncertain,
-                    # What the chat actually asks: can this pair produce a
-                    # signal on its next closed bar, or is something holding it?
-                    "ready": slot.is_warm and not gated and not uncertain and not delivery_paused,
-                }
-            )
-        return {
-            **self._ping_payload(),
-            "started_at": self._started_at.isoformat(),
-            "gate": self._bar_gate.to_payload(),
-            "transport": self.sink.transport,
-            "strategies": strategies,
-        }
-
-    async def _flat_on_request(self, scope: dict[str, Any]) -> dict[str, Any]:
-        """Close every open cycle the scope names, through the ordinary path.
-
-        The scope is the one the bot offers: everything, one symbol, or one
-        strategy. A pair already flat contributes nothing, and a refusal is
-        reported per pair rather than failing the whole request -- an operator
-        asking for everything wants whatever can be closed to be closed, and to
-        be told plainly about the rest.
-
-        The book this walks is the whole stored book, not only the pairs this
-        runner drives. A row whose strategy was unmapped or removed while it
-        still held a position has no slot, and skipping it silently is what made
-        ``/flat`` report "nothing was open" while ``/positions`` kept listing it
-        and the broker never heard anything. Those rows are closed by
-        :meth:`_flatten_orphan_cycle` instead.
-        """
-        everything = bool(scope.get("everything"))
-        symbol = (scope.get("symbol") or "").upper() or None
-        strategy = scope.get("strategy") or None
-        if not (everything or symbol or strategy):
-            return {"error": "the scope must name everything, a symbol or a strategy"}
-
-        closed: list[dict[str, str]] = []
-        refused: list[dict[str, str]] = []
-        moment = datetime.now(UTC)
-        for slot in self.slots:
-            if not everything and slot.symbol != symbol and slot.strategy.name != strategy:
-                continue
-            if not slot.factory.open_cycles(slot.symbol):
-                continue
-            refusal = _flat_refusal(slot, self._uncertain_pairs, self.sink.shadow_mode, self._scope)
-            if refusal is not None:
-                refused.append(
-                    {"strategy": slot.strategy.name, "symbol": slot.symbol, "reason": refusal}
+                entry_gate = gate_entries(
+                    as_intents(result), slot.weekend_flat, event.tick.ts, self._market_zone
                 )
-                continue
-            price = slot.buffer[-1].close
-            async with slot.lock:
-                for uxid in list(slot.factory.open_cycles(slot.symbol)):
-                    log.warning(
-                        "Operator FLAT: closing %s on %s uxid=%s",
+                for blocked in entry_gate.blocked:
+                    log.info(
+                        "Blocked tick %s for %s %s: inside the weekend-flat window %s",
+                        blocked.action.value,
                         slot.strategy.name,
                         slot.symbol,
-                        uxid,
+                        slot.weekend_flat.describe(),
                     )
-                    await self._flatten_cycle(slot, uxid, price, moment, reason="MANUAL_FLAT")
-                    record = {
-                        "strategy": slot.strategy.name,
-                        "symbol": slot.symbol,
-                        "signal_uxid": uxid,
-                    }
-                    if uxid in slot.factory.open_cycles(slot.symbol):
-                        refused.append({**record, "reason": "the close was not delivered"})
-                    else:
-                        closed.append(record)
-
-        for position in await self._orphan_positions(everything, symbol, strategy):
-            record = {
-                "strategy": position.strategy,
-                "symbol": position.symbol,
-                "signal_uxid": position.signal_uxid,
-            }
-            refusal = await self._flatten_orphan_cycle(position, moment)
-            if refusal is None:
-                closed.append(record)
-            else:
-                refused.append({**record, "reason": refusal})
-        return {"closed": closed, "refused": refused}
-
-    async def _orphan_positions(
-        self, everything: bool, symbol: str | None, strategy: str | None
-    ) -> list[OpenPosition]:
-        """Stored cycles inside the scope that no running slot can close.
-
-        Read from Postgres rather than from the factories because that is the
-        whole point: these are exactly the rows no factory knows about. The
-        pairs this runner does drive are left to the loop above, which goes
-        through the strategy's own factory and keeps the backtest and the live
-        loop deciding alike.
-        """
-        driven = {slot.key for slot in self.slots}
-        orphans: list[OpenPosition] = []
-        for position in await self.positions.list_open():
-            if (position.strategy, position.symbol.upper()) in driven:
-                continue
-            if (
-                not everything
-                and position.symbol.upper() != symbol
-                and position.strategy != strategy
-            ):
-                continue
-            orphans.append(position)
-        return orphans
-
-    async def _flatten_orphan_cycle(self, position: OpenPosition, moment: datetime) -> str | None:
-        """Send the ``FLAT`` that ends a cycle this runner drives no strategy for.
-
-        Built here rather than by a :class:`SignalFactory` because there is no
-        factory for an unmapped strategy, and minting one would need the
-        mapping entry that is precisely what is gone. Everything else is the
-        ordinary path: staged in the durable outbox, sent through the one sink,
-        marked in the outbox, and only then reconciled locally.
-
-        ``timeframe`` comes from the signals that opened the cycle — the broker
-        payload requires one and :class:`OpenPosition` carries none. Without it
-        no truthful payload exists, so the row is refused with that said rather
-        than closed with a guess.
-
-        Local state is dropped only on a confirmed ``sent`` whose outbox
-        checkpoint also landed. A failed or ambiguous delivery, or a checkpoint
-        that could not be written, leaves the row in place: the broker may
-        still be carrying the trade, and a book that forgot it is worse than
-        one that still shows it.
-
-        Every failure is returned as a refusal reason rather than raised. One
-        malformed row must not abort the reply: the operator would lose the
-        report of every cycle the slots already closed, and could not tell
-        which half of a ``/flat`` took effect.
-
-        Returns the refusal reason, or ``None`` when the cycle is closed.
-        """
-        if position.state_namespace not in (None, self._scope.namespace):
-            return "the stored position belongs to another state namespace"
-        if not self._scope.is_paper and self.sink.shadow_mode:
-            return "live delivery is paused (shadow mode)"
-        timeframes = await self.signals.cycle_timeframes([position.signal_uxid])
-        timeframe = timeframes.get(position.signal_uxid)
-        if not timeframe:
-            return "no signal records the timeframe this cycle trades, so no payload can be built"
-
-        try:
-            signal = BrokerSignal(
-                strategy=position.strategy,
-                symbol=position.symbol,
-                timeframe=timeframe,
-                timestamp=moment,
-                signal_uxid=position.signal_uxid,
-                position=PositionBlock(
-                    action=SignalAction.FLAT,
-                    price=position.price,
-                    # Passed through as stored. ``or None`` here would read a
-                    # remaining size of zero as "size unknown", which is a
-                    # different thing to tell the broker and the audit trail.
-                    quantity=position.remaining,
-                ),
-            )
-            signal.validate_shape()
-        except ValueError as invalid:
-            # Both models validate on construction and pydantic's
-            # ``ValidationError`` is a ``ValueError``, so a malformed uxid or a
-            # non-finite price arrives here. Refused, never raised: see above.
-            log.error(
-                "Cannot build the FLAT for %s %s uxid=%s: %s",
-                position.strategy,
-                position.symbol,
-                position.signal_uxid,
-                invalid,
-            )
-            return "the stored position cannot be expressed as a broker payload"
-        log.warning(
-            "Operator FLAT on an unmapped strategy: closing %s on %s uxid=%s",
-            position.strategy,
-            position.symbol,
-            position.signal_uxid,
-        )
-        delivery_id = await self.signals.stage_signal(
-            signal, transport=self.sink.transport, shadow=self._scope.is_paper
-        )
-        if delivery_id is None:
-            return "the close could not be staged in the outbox, so it was not sent"
-        outcome = await self._send_staged_signal(signal, delivery_id, shadow=self._scope.is_paper)
-        if outcome is None:
-            return "the close was not delivered"
-        self.telegram.note_signal(
-            signal,
-            delivery_id=delivery_id,
-            delivery_status=outcome.status,
-            transport=outcome.transport,
-            detail=outcome.detail or None,
-        )
-        # Checkpointed before the local writes and only then finalised, the
-        # same order `_finish_delivery` keeps. A checkpoint that cannot be
-        # written is a refusal: clearing the book against an outbox row still
-        # reading `prepared` would leave the position forgotten here and the
-        # row unresolvable, since no slot drives the pair the retry loop would
-        # need to reconcile it.
-        checkpointed = True
-        if outcome.status in {"sent", "shadow"}:
-            checkpointed = await self.signals.mark_delivery(
-                delivery_id, status=f"{outcome.status}_pending"
-            )
-        finalized = await self.signals.mark_delivery(
-            delivery_id, status=outcome.status, error=outcome.detail or None
-        )
-        if outcome.status not in {"sent", "shadow"}:
-            log.error(
-                "FLAT for unmapped %s %s uxid=%s came back %s — the stored position is kept "
-                "until the broker confirms",
-                position.strategy,
-                position.symbol,
-                position.signal_uxid,
-                outcome.status,
-            )
-            return f"the broker did not confirm the close ({outcome.status})"
-        if not (checkpointed and finalized):
-            log.error(
-                "FLAT for unmapped %s %s uxid=%s was %s but its outbox row could not be "
-                "marked — the stored position is kept for reconciliation",
-                position.strategy,
-                position.symbol,
-                position.signal_uxid,
-                outcome.status,
-            )
-            return "the broker took the close but the outbox could not record it"
-        await self.state.clear_open_position(
-            position.strategy, position.symbol, position.signal_uxid
-        )
-        if not await self.positions.clear(position.strategy, position.symbol, position.signal_uxid):
-            return "the broker took the close but the stored position could not be cleared"
-        return None
+                for intent in entry_gate.allowed:
+                    await self.emit(slot, intent, price, event.tick.ts)
 
     # ── Emission ──────────────────────────────────────────────────────
 
-    async def _emit(
+    async def emit(
         self,
         slot: StrategySlot,
         intent: SignalIntent,
         fallback_price: float | None,
         moment: datetime,
     ) -> None:
-        await self._check_ownership()
-        await self._refresh_shadow_mode()
-        if not self._scope.is_paper and self.sink.shadow_mode:
-            return
-        if slot.key in self._uncertain_pairs:
-            log.error(
-                "Dropped intent for uncertain delivery strategy=%s symbol=%s; "
-                "the durable outbox must reconcile first",
-                slot.strategy.name,
-                slot.symbol,
-            )
-            return
-        if intent.price is None:
-            intent.price = fallback_price
+        """Deliver one intent, holding a slot against the account ceiling.
 
-        # Size is not filled in here: `build()` risk-sizes the entry against
-        # the account and rescales the strategy's closes to match, so the
-        # backtest and this loop put the same number on the wire.
-        try:
-            signal = slot.factory.build(
-                intent,
-                symbol=slot.symbol,
-                moment=moment,
-                commit=False,
-            )
-        except ValueError as exc:
-            log.warning("Dropped intent from %s: %s", slot.strategy.name, exc)
-            return
+        Entries only. A close is never held up by a full book: a position that
+        cannot be got out of is a worse failure than one more than the account
+        wanted, and every close here is closing something the book already has.
 
-        original_shadow = self.sink.shadow_mode
-        delivery_id = await self.signals.stage_signal(
-            signal,
-            transport=self.sink.transport,
-            shadow=original_shadow,
-            recovery_context=slot.factory.pending_delivery_context(slot.symbol),
+        The reservation is what makes the ceiling hold. Two pairs whose bars
+        close on the same boundary are two tasks inside this method at once,
+        and neither one's entry reaches a book until several awaits later —
+        both would read the same count and both would open. Counting the
+        entries in flight closes that window, and ``finally`` gives the slot
+        straight back to an intent the factory refused or a delivery that never
+        landed. A committed entry is briefly counted twice, in its book and in
+        flight, which errs towards refusing rather than overfilling.
+
+        Ownership is checked here once for every intent, entry or close — the
+        pipeline does not repeat it, and keeps only the two checks that sit
+        right against the broker boundary.
+        """
+        # Before the ceiling, not after it: `check_ownership` is the kill
+        # switch, and a refusal is itself an effect — it writes an audit row. A
+        # runner that has lost its claim must find that out here rather than go
+        # quiet behind a full book.
+        await self.check_ownership()
+        if intent.action.is_entry:
+            if await self._account_is_full(slot, intent):
+                return
+            self._entries_in_flight += 1
+            try:
+                await self.delivery.emit_intent(slot, intent, fallback_price, moment)
+            finally:
+                self._entries_in_flight -= 1
+            return
+        await self.delivery.emit_intent(slot, intent, fallback_price, moment)
+
+    async def _account_is_full(self, slot: StrategySlot, intent: SignalIntent) -> bool:
+        """Whether one more position would exceed what the account will hold.
+
+        ``QTE_ACCOUNT__MAX_OPEN_POSITIONS`` is the engine's copy of a limit the
+        broker account enforces across every strategy and symbol *together* —
+        the worker that places the orders counts them all as one budget. Zero,
+        the default, means the engine was never told the number and does not
+        invent one.
+
+        It is a ceiling on the account and not on a pair. A per-pair cap would
+        not help: the pairs in a mapping each stay inside their own book and
+        overrun the account between them.
+
+        The count is this process's own book, summed over every slot in memory
+        — the same source :meth:`PositionRecovery.flush_stale_positions` treats as
+        authoritative, and no database round trip on the trade path. So it
+        counts what *this engine* opened, not what the account holds: a
+        position placed by hand, or an entry the worker refused for some other
+        reason, is invisible here. This keeps the engine inside its own budget;
+        it does not prove the two books equal. Only execution feedback could,
+        and the engine deliberately does not subscribe to it — see
+        ``docs/broker-contract.md``.
+
+        Refused out loud, deliberately. The per-pair cap that used to live
+        upstream of here skipped its bar in silence, which made a book that had
+        quietly stopped trading unreadable in the logs.
+        """
+        ceiling = self._account.max_open_positions
+        if ceiling <= 0:
+            return False
+        held = (
+            sum(len(other.factory.open_cycles(other.symbol)) for other in self.slots)
+            + self._entries_in_flight
         )
-        if delivery_id is None:
-            # The insert may have committed before its connection failed.
-            # Do not create a second command until a successful outbox scan
-            # proves whether this pair has an unfinished row.
-            self._uncertain_pairs.add(slot.key)
-            self._unconfirmed_staging.add(slot.key)
-            slot.factory.discard_pending_delivery_context(slot.symbol)
-            log.error(
-                "Signal not sent because its outbox row could not be persisted "
-                "strategy=%s symbol=%s uxid=%s",
-                slot.strategy.name,
-                slot.symbol,
-                signal.signal_uxid,
-            )
-            return
-
-        self._uncertain_pairs.add(slot.key)
-        result = await self._send_staged_signal(signal, delivery_id, shadow=original_shadow)
-        if result is None:
-            return
-        if await self._finish_delivery(slot, signal, delivery_id, result):
-            self._uncertain_pairs.discard(slot.key)
-
-        await self.bus.publish(
-            self.subjects.signal_emitted(),
-            {
-                "signal": signal_record(signal),
-                "delivery": {
-                    "id": delivery_id,
-                    "status": result.status,
-                    "transport": result.transport,
-                },
-                "reason": intent.reason,
-                "emitted_at": datetime.now(UTC).isoformat(),
+        if held < ceiling:
+            return False
+        log.warning(
+            "Refused %s for %s %s: the account already holds %d position(s) against a "
+            "ceiling of %d (QTE_ACCOUNT__MAX_OPEN_POSITIONS), counted across every "
+            "strategy and symbol together",
+            intent.action.value,
+            slot.strategy.name,
+            slot.symbol,
+            held,
+            ceiling,
+        )
+        await self.events.record_event(
+            service=SERVICE_NAME,
+            event="entry_refused_account_full",
+            level="WARNING",
+            payload={
+                "strategy": slot.strategy.name,
+                "symbol": slot.symbol,
+                "action": intent.action.value,
+                "open_positions": held,
+                "ceiling": ceiling,
             },
         )
-
-    async def _send_staged_signal(
-        self, signal: BrokerSignal, delivery_id: str, *, shadow: bool
-    ) -> DeliveryResult | None:
-        """Record uncertainty before crossing the broker boundary."""
-        await self._check_ownership()
-        await self._refresh_shadow_mode()
-        if shadow != self._scope.is_paper:
-            raise ValueError("Outbox execution mode does not match the state namespace")
-        if shadow:
-            return DeliveryResult(status="shadow", transport=self.sink.transport)
-        if self.sink.shadow_mode:
-            log.error(
-                "Cannot recover live delivery id=%s while shadow mode is enabled", delivery_id
-            )
-            return None
-        if not await self.signals.mark_delivery(delivery_id, status="unknown"):
-            return None
-        await self._check_ownership()
-        await self._refresh_shadow_mode()
-        if self.sink.shadow_mode:
-            return None
-        try:
-            return await self.sink.send(signal, delivery_id=delivery_id)
-        except Exception:
-            log.exception("Broker call raised after staging delivery id=%s", delivery_id)
-            return DeliveryResult(status="unknown", transport=self.sink.transport)
-
-    async def _finish_delivery(
-        self,
-        strategy_slot: StrategySlot,
-        signal: BrokerSignal,
-        delivery_id: str,
-        outcome: DeliveryResult,
-    ) -> bool:
-        """Checkpoint broker acceptance separately from local state persistence.
-
-        A known result stays in memory if its checkpoint fails. After a crash,
-        the pre-send unknown marker prevents blind resends outside a configured
-        deduplication horizon. Accepted checkpoints only retry local writes.
-
-        Also where the chat is told about the action, for both callers at once:
-        the emit path and the outbox recovery both land here with the same
-        delivery id, so a send that was first reported as ambiguous and later
-        confirmed updates its own line in the message instead of appending a
-        second one. Queuing only, so Telegram is never in front of the next bar.
-        """
-        self.telegram.note_signal(
-            signal,
-            delivery_id=delivery_id,
-            delivery_status=outcome.status,
-            transport=outcome.transport,
-            detail=outcome.detail or None,
-        )
-        if outcome.status != "unknown":
-            self._pending_results[delivery_id] = outcome
-        try:
-            if outcome.status in {"sent", "shadow"}:
-                if not await self.signals.mark_delivery(
-                    delivery_id, status=f"{outcome.status}_pending"
-                ):
-                    return False
-                strategy_slot.factory.commit(signal, delivery_id=delivery_id)
-                if not await self._track_cycle(strategy_slot, signal.signal_uxid):
-                    return False
-            finalized = await self.signals.mark_delivery(
-                delivery_id, status=outcome.status, error=outcome.detail or None
-            )
-            if not finalized or outcome.status == "unknown":
-                return False
-        except Exception:
-            log.exception("Could not reconcile delivery id=%s; pair remains blocked", delivery_id)
-            return False
-        self._pending_results.pop(delivery_id, None)
-        strategy_slot.factory.discard_pending_delivery_context(strategy_slot.symbol)
         return True
-
-    async def _recover_pending_deliveries(self) -> None:
-        """Reconcile every unfinished phase without starving rows beyond page one."""
-        await self._check_ownership()
-        await self._refresh_shadow_mode()
-        active_slots = {strategy_slot.key: strategy_slot for strategy_slot in self.slots}
-        blocked_pairs: set[tuple[str, str]] = set()
-        resolved_pairs: set[tuple[str, str]] = set()
-        after_cursor = None
-        while True:
-            pending_rows = await self.signals.pending_deliveries(
-                after_cursor=after_cursor, include_ids=tuple(self._pending_results)
-            )
-            if not pending_rows:
-                break
-            after_cursor = (pending_rows[-1].created_at, pending_rows[-1].id)
-            for pending_row in pending_rows:
-                pairing = (pending_row.strategy, pending_row.symbol.upper())
-                self._uncertain_pairs.add(pairing)
-                strategy_slot = active_slots.get(pairing)
-                if strategy_slot is None or pairing in blocked_pairs:
-                    blocked_pairs.add(pairing)
-                    continue
-                try:
-                    async with strategy_slot.lock:
-                        resolved = await self._recover_delivery(strategy_slot, pending_row)
-                except Exception:
-                    log.exception("Could not recover delivery id=%s", pending_row.id)
-                    resolved = False
-                if resolved:
-                    resolved_pairs.add(pairing)
-                else:
-                    blocked_pairs.add(pairing)
-        # Do not unblock between rows: an older unresolved row blocks every
-        # later row of its pair, including those on another page.
-        self._uncertain_pairs.difference_update(
-            (resolved_pairs | self._unconfirmed_staging) - blocked_pairs
-        )
-        self._unconfirmed_staging.clear()
-
-    async def _recover_delivery(self, strategy_slot: StrategySlot, pending_row: Any) -> bool:
-        await self._check_ownership()
-        delivery_id = str(pending_row.id)
-        # A scan may see a prepared row while its original sender still holds
-        # this lock. Never resend that stale snapshot after the sender finishes.
-        pending_row = await self.signals.get_delivery(delivery_id)
-        if pending_row is None:
-            raise ValueError("Outbox row disappeared during recovery")
-        if (
-            pending_row.namespace != self._scope.namespace
-            or pending_row.shadow != self._scope.is_paper
-        ):
-            raise ValueError("Outbox record belongs to another state namespace or execution mode")
-        if pending_row.delivery_status in {"shadow", "shadow_pending"} and not self._scope.is_paper:
-            raise ValueError("Paper delivery cannot become a live position")
-        if pending_row.delivery_status in {"sent", "sent_pending"} and self._scope.is_paper:
-            raise ValueError("Broker delivery cannot become a paper position")
-        if pending_row.delivery_status in {"sent", "shadow", "failed"}:
-            if delivery_id not in self._pending_results:
-                return True
-        signal = BrokerSignal.model_validate(pending_row.payload["payload"])
-        if (signal.strategy, signal.symbol.upper()) != strategy_slot.key:
-            raise ValueError("Outbox payload does not match its stored strategy and symbol")
-        strategy_slot.factory.restore_pending_delivery_context(
-            strategy_slot.symbol, self.signals.recovery_context(pending_row)
-        )
-        outcome = self._pending_results.get(delivery_id)
-        if outcome is None and pending_row.delivery_status in {"sent_pending", "shadow_pending"}:
-            outcome = DeliveryResult(
-                status=pending_row.delivery_status.removesuffix("_pending"),
-                transport=pending_row.transport,
-            )
-        if outcome is None:
-            if pending_row.transport != self.sink.transport:
-                log.error("Transport changed for unfinished delivery id=%s", delivery_id)
-                return False
-            if not pending_row.shadow and pending_row.delivery_status != "prepared":
-                elapsed = (datetime.now(UTC) - pending_row.created_at).total_seconds()
-                retry_horizon = runner_settings.delivery_retry_max_age
-                if retry_horizon <= 0 or not 0 <= elapsed < retry_horizon:
-                    log.error(
-                        "Delivery id=%s requires broker reconciliation: outside the configured "
-                        "deduplication horizon; no automatic resend",
-                        delivery_id,
-                    )
-                    return False
-            was_ambiguous = pending_row.delivery_status in {"pending", "unknown"}
-            outcome = await self._send_staged_signal(signal, delivery_id, shadow=pending_row.shadow)
-            if outcome is not None and outcome.status == "failed" and was_ambiguous:
-                # Rejecting a retry does not disprove acceptance of the first
-                # ambiguous attempt. Keep the pair blocked for reconciliation.
-                outcome = DeliveryResult(
-                    status="unknown", transport=outcome.transport, detail=outcome.detail
-                )
-        if outcome is None:
-            return False
-        return await self._finish_delivery(strategy_slot, signal, delivery_id, outcome)
-
-    async def _delivery_retry_loop(self) -> None:
-        """Continuously reconcile ambiguous sends without requiring a restart."""
-        while not self._stopping.is_set():
-            await asyncio.sleep(runner_settings.delivery_retry_interval)
-            try:
-                await self._recover_pending_deliveries()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.exception("Signal outbox retry failed — retrying at the next interval")
-
-    async def _track_cycle(self, slot: StrategySlot, signal_uxid: str) -> bool:
-        """Mirror one of the slot's cycles into Redis and Postgres, or clear both.
-
-        Written from what the factory now believes rather than from the action
-        that was just sent, so the "a TP1 taking the whole entry ends the
-        cycle" rule is decided once — in :class:`OpenPosition` — instead of
-        being restated by everything that persists a transition.
-        """
-        position = slot.factory.open_position(slot.symbol, signal_uxid)
-        if position is None:
-            await self.state.clear_open_position(slot.strategy.name, slot.symbol, signal_uxid)
-            return await self.positions.clear(slot.strategy.name, slot.symbol, signal_uxid)
-        return await self._persist_position(position)
-
-    async def _persist_position(self, position: OpenPosition) -> bool:
-        if position.state_namespace not in (None, self._scope.namespace):
-            raise ValueError("Cannot persist a position from another state namespace")
-        position.state_namespace = self._scope.namespace
-        await self.state.set_open_position(position)
-        return await self.positions.upsert(position)
 
     # ── Shutdown ──────────────────────────────────────────────────────
 
@@ -1958,6 +1114,26 @@ class StrategyRunner:
             except Exception:
                 cleanup_failed = True
                 log.exception("Could not release runner ownership")
+        elif self._ownership_acquired:
+            # Retaining the claim is the decision above, but it was silent: the
+            # next start reports only that a claim is held, and by then this
+            # container — and the cleanup failure that explains it — is gone
+            # with its logs. Name it here, and record it where it outlives the
+            # container.
+            log.warning(
+                "Retaining the runner ownership claim because shutdown cleanup failed "
+                "owner_id=%s namespace=%s — the next container is refused until "
+                "`qte-control owner clear` removes it",
+                self._owner_id,
+                self._scope.namespace,
+            )
+            with contextlib.suppress(Exception):
+                await self.events.record_event(
+                    service=SERVICE_NAME,
+                    event="ownership_retained",
+                    level="WARNING",
+                    payload={"owner_id": self._owner_id, "namespace": self._scope.namespace},
+                )
         try:
             await self.state.close()
         except Exception:
@@ -1967,86 +1143,4 @@ class StrategyRunner:
         log.info("Runner stopped")
 
 
-def _clean_history(
-    candles: list[Candle], strategy_slot: StrategySlot, *, allow_future: bool
-) -> list[Candle]:
-    """Redis history as a window: one bar per open time, and none from the future.
-
-    A duplicate open time is what an earlier backfill left behind when it stored
-    a bucket still forming and ingestion later closed the same bucket. The later
-    entry is the live close, so it wins. A bar whose bucket has not ended cannot
-    be market history either -- unless the configured feed is the simulator,
-    which anchors its bars ahead of the clock on purpose.
-    """
-    by_open_time: dict[datetime, Candle] = {}
-    for candle in candles:
-        by_open_time[candle.open_time] = candle
-    ordered = [by_open_time[open_time] for open_time in sorted(by_open_time)]
-    duplicate_count = len(candles) - len(ordered)
-    if duplicate_count:
-        log.warning(
-            "Dropped %d duplicate bar(s) from the %s/%s %s history in Redis",
-            duplicate_count,
-            strategy_slot.strategy.name,
-            strategy_slot.symbol,
-            strategy_slot.timeframe,
-        )
-    if allow_future:
-        return ordered
-    horizon = datetime.now(UTC) + CLOCK_TOLERANCE
-    finished = [
-        candle
-        for candle in ordered
-        if bucket_close(candle.open_time, strategy_slot.timeframe) <= horizon
-    ]
-    if len(finished) < len(ordered):
-        log.error(
-            "Ignored %d bar(s) dated after now in the %s/%s %s history, newest %s. "
-            "Ingestion discards such state on its next start.",
-            len(ordered) - len(finished),
-            strategy_slot.strategy.name,
-            strategy_slot.symbol,
-            strategy_slot.timeframe,
-            ordered[-1].open_time.isoformat(),
-        )
-    return finished
-
-
-def _as_aware(moment: datetime) -> datetime:
-    """A stored timestamp as an aware one, so arithmetic on it cannot raise.
-
-    ``OpenPosition.updated_at`` is typed ``datetime`` with no timezone
-    requirement and pydantic accepts a naive value, so a row written by an older
-    build or edited by hand can come back naive. Subtracting that from an aware
-    ``now()`` raises, and the flush runs inside ``start()`` — the runner would
-    refuse to boot over one malformed row. Read as UTC, which is what every
-    writer in this engine stores.
-    """
-    if moment.tzinfo is None:
-        return moment.replace(tzinfo=UTC)
-    return moment
-
-
-def _flat_refusal(
-    slot: StrategySlot,
-    uncertain_pairs: set[tuple[str, str]],
-    shadow_mode: bool,
-    state_scope: Any,
-) -> str | None:
-    """Why this pair cannot be flattened right now, or ``None`` when it can."""
-    if not slot.buffer:
-        # A FLAT carries no level to the broker, but the intent still has to be
-        # built and audited, and the last close is the only price there is.
-        return "no bar has been seen yet, so there is no price to report"
-    if slot.key in uncertain_pairs:
-        return "an unreconciled delivery is blocking the pair"
-    if not state_scope.is_paper and shadow_mode:
-        return "live delivery is paused (shadow mode)"
-    return None
-
-
-def _encode(payload: dict[str, Any]) -> bytes:
-    return json.dumps(payload, default=str).encode()
-
-
-__all__ = ["StrategyRunner", "StrategySlot"]
+__all__ = ["SERVICE_NAME", "StrategyRunner", "StrategySlot"]

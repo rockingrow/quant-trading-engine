@@ -1,18 +1,8 @@
-"""An outage leaves a position open; the pair must not come back locked on it.
+"""Startup settlement preserves mapped cycles and closes explicitly retired pairs.
 
-One ``(strategy, symbol)`` pair holds one cycle at a time, so a row that
-outlived a long downtime refuses every entry the strategy proposes afterwards —
-against a position whose bracket the market left behind hours ago. The runner
-closes those on start with ``R_SL``.
-
-Age is what separates that from an ordinary restart, and the split is the thing
-most worth pinning: a deploy comes back inside the window and keeps its
-positions, because the Redis/Postgres recovery path exists precisely so a
-restart does not forget a position the broker still holds.
-
-The second half of the file is the other direction of the pair rule — two pairs
-must never claim one ``signal_uxid``, because the broker groups a trade by it
-and a close on either would then close the other's position.
+Age-based closure is opt-in. Orphan settlement follows the mapping declaration,
+including when a repository disables a strategy, and preserves cycles whose
+ownership or broker delivery is uncertain. Duplicate cycle IDs refuse startup.
 """
 
 from __future__ import annotations
@@ -22,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from test_runner_delivery import (
     AcceptingSink,
+    FailedSink,
     FakePositions,
     FakeState,
     RecordingBus,
@@ -34,6 +25,7 @@ from qte_shared.strategies.signal_factory import SignalFactory
 from qte_shared.strategies.sizing import PositionSizer
 from qte_shared.strategies.strategy_base import StrategyBase
 from qte_strategy_engine.runner import StrategyRunner, StrategySlot
+from qte_strategy_engine.settings import RunnerSettings
 
 STRATEGY_NAME = "STALE_PROBE"
 SYMBOL = "XAUUSD"
@@ -141,7 +133,7 @@ async def test_a_stale_cycle_is_closed_with_one_r_sl(monkeypatch):
     restore(strategy_slot, position)
     with_history(strategy_slot, 2410.0)
 
-    await runner._flush_stale_positions()
+    await runner.recovery.flush_stale_positions()
 
     signals = emitted(runner)
     assert [signal.position.action for signal in signals] == [SignalAction.R_SL]
@@ -156,7 +148,7 @@ async def test_the_close_carries_the_whole_remaining_size_and_the_freshest_price
     restore(strategy_slot, position)
     with_history(strategy_slot, 2410.0)
 
-    await runner._flush_stale_positions()
+    await runner.recovery.flush_stale_positions()
 
     block = emitted(runner)[0].position
     assert block.quantity == pytest.approx(4.2)
@@ -171,7 +163,7 @@ async def test_the_price_falls_back_to_the_entry_when_redis_held_nothing(monkeyp
     runner, strategy_slot = build_runner(positions={(STRATEGY_NAME, SYMBOL): position})
     restore(strategy_slot, position)
 
-    await runner._flush_stale_positions()
+    await runner.recovery.flush_stale_positions()
 
     assert emitted(runner)[0].position.price == pytest.approx(2334.50)
 
@@ -183,7 +175,7 @@ async def test_a_cycle_of_unknown_size_still_closes(monkeypatch):
     runner, strategy_slot = build_runner(positions={(STRATEGY_NAME, SYMBOL): position})
     restore(strategy_slot, position)
 
-    await runner._flush_stale_positions()
+    await runner.recovery.flush_stale_positions()
 
     signals = emitted(runner)
     assert [signal.position.action for signal in signals] == [SignalAction.R_SL]
@@ -198,10 +190,23 @@ async def test_a_fresh_cycle_survives_a_quick_restart(monkeypatch):
     runner, strategy_slot = build_runner(positions={(STRATEGY_NAME, SYMBOL): position})
     restore(strategy_slot, position)
 
-    await runner._flush_stale_positions()
+    await runner.recovery.flush_stale_positions()
 
     assert emitted(runner) == []
     assert strategy_slot.factory.open_cycle(SYMBOL) == CYCLE_UXID
+
+
+def test_the_age_flush_is_off_by_default():
+    """Age is not evidence. A strategy that holds a cycle until its own exit
+    condition is met can be right to carry one for days, and an outage nobody
+    can attend to outlasts any window worth setting -- so closing on a clock is
+    something an operator asks for, never the default. What truly has nobody
+    deciding on it is settled by the mapping table instead.
+
+    Read off the field rather than an instance, so a local .env cannot decide
+    whether this passes."""
+    assert RunnerSettings.model_fields["flush_stale_positions"].default == "off"
+    assert RunnerSettings.model_fields["close_orphan_positions"].default == "close"
 
 
 async def test_a_zero_window_closes_regardless_of_age(monkeypatch):
@@ -211,7 +216,7 @@ async def test_a_zero_window_closes_regardless_of_age(monkeypatch):
     runner, strategy_slot = build_runner(positions={(STRATEGY_NAME, SYMBOL): position})
     restore(strategy_slot, position)
 
-    await runner._flush_stale_positions()
+    await runner.recovery.flush_stale_positions()
 
     assert [signal.position.action for signal in emitted(runner)] == [SignalAction.R_SL]
 
@@ -223,7 +228,7 @@ async def test_only_close_mode_sends_anything(monkeypatch, mode):
     runner, strategy_slot = build_runner(positions={(STRATEGY_NAME, SYMBOL): position})
     restore(strategy_slot, position)
 
-    await runner._flush_stale_positions()
+    await runner.recovery.flush_stale_positions()
 
     assert emitted(runner) == []
     assert strategy_slot.factory.open_cycle(SYMBOL) == CYCLE_UXID
@@ -237,7 +242,7 @@ async def test_warn_mode_says_what_close_mode_would_do(monkeypatch, caplog):
     restore(strategy_slot, position)
 
     with caplog.at_level("WARNING"):
-        await runner._flush_stale_positions()
+        await runner.recovery.flush_stale_positions()
 
     reported = [
         record.getMessage() for record in caplog.records if CYCLE_UXID in record.getMessage()
@@ -253,35 +258,214 @@ async def test_an_unreconciled_pair_is_left_for_the_outbox(monkeypatch, caplog):
     position = held_position(updated_at=aged(9 * 3600))
     runner, strategy_slot = build_runner(positions={(STRATEGY_NAME, SYMBOL): position})
     restore(strategy_slot, position)
-    runner._uncertain_pairs.add((STRATEGY_NAME, SYMBOL))
+    runner.delivery.uncertain_pairs.add((STRATEGY_NAME, SYMBOL))
 
     with caplog.at_level("WARNING"):
-        await runner._flush_stale_positions()
+        await runner.recovery.flush_stale_positions()
 
     assert emitted(runner) == []
     assert any("unreconciled" in record.getMessage() for record in caplog.records)
 
 
-async def test_a_position_for_a_strategy_we_do_not_run_is_reported_not_closed(monkeypatch, caplog):
-    """An orphan row: the strategy was unmapped while it held a position.
+# -- Cycles the mapping no longer claims ---------------------------------
 
-    Not closed, because ``OpenPosition`` records no timeframe and the broker
-    payload needs one — the engine cannot speak for a strategy it is not
-    driving. Loud, because nobody else will ever close it either.
-    """
-    flush_mode(monkeypatch, "close")
-    orphan = held_position(
-        strategy="RETIRED_STRATEGY", signal_uxid="1111111111111111", updated_at=aged(9 * 3600)
+
+RETIRED_STRATEGY = "RETIRED_STRATEGY"
+RETIRED_UXID = "1111111111111111"
+
+
+def orphan_mode(monkeypatch, mode: str) -> None:
+    monkeypatch.setattr(
+        "qte_strategy_engine.runner.runner_settings.close_orphan_positions", mode, raising=False
     )
-    runner, strategy_slot = build_runner(positions={("RETIRED_STRATEGY", SYMBOL): orphan})
+
+
+def retired_position(**overrides):
+    """A stored cycle for a strategy this runner drives no slot for."""
+    return held_position(
+        strategy=RETIRED_STRATEGY,
+        signal_uxid=RETIRED_UXID,
+        updated_at=aged(9 * 3600),
+        **overrides,
+    )
+
+
+def declare(runner, *pairs: tuple[str, str]) -> None:
+    """Stand in for what ``_build_slots`` read out of the mapping table."""
+    runner.context.declared_pairs = {(strategy, symbol.upper()) for strategy, symbol in pairs}
+
+
+def record_entry_timeframe(runner, signal_uxid: str, timeframe: str = "15") -> None:
+    """Seed the audit row the cycle's timeframe is read back from.
+
+    ``_flatten_orphan_cycle`` recovers it with ``cycle_timeframes``, because
+    :class:`OpenPosition` carries none and the broker payload requires one.
+    Live, the entry that opened the cycle left this behind.
+
+    Answered directly rather than by staging a row, so the seeded entry does
+    not read back as a signal this runner sent.
+    """
+    recorded = {signal_uxid: timeframe}
+
+    async def cycle_timeframes(cycle_ids):
+        return {uxid: recorded[uxid] for uxid in cycle_ids if uxid in recorded}
+
+    runner.signals.cycle_timeframes = cycle_timeframes
+
+
+async def test_a_retired_cycle_is_closed_with_one_flat(monkeypatch):
+    """The whole point: the operator dropped the pair, so nothing decides on it."""
+    orphan_mode(monkeypatch, "close")
+    runner, _ = build_runner(positions={(RETIRED_STRATEGY, SYMBOL): retired_position()})
+    declare(runner, (STRATEGY_NAME, SYMBOL))
+    record_entry_timeframe(runner, RETIRED_UXID)
+
+    await runner.recovery.settle_orphan_positions()
+
+    sent = [signal for signal in emitted(runner) if signal.strategy == RETIRED_STRATEGY]
+    assert len(sent) == 1
+    assert sent[0].position.action is SignalAction.FLAT
+    assert sent[0].signal_uxid == RETIRED_UXID
+    # The timeframe came back from the audit trail, not from a guess.
+    assert sent[0].timeframe == "15"
+    # Both stores drop it, so the next start does not try again.
+    assert (RETIRED_STRATEGY, SYMBOL) in runner.positions.cleared
+    assert (RETIRED_STRATEGY, SYMBOL) in runner.state.cleared
+
+
+async def test_a_pair_the_table_still_claims_is_reported_not_closed(monkeypatch, caplog):
+    """A missing mount is not a retirement.
+
+    The slot is absent either way, so the slots alone cannot tell a strategy
+    the operator parked from one that failed to load. Reading the declaration
+    is what stops a half-mounted ``__strategies__/`` from flattening the book.
+    """
+    orphan_mode(monkeypatch, "close")
+    runner, _ = build_runner(positions={(RETIRED_STRATEGY, SYMBOL): retired_position()})
+    declare(runner, (STRATEGY_NAME, SYMBOL), (RETIRED_STRATEGY, SYMBOL))
+    record_entry_timeframe(runner, RETIRED_UXID)
 
     with caplog.at_level("ERROR"):
-        await runner._flush_stale_positions()
+        await runner.recovery.settle_orphan_positions()
 
     assert emitted(runner) == []
+    assert runner.positions.cleared == []
     reported = [record.getMessage() for record in caplog.records]
-    assert any("RETIRED_STRATEGY" in message for message in reported), reported
-    assert any("no running strategy" in message for message in reported)
+    assert any(RETIRED_STRATEGY in message for message in reported), reported
+    assert any("not mounted" in message for message in reported), reported
+
+
+async def test_nothing_is_closed_when_no_mapping_table_was_read(monkeypatch, caplog):
+    """With no table the symbols come off each strategy's own class, so nothing
+    declared whether the pair is retired. Reported, never closed."""
+    orphan_mode(monkeypatch, "close")
+    runner, _ = build_runner(positions={(RETIRED_STRATEGY, SYMBOL): retired_position()})
+    assert runner.context.declared_pairs is None
+    record_entry_timeframe(runner, RETIRED_UXID)
+
+    with caplog.at_level("ERROR"):
+        await runner.recovery.settle_orphan_positions()
+
+    assert emitted(runner) == []
+    assert runner.positions.cleared == []
+    assert any("no mapping table" in record.getMessage() for record in caplog.records)
+
+
+@pytest.mark.parametrize("mode", ["off", "warn"])
+async def test_only_close_mode_flattens_a_retired_cycle(monkeypatch, mode):
+    orphan_mode(monkeypatch, mode)
+    runner, _ = build_runner(positions={(RETIRED_STRATEGY, SYMBOL): retired_position()})
+    declare(runner, (STRATEGY_NAME, SYMBOL))
+    record_entry_timeframe(runner, RETIRED_UXID)
+
+    await runner.recovery.settle_orphan_positions()
+
+    assert emitted(runner) == []
+    assert runner.positions.cleared == []
+
+
+async def test_warn_mode_says_what_close_mode_would_flatten(monkeypatch, caplog):
+    orphan_mode(monkeypatch, "warn")
+    runner, _ = build_runner(positions={(RETIRED_STRATEGY, SYMBOL): retired_position()})
+    declare(runner, (STRATEGY_NAME, SYMBOL))
+    record_entry_timeframe(runner, RETIRED_UXID)
+
+    with caplog.at_level("WARNING"):
+        await runner.recovery.settle_orphan_positions()
+
+    reported = " ".join(record.getMessage() for record in caplog.records)
+    assert "would close it with FLAT" in reported
+    assert RETIRED_UXID in reported
+
+
+async def test_a_cycle_whose_timeframe_nothing_records_is_refused(monkeypatch, caplog):
+    """No audit row, no truthful payload. Said out loud, and the row survives."""
+    orphan_mode(monkeypatch, "close")
+    runner, _ = build_runner(positions={(RETIRED_STRATEGY, SYMBOL): retired_position()})
+    declare(runner, (STRATEGY_NAME, SYMBOL))
+
+    with caplog.at_level("ERROR"):
+        await runner.recovery.settle_orphan_positions()
+
+    assert emitted(runner) == []
+    assert runner.positions.cleared == []
+    assert any("timeframe" in record.getMessage() for record in caplog.records)
+
+
+async def test_a_refused_delivery_leaves_the_retired_row_in_place(monkeypatch, caplog):
+    """The broker may still be carrying the trade -- a closed market over a
+    weekend, say. A book that forgot it is worse than one that still shows it,
+    so the next start tries again."""
+    orphan_mode(monkeypatch, "close")
+    runner, _ = build_runner(
+        positions={(RETIRED_STRATEGY, SYMBOL): retired_position()}, sink=FailedSink()
+    )
+    declare(runner, (STRATEGY_NAME, SYMBOL))
+    record_entry_timeframe(runner, RETIRED_UXID)
+
+    with caplog.at_level("ERROR"):
+        await runner.recovery.settle_orphan_positions()
+
+    assert runner.positions.cleared == []
+    assert any("stays" in record.getMessage() for record in caplog.records)
+
+
+async def test_an_orphan_with_an_unreconciled_delivery_is_left_alone(monkeypatch, caplog):
+    """A second command against one cycle is worse than a row left open.
+
+    The outbox cannot settle a pair no slot drives, so it leaves it blocked --
+    and an unconfirmed close keeps the row, which would make this resend on
+    every start.
+    """
+    orphan_mode(monkeypatch, "close")
+    runner, _ = build_runner(positions={(RETIRED_STRATEGY, SYMBOL): retired_position()})
+    declare(runner, (STRATEGY_NAME, SYMBOL))
+    record_entry_timeframe(runner, RETIRED_UXID)
+    runner.delivery.uncertain_pairs.add((RETIRED_STRATEGY, SYMBOL))
+
+    with caplog.at_level("ERROR"):
+        await runner.recovery.settle_orphan_positions()
+
+    assert emitted(runner) == []
+    assert runner.positions.cleared == []
+    assert any("unreconciled" in record.getMessage() for record in caplog.records)
+
+
+async def test_a_pair_this_runner_drives_is_never_an_orphan(monkeypatch):
+    """The slot owns it, and its own strategy decides when it closes."""
+    orphan_mode(monkeypatch, "close")
+    position = held_position(updated_at=aged(9 * 3600))
+    runner, strategy_slot = build_runner(positions={(STRATEGY_NAME, SYMBOL): position})
+    declare(runner, (STRATEGY_NAME, SYMBOL))
+    restore(strategy_slot, position)
+
+    await runner.recovery.settle_orphan_positions()
+
+    assert emitted(runner) == []
+    assert strategy_slot.factory.open_cycle(SYMBOL) == CYCLE_UXID
+
+
+# -- Back to the age flush -----------------------------------------------
 
 
 async def test_nothing_reaches_the_broker_in_shadow_mode(monkeypatch):
@@ -292,7 +476,7 @@ async def test_nothing_reaches_the_broker_in_shadow_mode(monkeypatch):
     runner, strategy_slot = build_runner(positions={(STRATEGY_NAME, SYMBOL): position}, sink=sink)
     restore(strategy_slot, position)
 
-    await runner._flush_stale_positions()
+    await runner.recovery.flush_stale_positions()
 
     assert sink.delivery_ids == [], "a shadowed runner sends nothing to the broker"
 
@@ -301,7 +485,7 @@ async def test_an_empty_table_is_not_an_error(monkeypatch):
     flush_mode(monkeypatch, "close")
     runner, _ = build_runner()
 
-    await runner._flush_stale_positions()
+    await runner.recovery.flush_stale_positions()
 
     assert emitted(runner) == []
 
@@ -320,7 +504,7 @@ async def test_two_pairs_sharing_a_cycle_id_refuse_to_start(monkeypatch):
     )
 
     with pytest.raises(RuntimeError, match=CYCLE_UXID) as excinfo:
-        await runner._flush_stale_positions()
+        await runner.recovery.flush_stale_positions()
 
     message = str(excinfo.value)
     assert f"{STRATEGY_NAME}/{SYMBOL}" in message
@@ -339,7 +523,7 @@ async def test_the_duplicate_check_runs_in_every_mode(monkeypatch, mode):
     )
 
     with pytest.raises(RuntimeError, match="share a trade-cycle id"):
-        await runner._flush_stale_positions()
+        await runner.recovery.flush_stale_positions()
 
 
 async def test_distinct_cycle_ids_are_fine(monkeypatch):
@@ -353,7 +537,7 @@ async def test_distinct_cycle_ids_are_fine(monkeypatch):
         }
     )
 
-    await runner._flush_stale_positions()
+    await runner.recovery.flush_stale_positions()
 
 
 # ── Which store decides ──────────────────────────────────────────────────
@@ -373,7 +557,7 @@ async def test_a_cycle_redis_restored_but_absent_from_the_table_is_still_flushed
     runner, strategy_slot = build_runner(positions={})
     restore(strategy_slot, position)
 
-    await runner._flush_stale_positions()
+    await runner.recovery.flush_stale_positions()
 
     assert [signal.position.action for signal in emitted(runner)] == [SignalAction.R_SL]
     assert strategy_slot.factory.open_cycle(SYMBOL) is None
@@ -394,7 +578,7 @@ async def test_duplicate_ids_are_caught_among_live_slots_with_no_table_at_all(mo
     second_slot.factory.restore_position(held_position(symbol="EURUSD"), symbol="EURUSD")
 
     with pytest.raises(RuntimeError, match="share a trade-cycle id") as excinfo:
-        await runner._flush_stale_positions()
+        await runner.recovery.flush_stale_positions()
 
     assert f"{STRATEGY_NAME}/EURUSD" in str(excinfo.value)
 
@@ -409,7 +593,7 @@ async def test_a_naive_stored_timestamp_does_not_stop_the_runner(monkeypatch):
     runner, strategy_slot = build_runner(positions={(STRATEGY_NAME, SYMBOL): position})
     restore(strategy_slot, position)
 
-    await runner._flush_stale_positions()
+    await runner.recovery.flush_stale_positions()
 
     assert [signal.position.action for signal in emitted(runner)] == [SignalAction.R_SL]
 
@@ -421,7 +605,7 @@ async def test_an_unknown_price_is_absent_rather_than_zero(monkeypatch):
     runner, strategy_slot = build_runner(positions={(STRATEGY_NAME, SYMBOL): position})
     restore(strategy_slot, position)
 
-    await runner._flush_stale_positions()
+    await runner.recovery.flush_stale_positions()
 
     assert emitted(runner)[0].position.price is None
 
@@ -435,7 +619,9 @@ async def test_start_flushes_after_recovery_and_before_subscribing(monkeypatch):
     Order matters twice over. After recovery, so the outbox has settled every
     ambiguous delivery and the book is what it says it is. Before the
     subscriptions, so no live close races the flush and no strategy is asked to
-    decide a bar against a position that is about to be closed.
+    decide a bar against a position that is about to be closed. Both settlement
+    passes are pinned: the orphan close is a separate mechanism from the age
+    flush and has to run on the same side of both boundaries.
     """
     from test_runner_catch_up import CandleStore
     from test_runner_catch_up import build_runner as build_catch_up_runner
@@ -447,17 +633,23 @@ async def test_start_flushes_after_recovery_and_before_subscribing(monkeypatch):
         sequence.append(name)
         await original()
 
-    for name in ("_recover_pending_deliveries", "_flush_stale_positions", "_subscribe"):
-        original = getattr(runner, name)
+    for owner, name in (
+        (runner.delivery, "recover_pending_deliveries"),
+        (runner.recovery, "flush_stale_positions"),
+        (runner.recovery, "settle_orphan_positions"),
+        (runner, "_subscribe"),
+    ):
+        original = getattr(owner, name)
         monkeypatch.setattr(
-            runner, name, (lambda name=name, original=original: record(name, original))
+            owner, name, (lambda name=name, original=original: record(name, original))
         )
 
     await runner.start()
     try:
         assert sequence == [
-            "_recover_pending_deliveries",
-            "_flush_stale_positions",
+            "recover_pending_deliveries",
+            "flush_stale_positions",
+            "settle_orphan_positions",
             "_subscribe",
         ]
     finally:
@@ -491,3 +683,56 @@ def live_state_scope(monkeypatch):
     monkeypatch.setattr(settings, "env", "prod")
     monkeypatch.setattr(settings.state_config, "execution_mode", "live")
     monkeypatch.setattr(settings.market_data, "provider", "tiingo")
+
+
+@pytest.mark.parametrize("mapping_state", ["mapped", "retired", "absent"])
+async def test_disabled_strategy_settlement_follows_mapping(monkeypatch, tmp_path, mapping_state):
+    """A disabled hook alone must not retire a position the mapping still claims."""
+    from test_runner_mapping import serve_directory, table
+
+    orphan_mode(monkeypatch, "close")
+    runner, _ = build_runner(positions={(RETIRED_STRATEGY, SYMBOL): retired_position()})
+    runner.slots.clear()
+    serve_directory(monkeypatch, [], {RETIRED_STRATEGY: tmp_path / "manifest.py"})
+    mapping_file = tmp_path / "absent.toml"
+    if mapping_state != "absent":
+        strategy_names = f'"{RETIRED_STRATEGY}"' if mapping_state == "mapped" else ""
+        mapping_file = table(tmp_path, f"[symbols.{SYMBOL}]\nstrategies = [{strategy_names}]\n")
+    monkeypatch.setattr(settings.engine, "mapping_file", mapping_file)
+    record_entry_timeframe(runner, RETIRED_UXID)
+
+    runner._build_slots()
+    await runner.recovery.settle_orphan_positions()
+
+    expected_actions = [SignalAction.FLAT] if mapping_state == "retired" else []
+    assert [signal.position.action for signal in emitted(runner)] == expected_actions
+    assert bool(runner.positions.cleared) == (mapping_state == "retired")
+
+
+async def test_unknown_orphan_close_is_not_resent_after_repeated_recovery(monkeypatch):
+    """Restart recovery blocks an orphan whose previous FLAT may have reached the broker."""
+    from test_runner_delivery import UnknownSink
+
+    orphan_mode(monkeypatch, "close")
+    original_runner, _ = build_runner(
+        positions={(RETIRED_STRATEGY, SYMBOL): retired_position()}, sink=UnknownSink()
+    )
+    declare(original_runner, (STRATEGY_NAME, SYMBOL))
+    record_entry_timeframe(original_runner, RETIRED_UXID)
+    await original_runner.recovery.settle_orphan_positions()
+    assert len(original_runner.signals.rows) == 1
+    assert original_runner.signals.rows[0][1]["delivery_status"] == "unknown"
+
+    for restart_index in range(2):
+        restarted_runner, _ = build_runner()
+        restarted_runner.signals = original_runner.signals
+        restarted_runner.positions = original_runner.positions
+        declare(restarted_runner, (STRATEGY_NAME, SYMBOL))
+        await restarted_runner.delivery.recover_pending_deliveries()
+        assert (RETIRED_STRATEGY, SYMBOL) in restarted_runner.delivery.uncertain_pairs
+
+        await restarted_runner.recovery.settle_orphan_positions()
+
+        assert restarted_runner.sink.delivery_ids == [], restart_index
+        assert len(restarted_runner.signals.rows) == 1
+        assert restarted_runner.positions.cleared == []

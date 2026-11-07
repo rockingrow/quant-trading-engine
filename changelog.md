@@ -5,6 +5,353 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-11-08
+
+### Fixed
+
+- **A candle close staged during a NATS outage is no longer lost to a
+  restart.** nats-py buffers a core publish while it reconnects and returns as
+  if it had gone, and the outbox removed the close on that return — so a
+  container restarted before NATS came back lost every close staged since. The
+  outbox now holds its closes while ingestion has no connection, and removes
+  one only after the server confirms the publish
+  (`QTE_INGESTION__PUBLISH_CONFIRM_TIMEOUT`, default `5` seconds) — one round
+  trip per batch of up to 100 closes. A publish or confirmation that fails
+  leaves the batch staged for the next flush interval, at start-up too, rather
+  than stopping ingestion; the hold is logged when it starts, when its reason
+  changes, and about once a minute while it lasts. A staged entry that can never be published moves to
+  `outbox:candles:dead` with an `ERROR` instead of blocking every close behind
+  it.
+- **An ambiguous HTTP delivery is `unknown`, not `failed`.** On
+  `ALGO_BROKER__TRANSPORT=http`, a connection dropped after the request was
+  written, and any 5xx (a proxy's 502 or 504 included), may have reached the
+  broker; they now go through outbox reconciliation, so a close the broker took
+  is no longer kept open locally and an entry is not offered again. A refused
+  connection and a 4xx stay `failed`. A payload that fails validation is
+  reported `failed` instead of raising and blocking its pair.
+- **`/prevent` pauses tick decisions too.** A strategy overriding `on_tick` was
+  still asked about ticks — entries included — on a paused pair.
+- **A failed `QTE.signal.emitted` mirror no longer cuts a bar short.** The
+  signal had already gone to the broker; the exception skipped the rest of that
+  bar's intents and the weekend `FLAT`. It is now a `WARNING`.
+- **`/flat` works before the first bar after a restart.** It refused a pair
+  whose window was still empty; the audit price now falls back to the entry's,
+  as the stale and orphan closes already did.
+- **A control request is always answered.** An unknown action, a payload that
+  is not a JSON object, or a handler that raised left the caller to wait out
+  its timeout; the runner and ingestion now reply with a `control_error`. The
+  bot, `make status` and `qte-control ping` read such a reply as a service that
+  is down, never as an answer — a `flat` refusal that is the handler's own
+  `error` is still shown as one.
+- **`ensure_stream` no longer mistakes a timeout for a missing stream**, and
+  the MT5 core-NATS consumer reconnects the moment its connection closes rather
+  than on a one-second poll. `qte-control owner clear` reads its confirmation
+  off the event loop.
+
+- **A Telegram position message spells its timeframe again.** The cycle stores
+  the timeframe as the broker contract spells it — bare minutes — so the header
+  read `SHORT XAGUSD (15)` instead of `(M15)`. It is now rendered through the
+  canonical label, and a spelling nothing recognises is shown unchanged rather
+  than raised.
+
+### Changed
+
+- **The strategy runner is split into a coordinator and four collaborators.**
+  `StrategyRunner` keeps the lifecycle, the ownership claim, the slots and the
+  decision path; the signal outbox (`delivery.py`), restore, stale flush and
+  orphan settlement (`recovery.py`), warm-up and catch-up (`history_sync.py`)
+  and the control plane (`control_plane.py`) are objects of their own that
+  share one `RunnerContext`. `StrategySlot` lives in `slot.py` and is still
+  importable from the runner. No behaviour changes apart from the fixes above;
+  ownership is now checked once per intent rather than twice.
+- **Outbox statuses are a `DeliveryStatus` enum with a transition table.**
+  `mark_delivery` writes only the moves the table allows and reports any other
+  as a failed write, which keeps the pair blocked for reconciliation. The
+  stored strings are unchanged, so there is no migration.
+- **One weekend entry gate for both drivers.** The runner's bar and tick paths
+  and the backtest replay now call the same `gate_entries`, instead of three
+  copies of the rule. `IngestionService` takes its collaborators through its
+  constructor, and Ruff's `BLE` rule now requires a reason on every
+  `except Exception`.
+- **The README is a landing page; the operator guides moved to `docs/`.** It
+  went from about 71 KB to 10 KB and now holds the quick start, the
+  architecture diagram, the core concepts, the everyday commands and an index
+  of `docs/`. Its long sections became eight guides —
+  `docs/strategies.md`, `docs/mapping-and-sizing.md`, `docs/backtesting.md`,
+  `docs/mt5-ingester.md`, `docs/telegram.md`, `docs/tailscale.md`,
+  `docs/operations.md` and `docs/deployment.md` — while the transport
+  comparison joined `docs/broker-contract.md` and the case for the simulator
+  joined `docs/simulator.md`. No behaviour changes; links into the old README
+  anchors need the new file. Two statements were corrected on the way: a
+  backtest **stacks** a second entry beside open cycles rather than rejecting
+  it, as the runner does, and the operator bot has thirteen commands, not ten.
+  The strategy audit's fix hint now points at `docs/strategies.md`.
+- **LONG and SHORT read as a green and a red square** in the lifecycle message
+  (`🟩` / `🟥`) in place of the two chart glyphs, which were hard to tell apart
+  at a glance. Dots were tried first and dropped: the flags, the service
+  UP/DOWN notices and the dashboard's severity badges are circles too, so a
+  green dot said nothing about being an entry. The squares are only ever an
+  entry. `broker/helpers/emoji_constants.py` in `algo-trading-broker` mirrors
+  this table and has to make the same change for one trade to read the same in
+  both messages. The Markdown report and the HTML dashboard keep their `L` /
+  `S` column, which takes its colour from the theme.
+- **Every glyph is named in one place**, `qte_shared.emoji_constants`, and
+  resolved through the `emoji` package — the table `algo-trading-broker`
+  already kept as `broker/helpers/emoji_constants.py`. They were literals in
+  seven modules, which is how the entry icon came to be spelled three ways.
+  The lifecycle message, the operator bot, the service UP/DOWN and ERROR
+  notices and the backtest dashboard's severity badges all read from it, and
+  an unknown name now fails at import rather than reaching a chat as
+  `":name:"`. New production dependency: `emoji`, a core one because
+  `qte_shared.notifications` imports it. `qte_bot.tables` keeps its `✓` and
+  `✗`: those are text marks, one cell wide, and an emoji would break the
+  column alignment the table exists for.
+
+### Added
+
+- **Each strategy's concept document now names its newest artefacts.** A
+  reporting backtest rewrites one machine-owned block at the bottom of the
+  replayed strategy's `docs/concepts/<strategy>.md` in the mounted strategy
+  repository: what was replayed and over which period, a headline of trades,
+  win rate, longest losing run, net result and maximum drawdown, and links to
+  the JSON, the Markdown and the HTML dashboard it just wrote, plus the newest
+  write-up under `data/audits/` that names the alias. Everything between the
+  `QTE-LATEST-ARTEFACTS` markers is generated, carries a "do not edit" notice
+  and is replaced wholesale; everything outside them is never touched. The
+  document is matched by the alias it opens with rather than by a filename
+  convention, and a missing mount, a missing document or an unwritable file is
+  logged and stepped over, never raised into a finished replay.
+  `--no-doc-reference` skips it for a run; `make doc-reference [STRATEGY=]
+  [REPORT=x.json]` seeds the block or fills it from a report written earlier.
+  New: `qte_backtest.doc_reference`, the `doc-reference` subcommand and
+  `QTE_ENGINE__AUDITS_DIR`.
+
+- **Three more commands on the operator's Telegram bot: `/demo`, `/mapping`
+  and `/provider`.**
+
+  - **`/demo all | STRATEGY`** runs the drill below from the chat: it drives
+    each mounted strategy over the same ideal candles `make demo-signal` uses
+    and publishes what comes out on the broker's drill subject, so the broker
+    answers with a Telegram card and commands no worker. The report tells
+    apart the three outcomes an operator acts on differently — an envelope
+    that did not leave, a strategy that *raised* while being driven, and a
+    strategy that merely declined every regime and got the synthetic
+    fallback. The strategy names it offers come from the `__strategies__/`
+    mount, not from the runner, because the drill loads the strategies off
+    disk itself; and one bot process runs one drill at a time, since two would
+    drive the same strategies and double every card in the channel. It runs in
+    the bot and not in the runner on purpose: driving a strategy over four
+    regimes is seconds of CPU per pair and the live loop must not spend them.
+    Nothing is written to Redis, Postgres or the outbox, so a running runner is
+    untouched.
+  - **`/mapping`** reads `config/strategies_mapping.toml` back: every pair,
+    the parameters it runs with, and the per-strategy defaults underneath
+    them. A table that is absent and a table that maps nothing read
+    differently, because they are different instructions — no table means
+    every strategy keeps the symbols it declares on itself, an empty one means
+    trade nothing.
+  - **`/provider`** reads each `config/data_providers/<provider>.toml` back:
+    the symbols that provider feeds with their market and timeframes, and its
+    own `[provider]` knobs. One message per provider, since each reads its own
+    file and a merged view loses the knobs. No credential can appear — the
+    parser drops every credential-shaped key as it reads the file.
+
+- **`make demo-signal` — one open cycle from a real strategy to the broker, for
+  the drill.** It answers a deployment question rather than a trading one:
+  given data a strategy would act on, does a signal still make it all the way
+  out of the engine and into the broker's Telegram notification? Every hop a
+  live signal takes after the strategy is exercised with the pair's own
+  configuration — the mapping table's params and risk, the strategy's warm-up
+  and timeframe, the bracket, the risk sizing, the broker envelope.
+
+  - It publishes on the broker's **`SIGNALS_DEMO.<strategy>`** subject
+    (`ALGO_BROKER__DEMO_SUBJECT_PREFIX`, `Subjects.broker_signal_demo()`),
+    which the broker answers with a Telegram card and nothing else. A
+    different first token, not `SIGNALS.DEMO.*`, on purpose: the broker's
+    JetStream stream captures `SIGNALS.>`, so a demo one token deeper would
+    land in the very buffer its worker fan-out drains.
+  - `make demo-signal` fires every mounted strategy in turn, on the first
+    symbol each is mapped to; `STRATEGY=` and `SYMBOL=` narrow it.
+    `qte-control demo-signal [--strategy] [--symbol]` is the same thing. One
+    envelope that does not reach the broker is reported against that pair
+    (`NOT DELIVERED`) rather than discarding the pairs that did get out, so a
+    NATS drop mid-run does not leave the operator guessing which cards reached
+    Telegram. A failure the drill cannot report around — an unreachable broker,
+    a mistyped `--strategy` — prints one line, like the rest of `qte-control`.
+  - **Ideal data is searched for, not assumed.** A strategy may be
+    trend-following or mean-reverting, so four synthetic regimes are replayed
+    — a clean trend each way and an exhaustion reversal each way — and the
+    first entry one of them produces is what gets published. A strategy that
+    enters on none of them still gets a payload: the drill falls back to a
+    synthetic entry priced off the last bar and says so on the console, since
+    what is being tested is the transport. Declining is not an error and exits
+    `0`; a strategy that **raised** while being driven is reported as `RAISED`
+    and exits `1`, because a crash on a frame of plausible bars is a crash the
+    runner would hit on a real one.
+  - It writes nothing. No Redis, no Postgres, no delivery outbox, no cycle
+    remembered — the `SignalFactory` it builds through is a throwaway — so a
+    running runner's own positions are untouched. Shadow mode is ignored for
+    the same reason: the subject is what keeps orders away from a worker, and
+    a drill that stayed silent in the mode most deployments sit in would
+    never be run.
+
+- **`dynamic_risk` — sizing each entry at the risk its strategy states.** A
+  pair whose mapping sets `dynamic_risk = true` is sized at the `risk_percent`
+  the strategy puts on each entry instead of the pair's own, so a strategy can
+  risk less on a setup it trusts less and more on one it trusts more. The entry
+  is sized at the lowest of what the strategy stated, the pair's
+  `max_risk_percent` and `QTE_ACCOUNT__MAX_RISK_PERCENT`. The pair's ceiling
+  defaults to its own `risk_percent`, so the switch alone can only lower risk;
+  the account ceiling covers every pair, dynamic or not, and `0`, the default,
+  leaves it off. Both mapping keys are read strictly and stay off the payload's
+  `inputs`: a `dynamic_risk` that is not a bool, or a `max_risk_percent` that is
+  not a finite number or sits below the pair's `risk_percent`, stops the pair at
+  startup instead of trading it some other way. A stated risk that is not a
+  finite number is refused on every pair, and on a dynamic pair so is one that
+  is not positive; it is never sized at a default. The backtest and the runner
+  share the path, so `--param dynamic_risk=true` replays what the runner would
+  send. Backtest reports gain keys without a schema bump — `schema_version`
+  stays `1.0`, because the addition is purely additive and a reader written
+  against `1.0` is still correct: every trade carries the `risk_percent` it was
+  sized at and `run` gains `dynamic_risk` and `max_risk_percent`; R-multiples
+  are per unit and unchanged. Rows written by `qte-backtest run --persist` do
+  not carry the per-trade figure yet.
+
+- **`DISABLED` — switching one strategy off from its own repository.** A
+  manifest may expose a third optional hook, `load_disabled()`, returning the
+  aliases its repository keeps (code, tests, documents) but has taken out of
+  service — by convention a `DISABLED` table beside `ALIASES`, the same shape, so
+  moving a line between the two is the switch. The loader never instantiates those
+  strategies and records them (`StrategyLoader.disabled_by_repository`,
+  `read_strategy_directory()`); the backtest refuses one by name; the audit lists
+  each as `[ off]` and counts it (`counts.disabled`, `disabled` in the JSON)
+  without a finding; a mapping table that still names one fails as
+  `mapped-to-disabled` rather than `mapped-to-nothing`, and the runner's `ERROR`
+  says the repository disabled it. An alias in both tables, or a hook that does
+  not read, fails the audit and is not loaded — an unreadable off switch stops
+  the whole repository. `_boilerplate` and `qte-signal-simulator` carry the hook
+  with an empty table as the pattern to copy; `SKIPPED_REPOSITORIES` still skips
+  them as bundles. A repository without the hook disables nothing. Existing positions remain
+  protected while their pair is still mapped; removing the mapping makes them
+  eligible for the startup orphan settlement described below.
+
+- **`/strategies` — the build deployed in each strategy folder, from Telegram.**
+  The bot scans `__strategies__/` and answers with one box per strategy
+  repository: the stamp from the `BUNDLE_VERSION.json` at the folder's root
+  (`version`, `built_at`, `branch`, `commit`, `tree`, `content`, `mode`,
+  `dirty`) and every strategy the mount record lists for it, each marked as
+  passing or failing its audit. A folder without the file is listed all the
+  same, with the version blank; an unreadable one is flagged in its box. The
+  two template folders (`SKIPPED_REPOSITORIES`) are never listed. It reads the
+  mounted directory, so it answers with the runner down and reports what is on
+  disk, not what the runner has loaded — `/runner` still answers that. A mount
+  too large for one message is split across several. `_boilerplate` and
+  `qte-signal-simulator` now carry an example `BUNDLE_VERSION.json`, and the
+  README documents where the file lives and what its keys mean.
+
+- **Account-wide open-position ceiling** — `QTE_ACCOUNT__MAX_OPEN_POSITIONS`
+  limits the runner's open cycles across every strategy and symbol together;
+  `0`, the default, keeps entries uncapped. Entries in flight reserve capacity
+  so concurrent pairs cannot both take the last slot. Excess entries are
+  refused before broker delivery, logged at `WARNING`, and recorded as
+  `entry_refused_account_full`; closing signals remain unaffected by the
+  ceiling. Set this to match the downstream account limit: it counts the
+  runner's own book, not broker-confirmed or manually opened positions.
+  Backtests remain unchanged, so enabling the ceiling can make the traded book
+  a subset of the replayed one.
+
+### Changed
+
+- **The payload's `risk_percent` is the one the quantity was sized at.** A
+  strategy's stated value used to reach the broker while the quantity was sized
+  at the pair's own, so a worker that sizes from `risk_percent` itself could
+  open a different position from the one QTE sized and recorded. Every entry
+  now states the figure it was sized at, and every close restates its cycle's
+  figure whatever the strategy puts on the close. A pair that has not opted in
+  to `dynamic_risk`, and whose strategy states a `risk_percent` other than the
+  pair's, now sends the pair's with a `WARNING`; a strategy that states the
+  pair's own value sees no change.
+
+- **Port-only params stay off the payload when a strategy echoes them.**
+  `warmup`, and now `dynamic_risk` and `max_risk_percent`, were removed only
+  from the pair's params, so a strategy that reports its own params through
+  `intent.inputs` handed them to the broker anyway. The filter now applies to
+  the merged `inputs` of the signal.
+
+- **Contributors update `changelog.md` before a PR is opened.** New rule 7 in
+  `AUDIT.md`, digested in `AGENTS.md`: the entry goes under `## [Unreleased]`,
+  which is created when it is missing.
+
+- **Age no longer closes a position; the mapping table does.**
+  `QTE_RUNNER__FLUSH_STALE_POSITIONS` now defaults to `off`. A strategy that
+  holds a cycle until its own exit condition is met can be right to carry one
+  for days, and the outage the window was meant to catch — overnight, a
+  weekend, a host that needs hands — outlasts any window worth setting, so the
+  old default closed positions that were still correct. Nothing is lost by it:
+  every transition is already written to Redis *and* to `open_positions`, and
+  the runner reloads the cycle from either on start. Set the variable to
+  `warn`, or to `close` with `QTE_RUNNER__STALE_POSITION_MAX_AGE` (back to
+  `3600`), for the old age-gated behaviour.
+
+  In its place, **an open cycle the mapping table no longer claims is closed on
+  start** — a strategy dropped from a symbol's `strategies` list, or a symbol
+  carrying `enabled = false`. Nothing decides on those and their size is still
+  charged against the account on every later sizing.
+  `QTE_RUNNER__CLOSE_ORPHAN_POSITIONS` (`off`/`warn`/`close`, default `close`)
+  sends one `FLAT` per cycle through the durable outbox, recovering the
+  timeframe the broker payload needs from the `signals` row that opened it, and
+  clears Redis and Postgres only on a confirmed send — so a `FLAT` the broker
+  rejects over a closed weekend is retried at the next start. A pair the table
+  **still** claims is reported and never closed, however long its slot has been
+  missing: that is a strategy that failed to load or a repository that is not
+  mounted, and a half-mounted `__strategies__/` must not flatten the book. With
+  no mapping table at all nothing is closed. An orphan whose earlier delivery
+  remains unreconciled is left open without sending another command; recovery
+  keeps that pair blocked across restarts, including an `unknown` FLAT result.
+  Previously such a row was only
+  logged as an error, on the mistaken grounds that no timeframe could be
+  recovered for it.
+
+- **Skip reference and simulator bundles during discovery and audit** —
+  `SKIPPED_REPOSITORIES` in `qte_shared.strategies.plugin_loader` excludes
+  `_boilerplate` and `qte-signal-simulator`, preventing their unused-strategy
+  warnings from blocking strict startup. Remove a name from the set to load
+  and audit that bundle again; its clone and mount verdict remain intact.
+- Update the README and broker/simulator documentation to describe the
+  account-wide ceiling, bundle exclusions, and existing support for multiple
+  trade cycles per strategy/symbol pair.
+
+
+### Fixed
+
+- **A Redis connection the container network dropped is detected instead of
+  waited out.** The strategy runner's history sync reported `TimeoutError`
+  tracebacks at `ERROR` against a server answering in 0.16ms: the client
+  inherited redis-py's defaults, with no keepalive and no health check, so a
+  pooled connection the bridge network had killed stayed in the pool looking
+  idle until a command read from it and blocked for the whole read deadline.
+  `RedisState.connect` now declares `socket_keepalive`,
+  `QTE_REDIS__HEALTH_CHECK_INTERVAL` (30s) and `retry_on_timeout`, and the
+  deadline itself (`QTE_REDIS__SOCKET_TIMEOUT`, 15s) is only the last resort —
+  set clear of the slowest legitimate command, because a deadline that cuts a
+  multi-key Lua write short turns a slow staging write into a lost one and
+  ingestion has no retry loop to cover it. Applies to all six services.
+
+- **The client talks RESP2 again.** `redis>=5.0` had resolved to redis-py 8,
+  which enables RESP3 and with it maintenance notifications — a Redis
+  Enterprise feature the OSS server rejects outright (`unknown subcommand
+  'MAINT_NOTIFICATIONS'` on every connect). Nothing here uses RESP3, so
+  `QTE_REDIS__RESP_PROTOCOL` defaults to `2` and the requirement is capped at
+  `redis<9` so a resolve cannot change the client's defaults again.
+
+- **A Redis blip in the history sync is one warning line, not a traceback.**
+  The loop loses that pass and re-reads the flag five seconds later, so the
+  forty-line `ERROR` was noise — and `ERROR` is forwarded to Telegram. Only
+  Redis's own exceptions are treated this way: the builtin `TimeoutError` would
+  also catch a history request the MT5 ingester never answered, and that outage
+  must not read as Redis being unreachable at a level nobody is paged for.
+
+
 ## [0.1.1] - 2026-10-19
 
 ### Added

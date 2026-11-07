@@ -11,6 +11,14 @@ should do *around* those strategies — going flat before their market shuts. Bo
 names are re-exported here so the engine reads one module; the settings table
 itself lives in :mod:`boilerplate.settings`, beside the code it describes.
 
+And :func:`load_disabled`, also optional: the aliases this repository keeps —
+code, tests, documents — but has taken out of service. They sit in
+:data:`DISABLED`, the same shape as :data:`ALIASES`, so switching a strategy off
+is moving its line from one table to the other, and back again to return it.
+The engine never loads a disabled strategy, the audit lists it as ``off``
+rather than missing, and :func:`load` refuses it by name. A disabled alias
+keeps no entry in the settings table, which describes published ones only.
+
 That is the whole integration. The engine learns no package name, no module
 path and no directory layout, so this repo can reorganise itself freely — and
 publishing is opt-in: a half-finished experiment sitting in ``src/`` cannot
@@ -48,6 +56,12 @@ ALIASES = {
     "QTE_BOILERPLATE_M15": MyEdge,
 }
 
+#: alias → class, for the strategies taken out of service: kept and tested,
+#: never published. Empty here; move a line in from :data:`ALIASES` to switch
+#: one off. An alias belongs to exactly one of the two tables — the engine
+#: refuses to load one that is in both.
+DISABLED: dict[str, type] = {}
+
 
 def load_all() -> dict[str, type]:
     """Every strategy this repository publishes. The engine calls exactly this.
@@ -58,18 +72,38 @@ def load_all() -> dict[str, type]:
     return dict(ALIASES)
 
 
+def load_disabled() -> list[str]:
+    """The aliases kept out of service. The engine calls this beside :func:`load_all`."""
+    return sorted(DISABLED)
+
+
 def aliases() -> list[str]:
     """The published names, for a human at a REPL: ``python -c ...``."""
     return sorted(ALIASES)
 
 
 def load(alias: str) -> type:
-    """One strategy class by alias, with a readable error when it is absent."""
+    """One strategy class by alias, with a readable error when it is absent or off."""
     try:
         return ALIASES[alias]
     except KeyError:
         known = ", ".join(aliases()) or "none"
+        if alias in DISABLED:
+            raise LookupError(
+                f"{alias!r} is disabled here — listed in DISABLED, not published "
+                f"(published: {known})"
+            ) from None
         raise LookupError(f"{alias!r} is not published here (published: {known})") from None
 
 
-__all__ = ["ALIASES", "REPO_ROOT", "SETTINGS", "aliases", "load", "load_all", "load_settings"]
+__all__ = [
+    "ALIASES",
+    "DISABLED",
+    "REPO_ROOT",
+    "SETTINGS",
+    "aliases",
+    "load",
+    "load_all",
+    "load_disabled",
+    "load_settings",
+]

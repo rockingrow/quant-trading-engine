@@ -117,6 +117,10 @@ class SimulatedPosition:
     #: Copied from the simulator's cost model so ``r_multiple`` can undo the
     #: contract scaling applied to P&L without reaching back for it.
     contract_size: float = 1.0
+    #: The ``risk_percent`` the entry was sized at. The run's own on most
+    #: pairs; on a ``dynamic_risk`` pair it differs from trade to trade, and
+    #: only this says which trades were the bigger bets.
+    risk_percent: float | None = None
 
     def __post_init__(self) -> None:
         if not self.remaining:
@@ -236,6 +240,7 @@ class FillSimulator:
         tp1_percent: float | None = None,
         move_sl_to_be: bool = False,
         signal_uxid: str | None = None,
+        risk_percent: float | None = None,
     ) -> SimulatedPosition:
         direction = 1 if action is SignalAction.LONG else -1
         fill = self.costs.entry_fill(price, direction)
@@ -254,6 +259,7 @@ class FillSimulator:
             entry_fees=self.costs.commission(quantity),
             initial_sl=sl,
             contract_size=self.costs.contract_size,
+            risk_percent=risk_percent,
         )
 
     # ── Walking forward ───────────────────────────────────────────────

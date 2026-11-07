@@ -36,6 +36,7 @@ import contextlib
 import logging
 import time
 
+from qte_shared import emoji_constants
 from qte_shared.config import settings
 from qte_shared.logging_setup import get_logger
 from qte_shared.notifications.telegram_sink import (
@@ -69,7 +70,7 @@ QUEUE_CAPACITY = 100
 #: header and the exception type — the part that says what broke.
 MAX_ERROR_CHARS = 3000
 
-ERROR_ICON = "🚨"
+ERROR_ICON = emoji_constants.ERROR_ALERT
 
 
 class _RecursionFilter(logging.Filter):
@@ -98,7 +99,7 @@ class TelegramErrorHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         try:
             self._notifier.offer(record, self.format(record))
-        except Exception:  # pragma: no cover — a handler must never raise
+        except Exception:  # pragma: no cover — a handler must never raise  # noqa: BLE001 - notifications never reach the trade path
             self.handleError(record)
 
 
@@ -210,7 +211,7 @@ class TelegramErrorNotifier:
             return False
         try:
             key = f"{record.name}|{record.levelno}|{record.getMessage()}"
-        except Exception:
+        except Exception:  # noqa: BLE001 - notifications never reach the trade path
             key = f"{record.name}|{record.levelno}|{record.msg!r}"
         now = time.monotonic()
         # Pruned on every call, so the map cannot grow without bound.
@@ -238,7 +239,7 @@ class TelegramErrorNotifier:
                 await self.deliver(message_text)
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception:  # noqa: BLE001 - notifications never reach the trade path
                 # Never log from here: the sink reports its own failures, and
                 # anything this task logged would be filtered out anyway.
                 pass

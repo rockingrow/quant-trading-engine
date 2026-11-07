@@ -54,6 +54,16 @@ def table(tmp_path: Path, body: str) -> Path:
     return path
 
 
+def serve_directory(monkeypatch, loaded, disabled: dict[str, Path] | None = None) -> None:
+    """Make the runner's one read of ``__strategies__/`` return exactly this."""
+    from qte_shared.strategies.plugin_loader import StrategyDirectory
+
+    monkeypatch.setattr(
+        "qte_strategy_engine.runner.read_strategy_directory",
+        lambda *a, **k: StrategyDirectory(loaded=list(loaded), disabled=dict(disabled or {})),
+    )
+
+
 @pytest.fixture
 def runner(monkeypatch, tmp_path):
     """A runner whose loader returns our two strategies and nothing else."""
@@ -63,9 +73,7 @@ def runner(monkeypatch, tmp_path):
         LoadedStrategy(name="GOLD_M15", cls=Edge, source=tmp_path / "edge.py"),
         LoadedStrategy(name="GOLD_SCALP", cls=Scalp, source=tmp_path / "scalp.py"),
     ]
-    monkeypatch.setattr(
-        "qte_strategy_engine.runner.load_strategies", lambda *a, **k: list(discovered)
-    )
+    serve_directory(monkeypatch, discovered)
     return StrategyRunner()
 
 
@@ -165,6 +173,36 @@ def test_a_name_nobody_publishes_is_logged_as_an_error(runner, monkeypatch, tmp_
     assert not runner.slots
 
 
+def test_a_name_its_repository_disabled_is_logged_as_disabled(
+    runner, monkeypatch, tmp_path, caplog
+):
+    """Still an error — the table routes a symbol to it — but named for what it is."""
+    from qte_shared.strategies.plugin_loader import LoadedStrategy
+
+    serve_directory(
+        monkeypatch,
+        [LoadedStrategy(name="GOLD_M15", cls=Edge, source=tmp_path / "edge.py")],
+        disabled={"GOLD_RETIRED": tmp_path / "manifest.py"},
+    )
+    mapping = table(
+        tmp_path,
+        """
+        [strategies.GOLD_RETIRED]
+        risk_percent = 2.0
+
+        [symbols.XAUUSD]
+        strategies = ["GOLD_M15", "GOLD_RETIRED"]
+        """,
+    )
+    with caplog.at_level("WARNING"):
+        pairs = build(runner, monkeypatch, mapping)
+
+    errors = [record.getMessage() for record in caplog.records if record.levelname == "ERROR"]
+    assert len(errors) == 1 and "keeps disabled" in errors[0] and "GOLD_RETIRED" in errors[0]
+    assert "did not publish" not in caplog.text
+    assert pairs == {("GOLD_M15", "XAUUSD")}, "the strategy that is on still runs"
+
+
 def test_strategy_defaults_for_an_unknown_name_are_warned_about(
     runner, monkeypatch, tmp_path, caplog
 ):
@@ -233,9 +271,7 @@ def switchable_runner(monkeypatch, tmp_path):
     discovered = [
         LoadedStrategy(name="GOLD_M15", cls=Edge, source=tmp_path / "edge.py", settings=declared)
     ]
-    monkeypatch.setattr(
-        "qte_strategy_engine.runner.load_strategies", lambda *a, **k: list(discovered)
-    )
+    serve_directory(monkeypatch, discovered)
     return StrategyRunner()
 
 

@@ -69,11 +69,23 @@ load_dotenv(REPO_ROOT / ".env", override=False)
 #: fixed-count downsampling of them. A reader that fed ``t`` to a date parser
 #: would get a number it cannot parse, which is what a major bump is for.
 #:
-#: 1.1 — the ``costs`` block also states ``profile``, ``profile_file`` and
-#: ``sources``: which cost profile priced the fills, and which layer supplied
-#: each number (:mod:`qte_backtest.costs`). Purely additive — every 1.0 key is
-#: still there, with the same meaning — so a minor bump.
-REPORT_SCHEMA_VERSION = "1.1"
+#: Two sets of keys have been added since, and neither bumped this constant,
+#: because both are purely additive — every 1.0 key is still there with the
+#: same meaning, so a reader written against 1.0 is still correct:
+#:
+#: * the ``costs`` block also states ``profile``, ``profile_file`` and
+#:   ``sources``: which cost profile priced the fills, and which layer supplied
+#:   each number (:mod:`qte_backtest.costs`);
+#: * every trade states the ``risk_percent`` it was sized at, and the ``run``
+#:   block says whether the pair sized per entry (``dynamic_risk``) and under
+#:   which ceiling (``max_risk_percent``). ``run.risk_percent`` keeps its
+#:   meaning as the pair's base risk.
+#:
+#: So a consumer must read this as a floor, not an inventory: a key it does not
+#: know may be present, and a key it needs may be absent on an older report.
+#: Test against the constant rather than a literal, so a bump stays a one-line
+#: change here.
+REPORT_SCHEMA_VERSION = "1.0"
 
 
 class NatsSettings(BaseSettings):
@@ -125,6 +137,11 @@ class BrokerSettings(BaseSettings):
     token: str = ""
     stream: str = "SIGNALS"
     subject_prefix: str = "SIGNALS"
+    #: Namespace for the end-to-end drill — see
+    #: :mod:`qte_strategy_engine.demo_signal`. The broker subscribes to it on
+    #: core NATS and answers with a Telegram notification only; nothing
+    #: published here can reach a trading worker.
+    demo_subject_prefix: str = "SIGNALS_DEMO"
     publish_timeout: float = 5.0
     # Shadow mode is the safety catch from phase 6: the runner does everything
     # it would do live — build the signal, log it, audit it — but stops short of
@@ -163,6 +180,11 @@ class AccountSettings(BaseSettings):
     #: Percent of :attr:`capital` put at risk on one entry when the mapping
     #: table names no ``risk_percent`` for the pair.
     risk_percent: float = 1.0
+    #: Hard ceiling on the ``risk_percent`` any one entry is sized at, on every
+    #: pair. ``0`` means no account ceiling, and is the default. A pair that
+    #: sizes per entry (``dynamic_risk``) also has a ceiling of its own; the
+    #: lower of the two wins — see :mod:`qte_shared.strategies.sizing`.
+    max_risk_percent: float = Field(default=0.0, ge=0, allow_inf_nan=False)
     #: Charged per unit on entry and on every partial exit, each side.
     commission_per_unit: float = 0.0
     #: Full bid/ask distance in price units; each side of a fill pays half.
@@ -183,6 +205,19 @@ class AccountSettings(BaseSettings):
     max_quantity: float = 0.0
     #: Decimals a sized quantity is rounded to before it reaches the wire.
     quantity_precision: int = 4
+    #: How many positions the broker account holds at once, counted across
+    #: every strategy and symbol together. ``0`` means uncapped, and is the
+    #: default: an engine that has not been told its account's limit must not
+    #: invent one. Above zero, the runner refuses an entry that would exceed it
+    #: — see :meth:`qte_strategy_engine.runner.StrategyRunner.emit`.
+    #:
+    #: **This is the engine's copy of a number it cannot read.** The limit is
+    #: enforced downstream, by the worker that places the orders, and the
+    #: engine has no channel to the account: an entry refused there is simply
+    #: never placed, nothing comes back, and the engine goes on managing a
+    #: cycle the account does not hold. Set this to whatever the account
+    #: actually enforces, and change the two together.
+    max_open_positions: int = Field(default=0, ge=0)
 
 
 class RedisSettings(BaseSettings):
@@ -194,6 +229,26 @@ class RedisSettings(BaseSettings):
     key_prefix: str = "qte"
     candle_history: int = 500
     ttl_seconds: int = 0
+    # A pooled connection the container network dropped is indistinguishable
+    # from an idle one until something reads from it. Without a keepalive and a
+    # periodic PING the next command blocks for the whole read deadline before
+    # the client gives up and reconnects, which surfaces as a TimeoutError on a
+    # server answering in under a millisecond.
+    # The deadline is a last resort, not the detector: the keepalive above and
+    # the health check below are what notice a dead connection. So it has to
+    # clear the slowest legitimate command — the multi-key Lua in
+    # :mod:`qte_shared.cache.redis_state`, staging or merging against a history
+    # of ``candle_history`` entries while the server is rewriting its AOF —
+    # because a deadline that cuts one of those turns a slow write into a lost
+    # one, and ingestion has no retry loop to cover it.
+    socket_timeout: float = 15.0
+    socket_connect_timeout: float = 5.0
+    health_check_interval: float = 30.0
+    # RESP3 buys this codebase nothing — no client-side caching, no pub/sub push
+    # handler — and redis-py 8 pairs it with maintenance notifications, a Redis
+    # Enterprise feature the OSS server rejects with "unknown subcommand
+    # MAINT_NOTIFICATIONS". Staying on RESP2 keeps the simpler parser.
+    resp_protocol: int = 2
 
 
 class PostgresSettings(BaseSettings):
@@ -379,6 +434,10 @@ class EngineSettings(BaseSettings):
     #: ``mt5/`` for a CSV import) so a file's path names its origin.
     parquet_dir: Path = REPO_ROOT / "data" / "parquet"
     reports_dir: Path = REPO_ROOT / "data" / "reports"
+    #: Where the dated audit write-ups live. Nothing writes here by itself —
+    #: an audit is written by hand — but a strategy's concept document links
+    #: the newest one that names it; see :mod:`qte_backtest.doc_reference`.
+    audits_dir: Path = REPO_ROOT / "data" / "audits"
     #: The zone a strategy's declared weekend-flat window is read in — see
     #: :mod:`qte_shared.strategies.strategy_settings`. An IANA name; ``UTC``
     #: takes the declared times literally, which is what the mounted strategies

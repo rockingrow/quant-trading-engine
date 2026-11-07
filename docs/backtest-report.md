@@ -21,14 +21,14 @@ uv run qte-backtest run --strategy MY_EDGE --symbol XAUUSD --timeframe M15 \
 | Block | Answers |
 | --- | --- |
 | `reading_guide` | The conventions an agent would otherwise have to guess — what R means, what the fill model assumes, why there is only ever one position. |
-| `run` | Strategy, class, module, params, warm-up, starting equity and the `risk_percent` every quantity was sized at. |
+| `run` | Strategy, class, module, params, warm-up, starting equity and the pair's `risk_percent`. `dynamic_risk` says whether each entry was sized at the risk its strategy stated instead, and `max_risk_percent` gives the ceiling that applied (null when uncapped). |
 | `data` | Bar count, first and last bar, decision-eligible bars including the warm-up boundary, gap count. |
 | `market` | The OHLC window of the replayed history for drawing — normally the run's own bars — plus the buy-and-hold basis, the one thing the trades cannot re-derive. |
 | `costs` | Spread, slippage, commission, contract size, derived round-trip cost — and where each came from: `profile` names the account type in `config/costs.toml` that priced the run, `profile_file` the file it was read from, and `sources` says per key whether it came from a `flag`, `profile.symbols`, `profile.defaults` or the `account` fallback. All three are null/empty for a run priced entirely from `QTE_ACCOUNT__*`. |
 | `metrics` | Currency **and** R-multiple statistics, excursion averages, exit-reason counts, direction split, exposure, streaks, equity curve. |
 | `diagnostics` | Findings, most severe first, each with its threshold, its evidence and one concrete change. |
 | `activity` | Trades taken, entries rejected, closes rejected, signals emitted. `rejected_entries` and `rejected_closes` are the intents the signal factory refused to build a payload from, counted apart because only the first has the entries that did fill to be read against. Neither counts anything refused for being a second position: nothing caps the cycles a pair stacks. |
-| `trades` | Every trade — entry, exit, bars held, initial risk, R-multiple, MAE/MFE, and each partial leg. `exit_note` (also on each leg) is the strategy's own explanation for that close, taken verbatim from `SignalIntent.reason`; null on a bracket fill, since the strategy is never consulted when a TP/SL level is simply touched. |
+| `trades` | Every trade — entry, exit, bars held, initial risk, the `risk_percent` it was sized at, R-multiple, MAE/MFE, and each partial leg. `exit_note` (also on each leg) is the strategy's own explanation for that close, taken verbatim from `SignalIntent.reason`; null on a bracket fill, since the strategy is never consulted when a TP/SL level is simply touched. |
 | `signals` | Broker trading fields the run would have published; authentication token omitted. |
 
 Two design choices to know about:
@@ -81,6 +81,13 @@ is why `metrics.average_loss` usually lands close to that budget, and why it is
 a red flag when it does not. Both figures are in the `run` block. The capital
 does not compound during a run, so an early trade cannot resize the ones after
 it and two runs stay comparable.
+
+On a pair with `run.dynamic_risk`, each trade's own `risk_percent` replaces the
+run's in that formula. It is the risk the strategy stated on the entry, capped
+at `run.max_risk_percent`, so the budget differs from trade to trade. Compare
+`average_loss` against those per-trade figures, not against `run.risk_percent`.
+R-multiples are per unit and need no adjustment: a 2% trade and a 4% trade that
+both stop out are both −1R.
 
 `metrics.starting_equity`, `ending_equity` and `return_pct` are that account
 before and after; `max_drawdown_pct` is measured against the running peak of the
@@ -190,6 +197,54 @@ Three rules the page keeps:
 
 The derivations live in `qte_backtest.visualize.view` and are tested without a
 browser; `render.py` only inlines them into the page.
+
+## Pointing the strategy document at it
+
+A reporting run also rewrites one block at the bottom of the replayed
+strategy's concept document in the mounted strategy repository,
+`__strategies__/<repo>/docs/concepts/<strategy>.md`:
+
+```markdown
+<!-- QTE-LATEST-ARTEFACTS:BEGIN -->
+## Latest artefacts
+...
+| Replayed | `XAUUSD` M15, 2020-01-02 → 2026-09-30 |
+| Run at   | 2026-10-17 10:11 UTC |
+| Headline | 187 trades, 49.73% win rate, max losing run 8, net …, max drawdown … |
+| Dashboard | [`data/reports/<session>/<stem>.html`](…) |
+| Report    | [`data/reports/<session>/<stem>.md`](…) |
+| JSON      | [`data/reports/<session>/<stem>.json`](…) |
+| Audit     | [`data/audits/<date>-<topic>.md`](…) |
+<!-- QTE-LATEST-ARTEFACTS:END -->
+```
+
+The concept document is written by hand; what it cannot state by hand is which
+of the reports accumulating in `data/reports/` is the one its defaults are
+standing on. So the engine owns that one block and nothing else:
+
+- **Everything between the two markers is generated**, carries a visible "do
+  not edit" notice, and is replaced wholesale by the next reporting run of that
+  strategy. A hand edit inside it is lost; everything outside them is never
+  read and never touched.
+- **The document is found by the alias it opens with** — `# <ALIAS>` on its
+  first line — not by a filename convention, so the engine needs to know
+  nothing about a repository it cannot see.
+- **The audit row is the newest file under `data/audits/` whose text names the
+  alias.** Audits are filed by topic, so the alias in the text is the only
+  honest link between the two.
+- **Nothing here can fail a replay.** No mount, no document, a read-only file:
+  logged and stepped over, with the report already on disk.
+
+`--no-doc-reference` leaves the block alone for a run. The block is seeded into
+a document that has never had one, or pointed at a report written before it
+existed, with:
+
+```bash
+make doc-reference                                   # seed any document missing the block
+make doc-reference REPORT=data/reports/….json        # fill it from a report written earlier
+```
+
+It lives in `qte_backtest.doc_reference`.
 
 ## Getting at it
 

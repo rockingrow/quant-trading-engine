@@ -52,6 +52,7 @@ from qte_shared.strategies.strategy_base import (
 from qte_shared.strategies.strategy_settings import (
     NO_WEEKEND_FLAT,
     WeekendFlatPolicy,
+    gate_entries,
     resolve_warmup,
 )
 from qte_shared.timeframes import TIMEFRAME_SECONDS, timeframe_seconds
@@ -147,8 +148,13 @@ class BacktestResult:
     starting_equity: float = 0.0
     #: Percent of the starting equity risked per entry. Together with the stop
     #: distance it is what produced every ``quantity`` below, so a reader can
-    #: re-derive the sizing rather than take the trade list on faith.
+    #: re-derive the sizing rather than take the trade list on faith. On a
+    #: ``dynamic_risk`` pair it is the base, and each trade states its own.
     risk_percent: float | None = None
+    #: Whether entries were sized at the risk the strategy stated on each.
+    dynamic_risk: bool = False
+    #: The ceiling on any one entry's ``risk_percent``; ``None`` when uncapped.
+    max_risk_percent: float | None = None
     #: The fallback size an entry that could not be risk-sized — no stop, or a
     #: stop on the entry — was filled at. Also what sizes the buy-and-hold
     #: benchmark, rather than comparing one unit of the market against
@@ -293,13 +299,16 @@ class BacktestEngine:
             start = 0 if window_size is None else max(0, position + 1 - window_size)
             window = frame.iloc[start : position + 1]
             close = float(bar["close"])
-            market_is_shut = self.weekend_flat.covers(bar_time, self.market_zone)
-            for intent in as_intents(self.strategy.on_candle_closed(window, context)):
-                if market_is_shut and intent.action.is_entry:
-                    self._blocked += 1
-                    continue
+            entry_gate = gate_entries(
+                as_intents(self.strategy.on_candle_closed(window, context)),
+                self.weekend_flat,
+                bar_time,
+                self.market_zone,
+            )
+            self._blocked += len(entry_gate.blocked)
+            for intent in entry_gate.allowed:
                 self._apply(intent, bar_time, close)
-            if market_is_shut:
+            if entry_gate.market_is_shut:
                 # After the strategy's own exits, as in the runner: a bar that
                 # hit the stop stopped out, and the flat is what is left.
                 self._flatten_for_the_weekend(bar_time, close)
@@ -350,6 +359,8 @@ class BacktestEngine:
             strategy_meta=self.strategy.describe(),
             starting_equity=self.starting_equity,
             risk_percent=self.factory.sizer.risk_percent,
+            dynamic_risk=self.factory.sizer.dynamic_risk,
+            max_risk_percent=self.factory.sizer.max_risk_percent,
             quantity=self.default_quantity,
             market=sample_market(frame, warmup, self.timeframe),
         )
@@ -411,6 +422,7 @@ class BacktestEngine:
                 tp1_percent=block.tp1_percent,
                 move_sl_to_be=bool(block.move_sl_to_be),
                 signal_uxid=signal.signal_uxid,
+                risk_percent=block.risk_percent,
             )
             self._open[signal.signal_uxid] = opened
             self.positions.append(opened)

@@ -1,0 +1,54 @@
+# Dependabot version updates. Security updates and alerts are switched on in the
+# repository settings (Code security); this file only drives the scheduled bumps.
+#
+# Every update PR targets `dev`: the project never opens a PR into `master`
+# directly. Dependabot security PRs ignore `target-branch` and follow the
+# repository's default branch.
+version: 2
+
+updates:
+  # pyproject.toml + uv.lock — runtime, optional extras and dependency groups.
+  - package-ecosystem: "uv"
+    directory: "/"
+    target-branch: "dev"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "Bump"
+    groups:
+      # One PR for all minor/patch bumps; a major bump stays its own PR so its
+      # breaking changes get a separate review.
+      python-minor-and-patch:
+        update-types: ["minor", "patch"]
+
+  # Dockerfile — the python base image.
+  - package-ecosystem: "docker"
+    directory: "/"
+    target-branch: "dev"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    commit-message:
+      prefix: "Bump"
+    ignore:
+      # requires-python is pinned to 3.13; moving to another Python is a
+      # deliberate migration, not an automatic bump.
+      - dependency-name: "python"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+
+  # docker-compose*.yml — redis, postgres, nats, tailscale, socat images.
+  - package-ecosystem: "docker-compose"
+    directory: "/"
+    target-branch: "dev"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    commit-message:
+      prefix: "Bump"
+    ignore:
+      # postgres holds persistent data: a major version needs a dump/restore,
+      # never an image swap.
+      - dependency-name: "postgres"
+        update-types: ["version-update:semver-major"]

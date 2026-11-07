@@ -64,6 +64,10 @@ def test_the_parser_accepts_the_documented_commands():
     assert parser.parse_args(["shadow", "on"]).state == "on"
     assert parser.parse_args(["shadow", "off", "--yes"]).yes is True
     assert parser.parse_args(["ping"]).command == "ping"
+    demo = parser.parse_args(["demo-signal", "--strategy", "S1", "--symbol", "XAUUSD"])
+    assert (demo.command, demo.strategy, demo.symbol) == ("demo-signal", "S1", "XAUUSD")
+    bare = parser.parse_args(["demo-signal"])
+    assert (bare.strategy, bare.symbol) == (None, None)
 
 
 def test_an_unknown_state_is_refused():
@@ -220,6 +224,7 @@ def wire_owner(monkeypatch, redis, bus):
 def test_the_parser_accepts_the_owner_commands():
     parser = control.build_parser()
     assert parser.parse_args(["owner", "status"]).operation == "status"
+    assert parser.parse_args(["owner", "check"]).operation == "check"
     assert parser.parse_args(["owner", "clear", "--yes"]).yes is True
     with pytest.raises(SystemExit):
         parser.parse_args(["owner", "delete"])
@@ -230,6 +235,58 @@ async def test_owner_status_names_the_key_and_its_holder(monkeypatch, capsys):
     await control._show_runner_owner()
     output = capsys.readouterr().out
     assert "qte:test:runner:owner" in output and "stale-owner" in output
+
+
+# ── owner check: what the deploy asks before it rebuilds the runner ─────
+
+
+async def test_the_check_passes_when_no_claim_is_held(monkeypatch):
+    wire_owner(monkeypatch, OwnedRedis(), PingBus())
+    assert await control._check_runner_owner() == 0
+
+
+async def test_the_check_passes_while_the_runner_that_owns_it_answers(monkeypatch):
+    # The normal state mid-deploy: the runner about to be replaced still owns
+    # the namespace it is handing over, and releases it on the way out.
+    redis = OwnedRedis("live-owner")
+    wire_owner(monkeypatch, redis, PingBus(runner_reply={"owner_id": "live-owner"}))
+    assert await control._check_runner_owner() == 0
+    assert redis.holder == "live-owner", "a read-only check must change nothing"
+
+
+async def test_the_check_reports_a_claim_no_runner_answers_for(monkeypatch, capsys):
+    redis = OwnedRedis("stale-owner")
+    wire_owner(monkeypatch, redis, PingBus())
+    assert await control._check_runner_owner() == 1
+    reported = capsys.readouterr().err
+    assert "stale-owner" in reported
+    assert "make owner-clear YES=1" in reported
+    assert redis.holder == "stale-owner", "the check must not clear anything itself"
+
+
+@pytest.mark.parametrize(
+    "bus", [PingBus(fail=True), PingBus(failure=ConnectionError("connection lost mid-request"))]
+)
+async def test_an_unverifiable_check_does_not_block_the_deploy(monkeypatch, capsys, bus):
+    # Refusing here would be circular: the deploy is what brings NATS back up.
+    wire_owner(monkeypatch, OwnedRedis("stale-owner"), bus)
+    assert await control._check_runner_owner() == 0
+    assert "not checked" in capsys.readouterr().out
+
+
+async def test_a_check_that_cannot_reach_redis_does_not_block_the_deploy(monkeypatch, capsys):
+    class UnreachableRedis(OwnedRedis):
+        async def connect(self):
+            raise ConnectionError("Redis is not up yet")
+
+    redis = UnreachableRedis("stale-owner")
+    wire_owner(monkeypatch, redis, PingBus())
+    assert await control._check_runner_owner() == 0
+    assert "not checked" in capsys.readouterr().out
+    assert redis.closed, "the check closed the client it opened"
+
+
+# ── owner clear ─────────────────────────────────────────────────────────
 
 
 async def test_clearing_without_a_claim_changes_nothing(monkeypatch, capsys):
@@ -338,6 +395,33 @@ async def test_an_unreachable_redis_changes_nothing_rather_than_half_applying(mo
     assert exit_info.value.code == 2
     assert bus.published == [], "nothing may be broadcast if the flag was not stored"
     assert "Could not reach Redis" in capsys.readouterr().err
+
+
+async def test_demo_signal_reports_an_unreachable_broker_as_one_line(monkeypatch, capsys):
+    """The drill is run *because* the broker link is suspect, so that is its likeliest
+    outcome and it must read like every other command's refusal.
+    """
+
+    async def unreachable(strategy, symbol):
+        raise ConnectionRefusedError("nats://broker:4222")
+
+    monkeypatch.setattr(control, "run_demo", unreachable)
+    with pytest.raises(SystemExit):
+        await control._run_demo_signal(None, None)
+
+    error = capsys.readouterr().err
+    assert "Could not fire the demo signal" in error
+    assert "Traceback" not in error
+    assert "ConnectionRefusedError" in error  # the cause is still named
+
+
+async def test_demo_signal_reports_a_bad_argument_without_a_traceback(monkeypatch, capsys):
+    async def refuse(strategy, symbol):
+        raise ValueError("No mounted strategy named 'TYPO'. Mounted: REAL_ONE")
+
+    monkeypatch.setattr(control, "run_demo", refuse)
+    with pytest.raises(SystemExit, match="No mounted strategy named"):
+        await control._run_demo_signal("TYPO", None)
 
 
 async def test_a_dependency_failure_prints_one_line_not_a_traceback(monkeypatch, capsys):

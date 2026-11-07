@@ -1,5 +1,13 @@
 # Each long-running service writes <YYYYMMDD>-<service>.log here (QTE_LOG_DIR),
-# and docker-compose mounts this directory into them. Tracked so a fresh clone
-# already owns it: a bind mount of a missing directory is created by the Docker
-# daemon, and on a Linux host that leaves it root-owned and unwritable by the
-# container's own user. The .log files themselves are git-ignored.
+# and docker-compose mounts this directory into them. Tracked so the directory
+# exists before the first `up`: a bind mount of a missing directory is created
+# by the Docker daemon, and on a Linux host that leaves it root-owned.
+#
+# Being tracked is not enough to make it writable, though. A clone belongs to
+# whoever ran it, while the containers run as uid 10001 (`USER qte` in the
+# Dockerfile), so on a Linux host nothing here is writable by the services
+# until someone hands that uid the directory — which is what `make
+# log-directory` does, as a prerequisite of every target that starts the stack.
+# Without it the services still run, logging to the console alone.
+#
+# The .log files themselves are git-ignored.

@@ -66,6 +66,19 @@ def cycles(emitted) -> dict[str, list[tuple[int, SignalAction]]]:
 def test_the_manifest_publishes_it_under_its_own_name():
     assert manifest.load_all() == {"SIGNAL_SIMULATOR_LIFECYCLE_V1": LifecycleSimulator}
     assert manifest.load_settings() == {}
+    assert manifest.load_disabled() == []
+
+
+def test_a_disabled_strategy_is_handed_over_as_off_and_refused_by_name(monkeypatch):
+    """Moving a line from ALIASES into DISABLED is the whole switch."""
+    target = manifest.ALIASES["SIGNAL_SIMULATOR_LIFECYCLE_V1"]
+    monkeypatch.delitem(manifest.ALIASES, "SIGNAL_SIMULATOR_LIFECYCLE_V1")
+    monkeypatch.setitem(manifest.DISABLED, "SIGNAL_SIMULATOR_LIFECYCLE_V1", target)
+
+    assert manifest.load_disabled() == ["SIGNAL_SIMULATOR_LIFECYCLE_V1"]
+    assert manifest.load_all() == {}
+    with pytest.raises(LookupError, match="disabled"):
+        manifest.load("SIGNAL_SIMULATOR_LIFECYCLE_V1")
 
 
 def test_no_symbol_is_written_into_the_strategy():
