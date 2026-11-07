@@ -80,9 +80,10 @@ the next start. Why these two are separate mechanisms:
 Closed candles are staged in Redis before they are published, and a staged
 close is removed only once the NATS server has confirmed it — a publish nats-py
 merely buffered while reconnecting does not count. While ingestion has no
-connection, or while a confirmation times out, the closes stay staged (one
-`WARNING` per outage) and go out, oldest first and in batches of up to 100 per
-round trip, when it returns. A staged entry that can never be published — it does
+connection, or while a confirmation times out, the closes stay staged and go
+out, oldest first and in batches of up to 100 per round trip, when it returns.
+A hold is logged when it starts, whenever its reason changes, and about once a
+minute while it lasts — so an outbox that never drains cannot go quiet. A staged entry that can never be published — it does
 not decode, or it belongs to another state namespace — is moved to the
 `outbox:candles:dead` list with an `ERROR` instead of holding back every close
 behind it; the list keeps the newest 1,000. `QTE_INGESTION__PUBLISH_CONFIRM_TIMEOUT`

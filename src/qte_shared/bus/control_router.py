@@ -10,9 +10,9 @@ reported "no runner answered" about a runner that was up.
 
 :class:`ControlRouter` is the Command pattern for that: actions register a
 handler, :meth:`ControlRouter.dispatch` does the parsing, the lookup and the
-reply, and every failure answers ``{"error": ...}`` when the message asked for
-an answer. A handler returning ``None`` sends nothing — the broadcasts
-(``set_shadow_mode``) are notifications, not requests.
+reply, and every failure answers when the message asked for an answer. A
+handler returning ``None`` sends nothing — the broadcasts (``set_shadow_mode``)
+are notifications, not requests.
 
 A failure reply carries :data:`CONTROL_ERROR_KEY`, never a bare ``error``. Some
 handlers answer with an ``error`` of their own that *is* their answer (``flat``

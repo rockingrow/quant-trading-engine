@@ -126,7 +126,7 @@ class SignalRepository:
         self,
         limit: int = 100,
         *,
-        statuses: tuple[str, ...] = tuple(sorted(UNFINISHED)),
+        statuses: tuple[str, ...] = tuple(sorted(status.value for status in UNFINISHED)),
         after_cursor: tuple[datetime, uuid.UUID] | None = None,
         include_ids: Sequence[str] = (),
     ) -> Sequence[SignalAudit]:

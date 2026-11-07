@@ -259,7 +259,12 @@ class RedisState:
 
         A batch rather than one at a time so the drain can publish them all and
         confirm the lot with one server round trip. Nothing is removed here.
+
+        A *batch_limit* of zero or less reads nothing. Passing it straight to
+        ``LRANGE`` would ask for ``0..-1``, which is Redis for *every* element.
         """
+        if batch_limit <= 0:
+            return []
         raw_entries = await self.client.lrange(self.key("outbox", "candles"), 0, batch_limit - 1)
         decoded: list[Candle | None] = []
         for raw_entry in raw_entries:

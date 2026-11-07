@@ -108,6 +108,10 @@ SERVICE_NAME = "data-ingestion"
 #: Closes published per confirmation round trip when the outbox drains.
 OUTBOX_BATCH_SIZE = 100
 
+#: Drains between two reports of an outbox that is still holding its closes.
+#: At the default one-second flush interval that is about a minute apart.
+OUTBOX_HOLD_LOG_EVERY = 60
+
 
 @dataclass
 class RetiredCandle:
@@ -216,9 +220,13 @@ class IngestionService:
         self._vendor_offline = False
         #: When each series last had a gap topped up inline.
         self._gap_asked_at: dict[tuple[str, str], datetime] = {}
-        #: True while the outbox is held back for want of a NATS connection, so
-        #: the outage is logged once rather than on every flush interval.
+        #: True while the outbox is holding its closes back; with the two
+        #: fields below it decides how often that is logged — see
+        #: :meth:`_note_outbox_held`.
         self._outbox_waiting_for_nats = False
+        #: Consecutive drains that have held, and why the last one did.
+        self._outbox_holds = 0
+        self._outbox_hold_reason: str | None = None
         self._control = self._build_control_router()
         self._cleaned = False
 
@@ -1101,8 +1109,9 @@ class IngestionService:
         exact case this outbox exists for. So the drain stops while there is no
         connection, publishes a batch, confirms the whole batch with one flush
         (a PING/PONG round trip), and only then removes it. A publish or a flush
-        that fails or times out leaves the batch staged for the next interval;
-        the outage is logged once, not on every flush.
+        that fails or times out leaves the batch staged for the next interval,
+        and :meth:`_note_outbox_held` reports the hold without repeating it on
+        every flush.
 
         A crash between the confirmation and the removal replays the batch,
         which the runner rejects by candle open time. Deleting before publish
@@ -1119,7 +1128,7 @@ class IngestionService:
             while True:
                 staged_batch = await self.state.pending_candle_batch(OUTBOX_BATCH_SIZE)
                 if not staged_batch:
-                    self._outbox_waiting_for_nats = False
+                    self._note_outbox_drained()
                     return
                 publishable = self._publishable_prefix(staged_batch)
                 if not publishable:
@@ -1135,7 +1144,7 @@ class IngestionService:
                 if not await self._publish_confirmed(publishable):
                     return
                 await self.state.ack_pending_candles(len(publishable))
-                self._outbox_waiting_for_nats = False
+                self._note_outbox_drained()
                 for candle in publishable:
                     log.info(
                         "Candle closed %s %s open_time=%s o=%s h=%s l=%s c=%s ticks=%d",
@@ -1178,11 +1187,33 @@ class IngestionService:
         return True
 
     def _note_outbox_held(self, reason: str) -> None:
-        if not self._outbox_waiting_for_nats:
+        """Report an outbox that is holding its closes back, and keep reporting it.
+
+        Once per outage is not enough. A connection that answers but never
+        confirms — a half-open socket, a server that accepts and stalls — makes
+        every drain fail the same way, and a single line would leave an engine
+        that is delivering no candles at all looking healthy for hours. So the
+        first hold is logged, a hold for a *different* reason is logged, and a
+        hold that simply persists is logged again every
+        :data:`OUTBOX_HOLD_LOG_EVERY` drains.
+        """
+        self._outbox_holds = self._outbox_holds + 1 if self._outbox_waiting_for_nats else 1
+        changed_reason = reason != self._outbox_hold_reason
+        if changed_reason or self._outbox_holds % OUTBOX_HOLD_LOG_EVERY == 1:
             log.warning(
-                "Staged candle closes stay in the outbox until NATS confirms them (%s)", reason
+                "Staged candle closes stay in the outbox until NATS confirms them (%s); "
+                "%d drain(s) held so far",
+                reason,
+                self._outbox_holds,
             )
-            self._outbox_waiting_for_nats = True
+        self._outbox_waiting_for_nats = True
+        self._outbox_hold_reason = reason
+
+    def _note_outbox_drained(self) -> None:
+        """Forget a hold, so the next outage is reported from its first drain."""
+        self._outbox_waiting_for_nats = False
+        self._outbox_holds = 0
+        self._outbox_hold_reason = None
 
     async def _quarantine_outbox_head(self, reason: str) -> None:
         """Move the outbox head aside so the candles behind it can go out."""

@@ -18,7 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`QTE_INGESTION__PUBLISH_CONFIRM_TIMEOUT`, default `5` seconds) — one round
   trip per batch of up to 100 closes. A publish or confirmation that fails
   leaves the batch staged for the next flush interval, at start-up too, rather
-  than stopping ingestion. A staged entry that can never be published moves to
+  than stopping ingestion; the hold is logged when it starts, when its reason
+  changes, and about once a minute while it lasts. A staged entry that can never be published moves to
   `outbox:candles:dead` with an `ERROR` instead of blocking every close behind
   it.
 - **An ambiguous HTTP delivery is `unknown`, not `failed`.** On

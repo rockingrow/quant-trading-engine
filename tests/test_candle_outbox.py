@@ -230,3 +230,54 @@ async def test_wait_closed_returns_once_the_client_gives_up():
     bus = NatsBus(url="nats://engine-node:4222", token="secret")
     await bus._on_closed()
     await bus.wait_closed()
+
+
+async def test_a_held_outbox_keeps_reporting_itself(caplog):
+    """One line per outage is not enough when the hold never ends.
+
+    A connection that answers but never confirms fails every drain the same
+    way; logging only the first would leave an engine delivering no candles at
+    all looking healthy.
+    """
+    from qte_ingestion.service import OUTBOX_HOLD_LOG_EVERY
+
+    bus = ConfirmingBus(connected=True, flush_fails=True)
+    service = outbox_service(bus)
+    await service.state.stage_closed_candle(closed_candle())
+
+    with caplog.at_level(logging.WARNING, logger="qte_ingestion.service"):
+        for _ in range(OUTBOX_HOLD_LOG_EVERY + 1):
+            await service._drain_candle_outbox()
+
+    held = [record for record in caplog.records if "stay in the outbox" in record.message]
+    assert len(held) == 2, "the first hold and one reminder a minute later"
+    assert "TimeoutError" in held[0].getMessage()
+
+
+async def test_a_hold_for_a_new_reason_is_reported_at_once(caplog):
+    bus = ConfirmingBus(connected=True, flush_fails=True)
+    service = outbox_service(bus)
+    await service.state.stage_closed_candle(closed_candle())
+
+    with caplog.at_level(logging.WARNING, logger="qte_ingestion.service"):
+        await service._drain_candle_outbox()
+        bus.is_connected = False
+        await service._drain_candle_outbox()
+
+    held = [
+        record.getMessage() for record in caplog.records if "stay in the outbox" in record.message
+    ]
+    assert len(held) == 2
+    assert "TimeoutError" in held[0] and "not connected" in held[1]
+
+
+async def test_a_batch_limit_of_zero_reads_nothing():
+    # LRANGE 0 -1 is Redis for "everything"; a limit of zero must not drain
+    # the whole outbox into one batch.
+    bus = ConfirmingBus(connected=True)
+    service = outbox_service(bus)
+    for symbol in ("XAUUSD", "BTCUSDT"):
+        await service.state.stage_closed_candle(closed_candle(symbol))
+
+    assert await service.state.pending_candle_batch(0) == []
+    assert len(await service.state.pending_candle_batch(2)) == 2
