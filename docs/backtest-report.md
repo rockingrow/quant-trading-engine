@@ -67,6 +67,16 @@ it rather than the strategy source when reproducing a result.
 Cash and percentage maximum drawdown are tracked independently over realised
 equity; their worst points need not be the same trade.
 
+**`metrics.equity_curve` steps in the order the trades closed; `trades` is
+listed in the order they opened.** The two are not index-parallel and must not
+be zipped: nothing caps the cycles a pair stacks, so a later entry that closed
+first moves the balance first. The curve is `starting_equity` followed by one
+point per closed trade, so it is one longer than `trades`. To attribute P&L to
+a trade, read `trades[].net_pnl`; to read the balance through time, read the
+curve. `metrics.period_start` is the earliest entry and `period_end` the last
+close of any trade — `period_end` also sets the trade frequency `sharpe` is
+annualised from.
+
 Everything risk-normalised is in **R** — profit divided by the risk taken at
 entry (`|entry - initial_sl| × quantity × contract_size`). Read expectancy and
 payoff in R and treat the currency figures as scale. A trade that reached the

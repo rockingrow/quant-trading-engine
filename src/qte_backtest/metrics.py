@@ -4,7 +4,9 @@ Every figure here is computed from realised, net-of-cost P&L. Two of them are
 easy to get wrong and are spelled out on purpose:
 
 * **Max drawdown** is measured on the running equity curve of closed trades,
-  not on the worst single loss. The curve starts at the account's capital
+  not on the worst single loss, and that curve steps in the order the trades
+  *closed* — with several cycles open at once, entry order would replay the
+  balance out of sequence. The curve starts at the account's capital
   (``QTE_ACCOUNT__CAPITAL``), so ``max_drawdown_pct`` and ``return_pct`` are
   percentages *of a real balance* rather than of whatever the first trade
   happened to make.
@@ -120,7 +122,11 @@ def compute_metrics(
     total_bars: int = 0,
     costs: CostModel | None = None,
 ) -> BacktestMetrics:
-    closed = [position for position in positions if position.legs]
+    # Walked in the order the P&L was realised, not the order the trades were
+    # opened: a pair may hold several cycles at once, and a later entry that
+    # closes first moves the balance first. The curve, the drawdown and the
+    # streaks are all read off that sequence.
+    closed = realisation_order(positions)
     metrics = BacktestMetrics(
         starting_equity=round(starting_equity, 6), ending_equity=round(starting_equity, 6)
     )
@@ -178,8 +184,8 @@ def compute_metrics(
     metrics.max_drawdown = round(max_drawdown, 6)
     metrics.max_drawdown_pct = round(max_drawdown_pct, 4) if max_drawdown_pct is not None else None
     metrics.max_consecutive_losses = worst_streak
-    metrics.period_start = closed[0].opened_at
-    metrics.period_end = closed[-1].closed_at or closed[-1].opened_at
+    metrics.period_start = min(position.opened_at for position in closed)
+    metrics.period_end = _realised_at(closed[-1])
     metrics.sharpe = _sharpe(pnls, metrics.period_start, metrics.period_end)
     _add_risk_normalised(metrics, closed)
     _add_cost_economics(metrics, closed, costs or CostModel())
@@ -297,6 +303,22 @@ def _add_shape(
     # net P&L is one outlier has not been demonstrated, it has been sampled.
     if metrics.net_pnl > 0 and metrics.largest_win > 0:
         metrics.best_trade_share_pct = round(100.0 * metrics.largest_win / metrics.net_pnl, 2)
+
+
+def realisation_order(positions: Sequence[SimulatedPosition]) -> list[SimulatedPosition]:
+    """Every position with a closed leg, ordered by when its last leg closed.
+
+    Ties keep entry order (the sort is stable, keyed second on the entry
+    time). A position still open counts at its latest leg, the last P&L it
+    realised.
+    """
+    closed = [position for position in positions if position.legs]
+    return sorted(closed, key=lambda position: (_realised_at(position), position.opened_at))
+
+
+def _realised_at(position: SimulatedPosition) -> datetime:
+    """When *position* last realised P&L: the time of its newest closed leg."""
+    return position.legs[-1].closed_at
 
 
 def _longest_run(pnls: Sequence[float], *, winning: bool) -> int:

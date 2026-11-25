@@ -54,6 +54,41 @@ def test_drawdown_is_measured_on_the_equity_curve_not_the_worst_trade():
     assert metrics.max_consecutive_losses == 2
 
 
+def _held(pnl: float, *, opened_day: int, closed_day: int) -> SimulatedPosition:
+    """A position held from one day to another — cycles may overlap."""
+    position = _position(pnl, opened_day)
+    position.legs[0].closed_at = START + timedelta(days=closed_day)
+    return position
+
+
+def test_the_curve_steps_in_the_order_trades_closed_not_the_order_they_opened():
+    # Entered A, B, C; closed B, C, A. Stacked cycles make the two orders differ.
+    positions = [
+        _held(-50, opened_day=0, closed_day=10),
+        _held(-50, opened_day=1, closed_day=2),
+        _held(100, opened_day=3, closed_day=4),
+    ]
+    metrics = compute_metrics(positions, starting_equity=1000)
+
+    assert metrics.equity_curve == [1000.0, 950.0, 1050.0, 1000.0]
+    # Entry order would read -50, -50 back to back: a drawdown of 100 and a run of 2.
+    assert metrics.max_drawdown == pytest.approx(50.0)
+    assert metrics.max_consecutive_losses == 1
+    assert metrics.period_start == START
+    assert metrics.period_end == START + timedelta(days=10)
+    assert metrics.net_pnl == pytest.approx(0.0)
+
+
+def test_trades_closing_together_keep_their_entry_order():
+    # Handed over newest entry first, so this fails unless the tie is broken on
+    # the entry time: a sort keyed on the close alone is stable and would leave
+    # them in the order they arrived, curving 1000 → 990 → 1020 instead.
+    entered_later = _held(-10, opened_day=1, closed_day=5)
+    entered_first = _held(30, opened_day=0, closed_day=5)
+    metrics = compute_metrics([entered_later, entered_first], starting_equity=1000)
+    assert metrics.equity_curve == [1000.0, 1030.0, 1020.0]
+
+
 def test_profit_factor_is_none_rather_than_infinite_without_a_loss():
     metrics = compute_metrics([_position(10, 1), _position(5, 2)])
     assert metrics.profit_factor is None

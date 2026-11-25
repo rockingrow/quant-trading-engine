@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Backtest drawdown, streaks and the equity curve follow the order trades
+  closed.** They walked the trades in the order they were opened, so with
+  several cycles open at once a later entry that closed first was booked last:
+  the max drawdown, the longest losing run and the dashboard's curve and
+  streaks could all come out wrong, and `period_end` (which also scales the
+  Sharpe ratio) was the close of the last trade *opened* rather than the last
+  one closed. They now step in exit order, ties kept in entry order; each curve
+  point keeps its trade's number from the table, and `period_start` is the
+  earliest entry. A trade whose `closed_at` is still null because it holds
+  size is dated by its newest filled leg rather than by its entry, so the
+  dashboard and the stored metrics cannot order the same run differently; the
+  P&L-by-period buckets and the CAGR span read that same instant. Reports of
+  strategies that stack cycles are worth regenerating.
+  `docs/backtest-report.md` now states that `metrics.equity_curve` steps in
+  close order while `trades` is listed in entry order, so the two are not to
+  be zipped.
+
 ## [0.1.2] - 2026-11-08
 
 ### Fixed
