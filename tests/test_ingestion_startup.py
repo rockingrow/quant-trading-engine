@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
 from ingestion_support import bare_ingestion_service
 
 from qte_ingestion.service import SERVICE_NAME
@@ -34,6 +35,17 @@ class JournalledResource:
 
     async def subscribe(self, subject, handler, queue: str = "") -> None:
         self.journal.append(f"subscribe:{self.resource_name}")
+
+    def key(self, *parts: str) -> str:
+        return ":".join(parts)
+
+    async def claim_service(self, service: str, owner_id: str) -> bool:
+        self.journal.append(f"claim:{self.resource_name}")
+        return True
+
+    async def release_service(self, service: str, owner_id: str) -> bool:
+        self.journal.append(f"release:{self.resource_name}")
+        return True
 
 
 class JournalledResampler:
@@ -148,6 +160,9 @@ async def test_start_up_guards_restores_closes_backfills_then_listens(monkeypatc
         assert journal == [
             "connect:bus",
             "connect:state",
+            # Before the state guard and the drain: everything below this line
+            # reads or writes candle state the namespace allows one writer of.
+            "claim:state",
             "guard",
             "drain",
             "repairer",
@@ -162,3 +177,49 @@ async def test_start_up_guards_restores_closes_backfills_then_listens(monkeypatc
         ]
     finally:
         await service.stop()
+
+
+class HeldOwnership(JournalledResource):
+    """A namespace another ingestion already holds."""
+
+    async def claim_service(self, service: str, owner_id: str) -> bool:
+        self.journal.append(f"claim:{self.resource_name}")
+        return False
+
+    async def reclaim_service(self, service: str, instance_token: str, owner_id: str) -> bool:
+        return False
+
+    async def service_owner(self, service: str) -> str:
+        return "another-ingestion"
+
+
+async def test_a_held_ownership_claim_refuses_the_start(monkeypatch):
+    # Two ingestion processes on one namespace share the candle outbox and one
+    # durable MT5 consumer, so they lose closes rather than splitting the work.
+    journal: list[str] = []
+    service = bare_ingestion_service()
+    service._scope = settings.state_scope
+    service.status = ServiceStatusNotifier(SERVICE_NAME)
+    service.telegram_errors = TelegramErrorNotifier()
+    service.bus = JournalledResource("bus", journal)
+    service.state = HeldOwnership("state", journal)
+    service.events = SilentEvents()
+    service._feeds = []
+    service._flush_task = None
+    service._stopping = asyncio.Event()
+    service._cleaned = False
+
+    guard_calls: list[str] = []
+
+    async def record_guard(*guard_arguments, **guard_keywords) -> bool:
+        guard_calls.append("guard")
+        return False
+
+    monkeypatch.setattr("qte_ingestion.service.discard_foreign_candle_state", record_guard)
+
+    with pytest.raises(RuntimeError, match="Ingestion ownership is already held"):
+        await service.start()
+
+    # Refused before anything reads or rewrites the shared candle state.
+    assert guard_calls == []
+    assert journal == ["connect:bus", "connect:state", "claim:state", "close:bus", "close:state"]

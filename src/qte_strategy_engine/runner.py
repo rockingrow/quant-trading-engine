@@ -83,6 +83,7 @@ from qte_shared.bus import NatsBus, Subjects
 from qte_shared.cache import RedisState
 from qte_shared.config import AccountSettings, settings
 from qte_shared.db import EventRepository
+from qte_shared.instance import container_instance_token
 from qte_shared.logging_setup import get_logger
 from qte_shared.models import (
     Candle,
@@ -117,7 +118,6 @@ from qte_strategy_engine.control_plane import ControlPlane, RunnerIdentity
 from qte_strategy_engine.db import OpenPositionRepository, SignalRepository
 from qte_strategy_engine.delivery import DeliveryPipeline
 from qte_strategy_engine.history_sync import HistorySync
-from qte_strategy_engine.instance import container_instance_token
 from qte_strategy_engine.preflight import run_preflight_audit
 from qte_strategy_engine.recovery import PositionRecovery
 from qte_strategy_engine.runner_context import (

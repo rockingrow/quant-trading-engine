@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from qte_strategy_engine import instance
-from qte_strategy_engine.instance import container_instance_token
+from qte_shared import instance
+from qte_shared.instance import container_instance_token
 
 
 def as_container_main_process(monkeypatch) -> None:

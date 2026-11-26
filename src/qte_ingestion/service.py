@@ -70,6 +70,7 @@ import contextlib
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from uuid import uuid4
 
 from nats.errors import Error as NatsError
 
@@ -79,9 +80,10 @@ from qte_ingestion.resampler import Resampler
 from qte_ingestion.settings import ingestion_settings
 from qte_ingestion.state_guard import discard_foreign_candle_state
 from qte_shared.bus import ControlRouter, NatsBus, Subjects
-from qte_shared.cache import RedisState
+from qte_shared.cache import RedisState, StagedCandle
 from qte_shared.config import market_data_plan, settings
 from qte_shared.db import EventRepository
+from qte_shared.instance import container_instance_token
 from qte_shared.interfaces.market_data import (
     Capability,
     HistoryNotServed,
@@ -228,9 +230,73 @@ class IngestionService:
         self._outbox_holds = 0
         self._outbox_hold_reason: str | None = None
         self._control = self._build_control_router()
+        #: Set only for a container's PID 1, whose stale claim is provably dead.
+        self._instance_token = (
+            container_instance_token(ingestion_settings.instance_file)
+            if ingestion_settings.reclaim_own_claim
+            else None
+        )
+        self._owner_id = (
+            f"{self._instance_token}:{uuid4()}" if self._instance_token else str(uuid4())
+        )
+        self._ownership_acquired = False
         self._cleaned = False
 
     # ── Lifecycle ─────────────────────────────────────────────────────
+
+    async def _acquire_ownership(self) -> None:
+        """Claim the namespace for this ingestion, or refuse to start.
+
+        The same claim the strategy runner makes, for the same reason and with
+        the same escape hatch: a held claim is refused, except one carrying this
+        container's instance token, which an earlier process of the container we
+        are PID 1 of left behind and cannot still be using.
+
+        Deliberately not re-checked on every candle the way the runner re-checks
+        before every trade decision. The claim is what keeps a second process
+        out; :meth:`_drain_candle_outbox` does not trust it anyway, because its
+        acknowledgement compares the outbox head against what it published
+        rather than counting entries.
+        """
+        if await self.state.claim_service(SERVICE_NAME, self._owner_id):
+            self._ownership_acquired = True
+            return
+        if self._instance_token is not None and await self.state.reclaim_service(
+            SERVICE_NAME, self._instance_token, self._owner_id
+        ):
+            self._ownership_acquired = True
+            log.warning(
+                "Reclaimed the ingestion ownership left by an earlier process of this "
+                "container owner_id=%s",
+                self._owner_id,
+            )
+            with contextlib.suppress(Exception):
+                await self.events.record_event(
+                    service=SERVICE_NAME,
+                    event="ownership_reclaimed",
+                    level="WARNING",
+                    payload={"owner_id": self._owner_id},
+                )
+            return
+        holder = None
+        with contextlib.suppress(Exception):
+            holder = await self.state.service_owner(SERVICE_NAME)
+        with contextlib.suppress(Exception):
+            await self.events.record_event(
+                service=SERVICE_NAME,
+                event="ownership_refused",
+                level="ERROR",
+                payload={"holder": holder, "namespace": self._scope.namespace},
+            )
+        raise RuntimeError(
+            "Ingestion ownership is already held in this Redis namespace "
+            f"(namespace={self._scope.namespace}, holder={holder}). Two ingestion "
+            "processes share one candle outbox and one MT5 consumer, so they lose "
+            "closes rather than splitting the work. Stop the other one; after an "
+            "unclean exit verify it is gone, then clear the stale "
+            f"{self.state.key(SERVICE_NAME, 'owner')} claim with "
+            "'make owner-clear SERVICE=ingestion'. Automatic failover is disabled."
+        )
 
     async def start(self) -> None:
         self._cleaned = False
@@ -241,6 +307,12 @@ class IngestionService:
             await self.telegram_errors.start(SERVICE_NAME)
             await self.bus.connect()
             await self.state.connect()
+            # Before anything touches the shared candle state. A second
+            # ingestion on one namespace is not a slower engine, it is a
+            # quieter one: the two share the candle outbox, whose drain is
+            # serialised only inside a process, and they bind one durable MT5
+            # consumer, which hands each of them a different half of the bars.
+            await self._acquire_ownership()
             # Before anything reads the cache back: bars another provider wrote,
             # or dated after now, are not this market's history.
             await discard_foreign_candle_state(
@@ -635,7 +707,6 @@ class IngestionService:
         for close in (
             self.telegram_errors.stop,
             self.status.aclose,
-            self.state.close,
             self.bus.close,
         ):
             try:
@@ -643,6 +714,39 @@ class IngestionService:
             except Exception:
                 cleanup_failed = True
                 log.exception("Resource cleanup failed during ingestion shutdown")
+        # After the feeds and the bus are down, so nothing of ours can still
+        # stage or publish a close once the namespace is free, and only when
+        # cleanup was clean: an uncertain shutdown keeps the claim, exactly as
+        # the runner does, because the alternative is a second process starting
+        # beside whatever is left of this one.
+        if self._ownership_acquired and not cleanup_failed:
+            try:
+                await self.state.release_service(SERVICE_NAME, self._owner_id)
+                self._ownership_acquired = False
+            except Exception:
+                cleanup_failed = True
+                log.exception("Could not release ingestion ownership")
+        elif self._ownership_acquired:
+            log.warning(
+                "Retaining the ingestion ownership claim because shutdown cleanup failed "
+                "owner_id=%s namespace=%s — the next container is refused until the "
+                "%s key is removed",
+                self._owner_id,
+                self._scope.namespace,
+                self.state.key(SERVICE_NAME, "owner"),
+            )
+            with contextlib.suppress(Exception):
+                await self.events.record_event(
+                    service=SERVICE_NAME,
+                    event="ownership_retained",
+                    level="WARNING",
+                    payload={"owner_id": self._owner_id, "namespace": self._scope.namespace},
+                )
+        try:
+            await self.state.close()
+        except Exception:
+            cleanup_failed = True
+            log.exception("Redis cleanup failed during ingestion shutdown")
         self._cleaned = not cleanup_failed
         log.info("Ingestion stopped")
 
@@ -1132,7 +1236,7 @@ class IngestionService:
                     return
                 publishable = self._publishable_prefix(staged_batch)
                 if not publishable:
-                    oldest_entry = staged_batch[0]
+                    oldest_entry = staged_batch[0].candle
                     await self._quarantine_outbox_head(
                         "it does not decode"
                         if oldest_entry is None
@@ -1141,11 +1245,29 @@ class IngestionService:
                         "belongs to another state scope"
                     )
                     continue
-                if not await self._publish_confirmed(publishable):
+                # Both lists come from the same pairs, so what is published and
+                # what is acknowledged cannot drift apart. Publishing fewer than
+                # we acknowledge is how a staged close gets deleted unpublished,
+                # and the staging watermark would never admit it again.
+                acknowledged = [entry for entry, _ in publishable]
+                candles = [candle for _, candle in publishable]
+                if not await self._publish_confirmed(candles):
                     return
-                await self.state.ack_pending_candles(len(publishable))
+                if not await self.state.ack_pending_candles(acknowledged):
+                    # The head is no longer what went out, so nothing was
+                    # removed and the batch is published again next drain. On a
+                    # healthy namespace this cannot happen: the ownership claim
+                    # allows one ingestion, and staging only ever appends.
+                    log.error(
+                        "The candle outbox head changed under this drain, so %d published "
+                        "close(s) were not acknowledged. Another writer is on namespace %s "
+                        "— check for a second data-ingestion process.",
+                        len(publishable),
+                        self._scope.namespace,
+                    )
+                    return
                 self._note_outbox_drained()
-                for candle in publishable:
+                for candle in candles:
                     log.info(
                         "Candle closed %s %s open_time=%s o=%s h=%s l=%s c=%s ticks=%d",
                         candle.symbol,
@@ -1158,13 +1280,20 @@ class IngestionService:
                         candle.tick_count,
                     )
 
-    def _publishable_prefix(self, staged_batch: list[Candle | None]) -> list[Candle]:
-        """The leading run of *staged_batch* that can go out, up to the first that cannot."""
-        publishable: list[Candle] = []
-        for candle in staged_batch:
-            if candle is None or not self._scope.accepts(candle.origin):
+    def _publishable_prefix(
+        self, staged_batch: list[StagedCandle]
+    ) -> list[tuple[StagedCandle, Candle]]:
+        """The leading run of *staged_batch* that can go out, up to the first that cannot.
+
+        Each one paired with its decoded candle: the publish needs the candle
+        and the acknowledgement needs the bytes it was stored as, and pairing
+        them here is what stops the two lists from ever differing in length.
+        """
+        publishable: list[tuple[StagedCandle, Candle]] = []
+        for entry in staged_batch:
+            if entry.candle is None or not self._scope.accepts(entry.candle.origin):
                 break
-            publishable.append(candle)
+            publishable.append((entry, entry.candle))
         return publishable
 
     async def _publish_confirmed(self, candles: list[Candle]) -> bool:

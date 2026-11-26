@@ -12,6 +12,8 @@ Postgres stays the audit trail; nothing here is a system of record.
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -27,6 +29,22 @@ log = get_logger(__name__)
 
 #: Undeliverable outbox candles kept for an operator to read; older ones are trimmed.
 DEAD_LETTER_LIMIT = 1000
+
+
+@dataclass(frozen=True, slots=True)
+class StagedCandle:
+    """One candle outbox entry: the bytes as stored, and what they decode to.
+
+    The bytes are kept because acknowledging a published batch compares them
+    against the list's head rather than trusting a count — see
+    :data:`ACK_PENDING_CANDLES`. Re-serialising the candle would compare a
+    value this process produced against one another process stored, which is a
+    guess about field order; the stored bytes are not a guess.
+    """
+
+    stored: str
+    candle: Candle | None
+
 
 STAGE_CLOSED_CANDLE = """
 local previous = redis.call('GET', KEYS[4])
@@ -53,6 +71,46 @@ if tonumber(ARGV[4]) > 0 then redis.call('EXPIRE', KEYS[1], ARGV[4]) end
 redis.call('RPUSH', KEYS[2], ARGV[1])
 redis.call('SET', KEYS[4], ARGV[2])
 if remove_open then redis.call('DEL', KEYS[3]) end
+return 1
+"""
+
+
+#: Remove the staged closes a drain has just published, but only while they are
+#: still the entries it published.
+#:
+#: The drain reads a batch, publishes it, then removes it, and only its own
+#: process-local lock keeps a second drain out of that window. A second
+#: *process* — one ingestion too many on a namespace — is not kept out by that
+#: lock, and a positional ``LTRIM`` by count would then remove entries nobody
+#: published: both drains trim the same length, so the second trim eats the
+#: batch behind the first. Those closes can never be staged again, because
+#: :data:`STAGE_CLOSED_CANDLE`'s watermark has already passed them.
+#:
+#: So the entries are compared, byte for byte, against the ones that went out
+#: before anything is removed. The bytes are the ones ``LRANGE`` returned, kept
+#: rather than re-serialised, so a mismatch means the list really did change.
+#: Nothing removed means the batch is published again on the next drain, which
+#: the runner drops by candle open time.
+ACK_PENDING_CANDLES = """
+local wanted = tonumber(ARGV[1])
+local staged = redis.call('LRANGE', KEYS[1], 0, wanted - 1)
+if #staged ~= wanted then return -1 end
+for index = 1, wanted do
+    if staged[index] ~= ARGV[index + 1] then return -1 end
+end
+redis.call('LTRIM', KEYS[1], wanted, -1)
+return wanted
+"""
+
+
+#: Move the outbox head to the dead-letter list and cap that list, in one step.
+#:
+#: Two commands left a crash between them able to grow the dead-letter list past
+#: its cap until the next quarantine trimmed it.
+QUARANTINE_PENDING_CANDLE = """
+local moved = redis.call('LMOVE', KEYS[1], KEYS[2], 'LEFT', 'RIGHT')
+if not moved then return 0 end
+redis.call('LTRIM', KEYS[2], -tonumber(ARGV[1]), -1)
 return 1
 """
 
@@ -130,18 +188,23 @@ class RedisState:
     def key(self, *parts: str) -> str:
         return ":".join((self._prefix, *parts))
 
-    # ── Runner ownership ──────────────────────────────────────────────
+    # ── Service ownership ─────────────────────────────────────────────
+    #
+    # One writer per service per state namespace. The runner claims ``runner``
+    # because two runners trading one book is a disaster; ingestion claims
+    # ``ingestion`` because two of them share a candle outbox whose drain is
+    # only serialised inside a process — see ``IngestionService.start``.
 
-    async def claim_runner(self, owner_id: str) -> bool:
-        """Allow one runner per state namespace, without automatic lease expiry.
+    async def claim_service(self, service: str, owner_id: str) -> bool:
+        """Allow one *service* process per state namespace, with no lease expiry.
 
         A paused process must not outlive a lease and resume alongside a new
         writer. After an unclean exit an operator must first stop that process
         and explicitly remove the stale ownership key before restarting.
         """
-        return bool(await self.client.set(self.key("runner", "owner"), owner_id, nx=True))
+        return bool(await self.client.set(self.key(service, "owner"), owner_id, nx=True))
 
-    async def reclaim_runner(self, instance_token: str, owner_id: str) -> bool:
+    async def reclaim_service(self, service: str, instance_token: str, owner_id: str) -> bool:
         """Replace a claim left by an earlier process of the same container.
 
         The caller must be that container's PID 1: its PID namespace died with
@@ -155,30 +218,48 @@ class RedisState:
                 "if holder and string.sub(holder, 1, string.len(ARGV[1])) == ARGV[1] then "
                 "redis.call('SET', KEYS[1], ARGV[2]) return 1 else return 0 end",
                 1,
-                self.key("runner", "owner"),
+                self.key(service, "owner"),
                 f"{instance_token}:",
                 owner_id,
             )
         )
 
-    async def runner_owner(self) -> str | None:
+    async def service_owner(self, service: str) -> str | None:
         """The current claim's holder, for the operator and the refusal message."""
-        return await self.client.get(self.key("runner", "owner"))
+        return await self.client.get(self.key(service, "owner"))
 
-    async def owns_runner(self, owner_id: str) -> bool:
-        return await self.client.get(self.key("runner", "owner")) == owner_id
+    async def owns_service(self, service: str, owner_id: str) -> bool:
+        return await self.client.get(self.key(service, "owner")) == owner_id
 
-    async def release_runner(self, owner_id: str) -> bool:
-        """Release only our own claim, never a replacement runner's claim."""
+    async def release_service(self, service: str, owner_id: str) -> bool:
+        """Release only our own claim, never a replacement process's claim."""
         return bool(
             await self.client.eval(
                 "if redis.call('GET', KEYS[1]) == ARGV[1] then "
                 "return redis.call('DEL', KEYS[1]) else return 0 end",
                 1,
-                self.key("runner", "owner"),
+                self.key(service, "owner"),
                 owner_id,
             )
         )
+
+    # The runner's own claim, named for its caller. The key is unchanged, so a
+    # runner upgraded in place keeps the claim it already holds.
+
+    async def claim_runner(self, owner_id: str) -> bool:
+        return await self.claim_service("runner", owner_id)
+
+    async def reclaim_runner(self, instance_token: str, owner_id: str) -> bool:
+        return await self.reclaim_service("runner", instance_token, owner_id)
+
+    async def runner_owner(self) -> str | None:
+        return await self.service_owner("runner")
+
+    async def owns_runner(self, owner_id: str) -> bool:
+        return await self.owns_service("runner", owner_id)
+
+    async def release_runner(self, owner_id: str) -> bool:
+        return await self.release_service("runner", owner_id)
 
     # ── Ticks ─────────────────────────────────────────────────────────
 
@@ -252,9 +333,12 @@ class RedisState:
         """Remove the oldest candle after its Core NATS publish succeeds."""
         await self.client.lpop(self.key("outbox", "candles"))
 
-    async def pending_candle_batch(self, batch_limit: int) -> list[Candle | None]:
+    async def pending_candle_batch(self, batch_limit: int) -> list[StagedCandle]:
         """The oldest *batch_limit* staged closes, oldest first.
 
+        Each entry carries the bytes as stored as well as the candle they decode
+        to, because :meth:`ack_pending_candles` removes an entry only while
+        those bytes are still at the head. A :attr:`StagedCandle.candle` of
         ``None`` stands for an entry that does not decode.
 
         A batch rather than one at a time so the drain can publish them all and
@@ -266,23 +350,36 @@ class RedisState:
         if batch_limit <= 0:
             return []
         raw_entries = await self.client.lrange(self.key("outbox", "candles"), 0, batch_limit - 1)
-        decoded: list[Candle | None] = []
+        staged: list[StagedCandle] = []
         for raw_entry in raw_entries:
             try:
-                decoded.append(Candle.model_validate_json(raw_entry))
+                candle = Candle.model_validate_json(raw_entry)
             except ValueError:
-                decoded.append(None)
-        return decoded
+                candle = None
+            staged.append(StagedCandle(stored=raw_entry, candle=candle))
+        return staged
 
-    async def ack_pending_candles(self, entry_count: int) -> None:
-        """Remove the oldest *entry_count* staged closes, once their publish is confirmed.
+    async def ack_pending_candles(self, published: Sequence[StagedCandle]) -> bool:
+        """Remove *published* from the head, and say whether it was removed.
 
-        Only the drain removes from the head, under its own lock, and staging
-        appends at the tail, so the first *entry_count* entries are exactly the ones
-        it published.
+        ``False`` means the head is no longer what was published, so nothing was
+        removed: another writer reached the outbox between the read and here —
+        on a healthy namespace, one ingestion process too many. The batch goes
+        out again on the next drain rather than being acknowledged unpublished.
+        See :data:`ACK_PENDING_CANDLES`.
         """
-        if entry_count > 0:
-            await self.client.ltrim(self.key("outbox", "candles"), entry_count, -1)
+        if not published:
+            return True
+        removed = int(
+            await self.client.eval(
+                ACK_PENDING_CANDLES,
+                1,
+                self.key("outbox", "candles"),
+                len(published),
+                *[entry.stored for entry in published],
+            )
+        )
+        return removed >= 0
 
     async def quarantine_pending_candle(self) -> None:
         """Move the oldest staged candle to the dead-letter list.
@@ -293,9 +390,13 @@ class RedisState:
         operator can still read what it was; the list keeps the newest
         :data:`DEAD_LETTER_LIMIT` entries.
         """
-        dead_letters = self.key("outbox", "candles", "dead")
-        await self.client.lmove(self.key("outbox", "candles"), dead_letters, "LEFT", "RIGHT")
-        await self.client.ltrim(dead_letters, -DEAD_LETTER_LIMIT, -1)
+        await self.client.eval(
+            QUARANTINE_PENDING_CANDLE,
+            2,
+            self.key("outbox", "candles"),
+            self.key("outbox", "candles", "dead"),
+            DEAD_LETTER_LIMIT,
+        )
 
     async def get_candles(self, symbol: str, timeframe: str, count: int = 0) -> list[Candle]:
         """Oldest-first history; ``count=0`` returns everything stored."""
@@ -484,9 +585,40 @@ class RedisState:
     async def set_decided_open_time(
         self, strategy: str, symbol: str, timeframe: str, open_time: datetime
     ) -> None:
-        await self.client.set(
-            self.key("decided", strategy, symbol, timeframe), open_time.isoformat()
-        )
+        """Record the newest bar a slot was fed; never move the mark backwards.
+
+        Every caller feeds bars oldest first, so the mark only advances — but
+        that is a property of four call sites rather than of this key, and what
+        it decides is whether a close this runner missed is traded or filed as
+        history. A mark nudged backwards would reopen a window already closed
+        and hand the strategy a bar it has decided on. So the stored value is
+        compared here instead of being overwritten.
+
+        A mark dated after now is the exception, and it is always replaced. A
+        synthetic feed running ahead of the clock leaves one behind, nothing
+        ever deletes this key — ``discard_candle_state`` clears the window, not
+        the mark — and
+        :meth:`~qte_strategy_engine.history_sync.HistorySync.decided_open_time`
+        only works around such a mark when it reads it. Refusing the write
+        because the poisoned value is "newer" would make it permanent; the
+        first real bar is what repairs it.
+
+        Read-then-write rather than a script: one runner owns the namespace, so
+        this key has a single writer, and the comparison is about call order
+        rather than concurrency. An unreadable mark is replaced too, since
+        :meth:`get_decided_open_time` could not parse it either.
+        """
+        key = self.key("decided", strategy, symbol, timeframe)
+        stored = await self.client.get(key)
+        if stored:
+            try:
+                stored_moment = datetime.fromisoformat(stored)
+                believable = stored_moment <= datetime.now(UTC) + CLOCK_TOLERANCE
+                if believable and stored_moment >= open_time:
+                    return
+            except (TypeError, ValueError):
+                log.warning("Replacing the unreadable decided-bar mark %s=%r", key, stored)
+        await self.client.set(key, open_time.isoformat())
 
     # ── Strategy cycle state ──────────────────────────────────────────
     #

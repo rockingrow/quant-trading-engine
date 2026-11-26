@@ -181,18 +181,20 @@ class DeadRedis(FakeRedis):
 
 
 class OwnedRedis(FakeRedis):
-    def __init__(self, holder=None, *, replaced_by=None):
+    def __init__(self, holder=None, *, replaced_by=None, service="runner"):
         super().__init__()
         self.holder = holder
         self.replaced_by = replaced_by
+        self.service = service
 
     def key(self, *parts):
         return ":".join(("qte", "test", *parts))
 
-    async def runner_owner(self):
-        return self.holder
+    async def service_owner(self, service):
+        return self.holder if service == self.service else None
 
-    async def release_runner(self, owner_id):
+    async def release_service(self, service, owner_id):
+        assert service == self.service
         if self.replaced_by is not None:
             self.holder = self.replaced_by
         if self.holder != owner_id:
@@ -226,13 +228,19 @@ def test_the_parser_accepts_the_owner_commands():
     assert parser.parse_args(["owner", "status"]).operation == "status"
     assert parser.parse_args(["owner", "check"]).operation == "check"
     assert parser.parse_args(["owner", "clear", "--yes"]).yes is True
+    # Every claim unless one is named: a check that read the runner's key alone
+    # would pass while a stale ingestion claim refused every start.
+    assert parser.parse_args(["owner", "check"]).service == "all"
+    assert parser.parse_args(["owner", "clear", "--service", "ingestion"]).service == "ingestion"
     with pytest.raises(SystemExit):
         parser.parse_args(["owner", "delete"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["owner", "status", "--service", "broker"])
 
 
 async def test_owner_status_names_the_key_and_its_holder(monkeypatch, capsys):
     wire_owner(monkeypatch, OwnedRedis("stale-owner"), PingBus())
-    await control._show_runner_owner()
+    await control._show_claim_owner(control.claims_for("runner"))
     output = capsys.readouterr().out
     assert "qte:test:runner:owner" in output and "stale-owner" in output
 
@@ -242,7 +250,7 @@ async def test_owner_status_names_the_key_and_its_holder(monkeypatch, capsys):
 
 async def test_the_check_passes_when_no_claim_is_held(monkeypatch):
     wire_owner(monkeypatch, OwnedRedis(), PingBus())
-    assert await control._check_runner_owner() == 0
+    assert await control._check_claim_owner(control.claims_for("runner")) == 0
 
 
 async def test_the_check_passes_while_the_runner_that_owns_it_answers(monkeypatch):
@@ -250,14 +258,39 @@ async def test_the_check_passes_while_the_runner_that_owns_it_answers(monkeypatc
     # the namespace it is handing over, and releases it on the way out.
     redis = OwnedRedis("live-owner")
     wire_owner(monkeypatch, redis, PingBus(runner_reply={"owner_id": "live-owner"}))
-    assert await control._check_runner_owner() == 0
+    assert await control._check_claim_owner(control.claims_for("runner")) == 0
     assert redis.holder == "live-owner", "a read-only check must change nothing"
+
+
+async def test_the_check_reports_a_stale_ingestion_claim_too(monkeypatch, capsys):
+    # The runner's key is fine and ingestion's is not: checking only the runner
+    # is what let this surface as a crash loop after the build instead.
+    redis = OwnedRedis("stale-ingestion", service="data-ingestion")
+    wire_owner(monkeypatch, redis, PingBus())
+    assert await control._check_claim_owner(control.claims_for("all")) == 1
+    reported = capsys.readouterr().err
+    assert "data-ingestion" in reported and "stale-ingestion" in reported
+    assert "make owner-clear SERVICE=ingestion YES=1" in reported
+
+
+async def test_clearing_names_the_service_or_refuses(monkeypatch):
+    redis = OwnedRedis("stale-ingestion", service="data-ingestion")
+    audit = wire_owner(monkeypatch, redis, PingBus())
+    monkeypatch.setattr("sys.argv", ["qte-control", "owner", "clear", "--yes"])
+    with pytest.raises(SystemExit, match="one service"):
+        control.main()
+    assert redis.holder == "stale-ingestion"
+    assert audit.events == []
+
+    await control._clear_claim_owner(control.SERVICE_CLAIMS["ingestion"], assume_yes=True)
+    assert redis.holder is None
+    assert audit.events[0]["event"] == "ingestion_owner_cleared"
 
 
 async def test_the_check_reports_a_claim_no_runner_answers_for(monkeypatch, capsys):
     redis = OwnedRedis("stale-owner")
     wire_owner(monkeypatch, redis, PingBus())
-    assert await control._check_runner_owner() == 1
+    assert await control._check_claim_owner(control.claims_for("runner")) == 1
     reported = capsys.readouterr().err
     assert "stale-owner" in reported
     assert "make owner-clear YES=1" in reported
@@ -270,7 +303,7 @@ async def test_the_check_reports_a_claim_no_runner_answers_for(monkeypatch, caps
 async def test_an_unverifiable_check_does_not_block_the_deploy(monkeypatch, capsys, bus):
     # Refusing here would be circular: the deploy is what brings NATS back up.
     wire_owner(monkeypatch, OwnedRedis("stale-owner"), bus)
-    assert await control._check_runner_owner() == 0
+    assert await control._check_claim_owner(control.claims_for("runner")) == 0
     assert "not checked" in capsys.readouterr().out
 
 
@@ -281,7 +314,7 @@ async def test_a_check_that_cannot_reach_redis_does_not_block_the_deploy(monkeyp
 
     redis = UnreachableRedis("stale-owner")
     wire_owner(monkeypatch, redis, PingBus())
-    assert await control._check_runner_owner() == 0
+    assert await control._check_claim_owner(control.claims_for("runner")) == 0
     assert "not checked" in capsys.readouterr().out
     assert redis.closed, "the check closed the client it opened"
 
@@ -292,7 +325,7 @@ async def test_a_check_that_cannot_reach_redis_does_not_block_the_deploy(monkeyp
 async def test_clearing_without_a_claim_changes_nothing(monkeypatch, capsys):
     redis = OwnedRedis()
     audit = wire_owner(monkeypatch, redis, PingBus(fail=True))
-    await control._clear_runner_owner(assume_yes=True)
+    await control._clear_claim_owner(control.SERVICE_CLAIMS["runner"], assume_yes=True)
     assert "nothing to clear" in capsys.readouterr().out
     assert audit.events == []
 
@@ -300,7 +333,7 @@ async def test_clearing_without_a_claim_changes_nothing(monkeypatch, capsys):
 async def test_a_stale_claim_is_cleared_and_audited(monkeypatch, capsys):
     redis = OwnedRedis("stale-owner")
     audit = wire_owner(monkeypatch, redis, PingBus())
-    await control._clear_runner_owner(assume_yes=True)
+    await control._clear_claim_owner(control.SERVICE_CLAIMS["runner"], assume_yes=True)
     assert redis.holder is None
     assert redis.closed
     assert audit.events[0]["event"] == "runner_owner_cleared"
@@ -311,7 +344,7 @@ async def test_a_stale_claim_is_cleared_and_audited(monkeypatch, capsys):
 async def test_no_responders_counts_as_no_runner(monkeypatch):
     redis = OwnedRedis("stale-owner")
     wire_owner(monkeypatch, redis, PingBus(failure=control.NoRespondersError()))
-    await control._clear_runner_owner(assume_yes=True)
+    await control._clear_claim_owner(control.SERVICE_CLAIMS["runner"], assume_yes=True)
     assert redis.holder is None
 
 
@@ -319,7 +352,7 @@ async def test_a_runner_that_answers_keeps_its_claim(monkeypatch, capsys):
     redis = OwnedRedis("live-owner")
     audit = wire_owner(monkeypatch, redis, PingBus(runner_reply={"owner_id": "live-owner"}))
     with pytest.raises(SystemExit, match="not stale"):
-        await control._clear_runner_owner(assume_yes=True)
+        await control._clear_claim_owner(control.SERVICE_CLAIMS["runner"], assume_yes=True)
     assert redis.holder == "live-owner"
     assert audit.events == []
     assert "live-owner" in capsys.readouterr().err
@@ -333,7 +366,7 @@ async def test_an_unverifiable_runner_keeps_its_claim(monkeypatch, capsys, bus):
     redis = OwnedRedis("stale-owner")
     audit = wire_owner(monkeypatch, redis, bus)
     with pytest.raises(SystemExit) as exit_info:
-        await control._clear_runner_owner(assume_yes=True)
+        await control._clear_claim_owner(control.SERVICE_CLAIMS["runner"], assume_yes=True)
     assert exit_info.value.code == 2
     assert redis.holder == "stale-owner"
     assert audit.events == []
@@ -344,7 +377,7 @@ async def test_a_claim_that_changed_meanwhile_is_not_removed(monkeypatch):
     redis = OwnedRedis("stale-owner", replaced_by="new-runner")
     audit = wire_owner(monkeypatch, redis, PingBus())
     with pytest.raises(SystemExit, match="claim changed"):
-        await control._clear_runner_owner(assume_yes=True)
+        await control._clear_claim_owner(control.SERVICE_CLAIMS["runner"], assume_yes=True)
     assert redis.holder == "new-runner"
     assert audit.events == []
 
@@ -353,7 +386,7 @@ def test_clearing_requires_typing_the_namespace(monkeypatch):
     redis = OwnedRedis("stale-owner")
     audit = wire_owner(monkeypatch, redis, PingBus())
     monkeypatch.setattr("builtins.input", lambda _: "yes")
-    monkeypatch.setattr("sys.argv", ["qte-control", "owner", "clear"])
+    monkeypatch.setattr("sys.argv", ["qte-control", "owner", "clear", "--service", "runner"])
     with pytest.raises(SystemExit) as exit_info:
         control.main()
     assert exit_info.value.code == 1
@@ -365,7 +398,7 @@ def test_typing_the_namespace_clears_the_claim(monkeypatch):
     redis = OwnedRedis("stale-owner")
     wire_owner(monkeypatch, redis, PingBus())
     monkeypatch.setattr("builtins.input", lambda _: control.settings.state_scope.namespace)
-    monkeypatch.setattr("sys.argv", ["qte-control", "owner", "clear"])
+    monkeypatch.setattr("sys.argv", ["qte-control", "owner", "clear", "--service", "runner"])
     control.main()
     assert redis.holder is None
 
@@ -373,7 +406,7 @@ def test_typing_the_namespace_clears_the_claim(monkeypatch):
 async def test_an_unreachable_redis_reports_one_line_for_the_owner_commands(monkeypatch, capsys):
     monkeypatch.setattr(control, "RedisState", lambda *a, **k: DeadRedis())
     with pytest.raises(SystemExit) as exit_info:
-        await control._clear_runner_owner(assume_yes=True)
+        await control._clear_claim_owner(control.SERVICE_CLAIMS["runner"], assume_yes=True)
     assert exit_info.value.code == 2
     assert "Could not reach Redis" in capsys.readouterr().err
 

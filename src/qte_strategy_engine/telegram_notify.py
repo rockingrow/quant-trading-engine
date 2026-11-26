@@ -574,7 +574,18 @@ class TelegramLifecycleNotifier:
             for target in targets:
                 await self._deliver_to(record, audience, target, message_text)
 
-        await self._cycles.save(record)
+        if not await self._cycles.save(record):
+            # Every target may have taken the edit path, in which case this is
+            # the only write of the action — and the event it carries is gone
+            # from the stored record for good, so the next re-render shows a
+            # cycle with a line missing and nothing says why.
+            log.error(
+                "Could not store the Telegram cycle %s %s uxid=%s: this action will be "
+                "missing from the message the next one re-renders",
+                record.strategy,
+                record.symbol,
+                record.signal_uxid,
+            )
         return record
 
     async def _deliver_to(
@@ -598,8 +609,24 @@ class TelegramLifecycleNotifier:
             record.messages.pop(stored_key, None)
 
         sent_id = await self._sink.send_message(target, message_text)
-        if sent_id is not None:
-            record.messages[stored_key] = sent_id
+        if sent_id is None:
+            return
+        record.messages[stored_key] = sent_id
+        # Persisted here rather than left to the save at the end of `deliver`.
+        # The id is the only thing that turns the next action into an edit of
+        # this message, and it exists nowhere else: Telegram will not tell us
+        # again. A write that fails after the message is in the chat means the
+        # next action sends a second one, so a failure is worth saying out loud
+        # before it shows up as a duplicate nobody can explain.
+        if not await self._cycles.save(record):
+            log.error(
+                "Sent message %s for %s %s uxid=%s but could not store its id: the next "
+                "action on this cycle will send a second message instead of editing it",
+                sent_id,
+                record.strategy,
+                record.symbol,
+                record.signal_uxid,
+            )
 
 
 def _merge_event(record: TelegramCycleRecord, event: dict[str, Any]) -> None:
