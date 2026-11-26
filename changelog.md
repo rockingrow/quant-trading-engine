@@ -82,6 +82,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   close order while `trades` is listed in entry order, so the two are not to
   be zipped.
 
+### Security
+
+- **Two vulnerable transitive dependencies are upgraded in `uv.lock`.**
+  `certifi` 2026.7.22 → 2026.11.20 (GHSA-6q48-6c7w-9gw2, critical): the older
+  bundle trusts emSign root CAs whose intermediate CA keys were compromised, and
+  it is the trust store of the HTTP client that reaches Tiingo, the Telegram Bot
+  API and the broker's HTTP transport. `Mako` 1.4.1 → 1.4.3
+  (GHSA-5639-2j2p-m4mx, CVE-2026-102991, medium): a path traversal through a
+  drive-letter URI on Windows in `TemplateLookup`; it arrives with Alembic and
+  nothing here imports it. No constraint in `pyproject.toml` changes, and the
+  images pick both up on their next build.
+
 ## [0.1.2] - 2026-11-08
 
 ### Fixed
