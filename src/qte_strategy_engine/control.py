@@ -2,8 +2,8 @@
 
 This is what is left of the control plane after the HTTP gateway was removed,
 and it is smaller for a reason: the only control that genuinely needed to reach
-a *running* process is shadow mode — plus ``owner``, for the one piece of state
-a runner that is no longer running can leave behind. Everything else the API used to serve —
+a *running* process is shadow mode — plus ``owner``, for the claim a service
+that is no longer running can leave behind. Everything else the API used to serve —
 listing strategies, reading the audit trail, running a backtest — is either a
 CLI command already or a SQL query, and neither of those needs a web service
 kept alive to answer it.
@@ -32,6 +32,8 @@ import argparse
 import asyncio
 import json
 import sys
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import NoReturn
 
 from nats.errors import NoRespondersError
@@ -46,6 +48,50 @@ from qte_strategy_engine import connectivity
 from qte_strategy_engine.demo_signal import run_demo
 
 log = get_logger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class ServiceClaim:
+    """One service's ownership claim, as the ``owner`` command talks about it.
+
+    ``service`` is the first part of the Redis key, which is also the name the
+    refusing service prints; ``control_subject`` is where a ping would reach a
+    process that still holds the claim.
+    """
+
+    service: str
+    control_subject: Callable[[Subjects], str]
+    cleared_event: str
+    clear_command: str
+
+
+SERVICE_CLAIMS: dict[str, ServiceClaim] = {
+    "runner": ServiceClaim(
+        service="runner",
+        control_subject=lambda subjects: subjects.engine_control(),
+        cleared_event="runner_owner_cleared",
+        clear_command="make owner-clear YES=1",
+    ),
+    "ingestion": ServiceClaim(
+        service="data-ingestion",
+        control_subject=lambda subjects: subjects.ingestion_control(),
+        cleared_event="ingestion_owner_cleared",
+        clear_command="make owner-clear SERVICE=ingestion YES=1",
+    ),
+}
+
+
+def claims_for(selection: str) -> list[ServiceClaim]:
+    """The claims one ``--service`` value names; ``all`` is every one of them.
+
+    ``status`` and ``check`` default to all of them deliberately. A deploy asks
+    this before it rebuilds any container, and a check that read only the
+    runner's key would pass while a stale ingestion claim refused every
+    `data-ingestion` start.
+    """
+    if selection == "all":
+        return list(SERVICE_CLAIMS.values())
+    return [SERVICE_CLAIMS[selection]]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -74,13 +120,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     owner = subparsers.add_parser(
-        "owner", help="Inspect or clear the runner ownership claim left by an unclean exit"
+        "owner", help="Inspect or clear a service ownership claim left by an unclean exit"
     )
     owner.add_argument(
         "operation",
         choices=["status", "check", "clear"],
         help="status = show who holds the claim; check = exit 1 when a claim is held that "
-        "no runner answers for; clear = remove a stale claim",
+        "no process answers for; clear = remove a stale claim",
+    )
+    owner.add_argument(
+        "--service",
+        choices=[*SERVICE_CLAIMS, "all"],
+        default="all",
+        help="Which claim: the strategy runner's, ingestion's, or every one of them "
+        "(the default). clear takes one service at a time",
     )
     owner.add_argument(
         "--yes",
@@ -223,125 +276,135 @@ def _die_unverifiable(unverifiable: _Unverifiable) -> NoReturn:
     _die(f"{unverifiable} — nothing was changed.", unverifiable.__cause__ or unverifiable)
 
 
-async def _read_runner_owner(redis_state: RedisState) -> str | None:
+async def _read_claim_holder(claim: ServiceClaim, redis_state: RedisState) -> str | None:
     try:
         await redis_state.connect()
-        return await redis_state.runner_owner()
+        return await redis_state.service_owner(claim.service)
     except Exception as exc:
         raise _Unverifiable(f"Could not reach Redis at {settings.redis.url}") from exc
 
 
-async def _show_runner_owner() -> None:
+async def _show_claim_owner(claims: Sequence[ServiceClaim]) -> None:
     redis_state = RedisState()
     try:
-        holder = await _read_runner_owner(redis_state)
+        held = [(claim, await _read_claim_holder(claim, redis_state)) for claim in claims]
     except _Unverifiable as unverifiable:
         _die_unverifiable(unverifiable)
     finally:
         await redis_state.close()
     print(f"State namespace: {settings.state_scope.namespace}")
-    print(f"Ownership key:   {redis_state.key('runner', 'owner')}")
-    print(f"Holder:          {holder if holder is not None else 'none — no runner claim'}")
+    for claim, holder in held:
+        holder_shown = holder if holder is not None else f"none — no {claim.service} claim"
+        print(f"Ownership key:   {redis_state.key(claim.service, 'owner')}")
+        print(f"Holder:          {holder_shown}")
 
 
-async def _answering_runner() -> dict | None:
-    """The runner that answers a ping, or ``None`` when none does.
+async def _answering_service(claim: ServiceClaim) -> dict | None:
+    """The process that answers *claim*'s ping, or ``None`` when none does.
 
-    An unreachable NATS is not "no runner": nothing can be verified through a
-    bus that is down, so that case refuses instead of returning ``None``.
+    An unreachable NATS is not "nothing is running": nothing can be verified
+    through a bus that is down, so that case refuses instead of returning
+    ``None``.
     """
     control_bus = NatsBus(name="qte-control")
     try:
         await control_bus.connect()
     except Exception as exc:
         raise _Unverifiable(
-            f"Could not reach NATS at {settings.nats.url}, so no runner could be ruled out"
+            f"Could not reach NATS at {settings.nats.url}, so no {claim.service} could be ruled out"
         ) from exc
     try:
         return await control_bus.request(
-            Subjects().engine_control(), {"action": "ping"}, timeout=2.0
+            claim.control_subject(Subjects()), {"action": "ping"}, timeout=2.0
         )
     except (NoRespondersError, NatsTimeoutError):
         return None
     except Exception as exc:
-        # Anything else is a broken request, not an absent runner.
-        raise _Unverifiable("The runner ping failed, so no runner could be ruled out") from exc
+        # Anything else is a broken request, not an absent process.
+        raise _Unverifiable(
+            f"The {claim.service} ping failed, so no {claim.service} could be ruled out"
+        ) from exc
     finally:
         await control_bus.close()
 
 
-async def _check_runner_owner() -> int:
-    """Report a claim that no runner answers for, before a deploy rebuilds one.
+async def _check_claim_owner(claims: Sequence[ServiceClaim]) -> int:
+    """Report a claim that nothing answers for, before a deploy rebuilds one.
 
-    A deploy that rebuilds the runner image recreates its container, and the
+    A deploy that rebuilds a service's image recreates its container, and the
     container instance token an automatic reclaim needs does not survive that.
     So a claim an unclean exit left behind refuses every new container, and the
     refusal surfaces as a crash loop minutes after the build began. Checking
-    first turns that into one message naming the remedy.
+    first turns that into one message naming the remedy — for every claim the
+    stack takes, because a deploy rebuilds more than the runner.
 
-    A claim whose runner answers is the normal state mid-deploy: the runner
+    A claim whose process answers is the normal state mid-deploy: the container
     about to be replaced still owns the namespace. An unreachable dependency
     reports nothing and does not block — the deploy is what brings it back up.
     """
     namespace = settings.state_scope.namespace
-    redis_state = RedisState()
-    try:
-        holder = await _read_runner_owner(redis_state)
-    except _Unverifiable as unverifiable:
-        print(f"Runner ownership not checked: {unverifiable}")
-        return 0
-    finally:
-        await redis_state.close()
-    if holder is None:
-        return 0
-    try:
-        runner_reply = await _answering_runner()
-    except _Unverifiable as unverifiable:
-        print(f"Runner ownership not checked: {unverifiable}")
-        return 0
-    if runner_reply is not None:
-        return 0
-    print(
-        f"The runner ownership claim for {namespace} is held by {holder}, and no runner "
-        "answers for it.\nThe next strategy-runner container will be refused until it is "
-        "cleared. Confirm no runner process for this namespace is left on any host, then:\n"
-        "    make owner-clear YES=1",
-        file=sys.stderr,
-    )
-    return 1
+    stale_claims = 0
+    for claim in claims:
+        redis_state = RedisState()
+        try:
+            holder = await _read_claim_holder(claim, redis_state)
+        except _Unverifiable as unverifiable:
+            print(f"{claim.service} ownership not checked: {unverifiable}")
+            continue
+        finally:
+            await redis_state.close()
+        if holder is None:
+            continue
+        try:
+            answered = await _answering_service(claim)
+        except _Unverifiable as unverifiable:
+            print(f"{claim.service} ownership not checked: {unverifiable}")
+            continue
+        if answered is not None:
+            continue
+        print(
+            f"The {claim.service} ownership claim for {namespace} is held by {holder}, and "
+            f"no {claim.service} answers for it.\nThe next {claim.service} container will "
+            "be refused until it is cleared. Confirm no process of it for this namespace is "
+            f"left on any host, then:\n    {claim.clear_command}",
+            file=sys.stderr,
+        )
+        stale_claims += 1
+    return 1 if stale_claims else 0
 
 
-async def _clear_runner_owner(*, assume_yes: bool) -> None:
+async def _clear_claim_owner(claim: ServiceClaim, *, assume_yes: bool) -> None:
     """Remove a stale claim, and only a stale one.
 
-    The claim never expires on purpose: a paused runner that outlived a lease
-    would resume beside its replacement. So this refuses while any runner
-    answers, asks before it deletes, and deletes only the holder it showed.
+    The claim never expires on purpose: a paused process that outlived a lease
+    would resume beside its replacement. So this refuses while anything answers
+    for the claim, asks before it deletes, and deletes only the holder it
+    showed. One service at a time, because the operator confirms one key.
     """
     namespace = settings.state_scope.namespace
     redis_state = RedisState()
     try:
-        holder = await _read_runner_owner(redis_state)
+        holder = await _read_claim_holder(claim, redis_state)
         print(f"State namespace: {namespace}")
-        print(f"Ownership key:   {redis_state.key('runner', 'owner')}")
+        print(f"Ownership key:   {redis_state.key(claim.service, 'owner')}")
         if holder is None:
-            print("No runner claim is held; nothing to clear.")
+            print(f"No {claim.service} claim is held; nothing to clear.")
             return
         print(f"Holder:          {holder}")
 
-        runner_reply = await _answering_runner()
-        if runner_reply is not None:
-            print(json.dumps(runner_reply, indent=2), file=sys.stderr)
+        answered = await _answering_service(claim)
+        if answered is not None:
+            print(json.dumps(answered, indent=2), file=sys.stderr)
             raise SystemExit(
-                "A runner answered the ping, so the claim is not stale. Stop it first; "
-                "nothing was changed."
+                f"A {claim.service} answered the ping, so the claim is not stale. Stop it "
+                "first; nothing was changed."
             )
 
         if not assume_yes:
             print(
-                "No runner answered the ping. A paused or hung runner does not answer "
-                "either: confirm yourself that no runner process for this namespace is "
-                "left on any host before continuing."
+                f"No {claim.service} answered the ping. A paused or hung process does not "
+                "answer either: confirm yourself that no process of it for this namespace "
+                "is left on any host before continuing."
             )
             # Off the event loop: the Redis connection opened above stays
             # serviced while the operator reads the warning.
@@ -353,13 +416,13 @@ async def _clear_runner_owner(*, assume_yes: bool) -> None:
                 raise SystemExit(1)
 
         try:
-            cleared = await redis_state.release_runner(holder)
+            cleared = await redis_state.release_service(claim.service, holder)
         except Exception as exc:  # noqa: BLE001 - the CLI reports the failure to the operator
             _die(f"Could not reach Redis at {settings.redis.url}.", exc)
         if not cleared:
             raise SystemExit(
-                "The claim changed while this command ran — another runner took it. "
-                "Nothing was removed."
+                f"The claim changed while this command ran — another {claim.service} took "
+                "it. Nothing was removed."
             )
     except _Unverifiable as unverifiable:
         _die_unverifiable(unverifiable)
@@ -368,11 +431,11 @@ async def _clear_runner_owner(*, assume_yes: bool) -> None:
 
     await EventRepository().record_event(
         service="qte-control",
-        event="runner_owner_cleared",
+        event=claim.cleared_event,
         level="WARNING",
         payload={"holder": holder},
     )
-    print("Cleared. The next runner to start will claim the namespace.")
+    print(f"Cleared. The next {claim.service} to start will claim the namespace.")
 
 
 async def _run_demo_signal(strategy: str | None, symbol: str | None) -> int:
@@ -425,12 +488,19 @@ def main() -> None:
         raise SystemExit(asyncio.run(_run_demo_signal(args.strategy, args.symbol)))
 
     if args.command == "owner":
+        claims = claims_for(args.service)
         if args.operation == "status":
-            asyncio.run(_show_runner_owner())
+            asyncio.run(_show_claim_owner(claims))
         elif args.operation == "check":
-            raise SystemExit(asyncio.run(_check_runner_owner()))
+            raise SystemExit(asyncio.run(_check_claim_owner(claims)))
+        elif len(claims) != 1:
+            # One key, one typed confirmation: clearing every claim at once is
+            # not something to arrive at by leaving an argument out.
+            raise SystemExit(
+                "owner clear takes one service: pass --service runner or --service ingestion."
+            )
         else:
-            asyncio.run(_clear_runner_owner(assume_yes=args.yes))
+            asyncio.run(_clear_claim_owner(claims[0], assume_yes=args.yes))
         return
 
     if args.state == "status":

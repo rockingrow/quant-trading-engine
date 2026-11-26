@@ -23,6 +23,7 @@ from ingestion_support import bare_ingestion_service
 
 from qte_ingestion.resampler import Resampler
 from qte_ingestion.service import SERVICE_NAME
+from qte_shared.cache import StagedCandle
 from qte_shared.config import settings
 from qte_shared.models import Tick
 from qte_shared.notifications import ServiceStatusNotifier, TelegramErrorNotifier
@@ -76,7 +77,10 @@ async def test_partial_ingestion_startup_closes_resources_already_acquired():
         await service.start()
     await service.stop()
 
-    assert events == ["connect:bus", "connect:state", "close:state", "close:bus"]
+    # Redis closes last, as it does in the runner: releasing the ownership
+    # claim is a Redis write, and it has to happen after the bus is down so
+    # nothing of ours can still publish once the namespace is free.
+    assert events == ["connect:bus", "connect:state", "close:bus", "close:state"]
 
 
 # ── The simulator feed ────────────────────────────────────────────────────
@@ -199,10 +203,20 @@ class CandleOutbox:
         self.pending.pop(0)
 
     async def pending_candle_batch(self, limit):
-        return list(self.pending[:limit])
+        return [
+            StagedCandle(stored=candle.model_dump_json(), candle=candle)
+            for candle in self.pending[:limit]
+        ]
 
-    async def ack_pending_candles(self, count) -> None:
-        del self.pending[:count]
+    async def ack_pending_candles(self, published) -> bool:
+        """Remove the batch only while it is still the head, as Redis does."""
+        head = self.pending[: len(published)]
+        if [entry.stored for entry in published] != [
+            candle.model_dump_json() for candle in head
+        ]:
+            return False
+        del self.pending[: len(published)]
+        return True
 
 
 class FlakyCandleBus:

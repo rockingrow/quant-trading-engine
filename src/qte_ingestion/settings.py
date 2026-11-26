@@ -8,6 +8,15 @@ from qte_shared.config import MarketStreamSettings, market_data_plan
 
 
 class IngestionSettings(MarketStreamSettings):
+    #: Reclaim an ownership claim this container's own earlier process left in
+    #: Redis. Only the container's PID 1 qualifies; a recreated container,
+    #: another host or a host process is still refused. See
+    #: :mod:`qte_shared.instance`.
+    reclaim_own_claim: bool = True
+    #: Where that container keeps its identity. It must stay on the container's
+    #: own writable layer — never on a mounted volume another container shares,
+    #: and never the runner's file, or the two would reclaim each other.
+    instance_file: str = "/tmp/qte-ingestion.instance"
     #: How often the wall-clock flush runs. Must stay well under the shortest
     #: timeframe, or bars close late in a quiet market.
     flush_interval: float = 1.0

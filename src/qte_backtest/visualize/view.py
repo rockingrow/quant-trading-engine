@@ -137,6 +137,23 @@ class Trade:
         return _parse(self.row.get("closed_at")) or self.opened
 
     @property
+    def realised(self) -> datetime | None:
+        """When this trade last moved the balance — its newest filled leg.
+
+        The same instant ``qte_backtest.metrics`` orders the equity curve by, so
+        the chart and the stored metrics cannot disagree about the sequence.
+        ``closed_at`` is null while a position is only part-closed, and reading
+        it alone would date such a trade at its entry while the metrics dated it
+        at its last partial. A report written before legs were recorded has no
+        legs to read, and falls back to :attr:`closed`.
+        """
+        for leg in reversed(self.row.get("legs") or []):
+            moment = _parse(leg.get("closed_at"))
+            if moment is not None:
+                return moment
+        return self.closed
+
+    @property
     def bars(self) -> int:
         return int(self.row.get("bars_held") or 0)
 
@@ -237,6 +254,27 @@ def _headline(metrics: dict[str, Any], curve: dict[str, Any], equity: float) -> 
     ]
 
 
+def _realisation_order(trades: Sequence[Trade]) -> list[tuple[int, Trade]]:
+    """Each trade with its table number, in the order its P&L was realised.
+
+    The report lists trades by entry, and that is the order the table and the
+    chart markers number them in. The curve and the streaks are a balance moving
+    through time, so they step by exit instead — with several cycles open at
+    once the two orders differ — while keeping each trade's own number, so a
+    point on the curve still names the trade the table shows.
+
+    Keyed on :attr:`Trade.realised`, which is what ``metrics`` orders by too;
+    ties fall back to the entry time, so trades closing on one bar keep the
+    order the table lists them in.
+    """
+    earliest = datetime.min.replace(tzinfo=UTC)
+    numbered = list(enumerate(trades, start=1))
+    return sorted(
+        numbered,
+        key=lambda item: (item[1].realised or earliest, item[1].opened or earliest),
+    )
+
+
 def _curve(trades: Sequence[Trade], equity: float) -> dict[str, Any]:
     """The closed-trade equity curve, with per-point drawdown and excursion.
 
@@ -250,7 +288,7 @@ def _curve(trades: Sequence[Trade], equity: float) -> dict[str, Any]:
     peak = equity
     trough = equity
     peak_equity = equity
-    for index, trade in enumerate(trades, start=1):
+    for index, trade in _realisation_order(trades):
         running += trade.net
         peak = max(peak, running)
         trough = min(trough, running)
@@ -258,7 +296,7 @@ def _curve(trades: Sequence[Trade], equity: float) -> dict[str, Any]:
         points.append(
             {
                 "i": index,
-                "t": _iso(trade.closed),
+                "t": _iso(trade.realised),
                 "opened": _iso(trade.opened),
                 "equity": round(running, 6),
                 "pnl": round(trade.net, 6),
@@ -486,7 +524,7 @@ def _periodical(
 def _bucket_pnl(trades: Sequence[Trade], period: str) -> list[dict[str, Any]]:
     buckets: dict[str, dict[str, Any]] = {}
     for trade in trades:
-        name = _key(trade.closed, period)
+        name = _key(trade.realised, period)
         bucket = buckets.setdefault(
             name,
             {
@@ -774,20 +812,20 @@ def _streaks(trades: Sequence[Trade]) -> dict[str, Any]:
     to sit through first.
     """
     runs: list[dict[str, Any]] = []
-    for trade in trades:
+    for _, trade in _realisation_order(trades):
         kind = "win" if trade.net > 0 else "loss"
         if runs and runs[-1]["kind"] == kind:
             runs[-1]["count"] += 1
             runs[-1]["amount"] += trade.net
-            runs[-1]["to"] = _iso(trade.closed)
+            runs[-1]["to"] = _iso(trade.realised)
         else:
             runs.append(
                 {
                     "kind": kind,
                     "count": 1,
                     "amount": trade.net,
-                    "from": _iso(trade.closed),
-                    "to": _iso(trade.closed),
+                    "from": _iso(trade.realised),
+                    "to": _iso(trade.realised),
                 }
             )
     for run in runs:
@@ -1027,7 +1065,7 @@ def _days_between(start: str | None, end: str | None) -> float | None:
 
 
 def _span_days(trades: Sequence[Trade]) -> float | None:
-    moments = [moment for moment in (trade.closed for trade in trades) if moment]
+    moments = [moment for moment in (trade.realised for trade in trades) if moment]
     opens = [moment for moment in (trade.opened for trade in trades) if moment]
     if not moments or not opens:
         return None

@@ -1,18 +1,21 @@
-"""The identity of the container this runner is the main process of.
+"""The identity of the container a service is the main process of.
 
-The runner's Redis claim never expires, so a crash leaves it behind and every
-restart is refused until an operator clears it. One case is provably safe to
-recover from without one: the same container restarting. A container's PID
-namespace is destroyed when its PID 1 exits, so a process that *is* PID 1 knows
-every earlier process of that container is gone — a claim carrying this
-container's token cannot belong to a runner that is still alive, or paused and
+A service's Redis ownership claim never expires, so a crash leaves it behind
+and every restart is refused until an operator clears it. One case is provably
+safe to recover from without one: the same container restarting. A container's
+PID namespace is destroyed when its PID 1 exits, so a process that *is* PID 1
+knows every earlier process of that container is gone — a claim carrying this
+container's token cannot belong to a process that is still alive, or paused and
 about to resume.
 
 The token is a random value kept on the container's writable layer. It survives
 a restart, is lost when the container is recreated, and no other container can
 read it. Anywhere the argument does not hold — a host process, ``docker exec``,
 an init wrapper as PID 1, an unwritable path — there is no token, and the
-runner falls back to refusing a held claim.
+service falls back to refusing a held claim.
+
+Both the strategy runner and ingestion claim a namespace this way, each with
+its own instance file, so it lives here rather than in either of them.
 """
 
 from __future__ import annotations

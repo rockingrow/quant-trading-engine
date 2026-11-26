@@ -5,6 +5,83 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Only one ingestion may own a Redis namespace.** Two `data-ingestion`
+  processes on one namespace did not split the work, they lost it: they drain
+  one candle outbox whose lock is process-local, and they bind one durable MT5
+  consumer that hands each of them a different half of the bars. Ingestion now
+  takes a non-expiring `data-ingestion:owner` claim before it touches any
+  candle state, on the same terms as the runner's — a refusal otherwise, the
+  same automatic reclaim for a restart of the same container
+  (`QTE_INGESTION__RECLAIM_OWN_CLAIM`, `QTE_INGESTION__INSTANCE_FILE`), and the
+  same `ownership_refused` / `ownership_reclaimed` / `ownership_retained`
+  events. Redis closes last on shutdown, after the bus, so the claim is
+  released only once nothing of ours can still publish.
+- **The candle outbox acknowledges what it published, not a count.** The drain
+  removed its batch with a positional `LTRIM`, which was safe only under its
+  own process-local lock; a second writer made both drains trim the same
+  length, so the second deleted the batch behind the first — closes the staging
+  watermark can never admit again. The acknowledgement now compares the outbox
+  head against the bytes that went out and removes nothing on a mismatch,
+  logging `The candle outbox head changed under this drain` at `ERROR`. The
+  batch is published again instead, which the runner drops by candle open time.
+- **A Telegram cycle's message id is stored as soon as the message is sent.**
+  Every id was written once at the end of the delivery, and the write was
+  allowed to fail silently, so one Postgres hiccup after a successful send lost
+  the id — and the next action on that cycle sent a second message instead of
+  editing the first. A failed write is now reported at `ERROR`, naming the
+  duplicate it will cause.
+- **The history cache is written atomically.** `to_parquet` wrote straight onto
+  the cached file, so a process killed mid-write left a truncated one — and
+  because a merge reads that file back and an unreadable one reads as empty,
+  the next fetch silently replaced the whole cached range instead of extending
+  it. The write now goes to a staging file and is moved onto the target, and a
+  cache that cannot be read is reported before it is rebuilt.
+- **The decided-bar watermark cannot move backwards.** It was a plain `SET`,
+  monotonic only because its four callers happen to feed bars oldest first. A
+  mark nudged backwards would reopen a window the runner has already decided
+  on, so the stored value is compared first. A mark dated after now is the
+  exception and is always replaced: a synthetic feed running ahead of the clock
+  leaves one behind, nothing deletes this key, and treating the poisoned value
+  as merely "newer" would make it permanent. An unreadable mark is replaced
+  with a warning.
+- **Quarantining an undeliverable candle is one atomic step.** The move to
+  `outbox:candles:dead` and the trim that caps it were two commands, so a crash
+  in between left the list over its limit until the next quarantine.
+
+### Changed
+
+- **`qte-control owner` takes a `--service`.** It read and cleared the runner's
+  claim only, so the pre-deploy `owner check` — which exists so that a refused
+  start does not surface as a crash loop long after the build — could not see
+  ingestion's new claim, and the only documented remedy for one was a raw
+  `redis-cli DEL`. `status` and `check` now cover every claim by default,
+  `clear` takes one service at a time (`make owner-clear SERVICE=ingestion`),
+  and clearing ingestion's records an `ingestion_owner_cleared` event.
+- **`container_instance_token` moved to `qte_shared.instance`.** Both the
+  runner and ingestion claim a namespace with it now, and a service may not
+  import a sibling.
+
+- **Backtest drawdown, streaks and the equity curve follow the order trades
+  closed.** They walked the trades in the order they were opened, so with
+  several cycles open at once a later entry that closed first was booked last:
+  the max drawdown, the longest losing run and the dashboard's curve and
+  streaks could all come out wrong, and `period_end` (which also scales the
+  Sharpe ratio) was the close of the last trade *opened* rather than the last
+  one closed. They now step in exit order, ties kept in entry order; each curve
+  point keeps its trade's number from the table, and `period_start` is the
+  earliest entry. A trade whose `closed_at` is still null because it holds
+  size is dated by its newest filled leg rather than by its entry, so the
+  dashboard and the stored metrics cannot order the same run differently; the
+  P&L-by-period buckets and the CAGR span read that same instant. Reports of
+  strategies that stack cycles are worth regenerating.
+  `docs/backtest-report.md` now states that `metrics.equity_curve` steps in
+  close order while `trades` is listed in entry order, so the two are not to
+  be zipped.
+
 ## [0.1.2] - 2026-11-08
 
 ### Fixed

@@ -197,6 +197,45 @@ def test_streaks_are_runs_of_the_same_sign():
     assert streaks["longest_loss"] == 4
 
 
+def test_overlapping_trades_step_the_curve_and_streaks_by_exit_time():
+    # Listed by entry, as the report lists them; the second one closes first.
+    first = _trade(1, -50.0, closed=START + timedelta(days=10))
+    first["opened_at"] = START.isoformat()
+    trades = [
+        first,
+        _trade(2, -50.0, closed=START + timedelta(days=2)),
+        _trade(3, 100.0, closed=START + timedelta(days=4)),
+    ]
+    view = build_view(_report(trades))
+
+    points = view["curve"]["points"]
+    assert [point["i"] for point in points] == [2, 3, 1]
+    assert [point["equity"] for point in points] == [950.0, 1050.0, 1000.0]
+    assert min(point["drawdown"] for point in points) == pytest.approx(-50.0)
+    assert [run["count"] for run in view["streaks"]["runs"]] == [1, 1, 1]
+    # The table keeps the report's own order.
+    assert [row["index"] for row in view["trades"]] == [1, 2, 3]
+
+
+def test_a_part_closed_trade_is_dated_by_its_last_leg_not_its_entry():
+    # `closed_at` is null while a position still holds size, exactly as the
+    # replay writes it; the legs are what say when the money moved. Dating this
+    # by its entry would put it first on the curve and disagree with the
+    # metrics block, which orders by the newest leg.
+    part_closed = _trade(1, 40.0, closed=START + timedelta(days=1))
+    part_closed["opened_at"] = START.isoformat()
+    part_closed["closed_at"] = None
+    part_closed["legs"] = [
+        {"closed_at": (START + timedelta(days=9)).isoformat(), "reason": "TP1", "gross_pnl": 40.0}
+    ]
+    trades = [part_closed, _trade(2, -15.0, closed=START + timedelta(days=4))]
+    view = build_view(_report(trades))
+
+    points = view["curve"]["points"]
+    assert [point["i"] for point in points] == [2, 1]
+    assert points[-1]["t"] == (START + timedelta(days=9)).isoformat()
+
+
 def test_periods_file_a_trade_under_the_month_it_closed_in():
     # Opened in March, closed in April: April's result, because that is when the
     # money moved.

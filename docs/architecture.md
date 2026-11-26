@@ -169,8 +169,9 @@ Three things keep that rule from turning every unclean exit into an outage:
   delivery still blocks its pair. Running the runner under an init wrapper
   (`init: true`) makes Python something other than PID 1 and so turns this off;
   `QTE_RUNNER__RECLAIM_OWN_CLAIM=false` does the same deliberately.
-- **A checked way to clear it.** `qte-control owner status` shows the key and
-  its holder. `qte-control owner clear` refuses while any runner answers a ping
+- **A checked way to clear it.** `qte-control owner status` shows every claim's
+  key and holder — ingestion takes one on the same terms. `qte-control owner
+  clear --service runner` refuses while any runner answers a ping
   or while NATS cannot be reached, asks for the namespace to be typed back, and
   deletes only the holder it displayed. A paused or hung runner does not answer
   a ping, so the operator still has to know that none is left. `--yes` (or
@@ -182,12 +183,12 @@ Three things keep that rule from turning every unclean exit into an outage:
 
   ```bash
   docker compose -f docker-compose.yml -f docker-compose.prod.yml \
-    run --rm --no-deps strategy-runner qte-control owner clear
+    run --rm --no-deps strategy-runner qte-control owner clear --service runner
   ```
 
 - **A deploy that says so before the build.** `make start-prod` runs
-  `qte-control owner check` first, which exits 1 when a claim is held that no
-  runner answers for. Without it the refusal arrives as a crash loop minutes
+  `qte-control owner check` first, which exits 1 when a claim is held — the
+  runner's or ingestion's — that nothing answers for. Without it the refusal arrives as a crash loop minutes
   into the build, by which time the container that could explain it is gone. A
   claim whose runner answers is the normal state mid-deploy and passes, and an
   unreachable Redis or NATS reports nothing rather than blocking — the deploy is
@@ -209,6 +210,25 @@ gone. It now logs `Retaining the runner ownership claim` and records
 `ownership_retained` at `WARNING` with the owner id and namespace — so the
 reason for a stale claim is in the audit table rather than in a container that
 no longer exists.
+
+**One active ingestion per Redis namespace, on the same terms.** A
+non-expiring `data-ingestion:owner` claim is acquired right after Redis
+connects and before anything reads or rewrites candle state, with the same
+container-instance reclaim and the same refusal otherwise
+(`QTE_INGESTION__RECLAIM_OWN_CLAIM`, `QTE_INGESTION__INSTANCE_FILE`). Two
+ingestion processes do not split the work, they lose it: they share one candle
+outbox whose drain is serialised only inside a process, and they bind one
+durable MT5 consumer, which hands each of them a different half of the bars.
+The refusal records `ownership_refused`, a reclaim `ownership_reclaimed`, and a
+shutdown that could not clean up keeps the claim and records
+`ownership_retained` — exactly as the runner does.
+
+The drain does not rely on that claim being honoured. It acknowledges a
+published batch by comparing the outbox head against the bytes it published,
+not by trimming a count, so a second writer that did get in acknowledges
+nothing instead of deleting closes nobody published. Those closes could never
+be re-staged, because the staging watermark has already passed them; the
+batch is simply published again, and the runner drops it by candle open time.
 
 Ingestion keeps each retired candle, including its partial-bar repair state,
 until Redis acknowledges staging. It retries that batch before retiring more

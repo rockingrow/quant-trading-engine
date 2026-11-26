@@ -89,6 +89,41 @@ not decode, or it belongs to another state namespace — is moved to the
 behind it; the list keeps the newest 1,000. `QTE_INGESTION__PUBLISH_CONFIRM_TIMEOUT`
 (default `5` seconds) is how long a publish may wait for that confirmation.
 
+## One ingestion per namespace
+
+Run exactly one `data-ingestion` against a Redis namespace — not two replicas,
+and not a hand-started `qte-ingestion` beside the container. Two of them do not
+share the load: they drain one candle outbox whose lock is process-local, and
+they bind one durable MT5 consumer that gives each of them a different half of
+the bars.
+
+Ingestion enforces it the way the runner does, with a non-expiring
+`data-ingestion:owner` claim taken before it touches any candle state. A second
+process logs `Ingestion ownership is already held`, records an
+`ownership_refused` event at `ERROR`, and restarts into the same refusal — so
+alert on either. A restart of the *same* container reclaims its own stale claim
+automatically (`QTE_INGESTION__RECLAIM_OWN_CLAIM`); a recreated container,
+another host or a host process does not. `make owner-status` shows both claims
+and their holders, and `make owner-check` — which `make start-prod` runs before
+it builds — exits 1 on either claim that nothing answers for. After an unclean
+exit, confirm no ingestion process is left on any host and then clear it:
+
+```bash
+make owner-clear SERVICE=ingestion YES=1
+```
+
+That refuses while any ingestion answers a ping, and deletes only the holder it
+printed. `SERVICE=` is required to clear anything but the runner's claim.
+
+A shutdown whose cleanup failed keeps the claim on purpose and logs
+`Retaining the ingestion ownership claim` with an `ownership_retained` event —
+that line is the explanation for a stale claim once the container is gone.
+
+If a second writer does get in anyway, the drain refuses to acknowledge: it
+logs `The candle outbox head changed under this drain` at `ERROR`, leaves the
+batch staged and publishes it again next time. That message means two
+ingestion processes, and nothing else.
+
 ## Where to look
 
 Everything else the engine knows is a CLI command or a SQL query:

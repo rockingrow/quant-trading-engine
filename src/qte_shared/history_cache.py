@@ -24,6 +24,8 @@ when it is missing rather than failing the caller.
 
 from __future__ import annotations
 
+import contextlib
+import os
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -109,13 +111,36 @@ class HistoryCache:
         if frame.empty or not self.available:
             return None
         path = self.path_for(symbol, timeframe)
-        merged = merge_frames(self.load(symbol, timeframe), frame) if merge else frame
+        merged = frame
+        if merge:
+            cached = self.load(symbol, timeframe)
+            if cached.empty and path.is_file():
+                # `load` answers an unreadable file with an empty frame, and a
+                # file that exists holds at least one bar — `_write` never
+                # writes an empty one. So this is a damaged cache, and merging
+                # against nothing would quietly replace it with this one range.
+                # Which is the right recovery, but not something to do silently.
+                log.warning(
+                    "History cache %s could not be read; rebuilding it from this fetch alone",
+                    path,
+                )
+            merged = merge_frames(cached, frame)
+        # Written beside the target and moved onto it, because `to_parquet`
+        # straight onto `path` leaves a half-written file when the process is
+        # killed mid-write — and the merge above reads this file back, so a
+        # truncated one costs the whole cached range, not just one fetch.
+        # `os.replace` is atomic within a directory, so a reader sees the old
+        # file or the new one.
+        staging_path = path.with_name(f"{path.name}.{os.getpid()}.partial")
         try:
             self.directory.mkdir(parents=True, exist_ok=True)
-            merged.to_parquet(path, engine="pyarrow", compression="snappy")
+            merged.to_parquet(staging_path, engine="pyarrow", compression="snappy")
+            os.replace(staging_path, path)
         except Exception:
             # The cache is an optimisation. Losing it costs a request, not the run.
             log.exception("Could not write history cache %s", path)
+            with contextlib.suppress(OSError):
+                staging_path.unlink()
             return None
         log.debug("History cache %s now holds %d bars", path.name, len(merged))
         return path

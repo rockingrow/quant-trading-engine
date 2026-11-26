@@ -267,6 +267,8 @@ async def test_a_provider_that_starts_no_feed_fails_the_start(two_vendors, monke
     for resource in (service.bus, service.state):
         monkeypatch.setattr(resource, "connect", _no_op)
         monkeypatch.setattr(resource, "close", _no_op)
+    monkeypatch.setattr(service.state, "claim_service", _claim_succeeds)
+    monkeypatch.setattr(service.state, "release_service", _claim_succeeds)
     monkeypatch.setattr(ingestion_service, "discard_foreign_candle_state", _guard_passes)
     monkeypatch.setattr(service, "_drain_candle_outbox", _no_op)
     monkeypatch.setattr(service, "_restore_open_candles", _no_op)
@@ -290,6 +292,11 @@ async def test_a_provider_that_starts_no_feed_fails_the_start(two_vendors, monke
 
 async def _no_op(*arguments, **keywords) -> None:
     return None
+
+
+async def _claim_succeeds(*arguments, **keywords) -> bool:
+    """The ingestion ownership claim, granted — this test is about the feeds."""
+    return True
 
 
 async def _guard_passes(*arguments, **keywords) -> bool:

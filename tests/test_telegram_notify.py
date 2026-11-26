@@ -79,15 +79,22 @@ class FakeSink:
 class FakeCycles:
     """In-memory stand-in for ``telegram_cycle_messages``."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, fail_saves: bool = False) -> None:
         self.stored: dict[tuple[str, str, str], TelegramCycleRecord] = {}
         self.saves = 0
+        #: The message ids known at each save, so a test can pin *when* an id
+        #: became durable rather than only that it ended up stored.
+        self.saved_messages: list[dict[str, str]] = []
+        self.fail_saves = fail_saves
 
     async def load(self, strategy: str, symbol: str, signal_uxid: str):
         return self.stored.get((strategy, symbol, signal_uxid))
 
     async def save(self, record: TelegramCycleRecord) -> bool:
         self.saves += 1
+        self.saved_messages.append(dict(record.messages))
+        if self.fail_saves:
+            return False
         self.stored[(record.strategy, record.symbol, record.signal_uxid)] = record
         return True
 
@@ -333,7 +340,38 @@ async def test_the_entry_sends_one_message_per_chat_and_remembers_its_id(configu
         f"{BROADCAST_AUDIENCE}:-1001111111111",
         f"{PRIVATE_AUDIENCE}:-1002173777783_924584",
     }
-    assert cycles.saves == 1
+    # One save for each message sent, so no id is left only in memory, plus the
+    # one that records the event itself.
+    assert cycles.saves == len(sink.sent) + 1
+
+
+async def test_each_message_id_is_stored_before_the_next_chat_is_sent_to(configured_chats):
+    # The id is the only thing that makes the next action an edit, and Telegram
+    # will not hand it over twice. Saving once at the end of `deliver` left
+    # every id sent so far at risk of a single failed write.
+    sink, cycles = FakeSink(), FakeCycles()
+    notifier = TelegramLifecycleNotifier(sink=sink, cycles=cycles)
+
+    await notifier.deliver(queued_event(build_signal(SignalAction.LONG)))
+
+    assert len(sink.sent) == 2
+    # The first save already carries the first chat's id, so a crash between
+    # the two sends loses nothing that was already in a chat.
+    assert len(cycles.saved_messages[0]) == 1
+    assert len(cycles.saved_messages[1]) == 2
+
+
+async def test_a_message_whose_id_could_not_be_stored_is_reported(configured_chats, caplog):
+    sink, cycles = FakeSink(), FakeCycles(fail_saves=True)
+    notifier = TelegramLifecycleNotifier(sink=sink, cycles=cycles)
+
+    with caplog.at_level("ERROR"):
+        await notifier.deliver(queued_event(build_signal(SignalAction.LONG)))
+
+    # Nothing can be done about it here, but a duplicate message later must be
+    # explainable from the log rather than look like a notifier bug.
+    assert "could not store its id" in caplog.text
+    assert "send a second message" in caplog.text
 
 
 async def test_a_later_action_edits_the_message_instead_of_sending_another(configured_chats):
@@ -471,7 +509,7 @@ async def test_a_queued_signal_reaches_the_chat_through_the_worker(configured_ch
         await notifier.stop()
 
     assert len(sink.sent) == 2
-    assert cycles.saves == 1
+    assert cycles.saves == len(sink.sent) + 1
     assert sink.stopped
 
 

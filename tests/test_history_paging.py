@@ -252,6 +252,40 @@ def test_cache_round_trips_a_frame(tmp_path):
     assert loaded.index[0] == first.index[0]
     assert loaded.index[-1] == second.index[-1]
     assert loaded.index.is_unique
+
+
+def test_a_write_leaves_no_partial_file_behind(tmp_path):
+    cache = HistoryCache("tiingo", tmp_path)
+    if not cache.available:
+        pytest.skip("pyarrow is not installed in this environment")
+
+    cache.store(frame_over(date(2026, 1, 1), date(2026, 1, 10)), "XAUUSD", "M15")
+
+    # Written to a staging name and moved onto the target, so a reader sees the
+    # old file or the new one — never a truncated parquet. Nothing is left over.
+    assert [path.name for path in cache.directory.iterdir()] == ["XAUUSD_M15.parquet"]
+
+
+def test_an_unreadable_cache_file_is_rebuilt_and_reported(tmp_path, caplog):
+    cache = HistoryCache("tiingo", tmp_path)
+    if not cache.available:
+        pytest.skip("pyarrow is not installed in this environment")
+
+    cached_path = cache.path_for("XAUUSD", "M15")
+    cached_path.parent.mkdir(parents=True, exist_ok=True)
+    # What a process killed mid-write used to leave behind.
+    cached_path.write_bytes(b"PAR1-truncated")
+
+    fresh = frame_over(date(2026, 2, 1), date(2026, 2, 5))
+    with caplog.at_level("WARNING"):
+        assert cache.store(fresh, "XAUUSD", "M15") is not None
+
+    # Replacing it is the right recovery; doing it silently is not, because the
+    # file may have held months of bars that merging against nothing discards.
+    assert "could not be read" in caplog.text
+    loaded = cache.load("XAUUSD", "M15")
+    assert loaded.index[0] == fresh.index[0]
+    assert loaded.index[-1] == fresh.index[-1]
     assert cache.path_for("XAUUSD", "M15").parent.name == "tiingo"
 
 

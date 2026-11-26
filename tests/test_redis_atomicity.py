@@ -157,6 +157,124 @@ async def test_a_claim_without_an_instance_token_is_never_reclaimed(candle_state
     assert await candle_state.runner_owner() == "9d0c5c1e-plain-host-process"
 
 
+async def test_each_service_claims_its_own_namespace_independently(candle_state):
+    # Ingestion claims one too: two of them share the candle outbox. The two
+    # claims must not block or reclaim each other — one host runs both.
+    assert await candle_state.claim_service("data-ingestion", "ingestion-one")
+    assert await candle_state.claim_runner("runner-one")
+    assert not await candle_state.claim_service("data-ingestion", "ingestion-two")
+
+    assert await candle_state.service_owner("data-ingestion") == "ingestion-one"
+    assert await candle_state.runner_owner() == "runner-one"
+    assert await candle_state.client.ttl(candle_state.key("data-ingestion", "owner")) == -1
+
+    assert not await candle_state.release_service("data-ingestion", "runner-one")
+    assert await candle_state.release_service("data-ingestion", "ingestion-one")
+    assert await candle_state.runner_owner() == "runner-one"
+    assert await candle_state.claim_service("data-ingestion", "ingestion-two")
+
+
+# ── The candle outbox: acknowledge only what was published ────────────────
+
+
+async def test_acknowledging_a_batch_removes_exactly_that_batch(candle_state):
+    for offset in range(3):
+        await candle_state.stage_closed_candle(closed_candle(offset * 15))
+    batch = await candle_state.pending_candle_batch(2)
+
+    assert await candle_state.ack_pending_candles(batch)
+    remaining = await candle_state.pending_candle_batch(10)
+    assert [entry.candle.open_time for entry in remaining] == [closed_candle(30).open_time]
+
+
+async def test_a_batch_that_is_no_longer_the_head_is_not_acknowledged(candle_state):
+    # Two ingestion processes on one namespace: both read the same batch, both
+    # publish it, and the second one must not trim the batch behind the first.
+    # Trimming by count would acknowledge closes nobody ever published, and the
+    # staging watermark means they could never be staged again.
+    for offset in range(4):
+        await candle_state.stage_closed_candle(closed_candle(offset * 15))
+    first_drain = await candle_state.pending_candle_batch(2)
+    second_drain = await candle_state.pending_candle_batch(2)
+
+    assert await candle_state.ack_pending_candles(first_drain)
+    assert not await candle_state.ack_pending_candles(second_drain)
+
+    survivors = await candle_state.pending_candle_batch(10)
+    assert [entry.candle.open_time for entry in survivors] == [
+        closed_candle(30).open_time,
+        closed_candle(45).open_time,
+    ]
+
+
+async def test_acknowledging_more_than_the_outbox_holds_removes_nothing(candle_state):
+    await candle_state.stage_closed_candle(closed_candle())
+    batch = await candle_state.pending_candle_batch(1)
+    await candle_state.ack_pending_candle()
+
+    assert not await candle_state.ack_pending_candles(batch)
+    assert await candle_state.pending_candle_batch(10) == []
+
+
+async def test_an_empty_acknowledgement_is_a_no_op(candle_state):
+    await candle_state.stage_closed_candle(closed_candle())
+    assert await candle_state.ack_pending_candles([])
+    assert len(await candle_state.pending_candle_batch(10)) == 1
+
+
+async def test_quarantine_moves_the_head_and_caps_the_dead_letters(candle_state, monkeypatch):
+    monkeypatch.setattr(redis_state_module, "DEAD_LETTER_LIMIT", 2)
+    for offset in range(3):
+        await candle_state.stage_closed_candle(closed_candle(offset * 15))
+
+    for _ in range(3):
+        await candle_state.quarantine_pending_candle()
+
+    assert await candle_state.pending_candle_batch(10) == []
+    dead_letters = await candle_state.client.lrange(
+        candle_state.key("outbox", "candles", "dead"), 0, -1
+    )
+    # One move and one trim in a single script, so the cap holds even though
+    # three entries passed through.
+    assert len(dead_letters) == 2
+    # An empty outbox is not an error, and moves nothing.
+    await candle_state.quarantine_pending_candle()
+    assert (
+        len(await candle_state.client.lrange(candle_state.key("outbox", "candles", "dead"), 0, -1))
+        == 2
+    )
+
+
+# ── The decided-bar watermark ─────────────────────────────────────────────
+
+
+async def test_the_decided_bar_mark_never_moves_backwards(candle_state):
+    newest = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    await candle_state.set_decided_open_time("QTE_X", "XAUUSD", "M15", newest)
+    # An older bar reaching this after the newer one would reopen a window the
+    # runner has already decided on, and the catch-up would trade it again.
+    await candle_state.set_decided_open_time(
+        "QTE_X", "XAUUSD", "M15", newest - timedelta(minutes=15)
+    )
+    assert await candle_state.get_decided_open_time("QTE_X", "XAUUSD", "M15") == newest
+
+    later = newest + timedelta(minutes=15)
+    await candle_state.set_decided_open_time("QTE_X", "XAUUSD", "M15", later)
+    assert await candle_state.get_decided_open_time("QTE_X", "XAUUSD", "M15") == later
+
+
+async def test_an_unreadable_decided_bar_mark_is_replaced(candle_state, caplog):
+    key = candle_state.key("decided", "QTE_X", "XAUUSD", "M15")
+    await candle_state.client.set(key, "not-a-timestamp")
+    moment = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+
+    with caplog.at_level("WARNING"):
+        await candle_state.set_decided_open_time("QTE_X", "XAUUSD", "M15", moment)
+
+    assert "unreadable decided-bar mark" in caplog.text
+    assert await candle_state.get_decided_open_time("QTE_X", "XAUUSD", "M15") == moment
+
+
 # ── Warm-up history: the one write allowed behind the watermark ───────────
 #
 # `stage_closed_candle` reads any bar at or below the staging watermark as a
@@ -315,3 +433,17 @@ async def test_connect_declares_the_connection_health_options(monkeypatch):
     assert captured["health_check_interval"] > 0
     # RESP3 pairs with maintenance notifications, which the OSS server rejects.
     assert captured["protocol"] == 2
+
+
+async def test_a_decided_bar_mark_dated_after_now_is_repaired(candle_state):
+    # A synthetic feed anchors its bars ahead of the clock, so it leaves a mark
+    # nothing can be newer than. Nothing deletes this key — `discard_candle_state`
+    # clears the window, not the mark — so refusing the write because the
+    # poisoned value is "newer" would make it permanent.
+    poisoned = datetime.now(UTC) + timedelta(days=400)
+    await candle_state.set_decided_open_time("QTE_X", "XAUUSD", "M15", poisoned)
+    assert await candle_state.get_decided_open_time("QTE_X", "XAUUSD", "M15") == poisoned
+
+    real_bar = datetime.now(UTC) - timedelta(minutes=15)
+    await candle_state.set_decided_open_time("QTE_X", "XAUUSD", "M15", real_bar)
+    assert await candle_state.get_decided_open_time("QTE_X", "XAUUSD", "M15") == real_bar

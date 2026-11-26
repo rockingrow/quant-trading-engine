@@ -759,28 +759,32 @@ ping: ## Ask the running runners to identify themselves
 demo-signal: ## Fire a demo open cycle at the broker, Telegram only [STRATEGY=] [SYMBOL=]
 	uv run qte-control demo-signal $(if $(STRATEGY),--strategy $(STRATEGY),) $(if $(SYMBOL),--symbol $(SYMBOL),)
 
-owner-status: ## Show which runner holds the ownership claim for this namespace
-	uv run qte-control owner status
+owner-status: ## Show who holds each service ownership claim for this namespace [SERVICE=]
+	uv run qte-control owner status $(if $(SERVICE),--service $(SERVICE),)
 
-owner-check: ## Report a claim no runner answers for; exit 1 when one is stale
-	uv run qte-control owner check
+owner-check: ## Report a claim nothing answers for; exit 1 when one is stale [SERVICE=]
+	uv run qte-control owner check $(if $(SERVICE),--service $(SERVICE),)
 
-# YES=1 skips the typed-namespace prompt and nothing else: the refusal while a
-# runner answers the ping, and the compare-and-delete against the holder it
+# One claim at a time, the runner's unless SERVICE= names another: the command
+# asks for one key's namespace to be typed back.
+#
+# YES=1 skips the typed-namespace prompt and nothing else: the refusal while the
+# service answers the ping, and the compare-and-delete against the holder it
 # printed, both still apply. It is here because that prompt needs a TTY, and a
 # `make` run from a deploy script or an agent terminal does not always have
 # one — without it the clear reads an empty line and aborts.
-owner-clear: ## Remove a stale runner claim after an unclean exit (YES=1 skips the prompt)
-	uv run qte-control owner clear $(if $(YES),--yes,)
+owner-clear: ## Remove a stale claim after an unclean exit [SERVICE=ingestion] (YES=1 skips the prompt)
+	uv run qte-control owner clear --service $(or $(SERVICE),runner) $(if $(YES),--yes,)
 
-# A claim an unclean exit left behind refuses every new runner container, and
-# the refusal only shows up as a crash loop minutes after the build started —
-# by which time the container that could explain it is gone. Checked before the
-# build instead. SKIP_OWNER_CHECK=1 is for the incident where ingestion has to
-# be redeployed while the runner's claim is still stale.
+# A claim an unclean exit left behind refuses every new container of that
+# service, and the refusal only shows up as a crash loop minutes after the build
+# started — by which time the container that could explain it is gone. Checked
+# before the build instead, for every claim the stack takes.
+# SKIP_OWNER_CHECK=1 is for the incident where one service has to be redeployed
+# while another's claim is still stale.
 owner-preflight:
 	@if [ -n "$(SKIP_OWNER_CHECK)" ]; then \
-		echo "Runner ownership check skipped (SKIP_OWNER_CHECK is set)"; \
+		echo "Ownership check skipped (SKIP_OWNER_CHECK is set)"; \
 	else \
 		uv run qte-control owner check; \
 	fi
